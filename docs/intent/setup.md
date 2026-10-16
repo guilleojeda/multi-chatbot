@@ -16,6 +16,8 @@ Las sesiones humanas se obtienen mediante el acceso autorizado de cada integrant
 
 Node y npm, dependencias directas y lockfile están fijados. Infraestructura y configuración compilan NodeNext a JavaScript ESM; CDK ejecuta ese resultado. TypeScript web comprueba TSX y DOM por separado; Vite produce activos estáticos. El mismo Vitest recoge la aceptación de ambos alcances. `synth` compila únicamente infraestructura y no necesita credenciales ni reconstruye la web: consume `dist/web/` ya preparado por `build:web`. Los hooks de tests construyen infraestructura y web antes de ejecutar la suite para no depender del orden de sus archivos.
 
+Vitest ejecuta los archivos de aceptación de manera serial (`fileParallelism: false`). Los casos de síntesis de setup y del sitio llaman a `npm run synth`, que compila TypeScript dentro de la misma carpeta `dist/infra/`; ejecutarlos en paralelo podía cargar un módulo mientras el compilador lo estaba reemplazando.
+
 La aceptación usa Git temporal real para distinguir commit del evento, historia de `main`, tags anotados y referencias movidas/eliminadas. Las comprobaciones de calidad introducen errores en copias temporales y exigen primero un resultado limpio. El fixture React prueba JSX, renderizado y activos; verificar su carga local acredita el montaje en navegador. La aceptación del sitio agrega el componente de producto, su build, tipos y publicación de activos en el assembly. La presentación y carga desde CloudFront se verifican directamente; estas comprobaciones no acreditan cuenta o chat todavía inexistentes.
 
 ## Contrato de los workflows
