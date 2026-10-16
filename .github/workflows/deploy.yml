@@ -1,0 +1,152 @@
+name: Deploy setup
+
+on:
+  push:
+    tags:
+      - dev
+      - prod
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks and assembly
+    if: github.event.deleted != true
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.deployment.outputs.commit }}
+      environment: ${{ steps.deployment.outputs.environment }}
+      account: ${{ steps.deployment.outputs.account }}
+      region: ${{ steps.deployment.outputs.region }}
+      deploy: ${{ steps.deployment.outputs.deploy }}
+      artifact_name: ${{ steps.artifact.outputs.name }}
+    steps:
+      - name: Check out the event SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Set up npm
+        run: npm install --global npm@11.19.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run project checks
+        run: npm run check
+
+      - name: Resolve and validate deployment context
+        id: deployment
+        run: node scripts/deployment-context.mjs resolve
+
+      - name: Synthesize the checked environment assembly
+        if: steps.deployment.outputs.deploy == 'true'
+        env:
+          DEPLOYMENT_ENVIRONMENT: ${{ steps.deployment.outputs.environment }}
+        run: npm run synth -- --context "environment=$DEPLOYMENT_ENVIRONMENT"
+
+      - name: Name the checked assembly
+        if: steps.deployment.outputs.deploy == 'true'
+        id: artifact
+        env:
+          DEPLOYMENT_COMMIT: ${{ steps.deployment.outputs.commit }}
+          DEPLOYMENT_ENVIRONMENT: ${{ steps.deployment.outputs.environment }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: printf 'name=deployment-%s-%s-%s-%s\n' "$DEPLOYMENT_ENVIRONMENT" "$DEPLOYMENT_COMMIT" "$RUN_ID" "$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload checked cloud assembly and assets
+        if: steps.deployment.outputs.deploy == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: cdk.out/
+          if-no-files-found: error
+          retention-days: 5
+
+  deploy:
+    name: Deploy checked assembly
+    needs: checks
+    if: needs.checks.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: multi-chatbot-deployment
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.checks.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Set up npm
+        run: npm install --global npm@11.19.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download the checked assembly and assets
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: ${{ needs.checks.outputs.artifact_name }}
+          path: cdk.out
+
+      - name: Confirm this tag still selects the validated commit
+        id: current
+        env:
+          DEPLOYMENT_TAG: ${{ github.ref_name }}
+          DEPLOYMENT_COMMIT: ${{ needs.checks.outputs.commit }}
+        run: node scripts/deployment-context.mjs current --tag "$DEPLOYMENT_TAG" --commit "$DEPLOYMENT_COMMIT"
+
+      - name: Configure AWS credentials with OIDC
+        if: steps.current.outputs.current == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::118903272638:role/multi-chatbot-github-actions
+          aws-region: ${{ needs.checks.outputs.region }}
+          allowed-account-ids: ${{ needs.checks.outputs.account }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Verify AWS account and region
+        if: steps.current.outputs.current == 'true'
+        env:
+          EXPECTED_ACCOUNT: ${{ needs.checks.outputs.account }}
+          EXPECTED_REGION: ${{ needs.checks.outputs.region }}
+        run: |
+          actual_account="$(aws sts get-caller-identity --query Account --output text)"
+          if [[ "$actual_account" != "$EXPECTED_ACCOUNT" ]]; then
+            printf 'Expected AWS account %s, received %s\n' "$EXPECTED_ACCOUNT" "$actual_account" >&2
+            exit 1
+          fi
+          if [[ "${AWS_REGION:-}" != "$EXPECTED_REGION" ]]; then
+            printf 'Expected AWS region %s, received %s\n' "$EXPECTED_REGION" "${AWS_REGION:-<unset>}" >&2
+            exit 1
+          fi
+
+      - name: Deploy the checked CDK assembly
+        if: steps.current.outputs.current == 'true'
+        run: ./node_modules/.bin/cdk deploy --app cdk.out --all --require-approval never
+
+      - name: Skip the stale deployment
+        if: steps.current.outputs.current == 'false'
+        env:
+          DEPLOYMENT_TAG: ${{ github.ref_name }}
+          DEPLOYMENT_COMMIT: ${{ needs.checks.outputs.commit }}
+        run: printf 'Skipping deployment because refs/tags/%s no longer points to %s.\n' "$DEPLOYMENT_TAG" "$DEPLOYMENT_COMMIT"

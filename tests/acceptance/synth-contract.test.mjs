@@ -79,8 +79,7 @@ function statementActions(statement) {
 function webIdentityAllowStatements(policy) {
   return list(policy.Statement || []).filter((statement) => {
     return (
-      statement.Effect === "Allow" &&
-      statementActions(statement).some(actionAllowsWebIdentity)
+      statement.Effect === "Allow" && statementActions(statement).some(actionAllowsWebIdentity)
     );
   });
 }
@@ -161,10 +160,9 @@ function verifySharedSetup(outputDirectory) {
     expect(roleTags.some(([key]) => key === "environment")).toBe(false);
   }
 
-  const webIdentityPolicies = roleResources
-    .flatMap(({ Properties }) =>
-      webIdentityAllowStatements(Properties?.AssumeRolePolicyDocument || {}),
-    );
+  const webIdentityPolicies = roleResources.flatMap(({ Properties }) =>
+    webIdentityAllowStatements(Properties?.AssumeRolePolicyDocument || {}),
+  );
   expect(webIdentityPolicies.length).toBeGreaterThan(0);
 
   const audiences = [];
@@ -219,25 +217,19 @@ describe("real CDK setup synthesis", () => {
     60_000,
   );
 
-  it(
-    "rejects an unknown CDK environment context",
-    () => {
-      const outputDirectory = mkdtempSync(path.join(tmpdir(), "multi-chatbot-cdk-invalid-"));
-      try {
-        const packageJson = JSON.parse(
-          readFileSync(path.join(projectRoot, "package.json"), "utf8"),
-        );
-        expect(packageJson.scripts.synth, "npm synth script must be present").toEqual(
-          expect.any(String),
-        );
-        const result = synthesize(outputDirectory, "invalid");
-        const output = commandOutput(result);
-        expect(result.status, output).not.toBe(0);
-        expect(output).toContain("invalid");
-      } finally {
-        rmSync(outputDirectory, { recursive: true, force: true });
-      }
-    },
-    60_000,
-  );
+  it("rejects an unknown CDK environment context", () => {
+    const outputDirectory = mkdtempSync(path.join(tmpdir(), "multi-chatbot-cdk-invalid-"));
+    try {
+      const packageJson = JSON.parse(readFileSync(path.join(projectRoot, "package.json"), "utf8"));
+      expect(packageJson.scripts.synth, "npm synth script must be present").toEqual(
+        expect.any(String),
+      );
+      const result = synthesize(outputDirectory, "invalid");
+      const output = commandOutput(result);
+      expect(result.status, output).not.toBe(0);
+      expect(output).toContain("invalid");
+    } finally {
+      rmSync(outputDirectory, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

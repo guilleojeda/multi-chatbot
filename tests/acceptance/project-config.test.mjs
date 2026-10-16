@@ -64,11 +64,8 @@ describe("shared project and environment configuration", () => {
     expect(() => resolveEnvironment("test")).toThrow();
   });
 
-  it.each(["", "../prod"])(
-    "rejects an invalid botId (%s)",
-    async (botId) => {
-      const { resolveEnvironment } = await loadProjectConfig();
-      expect(() => resolveEnvironment("dev", botId)).toThrow();
-    },
-  );
+  it.each(["", "../prod"])("rejects an invalid botId (%s)", async (botId) => {
+    const { resolveEnvironment } = await loadProjectConfig();
+    expect(() => resolveEnvironment("dev", botId)).toThrow();
+  });
 });

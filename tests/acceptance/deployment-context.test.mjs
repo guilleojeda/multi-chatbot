@@ -1,13 +1,9 @@
-import { existsSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  createGitRepositoryScenario,
-  readGitHubOutput,
-} from "./helpers/git-repository.mjs";
+import { createGitRepositoryScenario, readGitHubOutput } from "./helpers/git-repository.mjs";
 
 const cliPath = fileURLToPath(new URL("../../scripts/deployment-context.mjs", import.meta.url));
 let scenario;
@@ -21,10 +17,9 @@ afterEach(() => {
 });
 
 function invokeResolve({ ref, sha, deleted = false }) {
-  expect(
-    existsSync(cliPath),
-    "scripts/deployment-context.mjs must exist for acceptance",
-  ).toBe(true);
+  expect(existsSync(cliPath), "scripts/deployment-context.mjs must exist for acceptance").toBe(
+    true,
+  );
   const outputPath = path.join(scenario.root, "github-output");
   const eventPath = path.join(scenario.root, "event.json");
   writeFileSync(outputPath, "");
@@ -50,10 +45,9 @@ function invokeResolve({ ref, sha, deleted = false }) {
 }
 
 function invokeCurrent({ tag, commit }) {
-  expect(
-    existsSync(cliPath),
-    "scripts/deployment-context.mjs must exist for acceptance",
-  ).toBe(true);
+  expect(existsSync(cliPath), "scripts/deployment-context.mjs must exist for acceptance").toBe(
+    true,
+  );
   const outputPath = path.join(scenario.root, "github-output");
   writeFileSync(outputPath, "");
   const result = spawnSync(
@@ -96,11 +90,10 @@ describe("deployment context resolution", () => {
 
   it("resolves an annotated event SHA to its commit", () => {
     const tagObject = scenario.publishTag("prod", scenario.mainFirst, true);
-    const fetched = spawnSync(
-      "git",
-      ["fetch", "origin", "refs/tags/prod:refs/tags/prod"],
-      { cwd: scenario.checkout, encoding: "utf8" },
-    );
+    const fetched = spawnSync("git", ["fetch", "origin", "refs/tags/prod:refs/tags/prod"], {
+      cwd: scenario.checkout,
+      encoding: "utf8",
+    });
     expect(fetched.status, fetched.stderr).toBe(0);
 
     const result = invokeResolve({ ref: "refs/tags/prod", sha: tagObject });

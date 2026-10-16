@@ -87,7 +87,7 @@ export function createGitRepositoryScenario() {
 }
 
 export function readGitHubOutput(pathname) {
-  let contents = "";
+  let contents;
   try {
     contents = readFileSync(pathname, "utf8");
   } catch {

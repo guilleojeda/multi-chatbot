@@ -10,8 +10,8 @@ Este documento fija los límites y resultados de las fases. El workflow de goal,
 - TypeScript, React y Node.js; web en S3 y CloudFront; API Gateway HTTP y Lambda para las operaciones de aplicación; infraestructura con CDK. El navegador conversa directamente con Runtime usando autenticación Cognito. Desarrollo y producción tienen recursos y datos separados.
 - Strands en AgentCore Runtime. Perfil explícito, mensajes originales y estado de las sesiones en DynamoDB; resúmenes por conversación. Inicialmente sin AgentCore Memory.
 - Documentos preparados fuera de la aplicación y almacenados en S3; una Bedrock Knowledge Base y un índice S3 Vectors por chatbot. Recuperación documental separada de generación. La información relevante de imágenes se puede transcribir durante la preparación.
-- Claude Haiku 5.5 y GPT-6 Luna como candidatos mediante Bedrock, con sus respectivas APIs Converse/Messages y Responses. La elección para el piloto se hará con evaluaciones representativas.
-- Recursos en `us-east-1`; inference profiles US o global según disponibilidad, facilidad y precio. Sin restricción geográfica estricta ni presupuesto mensual fijo. Priorizar costos razonablemente bajos sin añadir complejidad para ahorros pequeños.
+- Claude Sonnet 4.6 mediante Bedrock como modelo inicial, mientras se gestiona acceso a Claude Haiku 5.5 y GPT-6 Luna. Estos dos se conservan como candidatos posteriores, con sus respectivas APIs Converse/Messages y Responses. La elección para el piloto se hará con evaluaciones representativas.
+- Cuenta AWS `118903272638`, compartida por desarrollo y producción, con recursos y datos separados y tags `environment=dev` y `environment=prod`. Despliegue privilegiado compartido aceptado. Recursos en `us-east-1`; inference profiles US o global según disponibilidad, facilidad y precio. Sin restricción geográfica estricta ni presupuesto mensual fijo. Priorizar costos razonablemente bajos sin añadir complejidad para ahorros pequeños.
 - Una cuenta común con acceso, perfil y preferencias separados por chatbot. Inicialmente por invitación; email y contraseña, verificación de email y recuperación de contraseña. Para docentes, niveles educativos y materias obligatorios, admitiendo varios; preferencias opcionales y guardadas únicamente cuando el usuario las completa explícitamente.
 - El chatbot de docentes ayuda con cualquier tarea de enseñanza: información, recomendaciones y creación de materiales como texto copiable. Usa documentos y conocimiento general, indicando cuando aporta este último. No muestra citas, fragmentos ni referencias documentales al usuario. Explica discrepancias relevantes sin presentar como indiscutible una conclusión. No permite archivos de usuarios ni búsquedas web.
 - Conversaciones persistentes y retomables. Un chat nuevo usa el perfil explícito; retomar uno existente usa además su contexto. Quitar del historial oculta la conversación al usuario y conserva sus datos para administración y exportación; no devuelve cupo. No se exige retención indefinida ni se ha fijado una expiración automática.
@@ -35,21 +35,21 @@ Se detallará solo la próxima fase contra el estado real del proyecto. Una fase
 
 ## Mapa de fases
 
-| Fase | Incremento | Resultado verificable |
-|---|---|---|
-| 1 | Groundwork del proyecto | Repositorio, herramientas, pipelines, cuenta AWS y ambientes preparados y comprobados para empezar a construir. |
-| 2 | Sitio público y cuenta | Una persona invitada conoce el proyecto y puede activar, verificar y recuperar su cuenta e ingresar. |
-| 3 | Perfil y preferencias explícitas | Una persona completa y edita su perfil del chatbot; los datos sobreviven al cierre de sesión. |
-| 4 | Primera conversación | Una persona con acceso y perfil consulta información y crea materiales con conocimiento general, con respuestas progresivas y registros persistentes. |
-| 5 | Uso limitado y recuperación de envíos | Cada envío respeta los cupos y se puede resolver después de un fallo o reconexión sin duplicar el consumo. |
-| 6 | Respuestas con documentos | La conversación usa la knowledge base del proyecto y distingue sus aportes del conocimiento general. |
-| 7 | Historial y continuidad | Una persona crea varias conversaciones y retoma la que elige, incluso después de reiniciar el backend. |
-| 8 | Quitar del historial | Una persona oculta una conversación y entiende que su contenido se conserva para el equipo. |
-| 9 | Administración de acceso | El admin invita y revoca usuarios de un chatbot desde el panel unificado. |
-| 10 | Administración de cuotas | El admin cambia los límites de un chatbot y comprueba su aplicación al siguiente envío. |
-| 11 | Administración de documentos | El admin publica, reemplaza y retira documentos y ve el resultado del procesamiento. |
-| 12 | Consulta y exportación de registros | El admin filtra consultas de un chatbot y exporta un CSV utilizable para análisis externo. |
-| 13 | Segundo chatbot por configuración | Otro despliegue usa el mismo código, con datos y contenido separados y cuenta y admin comunes. |
+| Fase | Incremento                            | Resultado verificable                                                                                                                                 |
+| ---- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | Groundwork del proyecto               | Repositorio, herramientas, pipelines, cuenta AWS y ambientes preparados y comprobados para empezar a construir.                                       |
+| 2    | Sitio público y cuenta                | Una persona invitada conoce el proyecto y puede activar, verificar y recuperar su cuenta e ingresar.                                                  |
+| 3    | Perfil y preferencias explícitas      | Una persona completa y edita su perfil del chatbot; los datos sobreviven al cierre de sesión.                                                         |
+| 4    | Primera conversación                  | Una persona con acceso y perfil consulta información y crea materiales con conocimiento general, con respuestas progresivas y registros persistentes. |
+| 5    | Uso limitado y recuperación de envíos | Cada envío respeta los cupos y se puede resolver después de un fallo o reconexión sin duplicar el consumo.                                            |
+| 6    | Respuestas con documentos             | La conversación usa la knowledge base del proyecto y distingue sus aportes del conocimiento general.                                                  |
+| 7    | Historial y continuidad               | Una persona crea varias conversaciones y retoma la que elige, incluso después de reiniciar el backend.                                                |
+| 8    | Quitar del historial                  | Una persona oculta una conversación y entiende que su contenido se conserva para el equipo.                                                           |
+| 9    | Administración de acceso              | El admin invita y revoca usuarios de un chatbot desde el panel unificado.                                                                             |
+| 10   | Administración de cuotas              | El admin cambia los límites de un chatbot y comprueba su aplicación al siguiente envío.                                                               |
+| 11   | Administración de documentos          | El admin publica, reemplaza y retira documentos y ve el resultado del procesamiento.                                                                  |
+| 12   | Consulta y exportación de registros   | El admin filtra consultas de un chatbot y exporta un CSV utilizable para análisis externo.                                                            |
+| 13   | Segundo chatbot por configuración     | Otro despliegue usa el mismo código, con datos y contenido separados y cuenta y admin comunes.                                                        |
 
 ## Fase 1 Groundwork del proyecto
 
@@ -60,9 +60,9 @@ Se detallará solo la próxima fase contra el estado real del proyecto. Una fase
 **Alcance.** Todo el setup necesario para trabajar con la arquitectura aprobada:
 
 - **Repositorio y Git:** estructura del código y de CDK, repositorio remoto, reglas de colaboración y entrega, y `.gitignore` para dependencias, cachés, archivos de entorno, artefactos generados y `.work/`. Los ejemplos de configuración no incluyen secretos.
-- **Herramientas locales:** versiones y dependencias fijadas, configuración de TypeScript, gestor de paquetes y comandos comunes para instalar, comprobar tipos, lint, formato, tests, build y síntesis de CDK. El runner de tests queda preparado; los casos de producto se agregan con las funcionalidades.
-- **Pipelines:** CI que ejecute las comprobaciones aplicables y prepare artefactos; CD con configuración por ambiente, autenticación y permisos de despliegue. La ruta queda preparada para desplegar las implementaciones de las fases siguientes.
-- **Cuenta AWS:** seleccionar y configurar la cuenta, accesos del equipo, identidad y roles de CI/CD, permisos necesarios y bootstrap de CDK. Comprobar región y habilitación de acceso a los servicios y modelos acordados, sin construir todavía sus integraciones de aplicación.
+- **Herramientas locales:** versiones y dependencias fijadas, TypeScript de infraestructura y React/TSX de navegador, gestor de paquetes y comandos comunes para instalar, comprobar tipos, lint, formato, tests, build y síntesis de CDK. La aplicación CDK queda inicializada, compilada y sintetizable. Build y runner de React se comprueban mediante fixtures locales sin publicarlos; los casos de producto se agregan con las funcionalidades.
+- **Pipelines:** CI en PR y `main`, con comprobaciones y artefactos; CD automático con GitHub Actions al crear o mover los tags Git `dev` y `prod`, ambos sobre commits de `main`. Cada tag despliega su revisión comprobada al ambiente correspondiente con autenticación OIDC y permisos compartidos aceptados. La ruta queda preparada para desplegar las implementaciones de las fases siguientes.
+- **Cuenta AWS:** configurar la cuenta confirmada `118903272638` en `us-east-1`, accesos del equipo, identidad y roles de CI/CD, permisos necesarios y bootstrap estándar compartido de CDK. Comprobar región y habilitación de acceso a los servicios y modelos acordados, sin construir todavía sus integraciones de aplicación.
 - **Ambientes y configuración:** separación de desarrollo y producción, convenciones de nombres, configuración por chatbot y manejo de secretos y credenciales. Preparar los parámetros necesarios para desplegar el mismo código en las instancias previstas.
 - **Documentación de trabajo:** instrucciones para preparar un checkout, ejecutar los comandos, configurar el acceso a AWS y utilizar los pipelines. Documentar qué configuración requiere cada ambiente y cómo se suministra.
 
@@ -94,11 +94,11 @@ Se detallará solo la próxima fase contra el estado real del proyecto. Una fase
 
 **Resultado.** Una persona con acceso y perfil completo hace preguntas y pide materiales de enseñanza en una conversación, recibe respuestas progresivas basadas en conocimiento general y puede copiar el texto. La interfaz deja claro que todavía no se usan documentos del proyecto.
 
-**Alcance.** Interfaz de chat, Runtime con Strands, integración de uno de los dos modelos candidatos y persistencia real de mensajes y estado de la conversación en DynamoDB. Usar el perfil vigente y los mensajes del hilo para responder y crear materiales como texto. Registrar desde el primer envío preguntas, respuestas, estados, contexto profesional e identificadores y datos de invocación disponibles para revisar fallos, consumo y versiones. La integración se incorpora al código de producto y se conserva en las fases siguientes.
+**Alcance.** Interfaz de chat, Runtime con Strands, integración del modelo inicial Sonnet 4.6 y persistencia real de mensajes y estado de la conversación en DynamoDB. Usar el perfil vigente y los mensajes del hilo para responder y crear materiales como texto. Registrar desde el primer envío preguntas, respuestas, estados, contexto profesional e identificadores y datos de invocación disponibles para revisar fallos, consumo y versiones. La integración se incorpora al código de producto y se conserva en las fases siguientes.
 
 **Verificación.** Comprobar JWT directo a Runtime, streaming, la invocación del modelo exacto elegido provisionalmente y la persistencia de preguntas y resultados completos o fallidos. Resolver una consulta de enseñanza, un pedido de creación de materiales y un seguimiento dentro del mismo hilo. Comprobar que se identifica el uso de conocimiento general, se utiliza el perfil vigente y se captura su contexto profesional al registrar cada pregunta. Un perfil incompleto no puede conversar. Acceso al chatbot y propiedad de la conversación se validan antes de cargar contexto o llamar al modelo; la autenticación de Runtime no sustituye esas comprobaciones.
 
-**Dependencias.** Fase 3 y acceso efectivo a un modelo candidato. El candidato inicial se define al preparar esta fase; habilitar su integración no decide todavía el modelo ganador del piloto. No incluye recuperación documental, comparación de proveedores, cupos, recuperación de envíos ni listado de conversaciones anteriores: se agregan en las fases 5 a 7. Tampoco incluye selección de modelo por parte del usuario, archivos, web ni descargas de materiales.
+**Dependencias.** Fase 3 y acceso efectivo a un modelo candidato. Sonnet 4.6 es la elección inicial confirmada; habilitar su integración no decide todavía el modelo ganador del piloto. No incluye recuperación documental, comparación de proveedores, cupos, recuperación de envíos ni listado de conversaciones anteriores: se agregan en las fases 5 a 7. Tampoco incluye selección de modelo por parte del usuario, archivos, web ni descargas de materiales.
 
 ## Fase 5 Uso limitado y recuperación de envíos
 
@@ -196,7 +196,7 @@ El primer piloto queda funcionalmente completo con las fases 1 a 12. La fase 13 
 
 La apertura necesita el corpus inicial preparado y ejemplos representativos. Las evaluaciones que se incorporan desde las primeras respuestas cubren fidelidad a documentos, uso identificado de conocimiento general, utilidad de materiales, contexto profesional y continuidad. Se amplían cuando cada fase incorpora esas capacidades. No se inventan respuestas de referencia ni umbrales de aprobación antes de contar con los casos y criterios del equipo.
 
-La fase 4 usa un candidato provisional; la fase 6 habilita la comparación de Haiku y Luna con documentos. La comparación usa casos equivalentes y registra calidad, latencia y consumo para decidir el modelo del piloto. Esa elección y los ajustes de recuperación o contexto se incorporan a las entregas que los necesitan; no forman otra fase técnica separada ni sustituyen la verificación de cada incremento.
+La fase 4 empieza con Sonnet 4.6; la fase 6 habilita la comparación de Haiku y Luna con documentos. La comparación usa casos equivalentes y registra calidad, latencia y consumo para decidir el modelo del piloto. Esa elección y los ajustes de recuperación o contexto se incorporan a las entregas que los necesitan; no forman otra fase técnica separada ni sustituyen la verificación de cada incremento.
 
 Antes de habilitar participantes externos deben estar verificadas las capacidades del piloto, con información visible sobre el uso de preguntas y perfiles, y separación entre desarrollo y producción. Las cuentas y conversaciones del piloto se conservarán al sumar proyectos y usuarios.
 

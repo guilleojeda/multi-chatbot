@@ -3,11 +3,44 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "packageManager": "npm@11.19.1",
+  "engines": {
+    "node": ">=24.0.0 <25.0.0",
+    "npm": "11.19.1"
+  },
   "scripts": {
+    "pretest": "npm run build:infra",
     "test": "vitest run",
-    "test:acceptance": "vitest run tests/acceptance"
+    "pretest:acceptance": "npm run build:infra",
+    "test:acceptance": "vitest run tests/acceptance",
+    "typecheck:infra": "tsc -p tsconfig.json --noEmit",
+    "typecheck:web": "tsc -p tsconfig.web.json",
+    "typecheck": "npm run typecheck:infra && npm run typecheck:web",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "build:infra": "tsc -p tsconfig.json",
+    "build:web": "vite build --config vite.config.ts",
+    "build": "npm run build:infra && npm run build:web",
+    "synth": "npm run build:infra && cdk synth",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm test && npm run build && npm run synth"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "aws-cdk": "2.1145.0",
+    "aws-cdk-lib": "2.273.0",
+    "constructs": "10.8.1",
+    "eslint": "10.13.0",
+    "globals": "17.13.0",
+    "prettier": "3.9.10",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.2",
+    "vite": "8.3.4",
     "vitest": "5.0.5"
   }
 }

@@ -5,8 +5,7 @@ import { describe, expect, it } from "vitest";
 
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const exactVersion = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
-const node24Engine =
-  /^(?:v?24(?:\.\d+){0,2}|24\.x|\^24(?:\.x)?|>=24(?:\.0)?\s*<\s*25(?:\.0)?)$/;
+const node24Engine = /^(?:v?24(?:\.\d+){0,2}|24\.x|\^24(?:\.x)?|>=24(?:\.0)?\s*<\s*25(?:\.0)?)$/;
 const node24FullPatchEngine = /^(?:\^24\.0\.0|>=24\.0\.0\s*<\s*25\.0\.0)$/;
 
 function readJson(relativePath) {
