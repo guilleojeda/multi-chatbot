@@ -1,4 +1,12 @@
-import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -45,6 +53,30 @@ function output(result) {
 }
 
 describe("local quality commands", () => {
+  it("typechecks the public product's TSX, including newly added source files", () => {
+    const temporary = createTemporaryCheckout();
+
+    try {
+      const productEntry = path.join(temporary.checkout, "web/PublicSite.tsx");
+      expect(existsSync(productEntry), "Expected the public product's TSX entry").toBe(true);
+
+      const cleanTypecheck = runScript(temporary.checkout, "typecheck:web");
+      expect(cleanTypecheck.status, output(cleanTypecheck)).toBe(0);
+
+      const productTypeError = path.join(
+        temporary.checkout,
+        "web/__acceptance_product_type_error__.tsx",
+      );
+      writeFileSync(productTypeError, "export const productAcceptanceType: string = 123;\n");
+
+      const typecheck = runScript(temporary.checkout, "typecheck:web");
+      expect(typecheck.status, output(typecheck)).not.toBe(0);
+      expect(output(typecheck)).toContain("__acceptance_product_type_error__.tsx");
+    } finally {
+      temporary.cleanup();
+    }
+  }, 90_000);
+
   it("pass on a clean checkout and reject representative type, syntax, and format errors", () => {
     const temporary = createTemporaryCheckout();
 
