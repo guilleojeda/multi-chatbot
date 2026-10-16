@@ -13,8 +13,13 @@ export class PublicSiteStack extends Stack {
   constructor(scope: Construct, id: string, environment: ResolvedBotEnvironment) {
     super(scope, id, {
       env: { account: environment.account, region: environment.region },
+      tags: {
+        project: "multi-chatbot",
+        environment: environment.environment,
+      },
     });
 
+    // explicitStackTags separates stack tags above from resource tags below.
     Tags.of(this).add("project", "multi-chatbot");
     Tags.of(this).add("environment", environment.environment);
 
