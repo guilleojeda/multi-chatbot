@@ -7,9 +7,9 @@ const repositoryRoot = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   plugins: [react()],
-  root: path.join(repositoryRoot, "tests/fixtures/web"),
+  root: path.join(repositoryRoot, "web"),
   build: {
-    outDir: path.join(repositoryRoot, "dist/web-fixture"),
+    outDir: path.join(repositoryRoot, "dist/web"),
     emptyOutDir: true,
   },
   test: {

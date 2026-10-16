@@ -127,24 +127,32 @@ function commandOutput(result) {
 
 function verifySharedSetup(outputDirectory) {
   const manifest = JSON.parse(readFileSync(path.join(outputDirectory, "manifest.json"), "utf8"));
-  const stacks = Object.values(manifest.artifacts).filter(
-    (artifact) => artifact.type === "aws:cloudformation:stack",
-  );
-  expect(stacks.length).toBeGreaterThan(0);
-  for (const stack of stacks) {
-    expect(stack.environment).toBe("aws://118903272638/us-east-1");
-    expect(stack.properties.bootstrapStackVersionSsmParameter).toBe(
-      "/cdk-bootstrap/hnb659fds/version",
+  for (const artifact of Object.values(manifest.artifacts)) {
+    if (artifact.type !== "aws:cloudformation:stack") continue;
+    const template = JSON.parse(
+      readFileSync(path.join(outputDirectory, artifact.properties.templateFile), "utf8"),
     );
-    expect(stack.properties.requiresBootstrapStackVersion).toBeGreaterThan(0);
+    expect(
+      Object.values(template.Resources || {}).some(({ Type }) => Type === "AWS::IAM::OIDCProvider"),
+      "application stacks must reuse the existing GitHub OIDC provider",
+    ).toBe(false);
   }
+  const setupStack = manifest.artifacts["multi-chatbot-setup"];
+  expect(setupStack, "expected the stable multi-chatbot-setup stack").toBeDefined();
+  if (!setupStack) return;
+  expect(setupStack.type).toBe("aws:cloudformation:stack");
 
-  const templates = stacks.map((stack) =>
-    JSON.parse(readFileSync(path.join(outputDirectory, stack.properties.templateFile), "utf8")),
+  expect(setupStack.environment).toBe("aws://118903272638/us-east-1");
+  expect(setupStack.properties.bootstrapStackVersionSsmParameter).toBe(
+    "/cdk-bootstrap/hnb659fds/version",
   );
-  const resources = templates.flatMap((template) => Object.values(template.Resources || {}));
+  expect(setupStack.properties.requiresBootstrapStackVersion).toBeGreaterThan(0);
+
+  const template = JSON.parse(
+    readFileSync(path.join(outputDirectory, setupStack.properties.templateFile), "utf8"),
+  );
+  const resources = Object.values(template.Resources || {});
   expect(resources.length).toBeGreaterThan(0);
-  expect(resources.some(({ Type }) => Type === "AWS::IAM::OIDCProvider")).toBe(false);
   const applicationResourcePattern =
     /^(?:AWS::(?:S3|S3Vectors|CloudFront|DynamoDB|Lambda|ApiGateway(?:V2)?|Cognito|Bedrock|BedrockAgentCore)::)/;
   const applicationResourceTypes = resources

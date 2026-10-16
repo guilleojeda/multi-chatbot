@@ -1,6 +1,6 @@
 # Multi-chatbot
 
-Repositorio común para los chatbots del proyecto. Incluye herramientas TypeScript y React, una aplicación CDK de setup y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
+Repositorio común para los chatbots del proyecto. Incluye el sitio público del proyecto de docentes, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
 
 ## Preparar un checkout
 
@@ -15,31 +15,33 @@ npm run check
 
 `npm ci` usa el lockfile del repositorio. CDK, TypeScript, Vite y las herramientas de comprobación son dependencias locales; los comandos npm no dependen de instalaciones globales de CDK.
 
-| Comando                               | Resultado                                                            |
-| ------------------------------------- | -------------------------------------------------------------------- |
-| `npm run typecheck`                   | Comprueba infraestructura/configuración y TSX de navegador.          |
-| `npm run lint`                        | ESLint sobre código y tests, incluidos TSX.                          |
-| `npm run format:check`                | Comprueba formato con Prettier.                                      |
-| `npm test`                            | Compila el setup y ejecuta la aceptación con Vitest.                 |
-| `npm run test:acceptance`             | Ejecuta explícitamente la aceptación.                                |
-| `npm run build`                       | Compila infraestructura y genera el build del fixture web.           |
-| `npm run synth -- -c environment=dev` | Compila infraestructura y sintetiza el setup; también admite `prod`. |
-| `npm run check`                       | Ejecuta los checks, tests, builds y síntesis usados por CI.          |
+| Comando                               | Resultado                                                           |
+| ------------------------------------- | ------------------------------------------------------------------- |
+| `npm run typecheck`                   | Comprueba infraestructura/configuración y TSX de navegador.         |
+| `npm run lint`                        | ESLint sobre código y tests, incluidos TSX.                         |
+| `npm run format:check`                | Comprueba formato con Prettier.                                     |
+| `npm test`                            | Compila infraestructura/web y ejecuta la aceptación con Vitest.     |
+| `npm run test:acceptance`             | Ejecuta explícitamente la aceptación.                               |
+| `npm run build`                       | Compila infraestructura y genera el sitio en `dist/web/`.           |
+| `npm run synth -- -c environment=dev` | Sintetiza setup y sitio; requiere build web previo y admite `prod`. |
+| `npm run check`                       | Ejecuta los checks, tests, builds y síntesis usados por CI.         |
 
-Las pruebas con errores intencionales trabajan en copias y repositorios Git temporales. No necesitan credenciales AWS ni modifican el remoto real. La síntesis de este setup tampoco necesita consultas a AWS.
+Las pruebas con errores intencionales trabajan en copias y repositorios Git temporales. No necesitan credenciales AWS ni modifican el remoto real. La síntesis tampoco necesita consultas a AWS; los activos web deben estar construidos.
 
 ## React y el build de navegador
 
 `tsconfig.web.json` comprueba TSX y tipos DOM; Vite transforma y empaqueta con el plugin React. Vitest utiliza esa transformación y mantiene su raíz en el repositorio. La infraestructura usa otra configuración TypeScript, NodeNext, y se ejecuta compilada a JavaScript.
 
-La entrada web actual es un fixture de herramientas en `tests/fixtures/web/`. No se publica en AWS. Para comprobarlo localmente:
+La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes`. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. El contenido describe el estado actual y el uso previsto de datos; cuenta y chat todavía no están habilitados.
+
+Para usar el sitio localmente:
 
 ```sh
 npm run build:web
 npm exec -- vite preview --config vite.config.ts --host 127.0.0.1 --port 4173 --strictPort
 ```
 
-Abrir `http://127.0.0.1:4173`, comprobar el texto `fixture-react-acceptance` y detener el servidor con Ctrl-C. El resultado está en `dist/web-fixture/`. La prueba de renderizado a string comprueba React en el runner; la carga local comprueba montaje y activos de navegador.
+Abrir `http://127.0.0.1:4173` y detener el servidor con Ctrl-C. La salida está en `dist/web/`. El fixture de herramientas se conserva en `tests/fixtures/web/`; sus pruebas pasan raíz y salida explícitas y no lo publican. Los tests comprueban contenido configurable, build, tipos y activos sintetizados; la carga real en teléfono y computadora comprueba montaje y presentación. Ver [comportamiento del sitio](docs/intent/public-site.md).
 
 ## AWS y configuración
 
@@ -67,7 +69,7 @@ Los archivos `.env` locales, credenciales, dependencias, `.work/` y salidas gene
 
 ## CDK y entrega
 
-La aplicación está inicializada en `infra/`, con `cdk.json` y un stack compartido `multi-chatbot-setup`. Inicializar una app CDK, sintetizarla y preparar el bootstrap de AWS son operaciones diferentes. La entrada ejecuta `dist/infra/bin/app.js` después de compilar.
+La aplicación vive en `infra/`, con `cdk.json`, el stack compartido `multi-chatbot-setup` y un stack de sitio por ambiente/chatbot. Inicializar una app CDK, sintetizarla y preparar el bootstrap de AWS son operaciones diferentes. La entrada ejecuta `dist/infra/bin/app.js` después de compilar.
 
 El setup referencia el proveedor OIDC existente de GitHub y administra únicamente su rol `multi-chatbot-github-actions`. Los recursos de cuenta compartidos llevan `project=multi-chatbot`; no se les adjudica un ambiente arbitrario. La cadena CDK común usa el bootstrap estándar `hnb659fds` y un ejecutor CloudFormation administrador, conforme al alcance de despliegue compartido. Ver [contrato de entrega](docs/intent/setup.md).
 
@@ -75,11 +77,14 @@ La primera preparación de una cuenta/región y del rol requiere la identidad hu
 
 ```sh
 npm exec -- cdk bootstrap aws://118903272638/us-east-1 --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess --tags project=multi-chatbot
+npm run build
 npm run synth -- -c environment=dev
-npm exec -- cdk deploy --app cdk.out --all --require-approval never
+npm exec -- cdk deploy --app cdk.out multi-chatbot-setup --require-approval never
 ```
 
-Estos comandos establecen la confianza inicial. Una cuenta ya preparada se comprueba antes de repetirlos. Las actualizaciones normales se entregan automáticamente al crear o mover un tag Git sobre un commit de `main`:
+Estos comandos establecen únicamente la confianza inicial del setup. El sitio se entrega por el pipeline. Una cuenta ya preparada se comprueba antes de repetirlos. Para sintetizar directamente, ejecutar antes `npm run build:web`; `synth` compila infraestructura pero consume la web ya construida. `npm run check` prepara ambos builds.
+
+Las actualizaciones normales se entregan automáticamente al crear o mover un tag Git sobre un commit de `main`:
 
 ```sh
 git fetch origin main
@@ -90,6 +95,12 @@ git push --force-with-lease=refs/tags/dev:<objeto-remoto-observado> origin refs/
 Para crear un tag nuevo, usar `git push origin refs/tags/dev`; para producción, aplicar el mismo procedimiento con `prod`. Registrar primero el objeto remoto con `git ls-remote origin refs/tags/dev`; el valor de lease es el objeto del tag, incluso si el tag es anotado. Un tag puede señalar una revisión anterior de `main`. Mover `dev` no mueve `prod`. Un push a `main` ejecuta CI sin promover ambientes.
 
 El workflow valida el commit del evento, ejecuta los checks y genera un assembly identificado por ambiente, SHA, run y attempt. El job de despliegue consume ese assembly. Los tags se mueven con una identidad autorizada que produzca eventos de Actions; un push hecho con `GITHUB_TOKEN` no dispara otro workflow de push.
+
+El sitio de desarrollo está en el stack `multi-chatbot-dev-docentes-site`. Su output proporciona la URL de CloudFront:
+
+```sh
+aws cloudformation describe-stacks --stack-name multi-chatbot-dev-docentes-site --region us-east-1 --query "Stacks[0].Outputs[?OutputKey=='PublicSiteUrl'].OutputValue | [0]" --output text
+```
 
 Las entregas comparten una cola de hasta 100 pendientes. Al obtener turno, el job comprueba la vigencia del tag antes de autenticarse. Una ejecución reemplazada se omite; una operación CloudFormation iniciada termina. Para diagnosticar un fallo, revisar el job, el SHA, el artefacto y el estado/eventos del stack. Reintentar únicamente si esa revisión sigue siendo el tag vigente y el stack permite continuar. Mover un tag a una revisión anterior solicita el despliegue normal de esa revisión; no establece un mecanismo adicional de rollback.
 
@@ -112,5 +123,7 @@ Para consultar CloudFormation, usar la sesión humana de la cuenta indicada arri
 aws cloudformation describe-stacks --stack-name multi-chatbot-setup --region us-east-1 --query 'Stacks[0].[StackStatus,StackId]'
 aws cloudformation describe-stack-events --stack-name multi-chatbot-setup --region us-east-1 --max-items 20
 ```
+
+Para diagnosticar el sitio, usar los mismos comandos con `multi-chatbot-dev-docentes-site` y contrastar el resultado con la URL y revisión del run.
 
 Si el fallo está en autenticación, revisar el rol `multi-chatbot-github-actions`, el subject exacto del tag y el audience `sts.amazonaws.com`, según el contrato de entrega. Si está en CloudFormation, resolver primero el estado del stack. Una vez corregida la causa y confirmado que el commit sigue vigente, `gh run rerun <run-id>` repite los checks y genera un artefacto para el nuevo attempt; después hay que observar su resultado. No volver a ejecutar el bootstrap para corregir por rutina un fallo de aplicación o de OIDC.
