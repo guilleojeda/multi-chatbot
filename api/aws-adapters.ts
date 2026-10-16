@@ -500,8 +500,11 @@ export function createSesInvitationMailer(client: SESv2Client) {
                   Data: [
                     `Recibiste una invitación para acceder a ${input.projectName}.`,
                     "",
-                    "Abrí este enlace para elegir tu contraseña y verificar tu email:",
+                    "Abrí este enlace para aceptar la invitación:",
                     input.url,
+                    "",
+                    "Si tu cuenta es nueva, elegí una contraseña para activarla y verificar tu email.",
+                    "Si tu cuenta ya está activa, iniciá sesión con tu contraseña actual.",
                     "",
                     `El enlace vence el ${expiry}. Si no esperabas esta invitación, podés ignorar este mensaje.`,
                   ].join("\n"),
