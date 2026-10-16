@@ -1,6 +1,6 @@
 # Multi-chatbot
 
-Repositorio común para los chatbots del proyecto. Incluye el sitio público del proyecto de docentes, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
+Repositorio común para los chatbots del proyecto. Incluye el sitio público y la cuenta por invitación del proyecto de docentes, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
 
 ## Preparar un checkout
 
@@ -15,16 +15,16 @@ npm run check
 
 `npm ci` usa el lockfile del repositorio. CDK, TypeScript, Vite y las herramientas de comprobación son dependencias locales; los comandos npm no dependen de instalaciones globales de CDK.
 
-| Comando                               | Resultado                                                           |
-| ------------------------------------- | ------------------------------------------------------------------- |
-| `npm run typecheck`                   | Comprueba infraestructura/configuración y TSX de navegador.         |
-| `npm run lint`                        | ESLint sobre código y tests, incluidos TSX.                         |
-| `npm run format:check`                | Comprueba formato con Prettier.                                     |
-| `npm test`                            | Compila infraestructura/web y ejecuta la aceptación con Vitest.     |
-| `npm run test:acceptance`             | Ejecuta explícitamente la aceptación.                               |
-| `npm run build`                       | Compila infraestructura y genera el sitio en `dist/web/`.           |
-| `npm run synth -- -c environment=dev` | Sintetiza setup y sitio; requiere build web previo y admite `prod`. |
-| `npm run check`                       | Ejecuta los checks, tests, builds y síntesis usados por CI.         |
+| Comando                               | Resultado                                                                              |
+| ------------------------------------- | -------------------------------------------------------------------------------------- |
+| `npm run typecheck`                   | Comprueba servidor, infraestructura/configuración y TSX de navegador.                  |
+| `npm run lint`                        | ESLint sobre código y tests, incluidos TSX.                                            |
+| `npm run format:check`                | Comprueba formato con Prettier.                                                        |
+| `npm test`                            | Compila servidor/infraestructura/web y ejecuta la aceptación con Vitest.               |
+| `npm run test:acceptance`             | Ejecuta explícitamente la aceptación.                                                  |
+| `npm run build`                       | Compila servidor/infraestructura y genera el sitio en `dist/web/`.                     |
+| `npm run synth -- -c environment=dev` | Sintetiza setup, identidad, cuenta y sitio; requiere build web previo y admite `prod`. |
+| `npm run check`                       | Ejecuta los checks, tests, builds y síntesis usados por CI.                            |
 
 Las pruebas con errores intencionales trabajan en copias y repositorios Git temporales. No necesitan credenciales AWS ni modifican el remoto real. La síntesis tampoco necesita consultas a AWS; los activos web deben estar construidos.
 
@@ -32,7 +32,7 @@ Las pruebas con errores intencionales trabajan en copias y repositorios Git temp
 
 `tsconfig.web.json` comprueba TSX y tipos DOM; Vite transforma y empaqueta con el plugin React. Vitest utiliza esa transformación y mantiene su raíz en el repositorio. La infraestructura usa otra configuración TypeScript, NodeNext, y se ejecuta compilada a JavaScript.
 
-La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes`. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. El contenido describe el estado actual y el uso previsto de datos; cuenta y chat todavía no están habilitados.
+La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes`. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. El contenido describe el estado actual y el uso previsto de datos. La cuenta está disponible por invitación; el chat, el perfil y la recuperación de contraseña todavía no están habilitados. Ver [cuenta y operación de invitaciones](docs/intent/account.md).
 
 Para usar el sitio localmente:
 
@@ -41,7 +41,18 @@ npm run build:web
 npm exec -- vite preview --config vite.config.ts --host 127.0.0.1 --port 4173 --strictPort
 ```
 
-Abrir `http://127.0.0.1:4173` y detener el servidor con Ctrl-C. La salida está en `dist/web/`. El fixture de herramientas se conserva en `tests/fixtures/web/`; sus pruebas pasan raíz y salida explícitas y no lo publican. Los tests comprueban contenido configurable, build, tipos y activos sintetizados; la carga real en teléfono y computadora comprueba montaje y presentación. Ver [comportamiento del sitio](docs/intent/public-site.md).
+Abrir `http://127.0.0.1:4173` y detener el servidor con Ctrl-C. La salida está en `dist/web/`. Las rutas de cuenta necesitan el `public-config.json` y la API publicados por el despliegue; el preview estático permite revisar la presentación pública. El fixture de herramientas se conserva en `tests/fixtures/web/`; sus pruebas pasan raíz y salida explícitas y no lo publican. Los tests comprueban contenido configurable, build, tipos y activos sintetizados; la carga real en teléfono y computadora comprueba montaje y presentación. Ver [comportamiento del sitio](docs/intent/public-site.md).
+
+## Invitar una cuenta de desarrollo
+
+Después del despliegue, con la sesión IAM humana vigente y el email verificado en SES `us-east-1`:
+
+```sh
+npm run build:infra
+node scripts/invite.mjs --environment dev --email sxvintage@gmail.com --sender sxvintage@gmail.com
+```
+
+La herramienta consulta los outputs de cuenta y sitio, crea o reutiliza la identidad y envía el enlace real. El enlace permite elegir contraseña y verifica ese email al aceptarlo. Una cuenta activa inicia sesión para aceptar y conserva su contraseña. La herramienta muestra metadata de envío sin imprimir el enlace ni sus tokens. Ver [configuración SES, permisos y fallos parciales](docs/intent/account.md).
 
 ## AWS y configuración
 
@@ -69,7 +80,7 @@ Los archivos `.env` locales, credenciales, dependencias, `.work/` y salidas gene
 
 ## CDK y entrega
 
-La aplicación vive en `infra/`, con `cdk.json`, el stack compartido `multi-chatbot-setup` y un stack de sitio por ambiente/chatbot. Inicializar una app CDK, sintetizarla y preparar el bootstrap de AWS son operaciones diferentes. La entrada ejecuta `dist/infra/bin/app.js` después de compilar.
+La aplicación vive en `infra/`, con `cdk.json`, el stack compartido `multi-chatbot-setup`, identidad común por ambiente y cuenta/sitio por ambiente y chatbot. Inicializar una app CDK, sintetizarla y preparar el bootstrap de AWS son operaciones diferentes. La entrada ejecuta `dist/infra/bin/app.js` después de compilar.
 
 El setup referencia el proveedor OIDC existente de GitHub y administra únicamente su rol `multi-chatbot-github-actions`. Los recursos de cuenta compartidos llevan `project=multi-chatbot`; no se les adjudica un ambiente arbitrario. La cadena CDK común usa el bootstrap estándar `hnb659fds` y un ejecutor CloudFormation administrador, conforme al alcance de despliegue compartido. Ver [contrato de entrega](docs/intent/setup.md).
 
@@ -82,7 +93,7 @@ npm run synth -- -c environment=dev
 npm exec -- cdk deploy --app cdk.out multi-chatbot-setup --require-approval never
 ```
 
-Estos comandos establecen únicamente la confianza inicial del setup. El sitio se entrega por el pipeline. Una cuenta ya preparada se comprueba antes de repetirlos. Para sintetizar directamente, ejecutar antes `npm run build:web`; `synth` compila infraestructura pero consume la web ya construida. `npm run check` prepara ambos builds.
+Estos comandos establecen únicamente la confianza inicial del setup. La identidad, la cuenta y el sitio se entregan por el pipeline. Una cuenta ya preparada se comprueba antes de repetirlos. Para sintetizar directamente, ejecutar antes `npm run build:web`; `synth` compila infraestructura pero consume la web ya construida. `npm run check` prepara ambos builds.
 
 Las actualizaciones normales se entregan automáticamente al crear o mover un tag Git sobre un commit de `main`:
 

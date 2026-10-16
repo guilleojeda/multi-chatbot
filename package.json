@@ -25,6 +25,11 @@
     "check": "npm run typecheck && npm run lint && npm run format:check && npm test && npm run build && npm run synth"
   },
   "devDependencies": {
+    "@aws-sdk/client-cloudformation": "3.1152.0",
+    "@aws-sdk/client-cognito-identity-provider": "3.1152.0",
+    "@aws-sdk/client-dynamodb": "3.1152.0",
+    "@aws-sdk/client-sesv2": "3.1152.0",
+    "@aws-sdk/lib-dynamodb": "3.1152.0",
     "@eslint/js": "10.0.1",
     "@types/node": "24.19.2",
     "@types/react": "19.3.0",
@@ -33,6 +38,7 @@
     "aws-cdk": "2.1145.0",
     "aws-cdk-lib": "2.273.0",
     "constructs": "10.8.1",
+    "esbuild": "0.28.2",
     "eslint": "10.13.0",
     "globals": "17.13.0",
     "prettier": "3.9.10",

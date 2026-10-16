@@ -18,6 +18,10 @@ export function PublicSite({ projectName, purpose, dataUse }: PublicSiteProps) {
             <p className="eyebrow">Conocé el proyecto</p>
             <h1 id="project-title">{projectName}</h1>
             <p className="intro__purpose">{purpose}</p>
+            <div className="intro__account">
+              <a href="/#/login">Iniciar sesión</a>
+              <span>El acceso se habilita únicamente mediante invitación.</span>
+            </div>
           </div>
         </section>
 
