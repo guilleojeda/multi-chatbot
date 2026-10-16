@@ -115,11 +115,12 @@ function referencesAnyLogicalId(value, resourceRecords) {
 
 function outputRecords(assembly) {
   return assembly.stacks.flatMap((stack) =>
-    Object.entries(stack.template.Outputs || {}).flatMap(([logicalId, output]) =>
-      output.Export?.Name === undefined
-        ? []
-        : [{ stack, logicalId, output, exportName: output.Export.Name }],
-    ),
+    Object.entries(stack.template.Outputs || {}).map(([logicalId, output]) => ({
+      stack,
+      logicalId,
+      output,
+      ...(output.Export?.Name === undefined ? {} : { exportName: output.Export.Name }),
+    })),
   );
 }
 
@@ -127,19 +128,66 @@ function sameExpression(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function importedExportNames(value) {
-  if (Array.isArray(value)) return value.flatMap(importedExportNames);
+function outputReferences(value) {
+  if (Array.isArray(value)) return value.flatMap(outputReferences);
   if (!value || typeof value !== "object") return [];
-  if (Object.hasOwn(value, "Fn::ImportValue")) return [value["Fn::ImportValue"]];
-  return Object.values(value).flatMap(importedExportNames);
+  if (Object.hasOwn(value, "Fn::ImportValue")) {
+    return [{ type: "export", exportName: value["Fn::ImportValue"] }];
+  }
+  const stackOutput = value["Fn::GetStackOutput"];
+  if (
+    stackOutput &&
+    typeof stackOutput === "object" &&
+    typeof stackOutput.StackName === "string" &&
+    typeof stackOutput.OutputName === "string"
+  ) {
+    return [
+      {
+        type: "stack-output",
+        stackName: stackOutput.StackName,
+        outputName: stackOutput.OutputName,
+        region: stackOutput.Region,
+      },
+    ];
+  }
+  return Object.values(value).flatMap(outputReferences);
 }
 
-function exportValueReferencesResource(
+function stackCoordinates(stack) {
+  const match = /^aws:\/\/([^/]+)\/([^/]+)$/.exec(stack.environment || "");
+  return match ? { account: match[1], region: match[2] } : null;
+}
+
+function findOutputRecord(reference, assembly, sourceStack) {
+  const records = outputRecords(assembly);
+  if (reference.type === "export") {
+    return records.find(
+      (record) =>
+        record.exportName !== undefined && sameExpression(record.exportName, reference.exportName),
+    );
+  }
+  const sourceCoordinates = stackCoordinates(sourceStack);
+  return records.find((record) => {
+    if (record.stack.id !== reference.stackName || record.logicalId !== reference.outputName) {
+      return false;
+    }
+    const targetCoordinates = stackCoordinates(record.stack);
+    return Boolean(
+      sourceCoordinates &&
+      targetCoordinates &&
+      sourceCoordinates.account === targetCoordinates.account &&
+      sourceCoordinates.region === targetCoordinates.region &&
+      (reference.region === undefined || reference.region === targetCoordinates.region),
+    );
+  });
+}
+
+function outputValueReferencesResource(
   outputRecord,
   targetStack,
   targetResource,
   assembly,
-  visitedExports = new Set(),
+  visitedOutputs = new Set(),
 ) {
   if (
     outputRecord.stack.id === targetStack.id &&
@@ -147,16 +195,14 @@ function exportValueReferencesResource(
   ) {
     return true;
   }
-  const visitKey = `${outputRecord.stack.id}:${JSON.stringify(outputRecord.exportName)}`;
-  if (visitedExports.has(visitKey)) return false;
-  const nextVisited = new Set(visitedExports).add(visitKey);
-  return importedExportNames(outputRecord.output.Value).some((exportName) => {
-    const nextOutput = outputRecords(assembly).find((candidate) =>
-      sameExpression(candidate.exportName, exportName),
-    );
+  const visitKey = outputRecord.stack.id + ":" + outputRecord.logicalId;
+  if (visitedOutputs.has(visitKey)) return false;
+  const nextVisited = new Set(visitedOutputs).add(visitKey);
+  return outputReferences(outputRecord.output.Value).some((reference) => {
+    const nextOutput = findOutputRecord(reference, assembly, outputRecord.stack);
     return (
       nextOutput &&
-      exportValueReferencesResource(nextOutput, targetStack, targetResource, assembly, nextVisited)
+      outputValueReferencesResource(nextOutput, targetStack, targetResource, assembly, nextVisited)
     );
   });
 }
@@ -174,13 +220,11 @@ function referencesResourceThroughExports(
   ) {
     return true;
   }
-  return importedExportNames(value).some((exportName) => {
-    const outputRecord = outputRecords(assembly).find((candidate) =>
-      sameExpression(candidate.exportName, exportName),
-    );
+  return outputReferences(value).some((reference) => {
+    const outputRecord = findOutputRecord(reference, assembly, valueStack);
     return (
       outputRecord &&
-      exportValueReferencesResource(outputRecord, targetStack, targetResource, assembly)
+      outputValueReferencesResource(outputRecord, targetStack, targetResource, assembly)
     );
   });
 }
