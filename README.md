@@ -92,3 +92,25 @@ Para crear un tag nuevo, usar `git push origin refs/tags/dev`; para producción,
 El workflow valida el commit del evento, ejecuta los checks y genera un assembly identificado por ambiente, SHA, run y attempt. El job de despliegue consume ese assembly. Los tags se mueven con una identidad autorizada que produzca eventos de Actions; un push hecho con `GITHUB_TOKEN` no dispara otro workflow de push.
 
 Las entregas comparten una cola de hasta 100 pendientes. Al obtener turno, el job comprueba la vigencia del tag antes de autenticarse. Una ejecución reemplazada se omite; una operación CloudFormation iniciada termina. Para diagnosticar un fallo, revisar el job, el SHA, el artefacto y el estado/eventos del stack. Reintentar únicamente si esa revisión sigue siendo el tag vigente y el stack permite continuar. Mover un tag a una revisión anterior solicita el despliegue normal de esa revisión; no establece un mecanismo adicional de rollback.
+
+### Diagnosticar y reintentar una entrega
+
+Con GitHub CLI autenticada en el repositorio, consultar el run y sus logs:
+
+```sh
+gh run list --workflow deploy.yml --limit 10
+gh run view <run-id>
+gh run view <run-id> --log-failed
+git ls-remote origin refs/tags/dev 'refs/tags/dev^{}'
+```
+
+Comparar el commit del run con el tag vigente; en un tag anotado, la referencia terminada en `^{}` es el commit. El nombre del artefacto incluye ambiente, commit, run y attempt. Si el job registra que el tag fue reemplazado, esa ejecución se omite antes de OIDC.
+
+Para consultar CloudFormation, usar la sesión humana de la cuenta indicada arriba y fijar la región:
+
+```sh
+aws cloudformation describe-stacks --stack-name multi-chatbot-setup --region us-east-1 --query 'Stacks[0].[StackStatus,StackId]'
+aws cloudformation describe-stack-events --stack-name multi-chatbot-setup --region us-east-1 --max-items 20
+```
+
+Si el fallo está en autenticación, revisar el rol `multi-chatbot-github-actions`, el subject exacto del tag y el audience `sts.amazonaws.com`, según el contrato de entrega. Si está en CloudFormation, resolver primero el estado del stack. Una vez corregida la causa y confirmado que el commit sigue vigente, `gh run rerun <run-id>` repite los checks y genera un artefacto para el nuevo attempt; después hay que observar su resultado. No volver a ejecutar el bootstrap para corregir por rutina un fallo de aplicación o de OIDC.
