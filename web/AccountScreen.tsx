@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
-export type AccountView = "login" | "invite-new" | "invite-existing" | "ready" | "denied";
+export type AccountView =
+  | "login"
+  | "invite-new"
+  | "invite-existing"
+  | "recover-request"
+  | "recover-confirm"
+  | "ready"
+  | "denied";
+
+export type AccountPendingAction = "request-reset" | "resend-reset" | "confirm-reset";
 
 export type AccountState = {
   view: AccountView;
@@ -11,12 +20,17 @@ export type AccountState = {
   projectName?: string;
   retryable?: boolean;
   canSignOut?: boolean;
+  pendingAction?: AccountPendingAction;
 };
 
 export type AccountSubmission =
   | { action: "sign-in"; email: string; password: string }
   | { action: "accept-new"; email: string; password: string }
   | { action: "accept-existing"; email: string; password: string }
+  | { action: "request-password-reset"; email: string }
+  | { action: "resend-password-reset"; email: string }
+  | { action: "confirm-password-reset"; email: string; code: string; password: string }
+  | { action: "change-recovery-email" }
   | { action: "retry" };
 
 export type AccountScreenProps = {
@@ -38,6 +52,14 @@ const viewCopy: Record<AccountView, { title: string; description: string }> = {
     title: "Aceptá la invitación",
     description: "Iniciá sesión con la cuenta invitada para agregar este asistente.",
   },
+  "recover-request": {
+    title: "Recuperá tu contraseña",
+    description: "Ingresá el email de tu cuenta para solicitar un código de recuperación.",
+  },
+  "recover-confirm": {
+    title: "Elegí una nueva contraseña",
+    description: "Si recibiste un código en tu email, ingresalo para continuar.",
+  },
   ready: {
     title: "Tu acceso está activo",
     description: "Tu cuenta tiene acceso a este asistente.",
@@ -47,6 +69,9 @@ const viewCopy: Record<AccountView, { title: string; description: string }> = {
     description: "Revisá el enlace o volvé a la página pública.",
   },
 };
+
+const passwordPolicyHint =
+  "Usá al menos 8 caracteres, con una mayúscula, una minúscula, un número y un símbolo.";
 
 function valueFrom(form: HTMLFormElement, name: string): string {
   const value = new FormData(form).get(name);
@@ -62,6 +87,7 @@ export function AccountScreen({ state, onSubmit, onSignOut }: AccountScreenProps
 
   useEffect(() => {
     headingRef.current?.focus();
+    setPasswordError("");
   }, [state.view]);
 
   useEffect(() => {
@@ -70,16 +96,34 @@ export function AccountScreen({ state, onSubmit, onSignOut }: AccountScreenProps
 
   function submit(
     event: FormEvent<HTMLFormElement>,
-    action: "sign-in" | "accept-new" | "accept-existing",
+    action:
+      | "sign-in"
+      | "accept-new"
+      | "accept-existing"
+      | "request-password-reset"
+      | "confirm-password-reset",
   ) {
     event.preventDefault();
     setPasswordError("");
     const form = event.currentTarget;
     const email = valueFrom(form, "email").trim().toLowerCase();
+    if (action === "request-password-reset") {
+      void onSubmit({ action, email });
+      return;
+    }
+
     const password = valueFrom(form, "password");
 
-    if (action === "accept-new" && password !== valueFrom(form, "confirmPassword")) {
+    if (
+      (action === "accept-new" || action === "confirm-password-reset") &&
+      password !== valueFrom(form, "confirmPassword")
+    ) {
       setPasswordError("Las contraseñas no coinciden.");
+      return;
+    }
+
+    if (action === "confirm-password-reset") {
+      void onSubmit({ action, email, code: valueFrom(form, "code").trim(), password });
       return;
     }
 
@@ -99,7 +143,11 @@ export function AccountScreen({ state, onSubmit, onSignOut }: AccountScreenProps
 
       <main className="account-main">
         <section className="account-card" aria-labelledby="account-title">
-          <p className="eyebrow account-eyebrow">Acceso por invitación</p>
+          <p className="eyebrow account-eyebrow">
+            {state.view === "recover-request" || state.view === "recover-confirm"
+              ? "Recuperación de contraseña"
+              : "Acceso por invitación"}
+          </p>
           <h1 id="account-title" ref={headingRef} tabIndex={-1}>
             {copy.title}
           </h1>
@@ -119,7 +167,15 @@ export function AccountScreen({ state, onSubmit, onSignOut }: AccountScreenProps
             <p className="account-progress" role="status" aria-live="polite">
               {state.view === "invite-new" || state.view === "invite-existing"
                 ? "Procesando la invitación…"
-                : "Comprobando tu acceso…"}
+                : state.view === "recover-request"
+                  ? "Preparando la recuperación…"
+                  : state.view === "recover-confirm"
+                    ? state.pendingAction === "resend-reset"
+                      ? "Solicitando otro código…"
+                      : state.pendingAction === "confirm-reset"
+                        ? "Actualizando tu contraseña…"
+                        : "Enviando el código…"
+                    : "Comprobando tu acceso…"}
             </p>
           ) : null}
 
@@ -154,6 +210,111 @@ export function AccountScreen({ state, onSubmit, onSignOut }: AccountScreenProps
             </form>
           ) : null}
 
+          {state.view === "recover-request" ? (
+            <form
+              key="recover-request"
+              className="account-form"
+              onSubmit={(event) => submit(event, "request-password-reset")}
+            >
+              <label htmlFor="recovery-email">Email</label>
+              <input
+                id="recovery-email"
+                name="email"
+                type="email"
+                autoComplete="email"
+                defaultValue={state.email || ""}
+                required
+                disabled={busy}
+              />
+              <button className="account-button" type="submit" disabled={busy}>
+                {busy ? "Enviando…" : "Enviar código"}
+              </button>
+              <a className="account-text-link" href="/#/login">
+                Volver a iniciar sesión
+              </a>
+            </form>
+          ) : null}
+
+          {state.view === "recover-confirm" ? (
+            <>
+              <form
+                key="recover-confirm"
+                className="account-form"
+                onSubmit={(event) => submit(event, "confirm-password-reset")}
+              >
+                <label htmlFor="recovery-confirm-email">Email</label>
+                <input
+                  id="recovery-confirm-email"
+                  name="email"
+                  type="email"
+                  autoComplete="email"
+                  value={state.email || ""}
+                  readOnly
+                  required
+                  disabled={busy}
+                />
+                <label htmlFor="recovery-code">Código de recuperación</label>
+                <input
+                  id="recovery-code"
+                  name="code"
+                  type="text"
+                  autoComplete="one-time-code"
+                  inputMode="numeric"
+                  required
+                  disabled={busy}
+                />
+                <label htmlFor="recovery-password">Elegí una nueva contraseña</label>
+                <input
+                  id="recovery-password"
+                  name="password"
+                  type="password"
+                  autoComplete="new-password"
+                  aria-describedby="recovery-password-hint"
+                  required
+                  disabled={busy}
+                />
+                <p id="recovery-password-hint" className="account-field-hint">
+                  {passwordPolicyHint}
+                </p>
+                <label htmlFor="recovery-confirm-password">Confirmá la nueva contraseña</label>
+                <input
+                  id="recovery-confirm-password"
+                  name="confirmPassword"
+                  type="password"
+                  autoComplete="new-password"
+                  required
+                  disabled={busy}
+                />
+                <button className="account-button" type="submit" disabled={busy}>
+                  {busy ? "Actualizando…" : "Cambiar contraseña"}
+                </button>
+              </form>
+              <div className="account-actions">
+                <button
+                  className="account-button account-button--secondary"
+                  type="button"
+                  onClick={() =>
+                    void onSubmit({ action: "resend-password-reset", email: state.email || "" })
+                  }
+                  disabled={busy}
+                >
+                  Reenviar código
+                </button>
+                <button
+                  className="account-button account-button--secondary"
+                  type="button"
+                  onClick={() => void onSubmit({ action: "change-recovery-email" })}
+                  disabled={busy}
+                >
+                  Cambiar email
+                </button>
+                <a className="account-text-link" href="/#/login">
+                  Volver a iniciar sesión
+                </a>
+              </div>
+            </>
+          ) : null}
+
           {state.view === "invite-new" ? (
             <form
               key="invite-new"
@@ -182,7 +343,7 @@ export function AccountScreen({ state, onSubmit, onSignOut }: AccountScreenProps
                 aria-describedby="invite-password-hint"
               />
               <p id="invite-password-hint" className="account-field-hint">
-                Usá al menos 8 caracteres, con una mayúscula, una minúscula, un número y un símbolo.
+                {passwordPolicyHint}
               </p>
               <label htmlFor="invite-confirm-password">Confirmá la contraseña</label>
               <input
@@ -282,7 +443,12 @@ export function AccountScreen({ state, onSubmit, onSignOut }: AccountScreenProps
 
           {state.view === "login" && !busy ? (
             <p className="account-help">
-              El acceso se habilita únicamente mediante una invitación.{" "}
+              ¿Olvidaste tu contraseña?{" "}
+              <a className="account-text-link" href="/#/recover">
+                Recuperala
+              </a>{" "}
+              <span aria-hidden="true">·</span> El acceso se habilita únicamente mediante una
+              invitación.{" "}
               <a className="account-text-link" href="/">
                 Volver a la página pública
               </a>

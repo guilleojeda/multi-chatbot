@@ -1,8 +1,9 @@
 import { createRoot } from "react-dom/client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { siteConfig } from "../config/site";
 import { AccountApp, type AccountRoute } from "./AccountApp";
 import { PublicSite } from "./PublicSite";
+import { createSession, type Session } from "./session";
 import "./style.css";
 
 const rootElement = document.getElementById("root");
@@ -21,6 +22,7 @@ function routeFromHash(hash: string): AccountRoute | null {
   const pathname = questionIndex < 0 ? route : route.slice(0, questionIndex);
   const query = questionIndex < 0 ? "" : route.slice(questionIndex + 1);
   if (pathname === "/login") return { kind: "login" };
+  if (pathname === "/recover") return { kind: "recover" };
   if (pathname === "/invite") {
     return { kind: "invite", token: new URLSearchParams(query).get("token") };
   }
@@ -29,6 +31,25 @@ function routeFromHash(hash: string): AccountRoute | null {
 
 function App() {
   const [hash, setHash] = useState(() => window.location.hash);
+  const sessionRef = useRef<{
+    clientId: string;
+    region: string;
+    session: Session;
+  } | null>(null);
+
+  const getSession = useCallback(({ clientId, region }: { clientId: string; region: string }) => {
+    const current = sessionRef.current;
+    if (current?.clientId === clientId && current.region === region) return current.session;
+
+    const session = createSession({
+      clientId,
+      region,
+      storage: window.sessionStorage,
+      fetch: window.fetch.bind(window),
+    });
+    sessionRef.current = { clientId, region, session };
+    return session;
+  }, []);
 
   useEffect(() => {
     const updateHash = () => setHash(window.location.hash);
@@ -37,7 +58,10 @@ function App() {
   }, []);
 
   const route = routeFromHash(hash);
-  if (route) return <AccountApp key={hash} route={route} projectName={siteConfig.projectName} />;
+  if (route)
+    return (
+      <AccountApp route={route} projectName={siteConfig.projectName} getSession={getSession} />
+    );
 
   return (
     <PublicSite

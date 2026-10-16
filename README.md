@@ -32,7 +32,7 @@ Las pruebas con errores intencionales trabajan en copias y repositorios Git temp
 
 `tsconfig.web.json` comprueba TSX y tipos DOM; Vite transforma y empaqueta con el plugin React. Vitest utiliza esa transformación y mantiene su raíz en el repositorio. La infraestructura usa otra configuración TypeScript, NodeNext, y se ejecuta compilada a JavaScript.
 
-La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes`. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. El contenido describe el estado actual y el uso previsto de datos. La cuenta está disponible por invitación; el chat, el perfil y la recuperación de contraseña todavía no están habilitados. Ver [cuenta y operación de invitaciones](docs/intent/account.md).
+La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes`. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. El contenido describe el estado actual y el uso previsto de datos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo; el chat y el perfil todavía no están habilitados. Ver [cuenta y operación de invitaciones](docs/intent/account.md).
 
 Para usar el sitio localmente:
 
@@ -53,6 +53,12 @@ node scripts/invite.mjs --environment dev --email sxvintage@gmail.com --sender s
 ```
 
 La herramienta consulta los outputs de cuenta y sitio, crea o reutiliza la identidad y envía el enlace real. El enlace permite elegir contraseña y verifica ese email al aceptarlo. Una cuenta activa inicia sesión para aceptar y conserva su contraseña. La herramienta muestra metadata de envío sin imprimir el enlace ni sus tokens. Ver [configuración SES, permisos y fallos parciales](docs/intent/account.md).
+
+## Recuperar una cuenta de desarrollo
+
+Desde el login del sitio publicado, abrir «Recuperar contraseña», ingresar el email de la cuenta activa y solicitar el código. Leer el email, completar el código y la nueva contraseña con su confirmación, y volver a ingresar. El cambio conserva la identidad y las membresías. La dirección de prueba es `sxvintage@gmail.com`; no se requiere una sesión IAM para este recorrido del usuario.
+
+El pool dev envía el código con la identidad SES individual verificada. El aviso de solicitud es condicional y no prueba que el email exista o haya sido entregado. Producción conserva recuperación deshabilitada hasta definir y verificar su remitente. Ver [comportamiento y configuración del correo](docs/intent/account.md#recuperar-la-contraseña).
 
 ## AWS y configuración
 
