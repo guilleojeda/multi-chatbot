@@ -9,9 +9,9 @@
     "npm": "11.19.1"
   },
   "scripts": {
-    "pretest": "npm run build:infra",
+    "pretest": "npm run build",
     "test": "vitest run",
-    "pretest:acceptance": "npm run build:infra",
+    "pretest:acceptance": "npm run build",
     "test:acceptance": "vitest run tests/acceptance",
     "typecheck:infra": "tsc -p tsconfig.json --noEmit",
     "typecheck:web": "tsc -p tsconfig.web.json",
