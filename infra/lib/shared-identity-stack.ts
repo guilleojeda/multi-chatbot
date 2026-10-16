@@ -18,6 +18,14 @@ export class SharedIdentityStack extends Stack {
     Tags.of(this).add("project", "multi-chatbot");
     Tags.of(this).add("environment", environment.environment);
 
+    const recoveryEmailConfig =
+      environment.environment === "dev"
+        ? {
+            accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+            email: cognito.UserPoolEmail.withSES({ fromEmail: "sxvintage@gmail.com" }),
+          }
+        : { accountRecovery: cognito.AccountRecovery.NONE };
+
     this.userPool = new cognito.UserPool(this, "SharedUserPool", {
       userPoolName: `${environment.resourcePrefix}-identity`,
       signInAliases: { email: true },
@@ -26,7 +34,7 @@ export class SharedIdentityStack extends Stack {
       standardAttributes: {
         email: { required: true, mutable: true },
       },
-      accountRecovery: cognito.AccountRecovery.NONE,
+      ...recoveryEmailConfig,
     });
 
     new CfnOutput(this, "UserPoolId", {

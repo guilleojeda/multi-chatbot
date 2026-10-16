@@ -48,6 +48,7 @@ export class AccountStack extends Stack {
         custom: false,
       },
       enableTokenRevocation: true,
+      preventUserExistenceErrors: true,
     });
 
     this.table = new dynamodb.Table(this, "AccountTable", {

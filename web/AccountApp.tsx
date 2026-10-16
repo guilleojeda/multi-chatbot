@@ -5,9 +5,10 @@ import {
   type AccountState,
   type AccountSubmission,
 } from "./AccountScreen";
-import { createSession, SessionError, type Session } from "./session";
+import { SessionError, type Session } from "./session";
 
-export type AccountRoute = { kind: "login" } | { kind: "invite"; token: string | null };
+export type AccountRoute =
+  { kind: "login" } | { kind: "recover" } | { kind: "invite"; token: string | null };
 
 type PublicConfig = {
   region: string;
@@ -23,6 +24,54 @@ type ApiError = Error & {
 };
 
 type RetryOperation = () => Promise<void>;
+type RouteIdentity = { key: string; epoch: number };
+
+const recoveryNotice =
+  "Si la cuenta está activa y tiene un email verificado, recibirás un código para continuar.";
+const passwordResetLoginNotice = "La contraseña se cambió. Iniciá sesión con la nueva contraseña.";
+
+function accountRouteKey(route: AccountRoute) {
+  return route.kind === "invite" ? `invite:${route.token || ""}` : route.kind;
+}
+
+function isRecoveryIdentityError(code: string) {
+  return [
+    "InvalidParameterException",
+    "NotAuthorizedException",
+    "UserNotConfirmedException",
+    "UserNotFoundException",
+  ].includes(code);
+}
+
+function recoveryRequestErrorMessage(code: string) {
+  if (code === "NETWORK_ERROR")
+    return "No pudimos conectar con el servicio de correo. Revisá tu conexión e intentá de nuevo.";
+  if (code === "LimitExceededException" || code === "TooManyRequestsException")
+    return "Esperá un momento antes de solicitar otro código.";
+  if (code === "CodeDeliveryFailureException")
+    return "No pudimos enviar el código. Intentá de nuevo más tarde.";
+  if (code === "INVALID_RESPONSE")
+    return "No pudimos validar la respuesta. Intentá solicitar el código de nuevo.";
+  return "No pudimos solicitar el código. Revisá tu conexión e intentá de nuevo.";
+}
+
+function recoveryConfirmErrorMessage(code: string) {
+  if (code === "CodeMismatchException")
+    return "El código no es correcto. Revisalo e intentá de nuevo.";
+  if (code === "ExpiredCodeException")
+    return "El código venció. Solicitá uno nuevo y volvé a intentar.";
+  if (code === "InvalidPasswordException")
+    return "La nueva contraseña no cumple con los requisitos. Elegí otra y volvé a intentar.";
+  if (code === "LimitExceededException" || code === "TooManyRequestsException")
+    return "Esperá un momento antes de volver a intentar.";
+  if (code === "NETWORK_ERROR")
+    return "No pudimos conectar con el servicio de cuenta. Revisá tu conexión e intentá de nuevo.";
+  if (code === "INVALID_RESPONSE")
+    return "No pudimos validar la respuesta. Revisá los datos e intentá de nuevo.";
+  if (isRecoveryIdentityError(code))
+    return "No pudimos confirmar el cambio. Revisá el email y solicitá un código nuevo.";
+  return "No pudimos cambiar la contraseña. Revisá el código e intentá de nuevo.";
+}
 
 export function invitationAcceptFailureState({
   kind,
@@ -227,9 +276,19 @@ function replaceHash(path: string) {
   );
 }
 
-export function AccountApp({ route, projectName }: { route: AccountRoute; projectName: string }) {
+export function AccountApp({
+  route,
+  projectName,
+  getSession,
+}: {
+  route: AccountRoute;
+  projectName: string;
+  getSession: (config: Pick<PublicConfig, "clientId" | "region">) => Session;
+}) {
+  const routeKey = accountRouteKey(route);
   const [state, setState] = useState<AccountState>({
-    view: route.kind === "invite" ? "denied" : "login",
+    view:
+      route.kind === "invite" ? "denied" : route.kind === "recover" ? "recover-request" : "login",
     pending: true,
     projectName,
   });
@@ -237,9 +296,35 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
   const configRef = useRef<PublicConfig | null>(null);
   const sessionRef = useRef<Session | null>(null);
   const retryOperationRef = useRef<RetryOperation | null>(null);
+  const currentRouteKeyRef = useRef(routeKey);
+  const routeEpochRef = useRef(0);
+  if (currentRouteKeyRef.current !== routeKey) {
+    currentRouteKeyRef.current = routeKey;
+    routeEpochRef.current += 1;
+  }
+  const mountedRef = useRef(false);
+  const initializeSequenceRef = useRef(0);
+  const recoverySubmissionInFlightRef = useRef(false);
+  const confirmOperationRef = useRef<{ email: string } | null>(null);
+  const passwordResetLoginEmailRef = useRef<string | null>(null);
+
+  function isCurrentRoute(identity: RouteIdentity) {
+    return (
+      mountedRef.current &&
+      currentRouteKeyRef.current === identity.key &&
+      routeEpochRef.current === identity.epoch
+    );
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const inspectInvitation = useCallback(
-    async (config: PublicConfig, token: string) => {
+    async (config: PublicConfig, token: string, isActive: () => boolean) => {
       const response = await apiRequest(config, "/account/invitations/inspect", {
         method: "POST",
         body: { token },
@@ -254,6 +339,7 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
           status: 400,
         });
       }
+      if (!isActive()) return;
       setState({
         view: invitation.kind === "new" ? "invite-new" : "invite-existing",
         email: invitation.email,
@@ -264,8 +350,14 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
   );
 
   const checkMembership = useCallback(
-    async (config: PublicConfig, session: Session, email?: string) => {
+    async (
+      config: PublicConfig,
+      session: Session,
+      email: string | undefined,
+      isActive: () => boolean,
+    ) => {
       retryOperationRef.current = async () => {
+        if (!isActive()) return;
         setState((current) => ({ ...current, pending: true, error: undefined }));
         try {
           const membership = await requestWithRefresh(config, session, "/account/me", {});
@@ -279,12 +371,14 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
               status: 502,
             });
           }
+          if (!isActive()) return;
           setState({
             view: "ready",
             email,
             projectName,
           });
         } catch (error) {
+          if (!isActive()) return;
           const apiError = asApiError(error);
           setState({
             view: "denied",
@@ -303,67 +397,166 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
     [projectName],
   );
 
-  const initialize = useCallback(async () => {
-    setState({
-      view: route.kind === "invite" ? "denied" : "login",
-      pending: true,
-      projectName,
-    });
-
-    try {
-      const config = await readPublicConfig();
-      configRef.current = config;
-      const session = createSession({
-        clientId: config.clientId,
-        region: config.region,
-        storage: window.sessionStorage,
-        fetch: window.fetch.bind(window),
-      });
-      sessionRef.current = session;
-
-      if (route.kind === "invite") {
-        if (!route.token) {
-          throw Object.assign(new Error("Invitation token is missing"), {
-            code: "INVALID_INVITATION",
-            status: 400,
-          });
-        }
-        await inspectInvitation(config, route.token);
-        return;
-      }
-
-      const restored = await session.restore();
-      if (!restored) {
-        setState({
-          view: "login",
-          pending: false,
-          projectName,
-        });
-        return;
-      }
-      await checkMembership(config, session);
-    } catch (error) {
-      const apiError = asApiError(error);
-      const context = configRef.current ? "inspect" : "config";
+  const initialize = useCallback(
+    async (isActive: () => boolean) => {
+      if (!isActive()) return;
+      retryOperationRef.current = null;
+      configRef.current = null;
       setState({
-        view: "denied",
-        error: errorMessage(apiError.code, apiError.status, context),
-        pending: false,
-        retryable: apiError.status === 0 || apiError.status >= 500,
+        view:
+          route.kind === "invite"
+            ? "denied"
+            : route.kind === "recover"
+              ? "recover-request"
+              : "login",
+        pending: true,
         projectName,
       });
-    }
-  }, [checkMembership, inspectInvitation, projectName, route]);
+
+      try {
+        const config = await readPublicConfig();
+        if (!isActive()) return;
+        configRef.current = config;
+        const session = getSession(config);
+        sessionRef.current = session;
+
+        if (route.kind === "invite") {
+          if (!route.token) {
+            throw Object.assign(new Error("Invitation token is missing"), {
+              code: "INVALID_INVITATION",
+              status: 400,
+            });
+          }
+          await inspectInvitation(config, route.token, isActive);
+          return;
+        }
+
+        if (route.kind === "recover") {
+          if (!isActive()) return;
+          setState({
+            view: "recover-request",
+            pending: false,
+            projectName,
+          });
+          return;
+        }
+
+        const pendingReset = confirmOperationRef.current;
+        if (pendingReset) {
+          setState({
+            view: "login",
+            email: pendingReset.email,
+            pending: true,
+            projectName,
+          });
+          return;
+        }
+
+        if (passwordResetLoginEmailRef.current !== null) {
+          const email = passwordResetLoginEmailRef.current;
+          passwordResetLoginEmailRef.current = null;
+          setState({
+            view: "login",
+            email,
+            notice: passwordResetLoginNotice,
+            projectName,
+          });
+          return;
+        }
+
+        const restored = await session.restore();
+        if (!isActive()) return;
+        if (confirmOperationRef.current) {
+          setState({
+            view: "login",
+            email: confirmOperationRef.current.email,
+            pending: true,
+            projectName,
+          });
+          return;
+        }
+        if (passwordResetLoginEmailRef.current !== null) {
+          const email = passwordResetLoginEmailRef.current;
+          passwordResetLoginEmailRef.current = null;
+          setState({ view: "login", email, notice: passwordResetLoginNotice, projectName });
+          return;
+        }
+        if (!restored) {
+          setState({
+            view: "login",
+            pending: false,
+            projectName,
+          });
+          return;
+        }
+        await checkMembership(config, session, undefined, isActive);
+      } catch (error) {
+        if (!isActive()) return;
+        const apiError = asApiError(error);
+        const context = configRef.current ? "inspect" : "config";
+        setState({
+          view: "denied",
+          error: errorMessage(apiError.code, apiError.status, context),
+          pending: false,
+          retryable: apiError.status === 0 || apiError.status >= 500,
+          projectName,
+        });
+      }
+    },
+    [checkMembership, getSession, inspectInvitation, projectName, route],
+  );
 
   useEffect(() => {
-    void initialize();
-  }, [initialize, retryCount]);
+    let cancelled = false;
+    const sequence = ++initializeSequenceRef.current;
+    const identity = { key: routeKey, epoch: routeEpochRef.current };
+    const isActive = () =>
+      !cancelled && sequence === initializeSequenceRef.current && isCurrentRoute(identity);
+    void initialize(isActive);
+    return () => {
+      cancelled = true;
+    };
+  }, [initialize, retryCount, routeKey]);
 
-  async function submit(submission: AccountSubmission) {
+  function submit(submission: AccountSubmission) {
+    const recoveryAction =
+      submission.action === "request-password-reset" ||
+      submission.action === "resend-password-reset" ||
+      submission.action === "confirm-password-reset";
+    if (
+      recoverySubmissionInFlightRef.current &&
+      (recoveryAction || submission.action === "change-recovery-email")
+    ) {
+      return Promise.resolve();
+    }
+    if (confirmOperationRef.current && submission.action === "sign-in") {
+      return Promise.resolve();
+    }
+
+    const identity = { key: routeKey, epoch: routeEpochRef.current };
+    if (recoveryAction) recoverySubmissionInFlightRef.current = true;
+    return performSubmit(submission, identity).finally(() => {
+      if (recoveryAction) recoverySubmissionInFlightRef.current = false;
+    });
+  }
+
+  async function performSubmit(submission: AccountSubmission, identity: RouteIdentity) {
+    const isActive = () => isCurrentRoute(identity);
+    if (submission.action === "change-recovery-email") {
+      if (!isActive()) return;
+      setState((current) => ({
+        view: "recover-request",
+        email: current.email,
+        pending: false,
+        projectName,
+      }));
+      return;
+    }
+
     if (submission.action === "retry") {
       if (retryOperationRef.current && sessionRef.current?.accessToken()) {
         await retryOperationRef.current();
-      } else {
+      } else if (isActive()) {
         setRetryCount((count) => count + 1);
       }
       return;
@@ -372,6 +565,7 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
     const session = sessionRef.current;
     const config = configRef.current;
     if (!session || !config) {
+      if (!isActive()) return;
       setState({
         view: "denied",
         error: errorMessage("NETWORK_ERROR", 0, "config"),
@@ -382,6 +576,98 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
       return;
     }
 
+    if (
+      submission.action === "request-password-reset" ||
+      submission.action === "resend-password-reset"
+    ) {
+      const isResend = submission.action === "resend-password-reset";
+      setState((current) => ({
+        ...current,
+        pending: true,
+        pendingAction: isResend ? "resend-reset" : "request-reset",
+        error: undefined,
+        notice: undefined,
+      }));
+      try {
+        await session.requestPasswordReset(submission.email);
+        if (!isActive()) return;
+        setState({
+          view: "recover-confirm",
+          email: submission.email,
+          notice: recoveryNotice,
+          projectName,
+        });
+      } catch (error) {
+        if (!isActive()) return;
+        const apiError = asApiError(error);
+        if (isRecoveryIdentityError(apiError.code)) {
+          setState({
+            view: "recover-confirm",
+            email: submission.email,
+            notice: recoveryNotice,
+            projectName,
+          });
+          return;
+        }
+        setState({
+          view: isResend ? "recover-confirm" : "recover-request",
+          email: submission.email,
+          error: recoveryRequestErrorMessage(apiError.code),
+          projectName,
+        });
+      }
+      return;
+    }
+
+    if (submission.action === "confirm-password-reset") {
+      const operation = { email: submission.email };
+      confirmOperationRef.current = operation;
+      setState((current) => ({
+        ...current,
+        pending: true,
+        pendingAction: "confirm-reset",
+        error: undefined,
+        notice: undefined,
+      }));
+      try {
+        await session.confirmPasswordReset(submission.email, submission.code, submission.password);
+        if (confirmOperationRef.current === operation) confirmOperationRef.current = null;
+        passwordResetLoginEmailRef.current = submission.email;
+        const currentRouteKey = currentRouteKeyRef.current;
+        if (!mountedRef.current) return;
+        if (currentRouteKey === "recover") {
+          window.location.hash = "/login";
+          return;
+        }
+        if (currentRouteKey === "login") {
+          passwordResetLoginEmailRef.current = null;
+          setState({
+            view: "login",
+            email: submission.email,
+            notice: passwordResetLoginNotice,
+            projectName,
+          });
+        }
+      } catch (error) {
+        if (confirmOperationRef.current === operation) confirmOperationRef.current = null;
+        if (!isActive()) {
+          if (isCurrentRoute({ key: "login", epoch: routeEpochRef.current })) {
+            setState({ view: "login", email: submission.email, projectName });
+          }
+          return;
+        }
+        const apiError = asApiError(error);
+        setState({
+          view: "recover-confirm",
+          email: submission.email,
+          error: recoveryConfirmErrorMessage(apiError.code),
+          projectName,
+        });
+      }
+      return;
+    }
+
+    if (!isActive()) return;
     setState((current) => ({ ...current, pending: true, error: undefined }));
     const isNewInvitation = submission.action === "accept-new";
     const isExistingInvitation = submission.action === "accept-existing";
@@ -407,8 +693,10 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
         replaceHash("/login");
         try {
           await session.signIn(submission.email, submission.password);
-          await checkMembership(config, session, submission.email);
+          if (!isActive()) return;
+          await checkMembership(config, session, submission.email, isActive);
         } catch {
+          if (!isActive()) return;
           setState({
             view: "login",
             email: submission.email,
@@ -421,6 +709,7 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
       }
 
       await session.signIn(submission.email, submission.password);
+      if (!isActive()) return;
 
       if (isExistingInvitation) {
         if (route.kind !== "invite" || !route.token) {
@@ -436,8 +725,9 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
         replaceHash("/login");
       }
 
-      await checkMembership(config, session, submission.email);
+      await checkMembership(config, session, submission.email, isActive);
     } catch (error) {
+      if (!isActive()) return;
       const apiError = asApiError(error);
       if (apiError.status === 401 && !session.accessToken()) {
         setState({
@@ -473,7 +763,9 @@ export function AccountApp({ route, projectName }: { route: AccountRoute; projec
   }
 
   async function signOut() {
+    const identity = { key: routeKey, epoch: routeEpochRef.current };
     await sessionRef.current?.signOut();
+    if (!isCurrentRoute(identity)) return;
     replaceHash("/login");
     setState({
       view: "login",

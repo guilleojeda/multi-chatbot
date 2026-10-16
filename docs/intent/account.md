@@ -20,6 +20,24 @@ Una reserva evita que dos canjes concurrentes establezcan contraseñas distintas
 
 La API acepta invitaciones solo para el chatbot configurado. Durante el canje compara el `sub` y email actuales de Cognito con la invitación. Para una identidad ya activa exige un access token validado por Cognito y ligado al pool y app client esperados; un token de otra identidad no concede membresía. `GET /api/account/me` usa las claims access/sub verificadas por el JWT authorizer y confirma la membresía actual del chatbot con DynamoDB. No confía en un `botId` enviado por el navegador ni consulta Cognito en cada lectura de membresía. El Lambda no envía correo ni crea usuarios.
 
-El app client público permite autenticación por email/contraseña, renovación y revocación desde React; no tiene client secret. El access token vive en memoria y el refresh token solo en `sessionStorage` de la pestaña. La recuperación de contraseña corresponde a una entrega posterior.
+El app client público permite autenticación por email/contraseña, renovación y revocación desde React; no tiene client secret. El access token vive en memoria y el refresh token solo en `sessionStorage` de la pestaña. La recuperación de contraseña utiliza ese mismo cliente público y las APIs nativas de Cognito.
 
 La razón de estas fronteras se conserva en [Identidad común, acceso por chatbot y sesión de pestaña](../decisions/0001-identidad-y-sesion.md).
+
+## Recuperar la contraseña
+
+Desde el login, «Recuperar contraseña» abre `/#/recover`. Una cuenta ya activada y con email verificado puede solicitar un código mediante `ForgotPassword`. El código llega por email y se ingresa junto con una nueva contraseña y su confirmación; `ConfirmForgotPassword` establece el cambio. No se crea otra cuenta ni se alteran el email, el `sub`, las invitaciones o las membresías. Una cuenta que todavía no activó su invitación debe completar ese recorrido.
+
+La solicitud presenta un aviso condicional: Cognito puede simular los detalles de entrega para no revelar si una cuenta existe. Ese resultado no acredita envío; el destinatario debe recibir el mensaje. La pantalla permite reenviar explícitamente, corregir el email o volver al login. Abrir o recargar recuperación no envía correo; una recarga vuelve al paso de email. Código y contraseña solo viven en el formulario, nunca en la URL, almacenamiento del navegador o registros de la aplicación.
+
+Una confirmación distinta no se envía. El código incorrecto o vencido, contraseña fuera de política, límites y fallos de conexión muestran un error que permite corregir o volver a solicitar el código. No se anuncia un cambio exitoso hasta que Cognito lo confirma. El código tiene la vigencia nativa de Cognito; no se crea otra tabla ni un mecanismo propio de tokens.
+
+Al completar el cambio se vuelve al login con el email y un aviso; no hay login automático. Se limpian access/ID en memoria y únicamente `auth-refresh` de esa pestaña. Un rechazo de recuperación no borra su sesión previa. La persona ingresa con la nueva contraseña y la API vuelve a comprobar su membresía. No se promete revocación instantánea de los access tokens de otras sesiones: el JWT authorizer conserva su contrato de validación y vigencia.
+
+## Configuración de correo de recuperación
+
+El pool de desarrollo habilita recuperación solo por email verificado. `SharedIdentityStack` configura SES `DEVELOPER` con la identidad individual `sxvintage@gmail.com` de `us-east-1`, en la cuenta del proyecto; no se usa ni verifica el dominio `gmail.com`. Cognito envía el código de recuperación, mientras la CLI del equipo sigue enviando las invitaciones de la aplicación. Los app clients públicos suprimen errores de existencia; no cambia el registro cerrado.
+
+Cognito administra `AWSServiceRoleForAmazonCognitoIdpEmailService` para enviar mediante SES. La identidad que aplica la configuración necesita `iam:CreateServiceLinkedRole`; el ejecutor CloudFormation compartido tiene los permisos de despliegue acordados. No se agrega permiso SES al Lambda de aplicación. Antes de verificar un entorno se comprueban identidad SES, envío habilitado y sandbox/cuotas. En sandbox el destinatario también debe estar verificado; la prueba de desarrollo usa el mismo buzón aprobado.
+
+Producción aún no tiene un remitente definitivo: su pool mantiene la recuperación deshabilitada y no configura correo SES. La síntesis sigue disponible, pero antes de publicar esta capacidad en producción se debe definir/verificar su identidad remitente, configurarla en su ambiente y comprobar allí el email y el recorrido. El Gmail de pruebas no se adopta como remitente de producción.

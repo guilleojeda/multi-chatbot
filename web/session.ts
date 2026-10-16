@@ -5,6 +5,8 @@ export type SessionTokens = {
 
 export type Session = {
   signIn(email: string, password: string): Promise<SessionTokens>;
+  requestPasswordReset(email: string): Promise<void>;
+  confirmPasswordReset(email: string, code: string, password: string): Promise<void>;
   restore(): Promise<SessionTokens | null>;
   accessToken(): string | null;
   idToken(): string | null;
@@ -132,6 +134,8 @@ export function createSession({
 }: CreateSessionOptions): Session {
   let currentAccessToken: string | null = null;
   let currentIdToken: string | null = null;
+  let authGeneration = 0;
+  let passwordResetPending = false;
 
   function clearMemory() {
     currentAccessToken = null;
@@ -143,6 +147,13 @@ export function createSession({
   }
 
   async function signIn(email: string, password: string): Promise<SessionTokens> {
+    if (passwordResetPending) {
+      throw new SessionError(
+        "PASSWORD_RESET_IN_PROGRESS",
+        "El cambio de contraseña sigue en curso.",
+      );
+    }
+    const generation = ++authGeneration;
     clearMemory();
     storage.removeItem(refreshStorageKey);
     const response = await cognitoJson(fetcher, region, "InitiateAuth", {
@@ -154,6 +165,12 @@ export function createSession({
       },
     });
     const tokens = authenticationResult(response);
+    if (passwordResetPending || generation !== authGeneration) {
+      throw new SessionError(
+        "PASSWORD_RESET_IN_PROGRESS",
+        "El cambio de contraseña sigue en curso.",
+      );
+    }
     if (!tokens.refreshToken) {
       throw new SessionError(
         "MISSING_REFRESH_TOKEN",
@@ -166,7 +183,43 @@ export function createSession({
     return { accessToken: tokens.accessToken, idToken: tokens.idToken };
   }
 
+  async function requestPasswordReset(email: string): Promise<void> {
+    await cognitoJson(fetcher, region, "ForgotPassword", {
+      ClientId: clientId,
+      Username: email.trim().toLowerCase(),
+    });
+  }
+
+  async function confirmPasswordReset(
+    email: string,
+    code: string,
+    password: string,
+  ): Promise<void> {
+    if (passwordResetPending) {
+      throw new SessionError(
+        "PASSWORD_RESET_IN_PROGRESS",
+        "El cambio de contraseña sigue en curso.",
+      );
+    }
+    passwordResetPending = true;
+    authGeneration += 1;
+    try {
+      await cognitoJson(fetcher, region, "ConfirmForgotPassword", {
+        ClientId: clientId,
+        Username: email.trim().toLowerCase(),
+        ConfirmationCode: code,
+        Password: password,
+      });
+      clearMemory();
+      storage.removeItem(refreshStorageKey);
+    } finally {
+      passwordResetPending = false;
+    }
+  }
+
   async function restore(): Promise<SessionTokens | null> {
+    if (passwordResetPending) return null;
+    const generation = ++authGeneration;
     clearMemory();
     const refreshToken = storage.getItem(refreshStorageKey);
     if (!refreshToken) return null;
@@ -178,11 +231,13 @@ export function createSession({
         AuthParameters: { REFRESH_TOKEN: refreshToken },
       });
       const tokens = authenticationResult(response);
+      if (passwordResetPending || generation !== authGeneration) return null;
       currentAccessToken = tokens.accessToken;
       currentIdToken = tokens.idToken;
       saveRefreshToken(tokens.refreshToken);
       return { accessToken: tokens.accessToken, idToken: tokens.idToken };
     } catch {
+      if (passwordResetPending || generation !== authGeneration) return null;
       clearMemory();
       storage.removeItem(refreshStorageKey);
       return null;
@@ -191,6 +246,7 @@ export function createSession({
 
   async function signOut(): Promise<void> {
     const refreshToken = storage.getItem(refreshStorageKey);
+    authGeneration += 1;
     clearMemory();
     storage.removeItem(refreshStorageKey);
     if (!refreshToken) return;
@@ -207,6 +263,8 @@ export function createSession({
 
   return {
     signIn,
+    requestPasswordReset,
+    confirmPasswordReset,
     restore,
     accessToken: () => currentAccessToken,
     idToken: () => currentIdToken,
