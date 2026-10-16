@@ -1,0 +1,13 @@
+{
+  "name": "multi-chatbot",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:acceptance": "vitest run tests/acceptance"
+  },
+  "devDependencies": {
+    "vitest": "5.0.5"
+  }
+}
