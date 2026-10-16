@@ -14,7 +14,7 @@ export default defineConfig({
   },
   test: {
     root: repositoryRoot,
-    include: ["tests/acceptance/**/*.test.mjs"],
+    include: ["tests/acceptance/**/*.test.mjs", "tests/implementation/**/*.test.mjs"],
     // Synthesis tests compile into shared dist/infra output, so test files must not overlap.
     fileParallelism: false,
   },

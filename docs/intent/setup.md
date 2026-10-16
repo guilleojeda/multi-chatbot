@@ -1,10 +1,16 @@
 # Herramientas, configuración y entrega
 
-La base común permite compilar y comprobar TypeScript/React y entregar infraestructura desde una revisión identificable del repositorio. El stack de setup no aprovisiona recursos de aplicación. El [sitio público](public-site.md) se entrega en un stack por ambiente/chatbot. La web bajo tests es un fixture local de las herramientas y no se publica.
+La base común permite compilar y comprobar TypeScript/React y entregar infraestructura desde una revisión identificable del repositorio. El stack de setup no aprovisiona recursos de aplicación. El [sitio público](public-site.md) se entrega en un stack por ambiente/chatbot. La identidad Cognito se entrega en un stack compartido por ambiente; la cuenta, API y tabla de invitaciones/membresías pertenecen a un stack por chatbot. La web bajo tests es un fixture local de las herramientas y no se publica.
 
 ## Configuración y propiedad
 
-`config/project.ts` es la fuente pública consumida por CDK y los scripts: cuenta `118903272638`, región `us-east-1`, ambientes, nombres y modelos. `dev` y `prod` usan la misma cuenta y recursos/datos distintos. Los recursos de cada ambiente que admiten tags llevan `environment` con su valor exacto. Los recursos por chatbot incorporan su `botId`; un `botId` no es autorización de usuario ni una instancia aprovisionada.
+`config/project.ts` es la fuente pública consumida por CDK y los scripts: cuenta `118903272638`, región `us-east-1`, ambientes, nombres y modelos. `dev` y `prod` usan la misma cuenta y recursos/datos distintos. Los recursos de aplicación llevan tags exactos `project=multi-chatbot` y `environment=dev|prod`; los stacks declaran esos mismos tags. Los nombres de recursos por chatbot incorporan su `botId`; un `botId` no es autorización de usuario ni una instancia aprovisionada.
+
+El stack `multi-chatbot-<ambiente>-identity` posee el pool Cognito de ese ambiente: acceso por email sin distinguir mayúsculas y registro público deshabilitado. `multi-chatbot-<ambiente>-<botId>-account` crea el cliente público de ese chatbot, la tabla DynamoDB y la API HTTP con su Lambda Node 24. Cada ambiente y chatbot tiene datos separados. La tabla usa claves `pk` y `sk`; `ttl` solo elimina invitaciones antiguas y no decide si un enlace venció. La Lambda recibe el identificador del bot, pool, cliente y tabla mediante variables de entorno. Sus permisos de DynamoDB quedan limitados a esa tabla y sus operaciones administrativas de Cognito al pool del ambiente.
+
+El stack de sitio consume el pool, cliente y API de sus stacks previos. CloudFront mantiene el bucket privado con OAC y enruta `/api/*` por HTTPS a la API, sin caché y enviando `Authorization` sin el `Host` del visitante; los paths se conservan. También publica `public-config.json` con región, pool, cliente, `apiBaseUrl=/api` y `botId`. Esos identificadores y URL son configuración pública, no secretos. No hay dependencia desde cuenta o identidad hacia el sitio.
+
+Los outputs de identidad y cuenta son `UserPoolId`, `ClientId`, `TableName`, `ApiUrl` y `BotId`. El equipo los usa para inspección y para su herramienta autorizada de invitaciones. No contienen credenciales. El sitio continúa publicando `PublicSiteUrl`.
 
 Bootstrap y rol de entrega son compartidos. El stack `multi-chatbot-setup` identifica sus recursos con `project=multi-chatbot`, sin `environment`. Referencia el proveedor OIDC `token.actions.githubusercontent.com` existente, cuya propiedad pertenece a otra configuración de la cuenta; no lo recrea, modifica ni elimina. El rol de otro repositorio permanece fuera de este stack.
 
@@ -14,7 +20,7 @@ Las sesiones humanas se obtienen mediante el acceso autorizado de cada integrant
 
 ## Checks y builds
 
-Node y npm, dependencias directas y lockfile están fijados. Infraestructura y configuración compilan NodeNext a JavaScript ESM; CDK ejecuta ese resultado. TypeScript web comprueba TSX y DOM por separado; Vite produce activos estáticos. El mismo Vitest recoge la aceptación de ambos alcances. `synth` compila únicamente infraestructura y no necesita credenciales ni reconstruye la web: consume `dist/web/` ya preparado por `build:web`. Los hooks de tests construyen infraestructura y web antes de ejecutar la suite para no depender del orden de sus archivos.
+Node y npm, dependencias directas y lockfile están fijados. Infraestructura, configuración y API compilan NodeNext a JavaScript ESM; CDK ejecuta el resultado de infraestructura. TypeScript web comprueba TSX y DOM por separado; Vite produce activos estáticos. La Lambda se empaqueta con `NodejsFunction`, el SDK de AWS incluido y el esbuild local fijado por el lockfile. El mismo Vitest recoge la aceptación de ambos alcances. `synth` compila infraestructura y empaqueta la Lambda, sin necesitar credenciales AWS ni reconstruir la web: consume `dist/web/` ya preparado por `build:web`. Los hooks de tests construyen infraestructura y web antes de ejecutar la suite para no depender del orden de sus archivos.
 
 Vitest ejecuta los archivos de aceptación de manera serial (`fileParallelism: false`). Los casos de síntesis de setup y del sitio llaman a `npm run synth`, que compila TypeScript dentro de la misma carpeta `dist/infra/`; ejecutarlos en paralelo podía cargar un módulo mientras el compilador lo estaba reemplazando.
 
