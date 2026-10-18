@@ -250,6 +250,7 @@ async function requestWithRefresh(
   session: Session,
   path: string,
   options: { method?: "GET" | "POST"; body?: unknown },
+  isActive: () => boolean,
 ): Promise<unknown> {
   let accessToken = session.accessToken();
   if (!accessToken)
@@ -259,9 +260,10 @@ async function requestWithRefresh(
     return await apiRequest(config, path, { ...options, accessToken });
   } catch (error) {
     const firstError = asApiError(error);
-    if (firstError.status !== 401) throw firstError;
+    if (firstError.status !== 401 || !isActive()) throw firstError;
 
     const refreshed = await session.restore();
+    if (!isActive()) throw firstError;
     if (!refreshed) throw firstError;
     accessToken = refreshed.accessToken;
     return apiRequest(config, path, { ...options, accessToken });
@@ -360,7 +362,7 @@ export function AccountApp({
         if (!isActive()) return;
         setState((current) => ({ ...current, pending: true, error: undefined }));
         try {
-          const membership = await requestWithRefresh(config, session, "/account/me", {});
+          const membership = await requestWithRefresh(config, session, "/account/me", {}, isActive);
           if (
             !isRecord(membership) ||
             typeof membership.sub !== "string" ||
@@ -684,6 +686,7 @@ export function AccountApp({
           method: "POST",
           body: { token: route.token, password: submission.password },
         });
+        if (!isActive()) return;
         if (!isRecord(acceptance) || acceptance.status !== "accepted") {
           throw Object.assign(new Error("Invitation acceptance response was invalid"), {
             code: "INVALID_RESPONSE",
@@ -718,10 +721,17 @@ export function AccountApp({
             status: 400,
           });
         }
-        await requestWithRefresh(config, session, "/account/invitations/accept", {
-          method: "POST",
-          body: { token: route.token },
-        });
+        await requestWithRefresh(
+          config,
+          session,
+          "/account/invitations/accept",
+          {
+            method: "POST",
+            body: { token: route.token },
+          },
+          isActive,
+        );
+        if (!isActive()) return;
         replaceHash("/login");
       }
 
