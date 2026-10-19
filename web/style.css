@@ -229,6 +229,12 @@ h1 {
   outline-offset: 4px;
 }
 
+.profile-form input:focus-visible,
+.profile-form button:focus-visible {
+  outline: 3px solid #b66d52;
+  outline-offset: 4px;
+}
+
 .account-main {
   width: min(100%, 760px);
   margin: auto;
@@ -405,6 +411,150 @@ h1 {
   min-height: 70px;
 }
 
+.profile-main {
+  width: min(100%, 900px);
+}
+
+.profile-card h1 {
+  max-width: 22ch;
+}
+
+.profile-form {
+  margin-top: 2rem;
+}
+
+.profile-fields {
+  display: grid;
+  gap: 1.2rem;
+}
+
+.profile-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 1.2rem;
+  border: 1px solid #c6d1cc;
+  border-radius: 0.8rem;
+}
+
+.profile-fieldset legend {
+  max-width: 100%;
+  padding: 0 0.35rem;
+  color: #183a36;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}
+
+.profile-required {
+  color: #55716c;
+  font-size: 0.82em;
+  font-weight: 550;
+}
+
+.profile-choice-list {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.profile-choice {
+  min-height: 2.8rem;
+  padding: 0.55rem 0.25rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  color: #183a36;
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.profile-choice input {
+  width: 1.15rem;
+  height: 1.15rem;
+  margin: 0.12rem 0 0;
+  flex: 0 0 auto;
+  accent-color: #173e39;
+}
+
+.profile-fieldset:disabled {
+  opacity: 0.72;
+}
+
+.profile-text-list {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.profile-text-list__row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 0.75rem;
+}
+
+.profile-text-list__input {
+  min-width: 0;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.profile-text-list__input label {
+  color: #49645f;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.profile-text-list__input input {
+  width: 100%;
+  min-width: 0;
+  min-height: 3rem;
+  padding: 0.72rem 0.85rem;
+  border: 1px solid #9aaca6;
+  border-radius: 0.55rem;
+  color: #183a36;
+  background: #fff;
+  font: inherit;
+}
+
+.profile-remove-button,
+.profile-add-button {
+  min-height: 2.8rem;
+  margin-top: 0.3rem;
+  padding: 0.6rem 0.9rem;
+}
+
+.profile-field-error {
+  margin: 0.65rem 0 0;
+  color: #6a261c;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.profile-actions,
+.profile-session-actions {
+  margin-top: 1.2rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.profile-actions .account-button,
+.profile-session-actions .account-button {
+  margin-top: 0;
+}
+
+.profile-navigation-note {
+  margin: 1.5rem 0 0;
+  color: #49645f;
+  font-size: 0.9rem;
+  line-height: 1.65;
+}
+
+.profile-error:focus {
+  outline: 2px solid #a84b38;
+  outline-offset: 3px;
+}
+
 @media (max-width: 700px) {
   .site-shell {
     width: min(100% - 2rem, 1200px);
@@ -450,6 +600,30 @@ h1 {
   .account-card {
     padding: 1.6rem 1.25rem;
     border-radius: 1rem;
+  }
+
+  .profile-fieldset {
+    padding: 1rem;
+  }
+
+  .profile-text-list__row {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .profile-remove-button {
+    justify-self: start;
+  }
+
+  .profile-actions,
+  .profile-session-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .profile-actions .account-button,
+  .profile-session-actions .account-button {
+    width: 100%;
   }
 }
 

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { accessTokenSubject } from "./auth.js";
 
 type AccountUser = {
   sub: string;
@@ -369,8 +370,8 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
 
   async function me(event: HttpEvent): Promise<ApiResponse> {
     const claims = event.requestContext?.authorizer?.jwt?.claims;
-    const sub = claims?.sub;
-    if (claims?.token_use !== "access" || typeof sub !== "string" || sub.length === 0) {
+    const sub = accessTokenSubject(claims);
+    if (!sub) {
       return json(401, { code: "UNAUTHORIZED", message: "Iniciá sesión para continuar." });
     }
     if (!(await store.hasMember({ sub, botId: config.botId }))) {

@@ -17,10 +17,5 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["vite/client"]
   },
-  "include": [
-    "web/**/*.ts",
-    "web/**/*.tsx",
-    "tests/fixtures/web/**/*.ts",
-    "tests/fixtures/web/**/*.tsx"
-  ]
+  "include": ["web/**/*.ts", "web/**/*.tsx", "tests/fixtures/**/*.ts", "tests/fixtures/**/*.tsx"]
 }

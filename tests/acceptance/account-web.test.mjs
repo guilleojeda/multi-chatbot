@@ -229,7 +229,7 @@ describe("the account screens", () => {
     ).toBe(true);
   });
 
-  it("shows the authorized account and sign-out without offering chat or profile actions", async () => {
+  it("shows the authorized account and sign-out without offering chat actions", async () => {
     const email = "teacher@example.edu";
     const html = await renderAccountScreen({ view: "ready", email });
     if (!assertAccountShell(html)) return;
@@ -242,7 +242,7 @@ describe("the account screens", () => {
       "Expected the signed-in account to have a sign-out action",
     ).toBe(true);
     for (const { name, href } of interactiveControls(html)) {
-      expect(`${name} ${href || ""}`).not.toMatch(/chat|profile|perfil/i);
+      expect(`${name} ${href || ""}`).not.toMatch(/chat/i);
     }
   });
 

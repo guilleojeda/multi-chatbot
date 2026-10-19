@@ -5,23 +5,23 @@ import {
   type AccountState,
   type AccountSubmission,
 } from "./AccountScreen";
-import { SessionError, type Session } from "./session";
+import {
+  apiRequest,
+  asApiError,
+  readPublicConfig,
+  requestWithRefresh,
+  type PublicConfig,
+} from "./api";
+import { type Session } from "./session";
+import { ProfileApp } from "./ProfileApp";
+import { siteConfig } from "../config/site";
+import type { ProfileConfig } from "../config/profile";
 
 export type AccountRoute =
-  { kind: "login" } | { kind: "recover" } | { kind: "invite"; token: string | null };
-
-type PublicConfig = {
-  region: string;
-  userPoolId: string;
-  clientId: string;
-  apiBaseUrl: string;
-  botId: string;
-};
-
-type ApiError = Error & {
-  code: string;
-  status: number;
-};
+  | { kind: "login" }
+  | { kind: "recover" }
+  | { kind: "profile" }
+  | { kind: "invite"; token: string | null };
 
 type RetryOperation = () => Promise<void>;
 type RouteIdentity = { key: string; epoch: number };
@@ -153,121 +153,8 @@ function errorMessage(
   return "No pudimos completar la invitación. Revisá el enlace e intentá de nuevo.";
 }
 
-function asApiError(error: unknown): ApiError {
-  if (error instanceof Error && "code" in error && "status" in error) {
-    if (typeof error.code === "string" && typeof error.status === "number") {
-      return Object.assign(error, { code: error.code, status: error.status });
-    }
-  }
-  const message = error instanceof SessionError ? error.message : "";
-  return Object.assign(new Error(message || "La solicitud no pudo completarse."), {
-    code: error instanceof SessionError ? error.code : "NETWORK_ERROR",
-    status: 0,
-  });
-}
-
-function assertPublicConfig(value: unknown): PublicConfig {
-  if (!isRecord(value)) throw new Error("Invalid public config");
-  const config = value;
-  const { region, userPoolId, clientId, apiBaseUrl, botId } = config;
-  if (
-    typeof region !== "string" ||
-    !region ||
-    typeof userPoolId !== "string" ||
-    !userPoolId ||
-    typeof clientId !== "string" ||
-    !clientId ||
-    typeof apiBaseUrl !== "string" ||
-    !apiBaseUrl.startsWith("/") ||
-    apiBaseUrl.startsWith("//") ||
-    typeof botId !== "string" ||
-    !botId
-  ) {
-    throw new Error("Invalid public config");
-  }
-  return { region, userPoolId, clientId, apiBaseUrl, botId };
-}
-
-async function readPublicConfig(): Promise<PublicConfig> {
-  const response = await fetch("/public-config.json", { cache: "no-store" });
-  if (!response.ok) throw new Error("Public config request failed");
-  return assertPublicConfig(await response.json());
-}
-
-function apiUrl(config: PublicConfig, path: string): string {
-  return config.apiBaseUrl.replace(/\/+$/, "") + path;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-async function apiRequest(
-  config: PublicConfig,
-  path: string,
-  options: { method?: "GET" | "POST"; body?: unknown; accessToken?: string | null },
-): Promise<unknown> {
-  const headers: Record<string, string> = {};
-  if (options.body !== undefined) headers["content-type"] = "application/json";
-  if (options.accessToken) headers.authorization = "Bearer " + options.accessToken;
-
-  let response: Response;
-  try {
-    response = await fetch(apiUrl(config, path), {
-      method: options.method || "GET",
-      headers,
-      ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-      cache: "no-store",
-    });
-  } catch {
-    throw Object.assign(new Error("API unavailable"), { code: "NETWORK_ERROR", status: 0 });
-  }
-
-  let payload: unknown;
-  try {
-    payload = await response.json();
-  } catch {
-    if (response.ok) {
-      throw Object.assign(new Error("API returned invalid JSON"), {
-        code: "INVALID_RESPONSE",
-        status: 502,
-      });
-    }
-    payload = null;
-  }
-
-  if (!response.ok) {
-    throw Object.assign(new Error("API request failed"), {
-      code: isRecord(payload) && typeof payload.code === "string" ? payload.code : "API_ERROR",
-      status: response.status,
-    });
-  }
-  return payload;
-}
-
-async function requestWithRefresh(
-  config: PublicConfig,
-  session: Session,
-  path: string,
-  options: { method?: "GET" | "POST"; body?: unknown },
-  isActive: () => boolean,
-): Promise<unknown> {
-  let accessToken = session.accessToken();
-  if (!accessToken)
-    throw Object.assign(new Error("No active session"), { code: "UNAUTHORIZED", status: 401 });
-
-  try {
-    return await apiRequest(config, path, { ...options, accessToken });
-  } catch (error) {
-    const firstError = asApiError(error);
-    if (firstError.status !== 401 || !isActive()) throw firstError;
-
-    const refreshed = await session.restore();
-    if (!isActive()) throw firstError;
-    if (!refreshed) throw firstError;
-    accessToken = refreshed.accessToken;
-    return apiRequest(config, path, { ...options, accessToken });
-  }
 }
 
 function replaceHash(path: string) {
@@ -281,10 +168,12 @@ function replaceHash(path: string) {
 export function AccountApp({
   route,
   projectName,
+  profileConfig = siteConfig.profile,
   getSession,
 }: {
   route: AccountRoute;
   projectName: string;
+  profileConfig?: ProfileConfig;
   getSession: (config: Pick<PublicConfig, "clientId" | "region">) => Session;
 }) {
   const routeKey = accountRouteKey(route);
@@ -298,6 +187,7 @@ export function AccountApp({
   const configRef = useRef<PublicConfig | null>(null);
   const sessionRef = useRef<Session | null>(null);
   const retryOperationRef = useRef<RetryOperation | null>(null);
+  const authorizedRouteRef = useRef<RouteIdentity | null>(null);
   const currentRouteKeyRef = useRef(routeKey);
   const routeEpochRef = useRef(0);
   if (currentRouteKeyRef.current !== routeKey) {
@@ -307,6 +197,7 @@ export function AccountApp({
   const mountedRef = useRef(false);
   const initializeSequenceRef = useRef(0);
   const recoverySubmissionInFlightRef = useRef(false);
+  const identityGenerationRef = useRef(0);
   const confirmOperationRef = useRef<{ email: string } | null>(null);
   const passwordResetLoginEmailRef = useRef<string | null>(null);
 
@@ -358,6 +249,11 @@ export function AccountApp({
       email: string | undefined,
       isActive: () => boolean,
     ) => {
+      const routeIdentity = {
+        key: currentRouteKeyRef.current,
+        epoch: routeEpochRef.current,
+      };
+      authorizedRouteRef.current = null;
       retryOperationRef.current = async () => {
         if (!isActive()) return;
         setState((current) => ({ ...current, pending: true, error: undefined }));
@@ -374,13 +270,20 @@ export function AccountApp({
             });
           }
           if (!isActive()) return;
+          authorizedRouteRef.current = routeIdentity;
           setState({
             view: "ready",
+            identity: {
+              sub: membership.sub,
+              botId: membership.botId,
+              generation: ++identityGenerationRef.current,
+            },
             email,
             projectName,
           });
         } catch (error) {
           if (!isActive()) return;
+          authorizedRouteRef.current = null;
           const apiError = asApiError(error);
           setState({
             view: "denied",
@@ -402,6 +305,7 @@ export function AccountApp({
   const initialize = useCallback(
     async (isActive: () => boolean) => {
       if (!isActive()) return;
+      authorizedRouteRef.current = null;
       retryOperationRef.current = null;
       configRef.current = null;
       setState({
@@ -772,23 +676,74 @@ export function AccountApp({
     }
   }
 
-  async function signOut() {
-    const identity = { key: routeKey, epoch: routeEpochRef.current };
-    await sessionRef.current?.signOut();
-    if (!isCurrentRoute(identity)) return;
-    replaceHash("/login");
+  const signOut = useCallback(() => {
+    authorizedRouteRef.current = null;
     setState({
       view: "login",
       pending: false,
       notice: "Cerraste sesión.",
       projectName,
     });
-  }
+    if (window.location.hash !== "#/login") window.location.hash = "/login";
+    void sessionRef.current?.signOut();
+  }, [projectName]);
+
+  const profileUnauthorized = useCallback(() => {
+    authorizedRouteRef.current = null;
+    setState({
+      view: "login",
+      pending: false,
+      notice: "Tu sesión venció. Iniciá sesión nuevamente.",
+      projectName,
+    });
+    if (window.location.hash !== "#/login") window.location.hash = "/login";
+    void sessionRef.current?.signOut();
+  }, [projectName]);
+
+  const profileForbidden = useCallback(() => {
+    authorizedRouteRef.current = null;
+    setState({
+      view: "denied",
+      pending: false,
+      error: "Esta cuenta no tiene acceso a este asistente.",
+      retryable: false,
+      canSignOut: Boolean(sessionRef.current?.accessToken()),
+      projectName,
+    });
+  }, [projectName]);
 
   const screenProps: AccountScreenProps = {
     state,
     onSubmit: submit,
     onSignOut: signOut,
   };
+  const profileRouteIsAuthorized =
+    authorizedRouteRef.current?.key === routeKey &&
+    authorizedRouteRef.current.epoch === routeEpochRef.current;
+  if (
+    route.kind === "profile" &&
+    profileRouteIsAuthorized &&
+    state.view === "ready" &&
+    state.identity
+  ) {
+    const apiConfig = configRef.current;
+    const session = sessionRef.current;
+    if (!apiConfig || !session) {
+      return <AccountScreen {...screenProps} />;
+    }
+    return (
+      <ProfileApp
+        key={JSON.stringify([state.identity.sub, state.identity.botId, state.identity.generation])}
+        config={profileConfig}
+        apiConfig={apiConfig}
+        session={session}
+        identity={state.identity}
+        projectName={projectName}
+        onSignOut={signOut}
+        onUnauthorized={profileUnauthorized}
+        onForbidden={profileForbidden}
+      />
+    );
+  }
   return <AccountScreen {...screenProps} />;
 }

@@ -117,6 +117,12 @@ export class AccountStack extends Stack {
       integration,
       authorizer: jwtAuthorizer,
     });
+    this.httpApi.addRoutes({
+      path: "/api/profile",
+      methods: [apigateway.HttpMethod.GET, apigateway.HttpMethod.PUT],
+      integration,
+      authorizer: jwtAuthorizer,
+    });
 
     new CfnOutput(this, "UserPoolId", {
       value: userPool.userPoolId,
@@ -128,7 +134,7 @@ export class AccountStack extends Stack {
     });
     new CfnOutput(this, "TableName", {
       value: this.table.tableName,
-      description: `Invitation and membership table for ${environment.botId}.`,
+      description: `Account and profile table for ${environment.botId}.`,
     });
     new CfnOutput(this, "ApiUrl", {
       value: this.httpApi.apiEndpoint,

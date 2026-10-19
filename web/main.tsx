@@ -22,6 +22,7 @@ function routeFromHash(hash: string): AccountRoute | null {
   const pathname = questionIndex < 0 ? route : route.slice(0, questionIndex);
   const query = questionIndex < 0 ? "" : route.slice(questionIndex + 1);
   if (pathname === "/login") return { kind: "login" };
+  if (pathname === "/profile") return { kind: "profile" };
   if (pathname === "/recover") return { kind: "recover" };
   if (pathname === "/invite") {
     return { kind: "invite", token: new URLSearchParams(query).get("token") };
@@ -60,7 +61,12 @@ function App() {
   const route = routeFromHash(hash);
   if (route)
     return (
-      <AccountApp route={route} projectName={siteConfig.projectName} getSession={getSession} />
+      <AccountApp
+        route={route}
+        projectName={siteConfig.projectName}
+        profileConfig={siteConfig.profile}
+        getSession={getSession}
+      />
     );
 
   return (
