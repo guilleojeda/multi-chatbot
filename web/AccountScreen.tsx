@@ -13,6 +13,7 @@ export type AccountPendingAction = "request-reset" | "resend-reset" | "confirm-r
 
 export type AccountState = {
   view: AccountView;
+  identity?: { sub: string; botId: string; generation: number };
   email?: string;
   pending?: boolean;
   error?: string;
@@ -399,6 +400,9 @@ export function AccountScreen({ state, onSubmit, onSignOut }: AccountScreenProps
             <div className="account-ready">
               {state.email ? <p className="account-email">{state.email}</p> : null}
               <p>{state.projectName || "Asistente para docentes"}</p>
+              <a className="account-button account-button--secondary" href="/#/profile">
+                Mi perfil
+              </a>
               <button
                 className="account-button account-button--secondary"
                 type="button"

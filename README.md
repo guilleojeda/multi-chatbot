@@ -1,6 +1,6 @@
 # Multi-chatbot
 
-Repositorio común para los chatbots del proyecto. Incluye el sitio público y la cuenta por invitación del proyecto de docentes, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
+Repositorio común para los chatbots del proyecto. Incluye el sitio público, la cuenta por invitación y el perfil profesional del proyecto de docentes, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
 
 ## Preparar un checkout
 
@@ -32,7 +32,7 @@ Las pruebas con errores intencionales trabajan en copias y repositorios Git temp
 
 `tsconfig.web.json` comprueba TSX y tipos DOM; Vite transforma y empaqueta con el plugin React. Vitest utiliza esa transformación y mantiene su raíz en el repositorio. La infraestructura usa otra configuración TypeScript, NodeNext, y se ejecuta compilada a JavaScript.
 
-La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes`. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. El contenido describe el estado actual y el uso previsto de datos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo; el chat y el perfil todavía no están habilitados. Ver [cuenta y operación de invitaciones](docs/intent/account.md).
+La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes` y define sus campos y opciones de perfil. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo. Una persona autorizada puede guardar y editar su perfil; el chat todavía no está habilitado. Ver [cuenta y operación de invitaciones](docs/intent/account.md) y [perfil y preferencias](docs/intent/profile.md).
 
 Para usar el sitio localmente:
 
