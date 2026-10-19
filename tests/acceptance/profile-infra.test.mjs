@@ -231,9 +231,7 @@ describe("profile CDK acceptance", () => {
       }
 
       expect(table.properties.TableName).toBe(`multi-chatbot-${environment}-${botId}-account-data`);
-      expect(client.properties.UserPoolClientName).toBe(
-        `multi-chatbot-${environment}-${botId}-account`,
-      );
+      expect(client.properties.ClientName).toBe(`multi-chatbot-${environment}-${botId}-account`);
       expect(api.properties.Name).toBe(`multi-chatbot-${environment}-${botId}-account`);
       const pool = onlyResource(stack.identityTemplate, "AWS::Cognito::UserPool");
       expect(pool.properties.UserPoolName).toBe(`multi-chatbot-${environment}-identity`);
