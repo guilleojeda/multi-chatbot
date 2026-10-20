@@ -2,6 +2,7 @@ import type { PublicConfig } from "./api";
 import type { Session } from "./session";
 
 export type ChatRequest = {
+  operation: "start" | "message";
   conversationId: string;
   text: string;
 };
@@ -167,7 +168,7 @@ export async function streamChat(
 
   const body = JSON.stringify({
     version: 1,
-    operation: "start",
+    operation: request.operation,
     conversationId: request.conversationId,
     text: request.text,
   });

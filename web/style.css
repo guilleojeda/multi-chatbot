@@ -219,6 +219,14 @@ h1 {
   text-decoration: none;
 }
 
+.profile-header-links {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.45rem 1rem;
+}
+
 .account-home-link:focus-visible,
 .account-public-link:focus-visible,
 .intro__account a:focus-visible,
@@ -579,6 +587,11 @@ h1 {
   line-height: 1.04;
 }
 
+.chat-card h1:focus {
+  outline: 3px solid #b66d52;
+  outline-offset: 5px;
+}
+
 .chat-knowledge-note,
 .chat-limit-note,
 .chat-profile-message,
@@ -656,6 +669,25 @@ h1 {
   background: #fff;
 }
 
+.chat-previous-turns {
+  margin: 1.5rem 0 0;
+  padding-left: 1.4rem;
+}
+
+.chat-previous-turn {
+  padding: 0 0 1.25rem 0.25rem;
+}
+
+.chat-previous-turn::marker {
+  color: #a85e48;
+  font-weight: 750;
+}
+
+.chat-previous-turn .chat-question,
+.chat-previous-turn .chat-answer-block {
+  margin-top: 0.65rem;
+}
+
 .chat-message-label {
   display: block;
   margin-bottom: 0.45rem;
@@ -670,6 +702,21 @@ h1 {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
   user-select: text;
+}
+
+.chat-copy-button {
+  margin-top: 0.8rem;
+}
+
+.chat-context-note {
+  margin: 0.75rem 0 0;
+  color: #49645f;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.chat-restart-button {
+  margin-top: 1.15rem;
 }
 
 .chat-form {

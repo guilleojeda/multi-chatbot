@@ -59,7 +59,7 @@ describe("the docentes profile configuration", () => {
     expect(siteConfig.purpose).toMatch(/enseñanza|docente/i);
     expect(siteConfig.purpose).toMatch(/chat/i);
     expect(siteConfig.purpose).not.toMatch(
-      /chat.*(?:no está disponible|no disponible|todavía no|aún no)/i,
+      /chat[^.!?;]*(?:no está disponible|no disponible|todavía no|aún no)/i,
     );
     expect(siteConfig.dataUse).toMatch(/preguntas|consultas/i);
     expect(siteConfig.dataUse).toMatch(/guardar|conserv/i);

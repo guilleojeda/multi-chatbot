@@ -14,7 +14,9 @@ Run the repository's existing Vite executable from the repository root:
 npx vite --config tests/fixtures/chat/vite.config.ts --host 127.0.0.1
 ```
 
-Open the local server URL printed by Vite. The fixture opens `/#/chat` with a restored test
+Open the local server URL printed by Vite. For navigation sequences, use a plain URL without a
+query string and select the scenario in the fixture controls; product links drop query parameters,
+which would reload this in-memory fixture. The fixture opens `/#/chat` with a restored test
 identity and complete profile. Choose a scenario before retrying an operation. The Runtime stream
 emits an accepted event and a text fragment immediately; use the fixture controls to emit more
 text, complete, fail, or close without a terminal event. `runtime-admission-pending` waits before

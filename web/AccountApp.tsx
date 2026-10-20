@@ -16,7 +16,7 @@ import { type Session } from "./session";
 import { ProfileApp } from "./ProfileApp";
 import { siteConfig } from "../config/site";
 import type { ProfileConfig } from "../config/profile";
-import { ChatScreen, type ChatScreenState } from "./ChatScreen";
+import { ChatScreen, type ChatScreenState, type PreviousChatTurn } from "./ChatScreen";
 import { streamChat } from "./chat-api";
 import { parseProfileEnvelope } from "./profile-data";
 
@@ -44,6 +44,18 @@ function chatOwnerKey(identity: { sub: string; botId: string }) {
 
 function emptyChatState(): ChatScreenState {
   return { profileStatus: "loading", queryStatus: "idle" };
+}
+
+function priorTurnsIncludingCurrent(state: ChatScreenState): PreviousChatTurn[] {
+  const previousTurns = [...(state.previousTurns || [])];
+  if (state.question && (state.queryStatus === "completed" || state.queryStatus === "failed")) {
+    previousTurns.push({
+      question: state.question,
+      answer: state.answer || "",
+      status: state.queryStatus,
+    });
+  }
+  return previousTurns;
 }
 
 function isRecoveryIdentityError(code: string) {
@@ -200,6 +212,7 @@ export function AccountApp({
   const [chatProfileRetryCount, setChatProfileRetryCount] = useState(0);
   const chatScreenStateRef = useRef(chatScreenState);
   const chatOwnerKeyRef = useRef<string | null>(null);
+  const chatConversationIdRef = useRef<string | null>(null);
   const chatEpochRef = useRef(0);
   const chatProfileSequenceRef = useRef(0);
   const chatRequestRef = useRef<AbortController | null>(null);
@@ -233,6 +246,7 @@ export function AccountApp({
     chatRequestRef.current = null;
     chatSubmissionInFlightRef.current = false;
     chatOwnerKeyRef.current = null;
+    chatConversationIdRef.current = null;
     setChat(emptyChatState());
   }, [setChat]);
 
@@ -252,6 +266,7 @@ export function AccountApp({
     chatRequestRef.current?.abort();
     chatRequestRef.current = null;
     chatSubmissionInFlightRef.current = false;
+    chatConversationIdRef.current = null;
     const current = chatScreenStateRef.current;
     setChat({
       profileStatus: current.profileStatus,
@@ -282,6 +297,7 @@ export function AccountApp({
       chatRequestRef.current = null;
       chatSubmissionInFlightRef.current = false;
       chatOwnerKeyRef.current = null;
+      chatConversationIdRef.current = null;
     },
     [],
   );
@@ -880,14 +896,18 @@ export function AccountApp({
       !session ||
       chatOwnerKeyRef.current !== ownerKey ||
       current.profileStatus !== "complete" ||
-      current.queryStatus !== "idle" ||
+      (current.queryStatus !== "idle" &&
+        current.queryStatus !== "completed" &&
+        current.queryStatus !== "failed") ||
       chatSubmissionInFlightRef.current ||
       !text.trim()
     ) {
       return;
     }
 
-    const conversationId = window.crypto.randomUUID();
+    const operation = chatConversationIdRef.current ? "message" : "start";
+    const conversationId = chatConversationIdRef.current || window.crypto.randomUUID();
+    chatConversationIdRef.current = conversationId;
     const controller = new AbortController();
     const chatEpoch = chatEpochRef.current;
     const isActive = () =>
@@ -898,6 +918,7 @@ export function AccountApp({
     chatSubmissionInFlightRef.current = true;
     chatRequestRef.current = controller;
     setChat({
+      previousTurns: priorTurnsIncludingCurrent(current),
       profileStatus: "complete",
       queryStatus: "sending",
       question: text,
@@ -907,7 +928,7 @@ export function AccountApp({
     void streamChat(
       apiConfig,
       session,
-      { conversationId, text },
+      { operation, conversationId, text },
       {
         signal: controller.signal,
         isActive,
@@ -941,10 +962,22 @@ export function AccountApp({
           profileForbidden();
           return;
         }
+        if (
+          operation === "start" &&
+          result.recordStatus === "not_admitted" &&
+          chatConversationIdRef.current === conversationId
+        ) {
+          chatConversationIdRef.current = null;
+        }
         setChat({
           ...before,
           profileStatus: failureCode === "profile_required" ? "incomplete" : "complete",
-          queryStatus: result.recordStatus === "unconfirmed" ? "unconfirmed" : "failed",
+          queryStatus:
+            result.recordStatus === "unconfirmed"
+              ? "unconfirmed"
+              : result.recordStatus === "not_admitted"
+                ? "rejected"
+                : "failed",
           error: result.message,
         });
       })

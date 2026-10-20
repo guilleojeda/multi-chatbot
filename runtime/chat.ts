@@ -1,5 +1,6 @@
 import { accessTokenSubject } from "../api/auth.js";
 import { isStoredProfile, type ProfileConfig, type StoredProfile } from "../config/profile.js";
+import type { MessageData } from "@strands-agents/sdk";
 import { splitUtf8Text } from "./text.js";
 
 type ChatConfig = {
@@ -21,6 +22,7 @@ type ProfileStore = {
 
 type ConversationStore = {
   getMeta(input: { conversationId: string }): Promise<unknown | null>;
+  readContext(input: { conversationId: string }): Promise<MessageData[]>;
   startTurn(input: {
     sub: string;
     botId: string;
@@ -30,6 +32,17 @@ type ConversationStore = {
     text: string;
     profileSnapshot: Record<string, unknown>;
     invocation: { modelId: string; revision: string };
+  }): Promise<{ queryId: string; ordinal: number }>;
+  continueTurn(input: {
+    sub: string;
+    botId: string;
+    conversationId: string;
+    queryId: string;
+    now: number;
+    text: string;
+    profileSnapshot: Record<string, unknown>;
+    invocation: { modelId: string; revision: string };
+    expectedLastOrdinal: number;
   }): Promise<{ queryId: string; ordinal: number }>;
   appendChunk(input: {
     conversationId: string;
@@ -85,7 +98,7 @@ type ProviderInput = {
   systemPrompt: string;
   profileSnapshot: Record<string, unknown>;
   text: string;
-  messages: [];
+  messages: MessageData[];
   modelId: string;
   revision: string;
 };
@@ -111,7 +124,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isPayload(value: unknown): value is {
   version: 1;
-  operation: "start";
+  operation: "start" | "message";
   conversationId: string;
   text: string;
 } {
@@ -119,11 +132,27 @@ function isPayload(value: unknown): value is {
     return false;
   return (
     value.version === 1 &&
-    value.operation === "start" &&
+    (value.operation === "start" || value.operation === "message") &&
     typeof value.conversationId === "string" &&
     uuidPattern.test(value.conversationId) &&
     typeof value.text === "string" &&
     value.text.trim().length > 0
+  );
+}
+
+function isOwnedConversationMeta(
+  value: unknown,
+  input: { conversationId: string; sub: string; botId: string },
+): value is Record<string, unknown> & { lastOrdinal: number } {
+  return (
+    isRecord(value) &&
+    value.conversationId === input.conversationId &&
+    value.sub === input.sub &&
+    value.botId === input.botId &&
+    typeof value.lastOrdinal === "number" &&
+    Number.isSafeInteger(value.lastOrdinal) &&
+    value.lastOrdinal > 0 &&
+    Number.isSafeInteger(value.lastOrdinal + 1)
   );
 }
 
@@ -258,9 +287,24 @@ export function createChatHandler(dependencies: ChatDependencies) {
       yield safeFailure("temporarily_unavailable", "not_admitted");
       return;
     }
-    if (meta !== null) {
-      yield safeFailure("conversation_unavailable", "not_admitted");
-      return;
+    let ownerMeta: (Record<string, unknown> & { lastOrdinal: number }) | null = null;
+    if (request.operation === "start") {
+      if (meta !== null) {
+        yield safeFailure("conversation_unavailable", "not_admitted");
+        return;
+      }
+    } else {
+      if (
+        !isOwnedConversationMeta(meta, {
+          conversationId: request.conversationId,
+          sub,
+          botId: config.botId,
+        })
+      ) {
+        yield safeFailure("conversation_unavailable", "not_admitted");
+        return;
+      }
+      ownerMeta = meta;
     }
 
     const profileKey = { sub, botId: config.botId };
@@ -280,6 +324,16 @@ export function createChatHandler(dependencies: ChatDependencies) {
       return;
     }
 
+    let messages: MessageData[] = [];
+    if (request.operation === "message") {
+      try {
+        messages = await store.readContext({ conversationId: request.conversationId });
+      } catch {
+        yield safeFailure("temporarily_unavailable", "not_admitted");
+        return;
+      }
+    }
+
     const profileSnapshot = makeProfileSnapshot(
       storedProfile,
       config.profile,
@@ -296,17 +350,28 @@ export function createChatHandler(dependencies: ChatDependencies) {
       return;
     }
 
+    const turnInput = {
+      ...profileKey,
+      conversationId: request.conversationId,
+      queryId,
+      now: now(),
+      text: request.text,
+      profileSnapshot,
+      invocation,
+    };
     let admitted: { queryId: string; ordinal: number };
     try {
-      admitted = await store.startTurn({
-        ...profileKey,
-        conversationId: request.conversationId,
-        queryId,
-        now: now(),
-        text: request.text,
-        profileSnapshot,
-        invocation,
-      });
+      if (request.operation === "start") {
+        admitted = await store.startTurn(turnInput);
+      } else if (ownerMeta !== null) {
+        admitted = await store.continueTurn({
+          ...turnInput,
+          expectedLastOrdinal: ownerMeta.lastOrdinal,
+        });
+      } else {
+        yield safeFailure("conversation_unavailable", "not_admitted");
+        return;
+      }
     } catch {
       yield safeFailure("temporarily_unavailable", "unconfirmed", queryId);
       return;
@@ -366,7 +431,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
         systemPrompt: profilePrompt(profileSnapshot, config),
         profileSnapshot,
         text: request.text,
-        messages: [],
+        messages,
         modelId: config.modelId,
         revision: config.revision,
       })) {
