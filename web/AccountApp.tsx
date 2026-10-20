@@ -16,10 +16,14 @@ import { type Session } from "./session";
 import { ProfileApp } from "./ProfileApp";
 import { siteConfig } from "../config/site";
 import type { ProfileConfig } from "../config/profile";
+import { ChatScreen, type ChatScreenState } from "./ChatScreen";
+import { streamChat } from "./chat-api";
+import { parseProfileEnvelope } from "./profile-data";
 
 export type AccountRoute =
   | { kind: "login" }
   | { kind: "recover" }
+  | { kind: "chat" }
   | { kind: "profile" }
   | { kind: "invite"; token: string | null };
 
@@ -32,6 +36,14 @@ const passwordResetLoginNotice = "La contraseña se cambió. Iniciá sesión con
 
 function accountRouteKey(route: AccountRoute) {
   return route.kind === "invite" ? `invite:${route.token || ""}` : route.kind;
+}
+
+function chatOwnerKey(identity: { sub: string; botId: string }) {
+  return JSON.stringify([identity.sub, identity.botId]);
+}
+
+function emptyChatState(): ChatScreenState {
+  return { profileStatus: "loading", queryStatus: "idle" };
 }
 
 function isRecoveryIdentityError(code: string) {
@@ -184,6 +196,14 @@ export function AccountApp({
     projectName,
   });
   const [retryCount, setRetryCount] = useState(0);
+  const [chatScreenState, setChatScreenState] = useState<ChatScreenState>(emptyChatState);
+  const [chatProfileRetryCount, setChatProfileRetryCount] = useState(0);
+  const chatScreenStateRef = useRef(chatScreenState);
+  const chatOwnerKeyRef = useRef<string | null>(null);
+  const chatEpochRef = useRef(0);
+  const chatProfileSequenceRef = useRef(0);
+  const chatRequestRef = useRef<AbortController | null>(null);
+  const chatSubmissionInFlightRef = useRef(false);
   const configRef = useRef<PublicConfig | null>(null);
   const sessionRef = useRef<Session | null>(null);
   const retryOperationRef = useRef<RetryOperation | null>(null);
@@ -201,6 +221,44 @@ export function AccountApp({
   const confirmOperationRef = useRef<{ email: string } | null>(null);
   const passwordResetLoginEmailRef = useRef<string | null>(null);
 
+  const setChat = useCallback((next: ChatScreenState) => {
+    chatScreenStateRef.current = next;
+    setChatScreenState(next);
+  }, []);
+
+  const invalidateChat = useCallback(() => {
+    chatEpochRef.current += 1;
+    chatProfileSequenceRef.current += 1;
+    chatRequestRef.current?.abort();
+    chatRequestRef.current = null;
+    chatSubmissionInFlightRef.current = false;
+    chatOwnerKeyRef.current = null;
+    setChat(emptyChatState());
+  }, [setChat]);
+
+  const activateChatIdentity = useCallback(
+    (identity: { sub: string; botId: string }) => {
+      const nextOwner = chatOwnerKey(identity);
+      if (chatOwnerKeyRef.current === nextOwner) return;
+      invalidateChat();
+      chatOwnerKeyRef.current = nextOwner;
+      setChat(emptyChatState());
+    },
+    [invalidateChat, setChat],
+  );
+
+  const resetChat = useCallback(() => {
+    chatEpochRef.current += 1;
+    chatRequestRef.current?.abort();
+    chatRequestRef.current = null;
+    chatSubmissionInFlightRef.current = false;
+    const current = chatScreenStateRef.current;
+    setChat({
+      profileStatus: current.profileStatus,
+      queryStatus: "idle",
+    });
+  }, [setChat]);
+
   function isCurrentRoute(identity: RouteIdentity) {
     return (
       mountedRef.current &&
@@ -215,6 +273,18 @@ export function AccountApp({
       mountedRef.current = false;
     };
   }, []);
+
+  useEffect(
+    () => () => {
+      chatEpochRef.current += 1;
+      chatProfileSequenceRef.current += 1;
+      chatRequestRef.current?.abort();
+      chatRequestRef.current = null;
+      chatSubmissionInFlightRef.current = false;
+      chatOwnerKeyRef.current = null;
+    },
+    [],
+  );
 
   const inspectInvitation = useCallback(
     async (config: PublicConfig, token: string, isActive: () => boolean) => {
@@ -270,6 +340,7 @@ export function AccountApp({
             });
           }
           if (!isActive()) return;
+          activateChatIdentity({ sub: membership.sub, botId: membership.botId });
           authorizedRouteRef.current = routeIdentity;
           setState({
             view: "ready",
@@ -284,6 +355,7 @@ export function AccountApp({
         } catch (error) {
           if (!isActive()) return;
           authorizedRouteRef.current = null;
+          invalidateChat();
           const apiError = asApiError(error);
           setState({
             view: "denied",
@@ -299,7 +371,7 @@ export function AccountApp({
 
       await retryOperationRef.current();
     },
-    [projectName],
+    [activateChatIdentity, invalidateChat, projectName],
   );
 
   const initialize = useCallback(
@@ -388,6 +460,7 @@ export function AccountApp({
           return;
         }
         if (!restored) {
+          invalidateChat();
           setState({
             view: "login",
             pending: false,
@@ -398,6 +471,7 @@ export function AccountApp({
         await checkMembership(config, session, undefined, isActive);
       } catch (error) {
         if (!isActive()) return;
+        invalidateChat();
         const apiError = asApiError(error);
         const context = configRef.current ? "inspect" : "config";
         setState({
@@ -409,7 +483,7 @@ export function AccountApp({
         });
       }
     },
-    [checkMembership, getSession, inspectInvitation, projectName, route],
+    [checkMembership, getSession, inspectInvitation, invalidateChat, projectName, route],
   );
 
   useEffect(() => {
@@ -677,6 +751,7 @@ export function AccountApp({
   }
 
   const signOut = useCallback(() => {
+    invalidateChat();
     authorizedRouteRef.current = null;
     setState({
       view: "login",
@@ -686,9 +761,10 @@ export function AccountApp({
     });
     if (window.location.hash !== "#/login") window.location.hash = "/login";
     void sessionRef.current?.signOut();
-  }, [projectName]);
+  }, [invalidateChat, projectName]);
 
   const profileUnauthorized = useCallback(() => {
+    invalidateChat();
     authorizedRouteRef.current = null;
     setState({
       view: "login",
@@ -698,9 +774,10 @@ export function AccountApp({
     });
     if (window.location.hash !== "#/login") window.location.hash = "/login";
     void sessionRef.current?.signOut();
-  }, [projectName]);
+  }, [invalidateChat, projectName]);
 
   const profileForbidden = useCallback(() => {
+    invalidateChat();
     authorizedRouteRef.current = null;
     setState({
       view: "denied",
@@ -710,19 +787,239 @@ export function AccountApp({
       canSignOut: Boolean(sessionRef.current?.accessToken()),
       projectName,
     });
-  }, [projectName]);
+  }, [invalidateChat, projectName]);
+
+  const authorizedRouteIsCurrent =
+    authorizedRouteRef.current?.key === routeKey &&
+    authorizedRouteRef.current.epoch === routeEpochRef.current;
+  const apiConfig = configRef.current;
+  const session = sessionRef.current;
+  const readyIdentity = state.view === "ready" ? state.identity : undefined;
+
+  useEffect(() => {
+    if (
+      route.kind !== "chat" ||
+      !authorizedRouteIsCurrent ||
+      state.view !== "ready" ||
+      !readyIdentity ||
+      !apiConfig ||
+      !session ||
+      chatOwnerKeyRef.current !== chatOwnerKey(readyIdentity)
+    ) {
+      return;
+    }
+
+    const identity = readyIdentity;
+    const identityKey = chatOwnerKey(identity);
+    const chatEpoch = chatEpochRef.current;
+    const profileSequence = ++chatProfileSequenceRef.current;
+    let active = true;
+    const isActive = () =>
+      active &&
+      chatProfileSequenceRef.current === profileSequence &&
+      chatEpochRef.current === chatEpoch &&
+      chatOwnerKeyRef.current === identityKey;
+
+    setChat({ ...chatScreenStateRef.current, profileStatus: "loading", error: undefined });
+    void requestWithRefresh(apiConfig, session, "/profile", {}, isActive)
+      .then((payload) => {
+        if (!isActive()) return;
+        const profile = parseProfileEnvelope(payload, profileConfig, identity);
+        setChat({
+          ...chatScreenStateRef.current,
+          profileStatus: profile ? "complete" : "incomplete",
+          error: undefined,
+        });
+      })
+      .catch((error: unknown) => {
+        if (!isActive()) return;
+        const apiError = asApiError(error);
+        if (apiError.status === 401 || apiError.refreshFailed) {
+          invalidateChat();
+          profileUnauthorized();
+          return;
+        }
+        if (apiError.status === 403) {
+          invalidateChat();
+          profileForbidden();
+          return;
+        }
+        setChat({
+          ...chatScreenStateRef.current,
+          profileStatus: "error",
+          error: "No pudimos cargar tu perfil. Podés reintentar.",
+        });
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [
+    apiConfig,
+    authorizedRouteIsCurrent,
+    chatProfileRetryCount,
+    invalidateChat,
+    profileConfig,
+    profileForbidden,
+    profileUnauthorized,
+    readyIdentity,
+    route.kind,
+    session,
+    setChat,
+    state.view,
+  ]);
+
+  function submitChat(text: string) {
+    const identity = state.view === "ready" ? state.identity : undefined;
+    const current = chatScreenStateRef.current;
+    const ownerKey = identity ? chatOwnerKey(identity) : null;
+    if (
+      !identity ||
+      !ownerKey ||
+      !apiConfig ||
+      !session ||
+      chatOwnerKeyRef.current !== ownerKey ||
+      current.profileStatus !== "complete" ||
+      current.queryStatus !== "idle" ||
+      chatSubmissionInFlightRef.current ||
+      !text.trim()
+    ) {
+      return;
+    }
+
+    const conversationId = window.crypto.randomUUID();
+    const controller = new AbortController();
+    const chatEpoch = chatEpochRef.current;
+    const isActive = () =>
+      chatEpochRef.current === chatEpoch &&
+      chatOwnerKeyRef.current === ownerKey &&
+      chatRequestRef.current === controller &&
+      !controller.signal.aborted;
+    chatSubmissionInFlightRef.current = true;
+    chatRequestRef.current = controller;
+    setChat({
+      profileStatus: "complete",
+      queryStatus: "sending",
+      question: text,
+      answer: "",
+    });
+
+    void streamChat(
+      apiConfig,
+      session,
+      { conversationId, text },
+      {
+        signal: controller.signal,
+        isActive,
+        onEvent: (event) => {
+          if (!isActive()) return;
+          const before = chatScreenStateRef.current;
+          if (event.type === "accepted") {
+            setChat({ ...before, queryStatus: "streaming" });
+          } else if (event.type === "text") {
+            setChat({
+              ...before,
+              queryStatus: "streaming",
+              answer: (before.answer || "") + event.text,
+            });
+          } else if (event.type === "completed") {
+            setChat({ ...before, queryStatus: "completed", error: undefined });
+          }
+        },
+      },
+    )
+      .then((result) => {
+        if (!isActive()) return;
+        const before = chatScreenStateRef.current;
+        if (result.status === "completed") {
+          setChat({ ...before, queryStatus: "completed", error: undefined });
+          return;
+        }
+        const failureCode = result.code.toLowerCase();
+        if (failureCode === "access_denied") {
+          invalidateChat();
+          profileForbidden();
+          return;
+        }
+        setChat({
+          ...before,
+          profileStatus: failureCode === "profile_required" ? "incomplete" : "complete",
+          queryStatus: result.recordStatus === "unconfirmed" ? "unconfirmed" : "failed",
+          error: result.message,
+        });
+      })
+      .catch((error: unknown) => {
+        if (!isActive()) return;
+        const apiError = asApiError(error);
+        if (apiError.status === 401 || apiError.refreshFailed) {
+          invalidateChat();
+          profileUnauthorized();
+          return;
+        }
+        if (apiError.status === 403) {
+          invalidateChat();
+          profileForbidden();
+          return;
+        }
+        setChat({
+          ...chatScreenStateRef.current,
+          queryStatus: "unconfirmed",
+          error:
+            apiError.code === "UNCONFIRMED"
+              ? "No pudimos confirmar que la respuesta haya terminado. Todavía no podés recuperar este envío desde esta pantalla."
+              : "No pudimos confirmar el resultado de esta consulta. Todavía no podés recuperar este envío desde esta pantalla.",
+        });
+      })
+      .finally(() => {
+        if (chatRequestRef.current !== controller) return;
+        chatRequestRef.current = null;
+        chatSubmissionInFlightRef.current = false;
+      });
+  }
+
+  function retryChatProfile() {
+    setChat({ ...chatScreenStateRef.current, profileStatus: "loading", error: undefined });
+    setChatProfileRetryCount((count) => count + 1);
+  }
+
+  function copyChatAnswer(text: string) {
+    if (!navigator.clipboard?.writeText) {
+      return Promise.reject(new Error("Clipboard unavailable"));
+    }
+    return navigator.clipboard.writeText(text);
+  }
 
   const screenProps: AccountScreenProps = {
     state,
     onSubmit: submit,
     onSignOut: signOut,
   };
-  const profileRouteIsAuthorized =
-    authorizedRouteRef.current?.key === routeKey &&
-    authorizedRouteRef.current.epoch === routeEpochRef.current;
+  if (
+    route.kind === "chat" &&
+    authorizedRouteIsCurrent &&
+    state.view === "ready" &&
+    state.identity
+  ) {
+    const apiConfig = configRef.current;
+    const session = sessionRef.current;
+    if (!apiConfig || !session) return <AccountScreen {...screenProps} />;
+    const visibleChatState =
+      chatOwnerKeyRef.current === chatOwnerKey(state.identity) ? chatScreenState : emptyChatState();
+    return (
+      <ChatScreen
+        state={{ ...visibleChatState, projectName }}
+        onSubmit={submitChat}
+        onSignOut={signOut}
+        onRetryProfile={retryChatProfile}
+        onReset={resetChat}
+        onCopy={copyChatAnswer}
+      />
+    );
+  }
+
   if (
     route.kind === "profile" &&
-    profileRouteIsAuthorized &&
+    authorizedRouteIsCurrent &&
     state.view === "ready" &&
     state.identity
   ) {

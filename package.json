@@ -20,16 +20,15 @@
     "format:check": "prettier --check .",
     "build:infra": "tsc -p tsconfig.json",
     "build:web": "vite build --config vite.config.ts",
-    "build": "npm run build:infra && npm run build:web",
-    "synth": "npm run build:infra && cdk synth",
+    "build:runtime": "node scripts/build-runtime.mjs",
+    "build": "npm run build:infra && npm run build:web && npm run build:runtime",
+    "synth": "npm run build:infra && npm run build:runtime && cdk synth",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm test && npm run build && npm run synth"
   },
   "devDependencies": {
     "@aws-sdk/client-cloudformation": "3.1152.0",
     "@aws-sdk/client-cognito-identity-provider": "3.1152.0",
-    "@aws-sdk/client-dynamodb": "3.1152.0",
     "@aws-sdk/client-sesv2": "3.1152.0",
-    "@aws-sdk/lib-dynamodb": "3.1152.0",
     "@eslint/js": "10.0.1",
     "@types/node": "24.19.2",
     "@types/react": "19.3.0",
@@ -48,5 +47,12 @@
     "typescript-eslint": "8.71.2",
     "vite": "8.3.4",
     "vitest": "5.0.5"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "3.1152.0",
+    "@aws-sdk/client-dynamodb": "3.1152.0",
+    "@aws-sdk/lib-dynamodb": "3.1152.0",
+    "@strands-agents/sdk": "1.21.0",
+    "bedrock-agentcore": "0.4.6"
   }
 }

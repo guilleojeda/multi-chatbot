@@ -6,6 +6,8 @@ export type PublicConfig = {
   clientId: string;
   apiBaseUrl: string;
   botId: string;
+  runtimeArn?: string;
+  runtimeQualifier?: string;
 };
 
 export type ApiError = Error & {
@@ -64,7 +66,16 @@ export function asApiError(error: unknown): ApiError {
 
 export function assertPublicConfig(value: unknown): PublicConfig {
   if (!isRecord(value)) throw new Error("Invalid public config");
-  const { region, userPoolId, clientId, apiBaseUrl, botId } = value;
+  const { region, userPoolId, clientId, apiBaseUrl, botId, runtimeArn, runtimeQualifier } = value;
+  const runtimeConfig =
+    runtimeArn === undefined && runtimeQualifier === undefined
+      ? {}
+      : typeof runtimeArn === "string" &&
+          runtimeArn.trim() &&
+          typeof runtimeQualifier === "string" &&
+          runtimeQualifier.trim()
+        ? { runtimeArn, runtimeQualifier }
+        : null;
   if (
     typeof region !== "string" ||
     !region ||
@@ -76,11 +87,19 @@ export function assertPublicConfig(value: unknown): PublicConfig {
     !apiBaseUrl.startsWith("/") ||
     apiBaseUrl.startsWith("//") ||
     typeof botId !== "string" ||
-    !botId
+    !botId ||
+    !runtimeConfig
   ) {
     throw new Error("Invalid public config");
   }
-  return { region, userPoolId, clientId, apiBaseUrl, botId };
+  return {
+    region,
+    userPoolId,
+    clientId,
+    apiBaseUrl,
+    botId,
+    ...runtimeConfig,
+  };
 }
 
 export async function readPublicConfig(): Promise<PublicConfig> {

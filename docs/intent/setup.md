@@ -1,6 +1,6 @@
 # Herramientas, configuración y entrega
 
-La base común permite compilar y comprobar TypeScript/React y entregar infraestructura desde una revisión identificable del repositorio. El stack de setup no aprovisiona recursos de aplicación. El [sitio público](public-site.md) se entrega en un stack por ambiente/chatbot. La identidad Cognito se entrega en un stack compartido por ambiente; la cuenta, API y tabla de invitaciones/membresías pertenecen a un stack por chatbot. La web bajo tests es un fixture local de las herramientas y no se publica.
+La base común permite compilar y comprobar TypeScript/React y entregar infraestructura desde una revisión identificable del repositorio. El stack de setup no aprovisiona recursos de aplicación. El [sitio público](public-site.md) se entrega en un stack por ambiente/chatbot. La identidad Cognito se entrega en un stack compartido por ambiente; cuenta/perfil y [chat](chat.md) tienen stacks y datos propios por chatbot. Los fixtures de navegador bajo tests son locales y no se publican.
 
 ## Configuración y propiedad
 
@@ -12,7 +12,9 @@ La API de cuenta también protege GET/PUT `/api/profile` con el mismo authorizer
 
 La identidad de desarrollo configura recuperación por email verificado y el remitente individual SES aprobado; Cognito administra su service-linked role de envío. La identidad de producción conserva recuperación deshabilitada hasta definir su remitente. La operación y sus límites se describen en [cuenta y acceso](account.md#configuración-de-correo-de-recuperación).
 
-El stack de sitio consume el pool, cliente y API de sus stacks previos. CloudFront mantiene el bucket privado con OAC y enruta `/api/*` por HTTPS a la API, sin caché y enviando `Authorization` sin el `Host` del visitante; los paths se conservan. También publica `public-config.json` con región, pool, cliente, `apiBaseUrl=/api` y `botId`. Esos identificadores y URL son configuración pública, no secretos. No hay dependencia desde cuenta o identidad hacia el sitio.
+El stack `multi-chatbot-<ambiente>-<botId>-chat` crea Runtime HTTP y una tabla conversacional DynamoDB bajo demanda, sin TTL ni índices. Runtime consume el pool/cliente de Cognito y tiene lectura sobre la tabla de cuenta/perfil, escritura sobre su propia tabla y streaming del perfil Global de Sonnet 4.6. Conserva los recursos persistentes de cuenta e identidad. No concede Bedrock al Lambda de cuenta.
+
+El stack de sitio consume el pool, cliente, API y Runtime de sus stacks previos. CloudFront mantiene el bucket privado con OAC y enruta `/api/*` por HTTPS a la API, sin caché y enviando `Authorization` sin el `Host` del visitante; los paths se conservan. También publica `public-config.json` con región, pool, cliente, `apiBaseUrl=/api`, `botId`, `runtimeArn` y `runtimeQualifier=DEFAULT`. Esos identificadores y URL son configuración pública, no secretos. La generación llama directamente al endpoint administrado Runtime con Cognito y CORS administrado, sin otro proxy. No hay dependencia desde cuenta o identidad hacia el sitio.
 
 Los outputs de identidad y cuenta son `UserPoolId`, `ClientId`, `TableName`, `ApiUrl` y `BotId`. El equipo los usa para inspección y para su herramienta autorizada de invitaciones. No contienen credenciales. El sitio continúa publicando `PublicSiteUrl`.
 
@@ -24,11 +26,15 @@ Las sesiones humanas se obtienen mediante el acceso autorizado de cada integrant
 
 ## Checks y builds
 
-Node y npm, dependencias directas y lockfile están fijados. Infraestructura, configuración y API compilan NodeNext a JavaScript ESM; CDK ejecuta el resultado de infraestructura. TypeScript web comprueba TSX y DOM por separado; Vite produce activos estáticos. La Lambda se empaqueta con `NodejsFunction`, el SDK de AWS incluido y el esbuild local fijado por el lockfile. El mismo Vitest recoge la aceptación de ambos alcances. `synth` compila infraestructura y empaqueta la Lambda, sin necesitar credenciales AWS ni reconstruir la web: consume `dist/web/` ya preparado por `build:web`. Los hooks de tests construyen infraestructura y web antes de ejecutar la suite para no depender del orden de sus archivos.
+Node y npm, dependencias directas y lockfile están fijados. Infraestructura, configuración, API y Runtime comprueban tipos NodeNext; CDK ejecuta el resultado ESM de infraestructura. TypeScript web comprueba TSX y DOM por separado; Vite produce activos estáticos. La Lambda se empaqueta con `NodejsFunction`, el SDK de AWS incluido y el esbuild local fijado por el lockfile. El mismo Vitest recoge la aceptación de servidor, cliente e infraestructura.
+
+El build de Runtime prepara un contexto de imagen autocontenido con su entry JavaScript y dependencias empaquetadas desde el lockfile. El Dockerfile usa una base Node 24 fijada por versión y digest, copia los archivos y no instala paquetes. Strands 1.21.0 y `bedrock-agentcore` 0.4.6 están fijados. La revisión comprobada forma parte de la configuración de Runtime y de cada consulta.
+
+`synth` prepara infraestructura y el asset Runtime sin construir la imagen ni consultar AWS. Consume `dist/web/` ya preparado por `build:web`; los hooks de tests y `check` realizan los builds necesarios. CDK stagea el contexto de imagen dentro de `cdk.out/`. El deploy usa ese assembly para construir/publicar Linux ARM64 con Docker/Buildx, sin volver a sintetizar ni instalar dependencias de aplicación durante la publicación privilegiada. La síntesis acredita el template y los archivos staged; el build, arranque y recorrido desplegado acreditan el contenedor real.
 
 Vitest ejecuta los archivos de aceptación de manera serial (`fileParallelism: false`). Los casos de síntesis de setup y del sitio llaman a `npm run synth`, que compila TypeScript dentro de la misma carpeta `dist/infra/`; ejecutarlos en paralelo podía cargar un módulo mientras el compilador lo estaba reemplazando.
 
-La aceptación usa Git temporal real para distinguir commit del evento, historia de `main`, tags anotados y referencias movidas/eliminadas. Las comprobaciones de calidad introducen errores en copias temporales y exigen primero un resultado limpio. El fixture React prueba JSX, renderizado y activos; verificar su carga local acredita el montaje en navegador. La aceptación del sitio agrega el componente de producto, su build, tipos y publicación de activos en el assembly. La presentación y carga desde CloudFront se verifican directamente; estas comprobaciones del sitio no sustituyen los recorridos de cuenta con Cognito y correo real ni acreditan el chat todavía inexistente.
+La aceptación usa Git temporal real para distinguir commit del evento, historia de `main`, tags anotados y referencias movidas/eliminadas. Las comprobaciones de calidad introducen errores en copias temporales y exigen primero un resultado limpio. Los fixtures React permiten comprobar estados y carreras con fronteras de red controladas. No sustituyen Cognito, CORS administrado, Bedrock, DynamoDB o el entry público reales. La presentación y los recorridos desplegados se verifican directamente en teléfono y computadora; cada comprobación acredita únicamente el límite que ejecuta.
 
 ## Contrato de los workflows
 

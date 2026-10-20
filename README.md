@@ -1,6 +1,6 @@
 # Multi-chatbot
 
-Repositorio común para los chatbots del proyecto. Incluye el sitio público, la cuenta por invitación y el perfil profesional del proyecto de docentes, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
+Repositorio común para los chatbots del proyecto. Incluye el sitio público, cuenta por invitación, perfil profesional y consulta docente progresiva con Sonnet 4.6, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
 
 ## Preparar un checkout
 
@@ -15,16 +15,17 @@ npm run check
 
 `npm ci` usa el lockfile del repositorio. CDK, TypeScript, Vite y las herramientas de comprobación son dependencias locales; los comandos npm no dependen de instalaciones globales de CDK.
 
-| Comando                               | Resultado                                                                              |
-| ------------------------------------- | -------------------------------------------------------------------------------------- |
-| `npm run typecheck`                   | Comprueba servidor, infraestructura/configuración y TSX de navegador.                  |
-| `npm run lint`                        | ESLint sobre código y tests, incluidos TSX.                                            |
-| `npm run format:check`                | Comprueba formato con Prettier.                                                        |
-| `npm test`                            | Compila servidor/infraestructura/web y ejecuta la aceptación con Vitest.               |
-| `npm run test:acceptance`             | Ejecuta explícitamente la aceptación.                                                  |
-| `npm run build`                       | Compila servidor/infraestructura y genera el sitio en `dist/web/`.                     |
-| `npm run synth -- -c environment=dev` | Sintetiza setup, identidad, cuenta y sitio; requiere build web previo y admite `prod`. |
-| `npm run check`                       | Ejecuta los checks, tests, builds y síntesis usados por CI.                            |
+| Comando                               | Resultado                                                                                    |
+| ------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `npm run typecheck`                   | Comprueba servidor, infraestructura/configuración y TSX de navegador.                        |
+| `npm run lint`                        | ESLint sobre código y tests, incluidos TSX.                                                  |
+| `npm run format:check`                | Comprueba formato con Prettier.                                                              |
+| `npm test`                            | Compila servidor/infraestructura/web y ejecuta la aceptación con Vitest.                     |
+| `npm run test:acceptance`             | Ejecuta explícitamente la aceptación.                                                        |
+| `npm run build:runtime`               | Prepara `dist/runtime-image/` con el entry y sus dependencias, sin construir Docker.         |
+| `npm run build`                       | Compila servidor/infraestructura, prepara imagen Runtime y genera `dist/web/`.               |
+| `npm run synth -- -c environment=dev` | Sintetiza setup, identidad, cuenta, chat y sitio; requiere build web previo y admite `prod`. |
+| `npm run check`                       | Ejecuta los checks, tests, builds y síntesis usados por CI.                                  |
 
 Las pruebas con errores intencionales trabajan en copias y repositorios Git temporales. No necesitan credenciales AWS ni modifican el remoto real. La síntesis tampoco necesita consultas a AWS; los activos web deben estar construidos.
 
@@ -32,7 +33,7 @@ Las pruebas con errores intencionales trabajan en copias y repositorios Git temp
 
 `tsconfig.web.json` comprueba TSX y tipos DOM; Vite transforma y empaqueta con el plugin React. Vitest utiliza esa transformación y mantiene su raíz en el repositorio. La infraestructura usa otra configuración TypeScript, NodeNext, y se ejecuta compilada a JavaScript.
 
-La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes` y define sus campos y opciones de perfil. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo. Una persona autorizada puede guardar y editar su perfil; el chat todavía no está habilitado. Ver [cuenta y operación de invitaciones](docs/intent/account.md) y [perfil y preferencias](docs/intent/profile.md).
+La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes` y define sus campos y opciones de perfil. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo. Una persona autorizada guarda su perfil y hace una consulta docente o pide un material como texto copiable. Cada consulta abre otro hilo; todavía no hay seguimientos ni historial recuperable. Ver [cuenta e invitaciones](docs/intent/account.md), [perfil y preferencias](docs/intent/profile.md) y [chat, datos y fallos](docs/intent/chat.md).
 
 Para usar el sitio localmente:
 
@@ -67,7 +68,7 @@ La configuración pública utilizada por CDK y los scripts vive en `config/proje
 - Cuenta **118903272638**, región **us-east-1**.
 - Ambientes `dev` y `prod`, con prefijos distintos y tags AWS `environment=dev` o `environment=prod` para sus recursos propios.
 - `resolveEnvironment(environment, botId?)` valida la selección y deriva nombres por chatbot. No crea instancias de aplicación.
-- Modelo inicial: `anthropic.claude-sonnet-4-6`. Haiku 5.5 y GPT-6 Luna permanecen como candidatos posteriores; no hay fallback automático.
+- Modelo inicial: Sonnet 4.6 mediante `global.anthropic.claude-sonnet-4-6`, con cliente Bedrock en `us-east-1`. Haiku 5.5 y GPT-6 Luna permanecen como candidatos posteriores; no hay fallback automático.
 
 El acceso humano usa una sesión temporal de la identidad autorizada de esta cuenta. Obtenerla o renovarla desde el acceso AWS de la organización y cargar sus variables en la terminal, o utilizar un perfil propio de IAM Identity Center con AWS CLI v2. El start URL y el acceso de cada integrante los suministra la organización; no se comparten credenciales entre integrantes. Para un perfil configurado:
 
@@ -80,13 +81,13 @@ aws sts get-caller-identity --query Account --output text
 
 La identidad debe devolver **118903272638**. Para una sesión proporcionada como variables, cargar `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` y `AWS_SESSION_TOKEN` desde el acceso autorizado, sin escribirlas en el repositorio. Al expirar, obtener una sesión nueva; un error de expiración no se corrige cambiando de cuenta.
 
-Usar una [AWS CLI v2 actual](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) o SDK vigente para las operaciones de control. La consulta `bedrock get-foundation-model-availability --model-id anthropic.claude-sonnet-4-6 --region us-east-1` informa autorización, acuerdo, entitlement y región por separado; estos estados no prueban una inferencia. Los permisos del futuro agente se comprueban con su integración.
+Usar una [AWS CLI v2 actual](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) o SDK vigente para las operaciones de control. La consulta `bedrock get-foundation-model-availability --model-id anthropic.claude-sonnet-4-6 --region us-east-1` informa autorización, acuerdo, entitlement y región por separado; estos estados no prueban una inferencia. Los permisos de Runtime se comprueban con el recorrido real del chat y sus registros.
 
 Los archivos `.env` locales, credenciales, dependencias, `.work/` y salidas generadas quedan fuera de Git. Los ejemplos explícitos `.env.example` pueden versionarse sin secretos. La configuración pública y el lockfile sí se versionan. No hay secretos AWS estáticos en Actions: el pipeline utiliza OIDC.
 
 ## CDK y entrega
 
-La aplicación vive en `infra/`, con `cdk.json`, el stack compartido `multi-chatbot-setup`, identidad común por ambiente y cuenta/sitio por ambiente y chatbot. Inicializar una app CDK, sintetizarla y preparar el bootstrap de AWS son operaciones diferentes. La entrada ejecuta `dist/infra/bin/app.js` después de compilar.
+La aplicación vive en `infra/`, con `cdk.json`, el stack compartido `multi-chatbot-setup`, identidad común por ambiente y cuenta/chat/sitio por ambiente y chatbot. Inicializar una app CDK, sintetizarla y preparar el bootstrap de AWS son operaciones diferentes. La entrada ejecuta `dist/infra/bin/app.js` después de compilar.
 
 El setup referencia el proveedor OIDC existente de GitHub y administra únicamente su rol `multi-chatbot-github-actions`. Los recursos de cuenta compartidos llevan `project=multi-chatbot`; no se les adjudica un ambiente arbitrario. La cadena CDK común usa el bootstrap estándar `hnb659fds` y un ejecutor CloudFormation administrador, conforme al alcance de despliegue compartido. Ver [contrato de entrega](docs/intent/setup.md).
 
