@@ -835,7 +835,11 @@ export function AccountApp({
       chatEpochRef.current === chatEpoch &&
       chatOwnerKeyRef.current === identityKey;
 
-    setChat({ ...chatScreenStateRef.current, profileStatus: "loading", error: undefined });
+    setChat({
+      ...chatScreenStateRef.current,
+      profileStatus: "loading",
+      profileError: undefined,
+    });
     void requestWithRefresh(apiConfig, session, "/profile", {}, isActive)
       .then((payload) => {
         if (!isActive()) return;
@@ -843,7 +847,7 @@ export function AccountApp({
         setChat({
           ...chatScreenStateRef.current,
           profileStatus: profile ? "complete" : "incomplete",
-          error: undefined,
+          profileError: undefined,
         });
       })
       .catch((error: unknown) => {
@@ -862,7 +866,7 @@ export function AccountApp({
         setChat({
           ...chatScreenStateRef.current,
           profileStatus: "error",
-          error: "No pudimos cargar tu perfil. Podés reintentar.",
+          profileError: "No pudimos cargar tu perfil. Podés reintentar.",
         });
       });
 
@@ -943,7 +947,11 @@ export function AccountApp({
               answer: (before.answer || "") + event.text,
             });
           } else if (event.type === "completed") {
-            setChat({ ...before, queryStatus: "completed", error: undefined });
+            setChat({
+              ...before,
+              queryStatus: "completed",
+              queryError: undefined,
+            });
           }
         },
       },
@@ -952,7 +960,7 @@ export function AccountApp({
         if (!isActive()) return;
         const before = chatScreenStateRef.current;
         if (result.status === "completed") {
-          setChat({ ...before, queryStatus: "completed", error: undefined });
+          setChat({ ...before, queryStatus: "completed", queryError: undefined });
           return;
         }
         const failureCode = result.code.toLowerCase();
@@ -970,14 +978,15 @@ export function AccountApp({
         }
         setChat({
           ...before,
-          profileStatus: failureCode === "profile_required" ? "incomplete" : "complete",
+          profileStatus: failureCode === "profile_required" ? "incomplete" : before.profileStatus,
+          profileError: failureCode === "profile_required" ? undefined : before.profileError,
           queryStatus:
             result.recordStatus === "unconfirmed"
               ? "unconfirmed"
               : result.recordStatus === "not_admitted"
                 ? "rejected"
                 : "failed",
-          error: result.message,
+          queryError: result.message,
         });
       })
       .catch((error: unknown) => {
@@ -996,7 +1005,7 @@ export function AccountApp({
         setChat({
           ...chatScreenStateRef.current,
           queryStatus: "unconfirmed",
-          error:
+          queryError:
             apiError.code === "UNCONFIRMED"
               ? "No pudimos confirmar que la respuesta haya terminado. Todavía no podés recuperar este envío desde esta pantalla."
               : "No pudimos confirmar el resultado de esta consulta. Todavía no podés recuperar este envío desde esta pantalla.",
@@ -1010,7 +1019,11 @@ export function AccountApp({
   }
 
   function retryChatProfile() {
-    setChat({ ...chatScreenStateRef.current, profileStatus: "loading", error: undefined });
+    setChat({
+      ...chatScreenStateRef.current,
+      profileStatus: "loading",
+      profileError: undefined,
+    });
     setChatProfileRetryCount((count) => count + 1);
   }
 
