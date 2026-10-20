@@ -1,6 +1,7 @@
 import { accessTokenSubject } from "../api/auth.js";
 import { isStoredProfile, type ProfileConfig, type StoredProfile } from "../config/profile.js";
 import type { MessageData } from "@strands-agents/sdk";
+import type { ContextReference, ConversationContext } from "./contracts.js";
 import { splitUtf8Text } from "./text.js";
 
 type ChatConfig = {
@@ -22,7 +23,7 @@ type ProfileStore = {
 
 type ConversationStore = {
   getMeta(input: { conversationId: string }): Promise<unknown | null>;
-  readContext(input: { conversationId: string }): Promise<MessageData[]>;
+  readContext(input: { conversationId: string }): Promise<ConversationContext>;
   startTurn(input: {
     sub: string;
     botId: string;
@@ -43,6 +44,7 @@ type ConversationStore = {
     profileSnapshot: Record<string, unknown>;
     invocation: { modelId: string; revision: string };
     expectedLastOrdinal: number;
+    contextReferences: ContextReference[];
   }): Promise<{ queryId: string; ordinal: number }>;
   appendChunk(input: {
     conversationId: string;
@@ -62,7 +64,7 @@ type ConversationStore = {
     invocation: { modelId: string; revision: string };
     stopReason: string;
     requestId?: string;
-    metrics?: Record<string, unknown>;
+    metrics?: Record<string, number>;
   }): Promise<void>;
   failTurn(input: {
     conversationId: string;
@@ -73,7 +75,7 @@ type ConversationStore = {
     answerManifest: { count: number; complete: false };
     stopReason?: string;
     requestId?: string;
-    metrics?: Record<string, unknown>;
+    metrics?: Record<string, number>;
     providerError?: Record<string, unknown>;
   }): Promise<void>;
 };
@@ -92,6 +94,8 @@ type ProviderEvent =
       requestId?: string;
       httpStatusCode?: number;
       attempts?: number;
+      stopReason?: string;
+      metrics?: Record<string, number>;
     };
 
 type ProviderInput = {
@@ -244,6 +248,31 @@ function providerResult(event: ProviderEvent): event is Extract<ProviderEvent, {
   return event.type === "result";
 }
 
+const providerMetricNames = new Set([
+  "inputTokens",
+  "outputTokens",
+  "totalTokens",
+  "cacheReadInputTokens",
+  "cacheWriteInputTokens",
+  "latencyMs",
+  "timeToFirstByteMs",
+]);
+
+function providerMetrics(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) return undefined;
+  const metrics: Record<string, number> = {};
+  for (const [name, metric] of Object.entries(value)) {
+    if (providerMetricNames.has(name) && typeof metric === "number" && Number.isFinite(metric)) {
+      metrics[name] = metric;
+    }
+  }
+  return Object.keys(metrics).length > 0 ? metrics : undefined;
+}
+
+function providerStopReason(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : undefined;
+}
+
 export function createChatHandler(dependencies: ChatDependencies) {
   const { config, accounts, profiles, store, generate, now, newQueryId } = dependencies;
 
@@ -325,9 +354,12 @@ export function createChatHandler(dependencies: ChatDependencies) {
     }
 
     let messages: MessageData[] = [];
+    let contextReferences: ContextReference[] = [];
     if (request.operation === "message") {
       try {
-        messages = await store.readContext({ conversationId: request.conversationId });
+        const context = await store.readContext({ conversationId: request.conversationId });
+        messages = context.messages;
+        contextReferences = context.references;
       } catch {
         yield safeFailure("temporarily_unavailable", "not_admitted");
         return;
@@ -367,6 +399,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
         admitted = await store.continueTurn({
           ...turnInput,
           expectedLastOrdinal: ownerMeta.lastOrdinal,
+          contextReferences,
         });
       } else {
         yield safeFailure("conversation_unavailable", "not_admitted");
@@ -383,6 +416,8 @@ export function createChatHandler(dependencies: ChatDependencies) {
     let failureRecorded = false;
     let failureCode = "provider_error";
     let finalResult: Extract<ProviderEvent, { type: "result" }> | undefined;
+    let providerOutcome:
+      { stopReason?: string; requestId?: string; metrics?: Record<string, number> } | undefined;
     let providerFailure: Record<string, unknown> | undefined;
     let bufferedText = "";
     let bufferedTextBytes = 0;
@@ -442,10 +477,28 @@ export function createChatHandler(dependencies: ChatDependencies) {
           if (finalResult) throw new Error("Provider returned more than one result.");
           finalResult = event;
           if (typeof event.stopReason !== "string") throw new Error("Invalid provider result.");
+          const metrics = providerMetrics(event.metrics);
+          providerOutcome = {
+            stopReason: providerStopReason(event.stopReason),
+            ...(typeof event.requestId === "string" && event.requestId.length > 0
+              ? { requestId: event.requestId }
+              : {}),
+            ...(metrics ? { metrics } : {}),
+          };
           yield* flushText();
           continue;
         }
         if (event.type === "error") {
+          const stopReason = providerStopReason(event.stopReason);
+          const metrics = providerMetrics(event.metrics);
+          providerOutcome = {
+            ...(stopReason ? { stopReason } : {}),
+            ...(typeof event.requestId === "string" && event.requestId.length > 0
+              ? { requestId: event.requestId }
+              : {}),
+            ...(metrics ? { metrics } : {}),
+          };
+          if (stopReason === "max_tokens") failureCode = "incomplete_response";
           const details = {
             ...(typeof event.providerCode === "string" &&
             /^[A-Za-z0-9_.-]{1,64}$/.test(event.providerCode)
@@ -500,11 +553,9 @@ export function createChatHandler(dependencies: ChatDependencies) {
         now: now(),
         answerManifest: { count: nextChunkIndex, complete: true },
         invocation,
-        stopReason: finalResult.stopReason,
-        ...(typeof finalResult.requestId === "string" && finalResult.requestId.length > 0
-          ? { requestId: finalResult.requestId }
-          : {}),
-        ...(finalResult.metrics ? { metrics: finalResult.metrics } : {}),
+        stopReason: providerOutcome?.stopReason ?? finalResult.stopReason,
+        ...(providerOutcome?.requestId ? { requestId: providerOutcome.requestId } : {}),
+        ...(providerOutcome?.metrics ? { metrics: providerOutcome.metrics } : {}),
       });
       completed = true;
       yield { type: "completed" as const, queryId: admittedQueryId };
@@ -524,11 +575,9 @@ export function createChatHandler(dependencies: ChatDependencies) {
           now: now(),
           code,
           answerManifest: { count: nextChunkIndex, complete: false },
-          ...(finalResult ? { stopReason: finalResult.stopReason } : {}),
-          ...(typeof finalResult?.requestId === "string" && finalResult.requestId.length > 0
-            ? { requestId: finalResult.requestId }
-            : {}),
-          ...(finalResult?.metrics ? { metrics: finalResult.metrics } : {}),
+          ...(providerOutcome?.stopReason ? { stopReason: providerOutcome.stopReason } : {}),
+          ...(providerOutcome?.requestId ? { requestId: providerOutcome.requestId } : {}),
+          ...(providerOutcome?.metrics ? { metrics: providerOutcome.metrics } : {}),
           ...(providerFailure ? { providerError: providerFailure } : {}),
         });
       } catch {
@@ -546,11 +595,9 @@ export function createChatHandler(dependencies: ChatDependencies) {
             now: now(),
             code: "stream_interrupted",
             answerManifest: { count: nextChunkIndex, complete: false },
-            ...(finalResult ? { stopReason: finalResult.stopReason } : {}),
-            ...(typeof finalResult?.requestId === "string" && finalResult.requestId.length > 0
-              ? { requestId: finalResult.requestId }
-              : {}),
-            ...(finalResult?.metrics ? { metrics: finalResult.metrics } : {}),
+            ...(providerOutcome?.stopReason ? { stopReason: providerOutcome.stopReason } : {}),
+            ...(providerOutcome?.requestId ? { requestId: providerOutcome.requestId } : {}),
+            ...(providerOutcome?.metrics ? { metrics: providerOutcome.metrics } : {}),
             ...(providerFailure ? { providerError: providerFailure } : {}),
           });
         } catch {

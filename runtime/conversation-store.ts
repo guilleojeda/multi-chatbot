@@ -7,6 +7,7 @@ import {
   type DynamoDBDocumentClient,
 } from "@aws-sdk/lib-dynamodb";
 import type { MessageData } from "@strands-agents/sdk";
+import type { ContextReference, ConversationContext } from "./contracts.js";
 import { maxDynamoTextChunkBytes, splitUtf8Text } from "./text.js";
 
 type ProfileSnapshot = Record<string, unknown>;
@@ -18,6 +19,7 @@ const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}
 const turnRecordPattern = /^TURN#(\d+)$/;
 const chunkPrefixPattern = /^TURN#(\d+)#/;
 const chunkRecordPattern = /^TURN#(\d+)#([0-9a-f-]{36})#(USER|ASSISTANT)#(\d+)$/i;
+const contextChunkRecordPattern = /^TURN#(\d+)#CONTEXT#(\d+)$/;
 
 type StartTurnInput = {
   sub: string;
@@ -45,10 +47,23 @@ function manifestCount(value: unknown): number | null {
   return value.count;
 }
 
+function contextManifestCount(value: unknown): number | null {
+  if (
+    !isRecord(value) ||
+    value.complete !== true ||
+    typeof value.count !== "number" ||
+    !Number.isSafeInteger(value.count) ||
+    value.count < 0
+  ) {
+    return null;
+  }
+  return value.count;
+}
+
 function assembleText(
   fragments: TextChunk[],
   count: number,
-  role: ChunkRole,
+  role: ChunkRole | "context",
   queryId: string,
 ): string {
   if (fragments.length !== count) {
@@ -67,7 +82,88 @@ function assembleText(
   return text;
 }
 
-function reconstructMessages(conversationId: string, items: unknown[]): MessageData[] {
+function parseContextReferences(input: {
+  ordinal: number;
+  queryId: string;
+  count: number | undefined;
+  chunks: Record<string, unknown>[];
+  partition: string;
+  conversationId: string;
+  turns: Map<string, Record<string, unknown>>;
+}): ContextReference[] {
+  const { ordinal, queryId, count, chunks, partition, conversationId, turns } = input;
+  const contextRecords = chunks.filter((chunk) => String(chunk.sk).includes("#CONTEXT#"));
+  if (count === undefined) {
+    if (contextRecords.length > 0) {
+      throw new Error("Conversation context has reference chunks without a manifest.");
+    }
+    return [];
+  }
+  if (contextRecords.length !== count) {
+    throw new Error("Conversation context has an incomplete reference manifest.");
+  }
+  if (count === 0) return [];
+
+  const fragments: TextChunk[] = [];
+  for (const chunk of contextRecords) {
+    const match = contextChunkRecordPattern.exec(String(chunk.sk));
+    const index = match ? Number(match[2]) : Number.NaN;
+    if (
+      !match ||
+      match[1] !== String(ordinal).padStart(8, "0") ||
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      String(index).padStart(8, "0") !== match[2] ||
+      chunk.pk !== partition ||
+      chunk.conversationId !== conversationId ||
+      chunk.ordinal !== ordinal ||
+      chunk.index !== index ||
+      typeof chunk.text !== "string"
+    ) {
+      throw new Error(`Completed conversation query ${queryId} has an invalid context reference.`);
+    }
+    fragments.push({ index, text: chunk.text });
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(assembleText(fragments, count, "context", queryId));
+  } catch {
+    throw new Error(`Completed conversation query ${queryId} has malformed context references.`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error(`Completed conversation query ${queryId} has malformed context references.`);
+  }
+
+  const references: ContextReference[] = [];
+  let previousOrdinal = 0;
+  for (const value of parsed) {
+    if (
+      !isRecord(value) ||
+      !isPositiveSafeInteger(value.ordinal) ||
+      value.ordinal <= previousOrdinal ||
+      value.ordinal >= ordinal ||
+      typeof value.queryId !== "string" ||
+      !uuidPattern.test(value.queryId)
+    ) {
+      throw new Error(`Completed conversation query ${queryId} has invalid context references.`);
+    }
+    const referencedTurn = turns.get(String(value.ordinal).padStart(8, "0"));
+    if (
+      !referencedTurn ||
+      referencedTurn.status !== "completed" ||
+      referencedTurn.ordinal !== value.ordinal ||
+      referencedTurn.queryId !== value.queryId
+    ) {
+      throw new Error(`Completed conversation query ${queryId} references a missing turn.`);
+    }
+    references.push({ ordinal: value.ordinal, queryId: value.queryId });
+    previousOrdinal = value.ordinal;
+  }
+  return references;
+}
+
+function reconstructMessages(conversationId: string, items: unknown[]): ConversationContext {
   const partition = `CONV#${conversationId}`;
   const turns = new Map<string, Record<string, unknown>>();
   const chunks = new Map<string, Record<string, unknown>[]>();
@@ -106,6 +202,7 @@ function reconstructMessages(conversationId: string, items: unknown[]): MessageD
     queryId: string;
     questionCount: number;
     answerCount: number;
+    contextCount: number | undefined;
   }[] = [];
 
   for (const [ordinalKey, turn] of turns) {
@@ -117,6 +214,8 @@ function reconstructMessages(conversationId: string, items: unknown[]): MessageD
     const ordinal = Number(ordinalKey);
     const questionCount = manifestCount(turn.questionManifest);
     const answerCount = manifestCount(turn.answerManifest);
+    const contextCount =
+      turn.contextManifest === undefined ? undefined : contextManifestCount(turn.contextManifest);
     if (
       !isPositiveSafeInteger(ordinal) ||
       String(ordinal).padStart(8, "0") !== ordinalKey ||
@@ -126,7 +225,8 @@ function reconstructMessages(conversationId: string, items: unknown[]): MessageD
       typeof turn.queryId !== "string" ||
       !uuidPattern.test(turn.queryId) ||
       questionCount === null ||
-      answerCount === null
+      answerCount === null ||
+      (turn.contextManifest !== undefined && contextCount === null)
     ) {
       throw new Error("Completed conversation context has an invalid turn record.");
     }
@@ -136,6 +236,7 @@ function reconstructMessages(conversationId: string, items: unknown[]): MessageD
       queryId: turn.queryId,
       questionCount,
       answerCount,
+      contextCount: contextCount ?? undefined,
     });
   }
 
@@ -147,10 +248,13 @@ function reconstructMessages(conversationId: string, items: unknown[]): MessageD
 
   completedTurns.sort((left, right) => left.ordinal - right.ordinal);
   const messages: MessageData[] = [];
+  const references: ContextReference[] = [];
   for (const turn of completedTurns) {
     const questionChunks: TextChunk[] = [];
     const answerChunks: TextChunk[] = [];
-    for (const chunk of chunks.get(turn.ordinalKey) ?? []) {
+    const turnChunks = chunks.get(turn.ordinalKey) ?? [];
+    for (const chunk of turnChunks) {
+      if (String(chunk.sk).includes("#CONTEXT#")) continue;
       const keyMatch = chunkRecordPattern.exec(String(chunk.sk));
       const index = keyMatch ? Number(keyMatch[4]) : Number.NaN;
       const role: ChunkRole | null =
@@ -182,12 +286,22 @@ function reconstructMessages(conversationId: string, items: unknown[]): MessageD
 
     const question = assembleText(questionChunks, turn.questionCount, "user", turn.queryId);
     const answer = assembleText(answerChunks, turn.answerCount, "assistant", turn.queryId);
+    parseContextReferences({
+      ordinal: turn.ordinal,
+      queryId: turn.queryId,
+      count: turn.contextCount,
+      chunks: turnChunks,
+      partition,
+      conversationId,
+      turns,
+    });
+    references.push({ ordinal: turn.ordinal, queryId: turn.queryId });
     messages.push(
       { role: "user", content: [{ text: question }] },
       { role: "assistant", content: [{ text: answer }] },
     );
   }
-  return messages;
+  return { messages, references };
 }
 
 function conversationKey(conversationId: string) {
@@ -216,6 +330,33 @@ function chunkKey(
     ...conversationKey(conversationId),
     sk: `${turnKey(conversationId, ordinal).sk}#${queryId}#${role.toUpperCase()}#${String(index).padStart(8, "0")}`,
   };
+}
+
+function contextChunkKey(conversationId: string, ordinal: number, index: number) {
+  return {
+    ...conversationKey(conversationId),
+    sk: `${turnKey(conversationId, ordinal).sk}#CONTEXT#${String(index).padStart(8, "0")}`,
+  };
+}
+
+function encodeContextReferences(references: ContextReference[], targetOrdinal: number): string[] {
+  if (!Array.isArray(references))
+    throw new TypeError("Conversation context references are invalid.");
+  let previousOrdinal = 0;
+  for (const reference of references) {
+    if (
+      !isRecord(reference) ||
+      !isPositiveSafeInteger(reference.ordinal) ||
+      reference.ordinal <= previousOrdinal ||
+      reference.ordinal >= targetOrdinal ||
+      typeof reference.queryId !== "string" ||
+      !uuidPattern.test(reference.queryId)
+    ) {
+      throw new TypeError("Conversation context references are invalid.");
+    }
+    previousOrdinal = reference.ordinal;
+  }
+  return references.length > 0 ? splitUtf8Text(JSON.stringify(references)) : [];
 }
 
 export function createConversationStoreAdapter(input: {
@@ -253,11 +394,47 @@ export function createConversationStoreAdapter(input: {
     );
   }
 
+  async function putContextChunk(chunk: {
+    conversationId: string;
+    ordinal: number;
+    index: number;
+    text: string;
+    now: number;
+  }): Promise<void> {
+    if (Buffer.byteLength(chunk.text, "utf8") > maxDynamoTextChunkBytes) {
+      throw new RangeError("Conversation context reference chunk exceeds the storage item limit.");
+    }
+    await documentClient.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: {
+          ...contextChunkKey(chunk.conversationId, chunk.ordinal, chunk.index),
+          conversationId: chunk.conversationId,
+          ordinal: chunk.ordinal,
+          index: chunk.index,
+          text: chunk.text,
+          createdAt: isoDate(chunk.now),
+        },
+        ConditionExpression: "attribute_not_exists(pk)",
+      }),
+    );
+  }
+
   async function writeQuestionAndPublish(
     turn: StartTurnInput,
     ordinal: number,
     questionChunks: string[],
+    contextChunks: string[],
   ): Promise<void> {
+    for (const [index, text] of contextChunks.entries()) {
+      await putContextChunk({
+        conversationId: turn.conversationId,
+        ordinal,
+        index,
+        text,
+        now: turn.now,
+      });
+    }
     for (const [index, text] of questionChunks.entries()) {
       await putChunk({
         conversationId: turn.conversationId,
@@ -276,16 +453,18 @@ export function createConversationStoreAdapter(input: {
         TableName: tableName,
         Key: turnKey(turn.conversationId, ordinal),
         UpdateExpression:
-          "SET #questionManifest = :manifest, #phase = :phase, #updatedAt = :updatedAt",
+          "SET #questionManifest = :manifest, #contextManifest = :contextManifest, #phase = :phase, #updatedAt = :updatedAt",
         ConditionExpression: "#status = :inProgress",
         ExpressionAttributeNames: {
           "#questionManifest": "questionManifest",
+          "#contextManifest": "contextManifest",
           "#phase": "phase",
           "#status": "status",
           "#updatedAt": "updatedAt",
         },
         ExpressionAttributeValues: {
           ":manifest": { count: questionChunks.length, complete: true },
+          ":contextManifest": { count: contextChunks.length, complete: true },
           ":phase": "generating",
           ":inProgress": "in_progress",
           ":updatedAt": updatedAt,
@@ -306,7 +485,11 @@ export function createConversationStoreAdapter(input: {
       return result.Item ?? null;
     },
 
-    async readContext({ conversationId }: { conversationId: string }): Promise<MessageData[]> {
+    async readContext({
+      conversationId,
+    }: {
+      conversationId: string;
+    }): Promise<ConversationContext> {
       const items: unknown[] = [];
       let exclusiveStartKey: Record<string, unknown> | undefined;
       do {
@@ -354,6 +537,7 @@ export function createConversationStoreAdapter(input: {
         updatedAt: createdAt,
         questionManifest: { count: questionChunks.length, complete: false },
         answerManifest: { count: 0, complete: false },
+        contextManifest: { count: 0, complete: false },
         profileSnapshot: turn.profileSnapshot,
         invocation: turn.invocation,
       };
@@ -379,12 +563,12 @@ export function createConversationStoreAdapter(input: {
         }),
       );
 
-      await writeQuestionAndPublish(turn, ordinal, questionChunks);
+      await writeQuestionAndPublish(turn, ordinal, questionChunks, []);
       return { queryId: turn.queryId, ordinal };
     },
 
     async continueTurn(
-      turn: StartTurnInput & { expectedLastOrdinal: number },
+      turn: StartTurnInput & { expectedLastOrdinal: number; contextReferences: ContextReference[] },
     ): Promise<{ queryId: string; ordinal: number }> {
       if (
         !isPositiveSafeInteger(turn.expectedLastOrdinal) ||
@@ -395,6 +579,7 @@ export function createConversationStoreAdapter(input: {
       const ordinal = turn.expectedLastOrdinal + 1;
       const createdAt = isoDate(turn.now);
       const questionChunks = splitUtf8Text(turn.text);
+      const contextChunks = encodeContextReferences(turn.contextReferences, ordinal);
       const record = {
         ...turnKey(turn.conversationId, ordinal),
         conversationId: turn.conversationId,
@@ -408,6 +593,7 @@ export function createConversationStoreAdapter(input: {
         updatedAt: createdAt,
         questionManifest: { count: questionChunks.length, complete: false },
         answerManifest: { count: 0, complete: false },
+        contextManifest: { count: contextChunks.length, complete: false },
         profileSnapshot: turn.profileSnapshot,
         invocation: turn.invocation,
       };
@@ -453,7 +639,7 @@ export function createConversationStoreAdapter(input: {
         }),
       );
 
-      await writeQuestionAndPublish(turn, ordinal, questionChunks);
+      await writeQuestionAndPublish(turn, ordinal, questionChunks, contextChunks);
       return { queryId: turn.queryId, ordinal };
     },
 

@@ -267,11 +267,8 @@ export function AccountApp({
     chatRequestRef.current = null;
     chatSubmissionInFlightRef.current = false;
     chatConversationIdRef.current = null;
-    const current = chatScreenStateRef.current;
-    setChat({
-      profileStatus: current.profileStatus,
-      queryStatus: "idle",
-    });
+    setChat({ profileStatus: "loading", queryStatus: "idle" });
+    setChatProfileRetryCount((count) => count + 1);
   }, [setChat]);
 
   function isCurrentRoute(identity: RouteIdentity) {
@@ -371,8 +368,9 @@ export function AccountApp({
         } catch (error) {
           if (!isActive()) return;
           authorizedRouteRef.current = null;
-          invalidateChat();
           const apiError = asApiError(error);
+          if (apiError.status === 401 || apiError.status === 403 || apiError.refreshFailed)
+            invalidateChat();
           setState({
             view: "denied",
             email,
@@ -487,8 +485,9 @@ export function AccountApp({
         await checkMembership(config, session, undefined, isActive);
       } catch (error) {
         if (!isActive()) return;
-        invalidateChat();
         const apiError = asApiError(error);
+        if (apiError.status === 401 || apiError.status === 403 || apiError.refreshFailed)
+          invalidateChat();
         const context = configRef.current ? "inspect" : "config";
         setState({
           view: "denied",

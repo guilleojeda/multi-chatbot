@@ -30,8 +30,23 @@ function bearer(claims = { sub: "teacher-123", token_use: "access" }) {
   return `Bearer e30.${encoded}.runtime-validated`;
 }
 
-function makeHarness({ generate, profile } = {}) {
-  const state = { appended: [], failed: [], completed: [], providerCalls: 0 };
+function makeHarness({
+  generate,
+  profile,
+  meta = null,
+  context = { messages: [], references: [] },
+  continueGate,
+  onContinue,
+} = {}) {
+  const state = {
+    appended: [],
+    failed: [],
+    completed: [],
+    continued: [],
+    providerCalls: 0,
+    meta,
+    context,
+  };
   const handler = createChatHandler({
     config: {
       botId: "bot-aurora",
@@ -60,10 +75,19 @@ function makeHarness({ generate, profile } = {}) {
     },
     store: {
       async getMeta() {
-        return null;
+        return state.meta;
+      },
+      async readContext() {
+        return state.context;
       },
       async startTurn() {
         return { queryId, ordinal: 1 };
+      },
+      async continueTurn(input) {
+        state.continued.push(input);
+        onContinue?.(input);
+        if (continueGate) await continueGate;
+        return { queryId: input.queryId, ordinal: input.expectedLastOrdinal + 1 };
       },
       async appendChunk(input) {
         state.appended.push(input);
@@ -86,11 +110,11 @@ function makeHarness({ generate, profile } = {}) {
   return { handler, state };
 }
 
-function request(harness) {
+function request(harness, operation = "start") {
   return harness.handler(
     {
       version: 1,
-      operation: "start",
+      operation,
       conversationId,
       text: "Armá una actividad de porcentajes.",
     },
@@ -111,6 +135,46 @@ async function collect(stream) {
 }
 
 describe("chat Runtime implementation regressions", () => {
+  it("persists the exact selected context and waits for that write before accepted", async () => {
+    const contextReferences = [
+      { ordinal: 1, queryId: "5faca543-38a3-4e57-a1a3-3045c96968f2" },
+      { ordinal: 2, queryId: "a8ff25b4-40e0-4f2e-990c-21aa0645d9dd" },
+    ];
+    let releaseContinue;
+    let resolveContinueStarted;
+    const continueGate = new Promise((resolve) => {
+      releaseContinue = resolve;
+    });
+    const continueStarted = new Promise((resolve) => {
+      resolveContinueStarted = resolve;
+    });
+    const harness = makeHarness({
+      meta: { conversationId, sub: "teacher-123", botId: "bot-aurora", lastOrdinal: 2 },
+      context: {
+        messages: [{ role: "user", content: [{ text: "Pregunta previa." }] }],
+        references: contextReferences,
+      },
+      continueGate,
+      onContinue: resolveContinueStarted,
+      generate: () =>
+        (async function* () {
+          yield { type: "text", text: "Respuesta." };
+          yield { type: "result", stopReason: "end_turn" };
+        })(),
+    });
+    const stream = request(harness, "message");
+
+    const acceptedEvent = stream.next();
+    await continueStarted;
+    expect(harness.state.continued[0].contextReferences).toEqual(contextReferences);
+    expect(harness.state.providerCalls).toBe(0);
+    releaseContinue();
+    expect(await acceptedEvent).toMatchObject({
+      value: { type: "accepted", ordinal: 3, queryId },
+    });
+    await stream.return();
+  });
+
   it("batches small provider deltas after the first text while preserving exact durable output", async () => {
     const deltaCount = 160;
     const delta = "á".repeat(64);
@@ -185,6 +249,34 @@ describe("chat Runtime implementation regressions", () => {
       stopReason: "max_tokens",
       requestId: "provider-request-123",
       metrics,
+    });
+    expect(harness.state.completed).toHaveLength(0);
+  });
+
+  it("persists model stop and usage metadata when Strands reports a max-token error", async () => {
+    const metrics = { inputTokens: 12, outputTokens: 8, totalTokens: 20, latencyMs: 37 };
+    const harness = makeHarness({
+      generate: () =>
+        (async function* () {
+          yield { type: "text", text: "Prefijo incompleto." };
+          yield {
+            type: "error",
+            providerCode: "MaxTokensError",
+            stopReason: "max_tokens",
+            metrics,
+          };
+        })(),
+    });
+
+    const events = await collect(request(harness));
+
+    expect(events.some(({ type }) => type === "completed")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "failed", code: "incomplete_response" });
+    expect(harness.state.appended.map(({ text }) => text).join("")).toBe("Prefijo incompleto.");
+    expect(harness.state.failed[0]).toMatchObject({
+      stopReason: "max_tokens",
+      metrics,
+      providerError: { providerCode: "MaxTokensError" },
     });
     expect(harness.state.completed).toHaveLength(0);
   });
