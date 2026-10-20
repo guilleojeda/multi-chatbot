@@ -93,6 +93,20 @@ function FixtureControls() {
           </button>
           <button
             type="button"
+            disabled={!state.pendingPasswordResets}
+            onClick={() => fixture.releasePasswordReset(true)}
+          >
+            Confirmar cambio de contraseña
+          </button>
+          <button
+            type="button"
+            disabled={!state.pendingPasswordResets}
+            onClick={() => fixture.releasePasswordReset(false)}
+          >
+            Rechazar cambio de contraseña
+          </button>
+          <button
+            type="button"
             disabled={!state.pendingRefreshes}
             onClick={() => fixture.releaseRefresh()}
           >
@@ -159,9 +173,10 @@ function FixtureControls() {
         </div>
         <p className="profile-fixture-readout">
           Perfiles pendientes: {state.pendingProfiles} · logout pendiente: {state.pendingSignOuts} ·
-          admisiones pendientes: {state.pendingAdmissions} · respuestas admitidas:{" "}
-          {state.admittedStreams}· 401 Runtime pendiente: {state.pendingRuntime401s} · refresh
-          pendiente: {state.pendingRefreshes}
+          confirmaciones de contraseña pendientes: {state.pendingPasswordResets} · admisiones
+          pendientes: {state.pendingAdmissions} · respuestas admitidas: {state.admittedStreams}· 401
+          Runtime pendiente: {state.pendingRuntime401s} · refresh pendiente:{" "}
+          {state.pendingRefreshes}
         </p>
       </section>
 

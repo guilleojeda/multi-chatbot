@@ -22,6 +22,7 @@ export const fixtureScenarios = [
   { id: "runtime-401-pending", label: "Runtime: 401 y refresh retenidos" },
   { id: "runtime-expired", label: "Runtime: 401 y sesión vencida" },
   { id: "runtime-forbidden", label: "Runtime: acceso denegado" },
+  { id: "password-reset-pending", label: "Cognito: retener confirmación de contraseña" },
   { id: "password-reset-failure", label: "Cognito: rechazar el cambio de contraseña" },
   { id: "signout-pending", label: "Logout: revocación retenida" },
   { id: "clipboard-fail", label: "Portapapeles: simular error al copiar" },
@@ -63,6 +64,7 @@ type PendingProfile = { release: () => void };
 type PendingSignOut = { release: () => void };
 type PendingRefresh = { release: () => void };
 type PendingRuntime401 = { request: FixtureRequest; release: () => void };
+type PendingPasswordReset = { release: (succeeds: boolean) => void };
 
 type ControlledStream = {
   request: FixtureRequest;
@@ -148,6 +150,7 @@ export class ChatBrowserFixture {
   private readonly pendingSignOuts: PendingSignOut[] = [];
   private readonly pendingRefreshes: PendingRefresh[] = [];
   private readonly pendingRuntime401s: PendingRuntime401[] = [];
+  private readonly pendingPasswordResets: PendingPasswordReset[] = [];
   private readonly streams: ControlledStream[] = [];
   private readonly conversations = new Map<string, FixtureConversation>();
   private readonly sessionStorage = new FixtureSessionStorage();
@@ -241,11 +244,27 @@ export class ChatBrowserFixture {
       }
       return new Response("", { status: 200 });
     }
-    if (
-      target.endsWith("ConfirmForgotPassword") &&
-      this.selectedScenario === "password-reset-failure"
-    ) {
-      return json({ __type: "CodeMismatchException" }, 400);
+    if (target.endsWith("ConfirmForgotPassword")) {
+      if (this.selectedScenario === "password-reset-pending") {
+        return new Promise<Response>((resolve) => {
+          this.pendingPasswordResets.push({
+            release: (succeeds) => {
+              if (succeeds) {
+                this.restorable = false;
+                this.activeSub = null;
+                this.changed();
+                resolve(new Response("", { status: 200 }));
+                return;
+              }
+              resolve(json({ __type: "CodeMismatchException" }, 400));
+            },
+          });
+          this.changed();
+        });
+      }
+      if (this.selectedScenario === "password-reset-failure") {
+        return json({ __type: "CodeMismatchException" }, 400);
+      }
     }
     if (target.endsWith("ForgotPassword") || target.endsWith("ConfirmForgotPassword")) {
       if (target.endsWith("ConfirmForgotPassword")) {
@@ -522,6 +541,14 @@ export class ChatBrowserFixture {
     pending.release();
   }
 
+  releasePasswordReset(succeeds: boolean) {
+    const pending = this.pendingPasswordResets.shift();
+    if (!pending) return;
+    this.selectedScenario = "ready";
+    pending.release(succeeds);
+    this.changed();
+  }
+
   admitStream() {
     this.streams.find((item) => !item.closed && !item.admitted)?.admit();
   }
@@ -719,6 +746,7 @@ export class ChatBrowserFixture {
       pendingSignOuts: this.pendingSignOuts.length,
       pendingRefreshes: this.pendingRefreshes.length,
       pendingRuntime401s: this.pendingRuntime401s.length,
+      pendingPasswordResets: this.pendingPasswordResets.length,
       pendingAdmissions: this.streams.filter(({ closed, admitted }) => !closed && !admitted).length,
       admittedStreams: this.streams.filter(({ closed, admitted }) => !closed && admitted).length,
       openStreams: this.streams.filter(({ closed }) => !closed).length,

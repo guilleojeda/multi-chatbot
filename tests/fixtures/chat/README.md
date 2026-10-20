@@ -84,19 +84,22 @@ After clicking “Cerrar sesión”, use “Emitir fragmento (o tardío tras log
 stream callback and confirm that the login screen stays clear; then release “Liberar promesa de
 logout”. The pending-profile scenario waits for “Liberar perfil”.
 
-To verify password reset while a chat stream is open, send a query and navigate to `/#/recover`.
-Request a code, select `signout-pending`, and confirm it with a new password. On success, the app
-should clear the old thread and abort its Runtime consumer before returning to login. This scenario
-leaves the old stream available for a deliberate late callback; after signing in as the same fixture
-identity, return to chat and use “Emitir fragmento” to confirm the old question and answer stay
-absent. For the rejected path, select `password-reset-failure` before confirming the reset. Cognito
-returns a code mismatch while retaining the session; return to chat and use “Emitir fragmento” to
-confirm the same turn continues.
+To test password reset while a chat stream is open, send a query, navigate to `/#/recover`, request
+a code, choose `password-reset-pending`, and confirm the new password. The confirmation remains
+pending until one of the two password-reset controls is used. While it is pending, open `/#/chat` or
+`/#/profile` and let “Comprobando tu acceso…” appear. “Confirmar cambio de contraseña” should clear
+the old chat and tokens, abort its Runtime consumer, and return to login with a usable sign-in form
+and success notice. After signing in as the same fixture identity, return to chat and use “Emitir
+fragmento” to confirm the old question and answer stay absent. “Rechazar cambio de contraseña” should
+retain the session, thread, and open stream, then reauthorize the current protected route. In chat,
+use “Emitir fragmento” to confirm the answer continues; from profile, return to chat first. The
+existing `password-reset-failure` scenario still returns an immediate code mismatch on the recovery
+screen for checking its error message.
 
 Append `?scenario=<name>` before the hash to select an initial scenario, for example
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-401`, `runtime-401-pending`, `runtime-expired`, `runtime-forbidden`,
-`password-reset-failure`, `signout-pending`, and `clipboard-fail`. The selector also changes the
+`password-reset-pending`, `password-reset-failure`, `signout-pending`, and `clipboard-fail`. The selector also changes the
 scenario for the next matching operation without reloading.
