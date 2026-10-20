@@ -31,7 +31,8 @@ beforeAll(async () => {
   globalThis.__accountScreens = {
     AccountScreen,
     ChatScreen,
-    ProfileApp: () => null,
+    ProfileApp: () =>
+      React.createElement("main", { "aria-label": "Perfil docente" }, "Perfil docente autorizado"),
   };
   tempDirectory = await mkdtemp(join(tmpdir(), "account-reset-chat-"));
   const outputFile = join(tempDirectory, "account-app.mjs");
@@ -245,15 +246,19 @@ function createHookRuntime() {
   };
 }
 
-function createEnvironment(confirmSucceeds) {
+function createEnvironment(confirmSucceeds, holdConfirmation = false) {
   const storage = new MemorySessionStorage();
   let tokenSequence = 0;
+  let confirmationOutcome = confirmSucceeds;
   let streamController;
   let streamSignal;
   let streamWasCancelled = false;
   let nextConversation = -1;
   const runtimeRequests = [];
+  const membershipRequests = [];
   const streamStarted = deferred();
+  const confirmationStarted = deferred();
+  const confirmationGate = deferred();
   const session = createSession({
     clientId: config.clientId,
     region: config.region,
@@ -269,7 +274,11 @@ function createEnvironment(confirmSucceeds) {
         });
       }
       if (target.endsWith("ConfirmForgotPassword")) {
-        return confirmSucceeds ? new Response("", { status: 200 }) : cognitoResponse(null, 400);
+        if (holdConfirmation) {
+          confirmationStarted.resolve();
+          await confirmationGate.promise;
+        }
+        return confirmationOutcome ? new Response("", { status: 200 }) : cognitoResponse(null, 400);
       }
       if (target.endsWith("ForgotPassword")) return new Response("", { status: 200 });
       throw new Error(`Unexpected Cognito operation: ${target}`);
@@ -289,7 +298,10 @@ function createEnvironment(confirmSucceeds) {
   const fetch = vi.fn(async (input, init = {}) => {
     const url = String(input);
     if (url === "/public-config.json") return Response.json(config);
-    if (url === "/api/account/me") return Response.json(identity);
+    if (url === "/api/account/me") {
+      membershipRequests.push(url);
+      return Response.json(identity);
+    }
     if (url === "/api/profile") {
       return Response.json({
         sub: identity.sub,
@@ -319,7 +331,7 @@ function createEnvironment(confirmSucceeds) {
                   frame("accepted", {
                     conversationId: request.conversationId,
                     queryId: query,
-                    ordinal: 1,
+                    ordinal: request.operation === "message" ? 2 : 1,
                   }),
                   frame("text", { queryId: query, index: 0, text: "Respuesta nueva" }),
                   frame("completed", { queryId: query }),
@@ -360,8 +372,14 @@ function createEnvironment(confirmSucceeds) {
     storage,
     runtimeRequests,
     streamStarted: streamStarted.promise,
+    confirmationStarted: confirmationStarted.promise,
+    releaseConfirmation(succeeds) {
+      confirmationOutcome = succeeds;
+      confirmationGate.resolve();
+    },
     streamSignal: () => streamSignal,
     streamWasCancelled: () => streamWasCancelled,
+    membershipRequests,
     sendLateChunk() {
       streamController.enqueue(
         new TextEncoder().encode(
@@ -413,6 +431,27 @@ async function resetPassword(app, confirmationCode = "123456") {
     password: "ValidPassword1!",
   });
   await app.flush();
+}
+
+async function beginPasswordReset(app, environment) {
+  await app.setRoute("recover");
+  expect(await app.html()).toContain("Recuperá tu contraseña");
+  await app.current().props.onSubmit({
+    action: "request-password-reset",
+    email: "teacher@example.test",
+  });
+  await vi.waitFor(async () => {
+    expect(await app.html()).toContain('id="recovery-code"');
+  });
+  const operation = app.current().props.onSubmit({
+    action: "confirm-password-reset",
+    email: "teacher@example.test",
+    code: "123456",
+    password: "ValidPassword1!",
+  });
+  await environment.confirmationStarted;
+  await app.flush();
+  return { operation };
 }
 
 describe("password reset and the in-memory chat", () => {
@@ -485,4 +524,95 @@ describe("password reset and the in-memory chat", () => {
     environment.finishStream();
     expect(environment.streamSignal()?.aborted).toBe(false);
   });
+
+  for (const destination of ["chat", "profile"]) {
+    it(`redirects to usable login after reset succeeds while ${destination} is current`, async () => {
+      const environment = createEnvironment(true, true);
+      const app = createHookRuntime();
+      await startStream(app, environment);
+      const { operation: confirmation } = await beginPasswordReset(app, environment);
+      await app.setRoute(destination);
+      expect(await app.html()).toContain("Comprobando tu acceso…");
+
+      environment.releaseConfirmation(true);
+      await confirmation;
+      await app.flush();
+      expect(globalThis.window.location.hash).toBe("/login");
+      await app.setRoute("login");
+
+      const html = await app.html();
+      expect(html).toContain('role="status"');
+      expect(html).toContain("La contraseña se cambió. Iniciá sesión con la nueva contraseña.");
+      expect(html).toContain('id="account-password"');
+      expect(html).not.toContain("Comprobando tu acceso…");
+      expect(environment.session.accessToken()).toBeNull();
+      expect(environment.storage.getItem("auth-refresh")).toBeNull();
+      expect(environment.streamSignal()?.aborted).toBe(true);
+
+      environment.sendLateChunk();
+      expect(await app.html()).not.toContain("fragmento posterior al reset");
+      await app.current().props.onSubmit({
+        action: "sign-in",
+        email: "teacher@example.test",
+        password: "ValidPassword1!",
+      });
+      await app.setRoute("chat");
+      await initializeChat(app);
+      expect(await app.html()).not.toContain("Respuesta inicial del hilo");
+
+      app.current().props.onSubmit("Una consulta nueva después del cambio.");
+      await vi.waitFor(() => expect(environment.runtimeRequests).toHaveLength(2));
+      expect(environment.runtimeRequests[0]).toMatchObject({
+        operation: "start",
+        conversationId,
+      });
+      expect(environment.runtimeRequests[1]).toMatchObject({ operation: "start" });
+      expect(environment.runtimeRequests[1].conversationId).not.toBe(conversationId);
+    });
+
+    it(`reauthorizes ${destination} and preserves its thread and active stream after a rejected reset`, async () => {
+      const environment = createEnvironment(false, true);
+      const app = createHookRuntime();
+      await startStream(app, environment);
+      const { operation: confirmation } = await beginPasswordReset(app, environment);
+      await app.setRoute(destination);
+      expect(await app.html()).toContain("Comprobando tu acceso…");
+      const membershipRequestsBefore = environment.membershipRequests.length;
+
+      environment.releaseConfirmation(false);
+      await confirmation;
+      await vi.waitFor(async () => {
+        const html = await app.html();
+        if (destination === "chat") expect(html).toContain("Respuesta inicial del hilo");
+        else expect(html).toContain('aria-label="Perfil docente"');
+      });
+
+      expect(environment.session.accessToken()).not.toBeNull();
+      expect(environment.storage.getItem("auth-refresh")).not.toBeNull();
+      expect(environment.streamSignal()?.aborted).toBe(false);
+      expect(environment.membershipRequests).toHaveLength(membershipRequestsBefore + 1);
+      expect(environment.runtimeRequests).toHaveLength(1);
+
+      await app.setRoute("chat");
+      await vi.waitFor(async () => {
+        const html = await app.html();
+        expect(html).toContain("Prepará una actividad para la clase.");
+        expect(html).toContain("Respuesta inicial del hilo");
+      });
+      environment.sendLateChunk();
+      await vi.waitFor(async () => {
+        expect(await app.html()).toContain("fragmento posterior al reset");
+      });
+      environment.finishStream();
+      await vi.waitFor(async () => {
+        expect(await app.html()).toContain("La respuesta está completa.");
+      });
+      app.current().props.onSubmit("Un seguimiento en el mismo hilo.");
+      await vi.waitFor(() => expect(environment.runtimeRequests).toHaveLength(2));
+      expect(environment.runtimeRequests[1]).toMatchObject({
+        operation: "message",
+        conversationId,
+      });
+    });
+  }
 });

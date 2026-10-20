@@ -626,32 +626,36 @@ export function AccountApp({
       }));
       try {
         await session.confirmPasswordReset(submission.email, submission.code, submission.password);
-        if (confirmOperationRef.current === operation) confirmOperationRef.current = null;
+        if (confirmOperationRef.current !== operation) return;
+        confirmOperationRef.current = null;
         invalidateChat();
         authorizedRouteRef.current = null;
         retryOperationRef.current = null;
         passwordResetLoginEmailRef.current = submission.email;
         const currentRouteKey = currentRouteKeyRef.current;
         if (!mountedRef.current) return;
-        if (currentRouteKey === "recover") {
+        if (currentRouteKey !== "login") {
           window.location.hash = "/login";
           return;
         }
-        if (currentRouteKey === "login") {
-          passwordResetLoginEmailRef.current = null;
-          setState({
-            view: "login",
-            email: submission.email,
-            notice: passwordResetLoginNotice,
-            projectName,
-          });
-        }
+        passwordResetLoginEmailRef.current = null;
+        setState({
+          view: "login",
+          email: submission.email,
+          notice: passwordResetLoginNotice,
+          projectName,
+        });
       } catch (error) {
-        if (confirmOperationRef.current === operation) confirmOperationRef.current = null;
-        if (!isActive()) {
-          if (isCurrentRoute({ key: "login", epoch: routeEpochRef.current })) {
-            setState({ view: "login", email: submission.email, projectName });
-          }
+        if (confirmOperationRef.current !== operation) return;
+        confirmOperationRef.current = null;
+        if (!mountedRef.current) return;
+        const currentRouteKey = currentRouteKeyRef.current;
+        if (currentRouteKey === "login") {
+          setState({ view: "login", email: submission.email, projectName });
+          return;
+        }
+        if (currentRouteKey !== "recover") {
+          setRetryCount((count) => count + 1);
           return;
         }
         const apiError = asApiError(error);
