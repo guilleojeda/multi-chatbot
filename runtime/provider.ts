@@ -1,10 +1,11 @@
 import { Agent, BedrockModel, configureLogging } from "@strands-agents/sdk";
+import type { MessageData } from "@strands-agents/sdk";
 
 type GenerationInput = {
   systemPrompt: string;
   profileSnapshot: Record<string, unknown>;
   text: string;
-  messages: [];
+  messages: MessageData[];
   modelId: string;
   revision: string;
 };

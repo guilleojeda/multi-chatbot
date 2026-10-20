@@ -1,4 +1,9 @@
-import type { ProfileDocument, ProfileDraft } from "../../../config/profile";
+import {
+  validateProfileInput,
+  type ProfileDocument,
+  type ProfileDraft,
+} from "../../../config/profile";
+import { siteConfig } from "../../../config/site";
 import type { Session, SessionTokens } from "../../../web/session";
 
 export const fixtureScenarios = [
@@ -6,6 +11,7 @@ export const fixtureScenarios = [
   { id: "incomplete", label: "Perfil docente incompleto" },
   { id: "profile-error", label: "GET del perfil: error recuperable" },
   { id: "profile-pending", label: "GET del perfil: mantener pendiente" },
+  { id: "profile-save-error", label: "PUT del perfil: 503 sin aplicar el cambio" },
   { id: "membership-denied", label: "Membresía: acceso denegado" },
   { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
   { id: "runtime-401", label: "Runtime: 401 y refresh correcto" },
@@ -44,7 +50,11 @@ type ControlledStream = {
   nextIndex: number;
   admitted: boolean;
   closed: boolean;
+  turn: FixtureTurn;
 };
+
+type FixtureTurn = { ordinal: number; question: string; answer: string; status: string };
+type FixtureConversation = { nextOrdinal: number; turns: FixtureTurn[] };
 
 const identity = { sub: "fixture-teacher", email: "docente@example.test" };
 const profileDraft: ProfileDraft = {
@@ -57,6 +67,19 @@ const fixtureProfile: ProfileDocument = {
   updatedAt: "2026-10-01T12:00:00.000Z",
   ...profileDraft,
 };
+
+function cloneDraft(draft: ProfileDraft): ProfileDraft {
+  return {
+    fields: Object.fromEntries(
+      Object.entries(draft.fields).map(([fieldId, values]) => [fieldId, [...values]]),
+    ),
+    responsePreferenceIds: [...draft.responsePreferenceIds],
+  };
+}
+
+function cloneProfile(profile: ProfileDocument): ProfileDocument {
+  return { ...profile, ...cloneDraft(profile) };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -100,6 +123,8 @@ export class ChatBrowserFixture {
   private readonly pendingProfiles: PendingProfile[] = [];
   private readonly pendingSignOuts: PendingSignOut[] = [];
   private readonly streams: ControlledStream[] = [];
+  private readonly conversations = new Map<string, FixtureConversation>();
+  private storedProfile = cloneProfile(fixtureProfile);
   private selectedScenario = initialScenario();
   private nextToken = 0;
   private restoreCount = 0;
@@ -241,6 +266,16 @@ export class ChatBrowserFixture {
   }
 
   private async profileResponse(request: FixtureRequest): Promise<Response> {
+    if (this.selectedScenario === "membership-denied") {
+      this.finish(request, 403, "membresía denegada al leer el perfil");
+      return json(
+        {
+          code: "FORBIDDEN",
+          message: "Esta cuenta no tiene acceso a este proyecto.",
+        },
+        403,
+      );
+    }
     if (this.selectedScenario === "profile-pending") {
       await new Promise<void>((resolve) => this.pendingProfiles.push({ release: resolve }));
       this.selectedScenario = "ready";
@@ -250,7 +285,8 @@ export class ChatBrowserFixture {
       this.finish(request, 503, "error recuperable simulado");
       return json({ code: "TEMPORARY_FAILURE" }, 503);
     }
-    const profile = this.selectedScenario === "incomplete" ? null : fixtureProfile;
+    const profile =
+      this.selectedScenario === "incomplete" ? null : cloneProfile(this.storedProfile);
     this.finish(request, 200, profile ? "perfil completo simulado" : "perfil ausente simulado");
     return json({ sub: identity.sub, botId: "docentes", profile });
   }
@@ -262,6 +298,7 @@ export class ChatBrowserFixture {
   ): Promise<Response> {
     const body = isRecord(requestBody) ? requestBody : {};
     const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+    const operation = body.operation;
 
     if (this.selectedScenario === "runtime-401" && !this.runtime401Used) {
       this.runtime401Used = true;
@@ -278,6 +315,19 @@ export class ChatBrowserFixture {
       return json({ code: "FORBIDDEN" }, 403);
     }
 
+    let conversation = this.conversations.get(conversationId);
+    if (operation === "start") {
+      if (conversation) {
+        this.finish(request, 409, "el ID ya pertenece a una conversación");
+        return json({ code: "CONVERSATION_EXISTS" }, 409);
+      }
+      conversation = { nextOrdinal: 1, turns: [] };
+      this.conversations.set(conversationId, conversation);
+    } else if (operation !== "message" || !conversation || conversation.turns.length === 0) {
+      this.finish(request, 400, "la operación no coincide con la conversación");
+      return json({ code: "INVALID_CONVERSATION" }, 400);
+    }
+
     const encoder = new TextEncoder();
     let stream: ControlledStream;
     let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -285,16 +335,28 @@ export class ChatBrowserFixture {
       start: (controller) => {
         controllerRef = controller;
         const queryId = `fixture-query-${request.number}`;
+        const turn: FixtureTurn = {
+          ordinal: 0,
+          question: typeof body.text === "string" ? body.text : "",
+          answer: "",
+          status: "pending",
+        };
         const admit = () => {
           if (stream.closed || stream.admitted) return;
           stream.admitted = true;
-          stream.push({ type: "accepted", conversationId, queryId, ordinal: 1 });
+          turn.ordinal = conversation!.nextOrdinal++;
+          turn.status = "streaming";
+          conversation!.turns.push(turn);
+          stream.push({ type: "accepted", conversationId, queryId, ordinal: turn.ordinal });
+          const firstText =
+            "Propuesta: abrí la clase con una situación cotidiana y pedí que expliquen sus ideas. ";
           stream.push({
             type: "text",
             queryId,
             index: stream.nextIndex++,
-            text: "Propuesta: abrí la clase con una situación cotidiana y pedí que expliquen sus ideas. ",
+            text: firstText,
           });
+          turn.answer += firstText;
           request.status = "pending";
           request.outcome = "respuesta progresiva abierta; esperar un cierre manual";
           this.changed();
@@ -305,6 +367,7 @@ export class ChatBrowserFixture {
           nextIndex: 0,
           admitted: false,
           closed: false,
+          turn,
           admit,
           push: (value) => {
             if (!stream.closed) controller.enqueue(encoder.encode(sse(value)));
@@ -371,12 +434,15 @@ export class ChatBrowserFixture {
   emitFragment() {
     const stream = this.streams.find((item) => !item.closed && item.admitted);
     if (!stream) return;
+    const text =
+      "Después, resolvé una consigna breve.\n\nLuego comparen estrategias en parejas: ¿cuál es más clara para el grupo? ¡Buen trabajo!";
     stream.push({
       type: "text",
       queryId: stream.queryId,
       index: stream.nextIndex++,
-      text: "Después, resolvé una consigna breve.\n\nLuego comparen estrategias en parejas: ¿cuál es más clara para el grupo? ¡Buen trabajo!",
+      text,
     });
+    stream.turn.answer += text;
   }
 
   finishStream(mode: "complete" | "failed" | "unconfirmed") {
@@ -384,6 +450,7 @@ export class ChatBrowserFixture {
     if (!stream) return;
     if (mode === "complete") {
       stream.push({ type: "completed", queryId: stream.queryId });
+      stream.turn.status = "completed";
     } else if (mode === "failed") {
       stream.push({
         type: "failed",
@@ -392,6 +459,9 @@ export class ChatBrowserFixture {
         recordStatus: "failed",
         queryId: stream.queryId,
       });
+      stream.turn.status = "failed";
+    } else {
+      stream.turn.status = "unconfirmed";
     }
     stream.close();
   }
@@ -440,12 +510,67 @@ export class ChatBrowserFixture {
       }
       return this.profileResponse(item);
     }
+    if (url.pathname === "/api/profile" && method === "PUT") {
+      if (!sub) {
+        this.finish(item, 401, "sin sesión");
+        return json({ code: "UNAUTHORIZED" }, 401);
+      }
+      if (this.selectedScenario === "membership-denied") {
+        this.finish(item, 403, "membresía denegada al guardar el perfil");
+        return json(
+          {
+            code: "FORBIDDEN",
+            message: "Esta cuenta no tiene acceso a este proyecto.",
+          },
+          403,
+        );
+      }
+      const validation = validateProfileInput(body, siteConfig.profile);
+      if (!validation.ok) {
+        this.finish(item, 400, "perfil inválido");
+        return json(
+          {
+            code: "INVALID_PROFILE",
+            message: "Revisá los campos del perfil.",
+            fields: validation.fields,
+          },
+          400,
+        );
+      }
+      if (this.selectedScenario === "profile-save-error") {
+        this.finish(item, 503, "fallo temporal al guardar; perfil anterior conservado");
+        return json(
+          {
+            code: "TRY_AGAIN",
+            message: "No pudimos completar la operación. Intentá de nuevo.",
+          },
+          503,
+        );
+      }
+      this.storedProfile = {
+        sub,
+        botId: this.publicConfig.botId,
+        updatedAt: new Date().toISOString(),
+        ...cloneDraft(validation.value),
+      };
+      this.finish(item, 200, "perfil de fixture guardado");
+      return json({
+        sub,
+        botId: this.publicConfig.botId,
+        profile: cloneProfile(this.storedProfile),
+      });
+    }
     if (url.hostname === "bedrock-agentcore.us-east-1.amazonaws.com") {
       if (!sub) {
         this.finish(item, 401, "sin sesión");
         return json({ code: "UNAUTHORIZED" }, 401);
       }
-      if (!isRecord(body) || body.operation !== "start") {
+      if (
+        !isRecord(body) ||
+        (body.operation !== "start" && body.operation !== "message") ||
+        typeof body.conversationId !== "string" ||
+        typeof body.text !== "string"
+      ) {
         this.finish(item, 400, "payload de inicio inválido");
         return json({ code: "INVALID_REQUEST" }, 400);
       }
@@ -466,6 +591,11 @@ export class ChatBrowserFixture {
       pendingAdmissions: this.streams.filter(({ closed, admitted }) => !closed && !admitted).length,
       admittedStreams: this.streams.filter(({ closed, admitted }) => !closed && admitted).length,
       openStreams: this.streams.filter(({ closed }) => !closed).length,
+      conversations: [...this.conversations.entries()].map(([conversationId, conversation]) => ({
+        conversationId,
+        turns: conversation.turns.map((turn) => ({ ...turn })),
+      })),
+      storedProfile: cloneDraft(this.storedProfile),
       requestCount: this.requests.length,
       requests: this.requests.map(({ ...item }) => ({ ...item })),
     };

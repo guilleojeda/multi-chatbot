@@ -109,6 +109,7 @@ export class ChatStack extends Stack {
     this.conversationTable.grant(
       this.runtime.role,
       "dynamodb:GetItem",
+      "dynamodb:Query",
       "dynamodb:PutItem",
       "dynamodb:UpdateItem",
     );

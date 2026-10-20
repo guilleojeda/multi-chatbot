@@ -189,17 +189,54 @@ describe("the chat screen", () => {
 
     expect(completed).toContain(answer);
     expect(buttons(completed).some(({ name }) => /copiar respuesta/i.test(name))).toBe(true);
+    expect(completed).toMatch(/<textarea\b/i);
+    expectLabeledQuery(completed);
     expect(untrusted).not.toContain("<img src=x");
     expect(untrusted).toContain("&lt;img");
   });
 
-  it("shows failed and unconfirmed results separately and offers reset without resending", async () => {
+  it("shows earlier completed exchanges in order, with a copy action for each answer", async () => {
+    const firstQuestion = "¿Cómo explico los porcentajes?";
+    const firstAnswer = "Usá descuentos de una librería como ejemplo.";
+    const secondQuestion = "¿Podés agregar una consigna?";
+    const secondAnswer = "Calculen el 25 % de 80 y expliquen el procedimiento.";
+    const html = await render(
+      readyState({
+        queryStatus: "idle",
+        previousTurns: [
+          { question: firstQuestion, answer: firstAnswer, status: "completed" },
+          { question: secondQuestion, answer: secondAnswer, status: "completed" },
+        ],
+      }),
+    );
+    if (!expectRendered(html)) return;
+
+    const text = plainText(html);
+    const positions = [firstQuestion, firstAnswer, secondQuestion, secondAnswer].map((value) =>
+      text.indexOf(value),
+    );
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((left, right) => left - right));
+    expect(buttons(html).filter(({ name }) => /copiar respuesta/i.test(name))).toHaveLength(2);
+    expect(html).toMatch(/<textarea\b/i);
+    expect(text).not.toContain("Cada consulta inicia un hilo nuevo");
+  });
+
+  it("allows a new query after a confirmed failure, but makes an uncertain result restart-only", async () => {
+    const previousTurns = [
+      {
+        question: "¿Cómo explico los porcentajes?",
+        answer: "Usá descuentos de una librería como ejemplo.",
+        status: "completed",
+      },
+    ];
     const failed = await render(
       readyState({
         queryStatus: "failed",
         question: "Armá una actividad.",
         answer: "Primer tramo guardado",
         error: "La respuesta quedó incompleta.",
+        previousTurns,
       }),
     );
     const unconfirmed = await render(
@@ -208,6 +245,7 @@ describe("the chat screen", () => {
         question: "Armá otra actividad.",
         answer: "Texto sin cierre confirmado",
         error: "No pudimos confirmar que la respuesta haya terminado.",
+        previousTurns,
       }),
     );
     const reset = await render(readyState());
@@ -221,12 +259,21 @@ describe("the chat screen", () => {
       "No pudimos confirmar que la respuesta haya terminado.",
     );
     expect(plainText(unconfirmed)).not.toContain("La respuesta quedó incompleta.");
-    for (const html of [failed, unconfirmed]) {
-      expect(buttons(html).some(({ name }) => /copiar respuesta/i.test(name))).toBe(false);
-      expect(buttons(html).some(({ name }) => /volver al inicio|nuevo chat/i.test(name))).toBe(
-        true,
-      );
-    }
+    expect(plainText(failed)).toContain("Usá descuentos de una librería como ejemplo.");
+    expect(plainText(unconfirmed)).toContain("Usá descuentos de una librería como ejemplo.");
+    expect(plainText(failed)).toContain("Primer tramo guardado");
+    expect(plainText(unconfirmed)).toContain("Texto sin cierre confirmado");
+    expect(failed).toMatch(/<textarea\b/i);
+    expect(buttons(failed).some(({ name }) => /enviar/i.test(name))).toBe(true);
+    expect(buttons(failed).filter(({ name }) => /copiar respuesta/i.test(name))).toHaveLength(1);
+    expect(buttons(unconfirmed).filter(({ name }) => /copiar respuesta/i.test(name))).toHaveLength(
+      1,
+    );
+    expect(unconfirmed).not.toMatch(/<textarea\b/i);
+    expect(
+      buttons(unconfirmed).some(({ name }) => /volver al inicio|nuevo chat|reiniciar/i.test(name)),
+    ).toBe(true);
+    expect(buttons(unconfirmed).some(({ name }) => /reintentar|reenviar/i.test(name))).toBe(false);
     expect(plainText(reset)).not.toMatch(
       /Armá una actividad|Primer tramo|Texto sin cierre|generando respuesta/i,
     );

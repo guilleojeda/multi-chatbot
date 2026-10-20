@@ -213,9 +213,14 @@ export function ProfileScreen({
         <a className="site-header__name account-home-link" href="/">
           {projectName}
         </a>
-        <a className="site-header__label account-public-link" href="/">
-          Página pública
-        </a>
+        <nav className="profile-header-links" aria-label="Navegación de cuenta">
+          <a className="site-header__label account-public-link" href="/#/chat">
+            Volver al chat
+          </a>
+          <a className="site-header__label account-public-link" href="/">
+            Página pública
+          </a>
+        </nav>
       </header>
 
       <main className="account-main profile-main">

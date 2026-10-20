@@ -22,7 +22,7 @@ La API acepta invitaciones solo para el chatbot configurado. Durante el canje co
 
 El app client público permite autenticación por email/contraseña, renovación y revocación desde React; no tiene client secret. El access token vive en memoria y el refresh token solo en `sessionStorage` de la pestaña. La recuperación de contraseña utiliza ese mismo cliente público y las APIs nativas de Cognito.
 
-Una vez confirmado el acceso, «Mi perfil» abre el [perfil profesional y las preferencias](profile.md) e «Ir al chat» abre la [consulta docente](chat.md). Las rutas directas restauran o solicitan esa misma sesión y vuelven a comprobar membresía. Cuenta sigue siendo dueña de autenticación y salida; las vistas protegidas no implementan otro flujo de Cognito. Al iniciar logout se retiran sus datos antes de esperar la revocación remota.
+Una vez confirmado el acceso, «Mi perfil» abre el [perfil profesional y las preferencias](profile.md) e «Ir al chat» abre la [consulta docente](chat.md). Las rutas directas restauran o solicitan esa misma sesión y vuelven a comprobar membresía. El hilo y su consumidor permanecen en la frontera de cuenta al navegar entre chat y perfil con la misma identidad; las comprobaciones de ruta no reinician la conversación. Cuenta sigue siendo dueña de autenticación y salida; las vistas protegidas no implementan otro flujo de Cognito. Al iniciar logout se retiran sus datos antes de esperar la revocación remota.
 
 La razón de estas fronteras se conserva en [Identidad común, acceso por chatbot y sesión de pestaña](../decisions/0001-identidad-y-sesion.md).
 
