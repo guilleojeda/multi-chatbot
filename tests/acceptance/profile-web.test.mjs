@@ -138,6 +138,23 @@ describe("the profile presentation", () => {
     expect(html).toMatch(/<a\b[^>]*href="\/#\/profile"[^>]*>\s*Mi perfil\s*<\/a>/i);
   });
 
+  it("offers an in-app return to chat while the profile loads, is edited, saves, or fails", async () => {
+    const states = [
+      { view: "loading" },
+      { view: "editing", hasProfile: true, draft: savedDraft },
+      { view: "editing", hasProfile: true, draft: savedDraft, saving: true },
+      { view: "load-error", error: "No pudimos cargar tu perfil." },
+    ];
+    for (const state of states) {
+      const html = await render(state);
+      const chatLink = [...html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)].find(
+        ([, attrs, content]) =>
+          attribute(attrs, "href") === "/#/chat" && /chat|conversaci[oó]n/i.test(text(content)),
+      );
+      expect(chatLink, `Expected return to chat from profile state ${state.view}`).toBeDefined();
+    }
+  });
+
   it("renders an accessible empty form with no default selections and an explicit save", async () => {
     const html = await render();
     expect(html).toMatch(/<main\b/);

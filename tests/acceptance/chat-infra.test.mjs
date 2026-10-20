@@ -466,15 +466,20 @@ describe("chat infrastructure acceptance", () => {
 
       expect(accountTableActions).toEqual(new Set(["dynamodb:GetItem"]));
       expect([...conversationActions]).toEqual(
-        expect.arrayContaining(["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]),
+        expect.arrayContaining([
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+        ]),
       );
       expect(
         [...conversationActions].every((action) =>
           [
             "dynamodb:GetItem",
+            "dynamodb:Query",
             "dynamodb:PutItem",
             "dynamodb:UpdateItem",
-            "dynamodb:Query",
           ].includes(action),
         ),
       ).toBe(true);

@@ -128,6 +128,11 @@ function makeHarness({
   startFailure,
   startGate,
   onStart,
+  continueFailure,
+  continueGate,
+  onContinue,
+  contextMessages = [],
+  contextFailure,
   chunkFailureAt,
   completeGate,
   completeFailure,
@@ -140,6 +145,7 @@ function makeHarness({
   generationFailure,
   generationFactory,
   config = profileConfig,
+  queryIds = [queryId],
 } = {}) {
   const state = {
     member,
@@ -150,6 +156,11 @@ function makeHarness({
     startFailure,
     startGate,
     onStart,
+    continueFailure,
+    continueGate,
+    onContinue,
+    contextMessages: clone(contextMessages),
+    contextFailure,
     chunkFailureAt,
     completeGate,
     completeFailure,
@@ -167,6 +178,8 @@ function makeHarness({
     failureInput: null,
     providerInputs: [],
     providerCalls: 0,
+    nextQueryIndex: 0,
+    admittedTurns: [],
     completed: false,
     failed: false,
   };
@@ -176,14 +189,38 @@ function makeHarness({
       state.calls.push(["getMeta", clone(input)]);
       return clone(state.meta);
     },
+    async readContext(input) {
+      state.calls.push(["readContext", clone(input)]);
+      if (state.contextFailure) throw state.contextFailure;
+      return clone(state.contextMessages);
+    },
     async startTurn(input) {
       state.calls.push(["startTurn", clone(input)]);
       state.onStart?.(clone(input));
       if (state.startGate) await state.startGate;
       if (state.startFailure) throw state.startFailure;
       state.admitted = clone(input);
+      state.admittedTurns.push(clone(input));
       state.inputChunks.push({ role: "user", text: input.text });
+      state.meta = {
+        conversationId: input.conversationId,
+        sub: input.sub,
+        botId: input.botId,
+        lastOrdinal: 1,
+      };
       return { queryId: input.queryId, ordinal: 1 };
+    },
+    async continueTurn(input) {
+      state.calls.push(["continueTurn", clone(input)]);
+      state.onContinue?.(clone(input));
+      if (state.continueGate) await state.continueGate;
+      if (state.continueFailure) throw state.continueFailure;
+      state.admitted = clone(input);
+      state.admittedTurns.push(clone(input));
+      state.inputChunks.push({ role: "user", text: input.text });
+      const ordinal = input.expectedLastOrdinal + 1;
+      state.meta = { ...state.meta, lastOrdinal: ordinal };
+      return { queryId: input.queryId, ordinal };
     },
     async appendChunk(input) {
       state.calls.push(["appendChunk", clone(input)]);
@@ -249,7 +286,7 @@ function makeHarness({
             })();
           },
           now: () => fixedNow,
-          newQueryId: () => queryId,
+          newQueryId: () => queryIds[state.nextQueryIndex++] ?? queryId,
         })
       : null;
 
@@ -264,7 +301,7 @@ function terminal(events) {
   return events.at(-1);
 }
 
-describe("the first conversation Runtime handler", () => {
+describe("the conversation Runtime handler", () => {
   beforeAll(async () => {
     if (!existsSync(handlerPath)) return;
     const module = await import(pathToFileURL(handlerPath).href);
@@ -281,7 +318,7 @@ describe("the first conversation Runtime handler", () => {
   it.each([
     ["a null payload", null],
     ["an unsupported payload version", makePayload({ version: 2 })],
-    ["a message operation", makePayload({ operation: "message" })],
+    ["an unknown operation", makePayload({ operation: "replay" })],
     ["a malformed conversation UUID", makePayload({ conversationId: "not-a-uuid" })],
     ["empty text", makePayload({ text: "" })],
     ["whitespace-only text", makePayload({ text: " \n\t " })],
@@ -355,9 +392,61 @@ describe("the first conversation Runtime handler", () => {
   });
 
   it.each([
+    [
+      "a user without current membership",
+      { member: false, meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 1 } },
+      ["hasMember"],
+      "access_denied",
+    ],
+    [
+      "a conversation that does not exist",
+      { meta: null },
+      ["hasMember", "getMeta"],
+      "conversation_unavailable",
+    ],
+    [
+      "another owner's conversation",
+      { meta: { conversationId, sub: "another-teacher", botId, lastOrdinal: 1 } },
+      ["hasMember", "getMeta"],
+      "conversation_unavailable",
+    ],
+    [
+      "another chatbot's conversation",
+      { meta: { conversationId, sub: caller.sub, botId: "bot-cobalt", lastOrdinal: 1 } },
+      ["hasMember", "getMeta"],
+      "conversation_unavailable",
+    ],
+    [
+      "a missing saved profile",
+      { profile: null, meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 1 } },
+      ["hasMember", "getMeta", "getProfile"],
+      "profile_required",
+    ],
+  ])(
+    "rejects a follow-up from %s before context or model access",
+    async (_label, options, calls, code) => {
+      const harness = makeHarness(options);
+
+      const events = await request(harness, makePayload({ operation: "message" }));
+
+      expect(terminal(events)).toMatchObject({
+        type: "failed",
+        recordStatus: "not_admitted",
+        code,
+      });
+      expect(harness.state.calls.map(([name]) => name)).toEqual(calls);
+      expect(harness.state.calls.some(([name]) => name === "readContext")).toBe(false);
+      expect(harness.state.providerCalls).toBe(0);
+    },
+  );
+
+  it.each([
     ["another owner", { conversationId, sub: "another-teacher", botId }],
     ["another chatbot", { conversationId, sub: caller.sub, botId: "bot-cobalt" }],
-    ["an existing conversation owned by the caller", { conversationId, ...caller, botId }],
+    [
+      "an existing conversation owned by the caller",
+      { conversationId, sub: caller.sub, botId, lastOrdinal: 1 },
+    ],
   ])("checks %s before reading the profile or invoking the model", async (_label, meta) => {
     const harness = makeHarness({ meta });
 
@@ -367,6 +456,28 @@ describe("the first conversation Runtime handler", () => {
     expect(harness.state.calls.map(([name]) => name)).toEqual(["hasMember", "getMeta"]);
     expect(harness.state.providerCalls).toBe(0);
   });
+
+  it.each([
+    ["missing", { conversationId, sub: caller.sub, botId }],
+    ["zero", { conversationId, sub: caller.sub, botId, lastOrdinal: 0 }],
+    ["negative", { conversationId, sub: caller.sub, botId, lastOrdinal: -1 }],
+    ["fractional", { conversationId, sub: caller.sub, botId, lastOrdinal: 1.5 }],
+    [
+      "unsafe",
+      { conversationId, sub: caller.sub, botId, lastOrdinal: Number.MAX_SAFE_INTEGER + 1 },
+    ],
+  ])(
+    "rejects an owned conversation with a %s last ordinal before loading context",
+    async (_label, meta) => {
+      const harness = makeHarness({ meta });
+
+      const events = await request(harness, makePayload({ operation: "message" }));
+
+      expect(terminal(events)).toMatchObject({ type: "failed" });
+      expect(harness.state.calls.map(([name]) => name)).toEqual(["hasMember", "getMeta"]);
+      expect(harness.state.providerCalls).toBe(0);
+    },
+  );
 
   it.each([
     ["absent", { profile: null }, "profile_required"],
@@ -450,6 +561,160 @@ describe("the first conversation Runtime handler", () => {
     expect(JSON.stringify(harness.state.admitted.profileSnapshot)).toContain(
       "reviewed-revision-123",
     );
+  });
+
+  it("continues an owned thread with only its completed prior pairs and the current text separately", async () => {
+    const priorMessages = [
+      { role: "user", content: [{ text: "Armá una actividad de porcentajes." }] },
+      { role: "assistant", content: [{ text: "Actividad de porcentajes: ..." }] },
+      { role: "user", content: [{ text: "¿Podés agregar una comprobación?" }] },
+      { role: "assistant", content: [{ text: "Cierre: ..." }] },
+    ];
+    const harness = makeHarness({
+      meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 2 },
+      contextMessages: priorMessages,
+    });
+    const text = "Ahora adaptala para un grupo que todavía no trabajó decimales.";
+
+    const events = await request(harness, makePayload({ operation: "message", text }));
+
+    expect(terminal(events)).toMatchObject({ type: "completed", queryId });
+    expect(events[0]).toMatchObject({ type: "accepted", conversationId, ordinal: 3 });
+    expect(harness.state.calls.map(([name]) => name)).toEqual([
+      "hasMember",
+      "getMeta",
+      "getProfile",
+      "readContext",
+      "continueTurn",
+      "generate",
+      "appendChunk",
+      "completeTurn",
+    ]);
+    expect(harness.state.calls.find(([name]) => name === "readContext")[1]).toEqual({
+      conversationId,
+    });
+    expect(harness.state.admitted).toMatchObject({
+      conversationId,
+      sub: caller.sub,
+      botId,
+      expectedLastOrdinal: 2,
+      text,
+    });
+    expect(harness.state.providerInputs).toHaveLength(1);
+    expect(harness.state.providerInputs[0]).toMatchObject({
+      messages: priorMessages,
+      text,
+    });
+    expect(harness.state.providerInputs[0].messages).not.toContainEqual({
+      role: "user",
+      content: [{ text }],
+    });
+    expect(harness.state.providerCalls).toBe(1);
+    expect(harness.state.calls.some(([name]) => name === "startTurn")).toBe(false);
+  });
+
+  it("uses a newly saved profile for each continuation and leaves the earlier snapshot unchanged", async () => {
+    const secondQueryId = "e54bd567-c9a1-49af-b204-8b69ef988a31";
+    const harness = makeHarness({
+      queryIds: [queryId, secondQueryId],
+      contextMessages: [
+        { role: "user", content: [{ text: "Pregunta anterior" }] },
+        { role: "assistant", content: [{ text: "Respuesta anterior" }] },
+      ],
+    });
+    const first = await request(harness, makePayload());
+    const firstSnapshot = clone(harness.state.admittedTurns[0].profileSnapshot);
+    harness.state.profile = {
+      ...validProfile,
+      fields: { educationLevels: ["primario"], subjects: ["Historia"] },
+      responsePreferenceIds: ["step-by-step"],
+      updatedAt: "2026-10-20T10:00:00.000Z",
+    };
+
+    const second = await request(
+      harness,
+      makePayload({ operation: "message", text: "Seguimiento con el perfil actualizado." }),
+    );
+
+    expect(terminal(first)).toMatchObject({ type: "completed", queryId });
+    expect(terminal(second)).toMatchObject({ type: "completed", queryId: secondQueryId });
+    expect(harness.state.admittedTurns).toHaveLength(2);
+    expect(harness.state.admittedTurns[0].profileSnapshot).toEqual(firstSnapshot);
+    expect(harness.state.admittedTurns[1].profileSnapshot).toMatchObject({
+      fields: expect.objectContaining({ subjects: ["Historia"] }),
+      responsePreferenceIds: ["step-by-step"],
+      promptTexts: ["Explicá cada paso con claridad."],
+      updatedAt: "2026-10-20T10:00:00.000Z",
+    });
+    expect(harness.state.admittedTurns[0].profileSnapshot).not.toEqual(
+      harness.state.admittedTurns[1].profileSnapshot,
+    );
+    expect(harness.state.providerInputs[1]).toMatchObject({
+      messages: harness.state.contextMessages,
+      text: "Seguimiento con el perfil actualizado.",
+    });
+  });
+
+  it("does not read context or generate when the current saved profile is invalid", async () => {
+    const harness = makeHarness({
+      meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 1 },
+      profile: { ...validProfile, fields: { educationLevels: [], subjects: [] } },
+    });
+
+    const events = await request(harness, makePayload({ operation: "message" }));
+
+    expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
+    expect(harness.state.calls.map(([name]) => name)).toEqual([
+      "hasMember",
+      "getMeta",
+      "getProfile",
+    ]);
+    expect(harness.state.providerCalls).toBe(0);
+  });
+
+  it("does not admit or generate when the completed conversation context cannot be validated", async () => {
+    const harness = makeHarness({
+      meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 1 },
+      contextFailure: new Error("private completed chunk is missing"),
+    });
+
+    const events = await request(harness, makePayload({ operation: "message" }));
+
+    expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
+    expect(harness.state.calls.map(([name]) => name)).toEqual([
+      "hasMember",
+      "getMeta",
+      "getProfile",
+      "readContext",
+    ]);
+    expect(harness.state.providerCalls).toBe(0);
+    expect(harness.state.calls.some(([name]) => name === "continueTurn")).toBe(false);
+  });
+
+  it("rejects a competing continuation allocation before invoking the model", async () => {
+    const harness = makeHarness({
+      meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 4 },
+      contextMessages: [
+        { role: "user", content: [{ text: "Pregunta anterior" }] },
+        { role: "assistant", content: [{ text: "Respuesta anterior" }] },
+      ],
+      continueFailure: Object.assign(new Error("ordinal allocation conflict"), {
+        name: "ConditionalCheckFailedException",
+      }),
+    });
+
+    const events = await request(harness, makePayload({ operation: "message" }));
+
+    expect(terminal(events)).toMatchObject({ type: "failed" });
+    expect(events.some(({ type }) => type === "accepted" || type === "completed")).toBe(false);
+    expect(harness.state.calls.map(([name]) => name)).toEqual([
+      "hasMember",
+      "getMeta",
+      "getProfile",
+      "readContext",
+      "continueTurn",
+    ]);
+    expect(harness.state.providerCalls).toBe(0);
   });
 
   it.each([
