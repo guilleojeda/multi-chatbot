@@ -421,7 +421,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
     let providerFailure: Record<string, unknown> | undefined;
     let bufferedText = "";
     let bufferedTextBytes = 0;
-    let outputBytes = 0;
+    let hasNonWhitespaceOutput = false;
     let lastFlushAt = performance.now();
 
     async function* flushText(): AsyncGenerator<{
@@ -526,7 +526,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
           throw new Error("Unexpected provider event.");
         }
         if (event.text.length === 0) continue;
-        outputBytes += Buffer.byteLength(event.text, "utf8");
+        if (event.text.trim().length > 0) hasNonWhitespaceOutput = true;
         bufferedText += event.text;
         bufferedTextBytes += Buffer.byteLength(event.text, "utf8");
         // Show the first text immediately, then batch by size or elapsed time.
@@ -541,7 +541,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
 
       yield* flushText();
 
-      if (!finalResult || finalResult.stopReason !== "end_turn" || outputBytes === 0) {
+      if (!finalResult || finalResult.stopReason !== "end_turn" || !hasNonWhitespaceOutput) {
         failureCode = "incomplete_response";
         throw new Error("Provider did not complete a non-empty answer.");
       }

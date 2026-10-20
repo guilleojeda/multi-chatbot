@@ -627,6 +627,9 @@ export function AccountApp({
       try {
         await session.confirmPasswordReset(submission.email, submission.code, submission.password);
         if (confirmOperationRef.current === operation) confirmOperationRef.current = null;
+        invalidateChat();
+        authorizedRouteRef.current = null;
+        retryOperationRef.current = null;
         passwordResetLoginEmailRef.current = submission.email;
         const currentRouteKey = currentRouteKeyRef.current;
         if (!mountedRef.current) return;

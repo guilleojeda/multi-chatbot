@@ -90,7 +90,7 @@ describe("conversation context references", () => {
     });
   });
 
-  it("records the exact context selected before an in-progress turn finishes", async () => {
+  it("excludes failed turns with whitespace-only prefixes from the selected context", async () => {
     const items = [
       completedTurn(1, queryIds[0]),
       turnChunk(1, queryIds[0], "user", "Pregunta completa."),
@@ -102,7 +102,7 @@ describe("conversation context references", () => {
         answerManifest: { count: 1, complete: false },
       },
       turnChunk(2, queryIds[1], "user", "Pregunta fallida."),
-      turnChunk(2, queryIds[1], "assistant", "Prefijo fallido."),
+      turnChunk(2, queryIds[1], "assistant", " \n\t "),
       {
         ...completedTurn(3, queryIds[2]),
         status: "in_progress",

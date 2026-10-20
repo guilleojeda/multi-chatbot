@@ -31,19 +31,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function providerErrorDetails(error: unknown): {
+  name?: string;
+  metadata?: Record<string, unknown>;
+} {
+  const seen = new Set<Record<string, unknown>>();
+  let current: unknown = error;
+  let firstName: string | undefined;
+  let metadata: Record<string, unknown> | undefined;
+  let metadataName: string | undefined;
+
+  for (let depth = 0; depth < 8 && isRecord(current) && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const name = typeof current.name === "string" ? current.name : undefined;
+    if (firstName === undefined) firstName = name;
+    if (metadata === undefined && isRecord(current.$metadata)) {
+      metadata = current.$metadata;
+      metadataName = name;
+    }
+    current = current.cause;
+  }
+
+  return { name: metadataName ?? firstName, metadata };
+}
+
 function safeProviderError(
   error: unknown,
   outcome?: { stopReason?: string; metrics?: Record<string, number> },
 ): Extract<ProviderEvent, { type: "error" }> {
-  if (!isRecord(error)) {
-    return {
-      type: "error",
-      ...(outcome?.stopReason ? { stopReason: outcome.stopReason } : {}),
-      ...(outcome?.metrics ? { metrics: outcome.metrics } : {}),
-    };
-  }
-  const metadata = isRecord(error.$metadata) ? error.$metadata : {};
-  const name = typeof error.name === "string" ? error.name : undefined;
+  const details = providerErrorDetails(error);
+  const metadata = details.metadata ?? {};
+  const name = typeof details.name === "string" ? details.name : undefined;
   const requestId = typeof metadata.requestId === "string" ? metadata.requestId : undefined;
   const httpStatusCode = metadata.httpStatusCode;
   const attempts = metadata.attempts;

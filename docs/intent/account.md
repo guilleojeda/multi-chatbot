@@ -34,7 +34,7 @@ La solicitud presenta un aviso condicional: Cognito puede simular los detalles d
 
 Una confirmación distinta no se envía. El código incorrecto o vencido, contraseña fuera de política, límites y fallos de conexión muestran un error que permite corregir o volver a solicitar el código. No se anuncia un cambio exitoso hasta que Cognito lo confirma. El código tiene la vigencia nativa de Cognito; no se crea otra tabla ni un mecanismo propio de tokens.
 
-Al completar el cambio se vuelve al login con el email y un aviso; no hay login automático. Se limpian access/ID en memoria y únicamente `auth-refresh` de esa pestaña. Un rechazo de recuperación no borra su sesión previa. La persona ingresa con la nueva contraseña y la API vuelve a comprobar su membresía. No se promete revocación instantánea de los access tokens de otras sesiones: el JWT authorizer conserva su contrato de validación y vigencia.
+Al completar el cambio se vuelve al login con el email y un aviso; no hay login automático. Se limpian access/ID en memoria y únicamente `auth-refresh` de esa pestaña. También se retira el hilo local del chat y se invalida su consumidor, de modo que un ingreso posterior de la misma persona comience vacío. Un rechazo de recuperación conserva la sesión previa y su hilo. La persona ingresa con la nueva contraseña y la API vuelve a comprobar su membresía. No se promete revocación instantánea de los access tokens de otras sesiones: el JWT authorizer conserva su contrato de validación y vigencia.
 
 ## Configuración de correo de recuperación
 

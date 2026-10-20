@@ -34,7 +34,7 @@ async function collect(source) {
   return events;
 }
 
-async function withModelStream(events, run) {
+async function withModelStream(events, run, streamError) {
   const original = Object.getOwnPropertyDescriptor(BedrockModel.prototype, "stream");
   let calls = 0;
   Object.defineProperty(BedrockModel.prototype, "stream", {
@@ -42,6 +42,7 @@ async function withModelStream(events, run) {
     value: async function* () {
       calls += 1;
       yield* events;
+      if (streamError) throw streamError;
     },
   });
   try {
@@ -72,6 +73,57 @@ function modelMessageEvents(stopReason, includeMetadata) {
         ]
       : []),
   ];
+}
+
+function makeHandler() {
+  const state = { appended: [], failed: [], completed: [] };
+  const profile = {
+    sub: "teacher-123",
+    botId: "bot-aurora",
+    fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
+    responsePreferenceIds: [],
+    updatedAt: "2026-10-20T12:00:00.000Z",
+  };
+  const handler = createChatHandler({
+    config: {
+      botId: "bot-aurora",
+      profile: profileConfig,
+      modelId: request.modelId,
+      revision: request.revision,
+      systemPrompt: request.systemPrompt,
+    },
+    accounts: {
+      async hasMember() {
+        return true;
+      },
+    },
+    profiles: {
+      async getProfile() {
+        return profile;
+      },
+    },
+    store: {
+      async getMeta() {
+        return null;
+      },
+      async startTurn() {
+        return { queryId, ordinal: 1 };
+      },
+      async appendChunk(input) {
+        state.appended.push(input);
+      },
+      async completeTurn(input) {
+        state.completed.push(input);
+      },
+      async failTurn(input) {
+        state.failed.push(input);
+      },
+    },
+    generate: createStrandsGenerator({ region: "us-east-1" }),
+    now: () => Date.parse("2026-10-20T12:00:00.000Z"),
+    newQueryId: () => queryId,
+  });
+  return { handler, state };
 }
 
 describe("the real Strands/Bedrock provider stream contract", () => {
@@ -111,53 +163,7 @@ describe("the real Strands/Bedrock provider stream contract", () => {
   });
 
   it("persists the real Strands max-token failure metadata on the failed turn", async () => {
-    const state = { appended: [], failed: [], completed: [] };
-    const profile = {
-      sub: "teacher-123",
-      botId: "bot-aurora",
-      fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
-      responsePreferenceIds: [],
-      updatedAt: "2026-10-20T12:00:00.000Z",
-    };
-    const handler = createChatHandler({
-      config: {
-        botId: "bot-aurora",
-        profile: profileConfig,
-        modelId: request.modelId,
-        revision: request.revision,
-        systemPrompt: request.systemPrompt,
-      },
-      accounts: {
-        async hasMember() {
-          return true;
-        },
-      },
-      profiles: {
-        async getProfile() {
-          return profile;
-        },
-      },
-      store: {
-        async getMeta() {
-          return null;
-        },
-        async startTurn() {
-          return { queryId, ordinal: 1 };
-        },
-        async appendChunk(input) {
-          state.appended.push(input);
-        },
-        async completeTurn(input) {
-          state.completed.push(input);
-        },
-        async failTurn(input) {
-          state.failed.push(input);
-        },
-      },
-      generate: createStrandsGenerator({ region: "us-east-1" }),
-      now: () => Date.parse("2026-10-20T12:00:00.000Z"),
-      newQueryId: () => queryId,
-    });
+    const { handler, state } = makeHandler();
     const claims = Buffer.from(
       JSON.stringify({ sub: "teacher-123", token_use: "access" }),
     ).toString("base64url");
@@ -194,5 +200,57 @@ describe("the real Strands/Bedrock provider stream contract", () => {
       expect(streamCalls()).toBe(1);
       expect(JSON.stringify(events)).not.toContain("maximum token limit");
     });
+  });
+
+  it("persists allowlisted Bedrock metadata through the real Strands cause wrapper", async () => {
+    const { handler, state } = makeHandler();
+    const claims = Buffer.from(
+      JSON.stringify({ sub: "teacher-123", token_use: "access" }),
+    ).toString("base64url");
+    const sdkError = Object.assign(
+      new Error("private provider message contains a token and response body"),
+      {
+        name: "ThrottlingException",
+        $metadata: {
+          requestId: "provider-request-429",
+          httpStatusCode: 429,
+          attempts: 1,
+        },
+        body: "private provider response body",
+      },
+    );
+
+    await withModelStream(
+      [],
+      async (streamCalls) => {
+        const events = await collect(
+          handler(
+            { version: 1, operation: "start", conversationId, text: request.text },
+            {
+              sessionId: conversationId,
+              headers: {
+                authorization: `Bearer e30.${claims}.runtime-validated`,
+                "x-amzn-bedrock-agentcore-runtime-session-id": conversationId,
+              },
+            },
+          ),
+        );
+
+        expect(events.at(-1)).toMatchObject({ type: "failed", code: "provider_error" });
+        expect(JSON.stringify(events)).not.toMatch(
+          /ThrottlingException|provider-request-429|private provider|response body|token/,
+        );
+        expect(state.failed).toHaveLength(1);
+        expect(state.failed[0].providerError).toEqual({
+          providerCode: "ThrottlingException",
+          requestId: "provider-request-429",
+          httpStatusCode: 429,
+          attempts: 1,
+        });
+        expect(state.completed).toHaveLength(0);
+        expect(streamCalls()).toBe(1);
+      },
+      sdkError,
+    );
   });
 });
