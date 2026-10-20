@@ -22,6 +22,7 @@ function routeFromHash(hash: string): AccountRoute | null {
   if (route === "/chat") return { kind: "chat" };
   if (route === "/profile") return { kind: "profile" };
   if (route === "/login") return { kind: "login" };
+  if (route === "/recover") return { kind: "recover" };
   return null;
 }
 

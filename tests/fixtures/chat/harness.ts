@@ -22,6 +22,7 @@ export const fixtureScenarios = [
   { id: "runtime-401-pending", label: "Runtime: 401 y refresh retenidos" },
   { id: "runtime-expired", label: "Runtime: 401 y sesión vencida" },
   { id: "runtime-forbidden", label: "Runtime: acceso denegado" },
+  { id: "password-reset-failure", label: "Cognito: rechazar el cambio de contraseña" },
   { id: "signout-pending", label: "Logout: revocación retenida" },
   { id: "clipboard-fail", label: "Portapapeles: simular error al copiar" },
 ] as const;
@@ -239,6 +240,12 @@ export class ChatBrowserFixture {
         this.changed();
       }
       return new Response("", { status: 200 });
+    }
+    if (
+      target.endsWith("ConfirmForgotPassword") &&
+      this.selectedScenario === "password-reset-failure"
+    ) {
+      return json({ __type: "CodeMismatchException" }, 400);
     }
     if (target.endsWith("ForgotPassword") || target.endsWith("ConfirmForgotPassword")) {
       if (target.endsWith("ConfirmForgotPassword")) {

@@ -201,6 +201,60 @@ describe("chat Runtime implementation regressions", () => {
     expect(harness.state.appended.length).toBeLessThan(deltaCount);
   });
 
+  it("fails a whitespace-only result after durably preserving its exact prefix", async () => {
+    const answer = " \n\t ";
+    const harness = makeHarness({
+      generate: () =>
+        (async function* () {
+          yield { type: "text", text: answer };
+          yield { type: "result", stopReason: "end_turn" };
+        })(),
+    });
+
+    const events = await collect(request(harness));
+
+    expect(events.some(({ type }) => type === "accepted")).toBe(true);
+    expect(events.some(({ type }) => type === "completed")).toBe(false);
+    expect(
+      events
+        .filter(({ type }) => type === "text")
+        .map(({ text }) => text)
+        .join(""),
+    ).toBe(answer);
+    expect(events.at(-1)).toMatchObject({ type: "failed", code: "incomplete_response" });
+    expect(harness.state.appended.map(({ text }) => text).join("")).toBe(answer);
+    expect(harness.state.failed).toHaveLength(1);
+    expect(harness.state.failed[0]).toMatchObject({
+      code: "incomplete_response",
+      answerManifest: { count: 1, complete: false },
+    });
+    expect(harness.state.completed).toHaveLength(0);
+  });
+
+  it("completes useful text with surrounding whitespace without changing its bytes", async () => {
+    const answer = " \n  Respuesta útil. \t ";
+    const harness = makeHarness({
+      generate: () =>
+        (async function* () {
+          yield { type: "text", text: answer };
+          yield { type: "result", stopReason: "end_turn" };
+        })(),
+    });
+
+    const events = await collect(request(harness));
+
+    expect(events.at(-1)).toMatchObject({ type: "completed", queryId });
+    expect(
+      events
+        .filter(({ type }) => type === "text")
+        .map(({ text }) => text)
+        .join(""),
+    ).toBe(answer);
+    expect(harness.state.appended.map(({ text }) => text).join("")).toBe(answer);
+    expect(harness.state.failed).toHaveLength(0);
+    expect(harness.state.completed).toHaveLength(1);
+  });
+
   it("marks the admitted turn failed if the consumer returns immediately after accepted", async () => {
     const harness = makeHarness({
       generate: () =>
