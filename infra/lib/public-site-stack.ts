@@ -7,6 +7,7 @@ import type { Construct } from "constructs";
 import { fileURLToPath } from "node:url";
 import type { ResolvedBotEnvironment } from "../../config/project.js";
 import type { AccountStack } from "./account-stack.js";
+import type { ChatStack } from "./chat-stack.js";
 import type { SharedIdentityStack } from "./shared-identity-stack.js";
 
 const websiteAssetPath = fileURLToPath(new URL("../../web", import.meta.url));
@@ -18,6 +19,7 @@ export class PublicSiteStack extends Stack {
     environment: ResolvedBotEnvironment,
     identity: SharedIdentityStack,
     account: AccountStack,
+    chat?: ChatStack,
   ) {
     super(scope, id, {
       env: { account: environment.account, region: environment.region },
@@ -69,6 +71,7 @@ export class PublicSiteStack extends Stack {
           clientId: account.userPoolClient.userPoolClientId,
           apiBaseUrl: "/api",
           botId: environment.botId,
+          ...(chat ? { runtimeArn: chat.runtimeArn, runtimeQualifier: chat.runtimeQualifier } : {}),
         }),
       ],
       destinationBucket: websiteBucket,

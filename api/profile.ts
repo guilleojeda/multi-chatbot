@@ -1,4 +1,5 @@
 import {
+  isStoredProfile,
   validateProfileInput,
   type ProfileConfig,
   type ProfileDocument,
@@ -47,10 +48,6 @@ function json(statusCode: number, body: Record<string, unknown>): ApiResponse {
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function readBody(event: HttpEvent): ReadBodyResult {
   if (event.body === undefined || event.body.length === 0) {
     return { kind: "ok", value: {} };
@@ -80,75 +77,6 @@ function safeFailure(): ApiResponse {
     code: "TRY_AGAIN",
     message: "No pudimos completar la operación. Intentá de nuevo.",
   });
-}
-
-function isCanonicalIsoDate(value: unknown): value is string {
-  if (typeof value !== "string") return false;
-  const time = Date.parse(value);
-  return Number.isFinite(time) && new Date(time).toISOString() === value;
-}
-
-function isStoredProfile(
-  value: unknown,
-  input: { sub: string; botId: string },
-  config: ProfileConfig,
-): value is StoredProfile {
-  if (!isRecord(value)) return false;
-  const allowedKeys = new Set(["sub", "botId", "fields", "responsePreferenceIds", "updatedAt"]);
-  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
-  if (
-    value.sub !== input.sub ||
-    value.botId !== input.botId ||
-    !isCanonicalIsoDate(value.updatedAt)
-  ) {
-    return false;
-  }
-  if (!isRecord(value.fields)) return false;
-
-  const configuredFieldIds = config.fields.map(({ id }) => id).sort();
-  const storedFieldIds = Object.keys(value.fields).sort();
-  if (
-    configuredFieldIds.length !== storedFieldIds.length ||
-    configuredFieldIds.some((id, index) => id !== storedFieldIds[index])
-  ) {
-    return false;
-  }
-
-  const responsePreferenceIds = value.responsePreferenceIds;
-  if (
-    responsePreferenceIds !== undefined &&
-    (!Array.isArray(responsePreferenceIds) ||
-      !responsePreferenceIds.every((id) => typeof id === "string"))
-  ) {
-    return false;
-  }
-
-  const draft = validateProfileInput(
-    {
-      fields: value.fields,
-      responsePreferenceIds: responsePreferenceIds ?? [],
-    },
-    config,
-  );
-  if (!draft.ok) return false;
-
-  for (const fieldId of configuredFieldIds) {
-    const storedValues = value.fields[fieldId];
-    const normalizedValues = draft.value.fields[fieldId];
-    if (
-      !Array.isArray(storedValues) ||
-      storedValues.length !== normalizedValues.length ||
-      storedValues.some((entry, index) => entry !== normalizedValues[index])
-    ) {
-      return false;
-    }
-  }
-
-  const storedPreferences = responsePreferenceIds ?? [];
-  return (
-    storedPreferences.length === draft.value.responsePreferenceIds.length &&
-    storedPreferences.every((id, index) => id === draft.value.responsePreferenceIds[index])
-  );
 }
 
 function apiProfile(profile: StoredProfile | null): StoredProfile | null {

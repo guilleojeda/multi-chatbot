@@ -13,6 +13,6 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["infra/**/*.ts", "config/**/*.ts", "api/**/*.ts"],
+  "include": ["infra/**/*.ts", "config/**/*.ts", "api/**/*.ts", "runtime/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

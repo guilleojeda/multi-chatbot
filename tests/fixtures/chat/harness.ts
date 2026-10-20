@@ -1,0 +1,473 @@
+import type { ProfileDocument, ProfileDraft } from "../../../config/profile";
+import type { Session, SessionTokens } from "../../../web/session";
+
+export const fixtureScenarios = [
+  { id: "ready", label: "Perfil completo; Runtime controlado" },
+  { id: "incomplete", label: "Perfil docente incompleto" },
+  { id: "profile-error", label: "GET del perfil: error recuperable" },
+  { id: "profile-pending", label: "GET del perfil: mantener pendiente" },
+  { id: "membership-denied", label: "Membresía: acceso denegado" },
+  { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
+  { id: "runtime-401", label: "Runtime: 401 y refresh correcto" },
+  { id: "runtime-expired", label: "Runtime: 401 y sesión vencida" },
+  { id: "runtime-forbidden", label: "Runtime: acceso denegado" },
+  { id: "signout-pending", label: "Logout: revocación retenida" },
+  { id: "clipboard-fail", label: "Portapapeles: simular error al copiar" },
+] as const;
+
+export type FixtureScenario = (typeof fixtureScenarios)[number]["id"];
+
+type FixtureStatus = number | "pending" | "cancelled" | "network-error";
+
+type FixtureRequest = {
+  number: number;
+  method: string;
+  url: string;
+  authenticated: boolean;
+  sessionId?: string;
+  accept?: string;
+  status: FixtureStatus;
+  outcome: string;
+  body?: unknown;
+};
+
+type PendingProfile = { release: () => void };
+type PendingSignOut = { release: () => void };
+
+type ControlledStream = {
+  request: FixtureRequest;
+  push: (value: unknown) => void;
+  admit: () => void;
+  close: () => void;
+  cancel: () => void;
+  queryId: string;
+  nextIndex: number;
+  admitted: boolean;
+  closed: boolean;
+};
+
+const identity = { sub: "fixture-teacher", email: "docente@example.test" };
+const profileDraft: ProfileDraft = {
+  fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
+  responsePreferenceIds: ["brief-practical", "classroom-ready"],
+};
+const fixtureProfile: ProfileDocument = {
+  sub: identity.sub,
+  botId: "docentes",
+  updatedAt: "2026-10-01T12:00:00.000Z",
+  ...profileDraft,
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function json(value: unknown, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function sse(value: unknown) {
+  const type = isRecord(value) && typeof value.type === "string" ? value.type : "message";
+  return `event: ${type}\ndata: ${JSON.stringify(value)}\n\n`;
+}
+
+function initialScenario(): FixtureScenario {
+  const requested = new URLSearchParams(window.location.search).get("scenario");
+  return fixtureScenarios.some(({ id }) => id === requested)
+    ? (requested as FixtureScenario)
+    : "ready";
+}
+
+export class ChatBrowserFixture {
+  readonly session: Session;
+
+  readonly publicConfig = {
+    region: "us-east-1",
+    userPoolId: "fixture-user-pool",
+    clientId: "fixture-web-client",
+    apiBaseUrl: "/api",
+    botId: "docentes",
+    runtimeArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/fixture-only",
+    runtimeQualifier: "DEFAULT",
+  };
+
+  private readonly listeners = new Set<() => void>();
+  private readonly requests: FixtureRequest[] = [];
+  private readonly tokens = new Map<string, string>();
+  private readonly pendingProfiles: PendingProfile[] = [];
+  private readonly pendingSignOuts: PendingSignOut[] = [];
+  private readonly streams: ControlledStream[] = [];
+  private selectedScenario = initialScenario();
+  private nextToken = 0;
+  private restoreCount = 0;
+  private restorable = true;
+  private access: string | null = null;
+  private id: string | null = null;
+  private activeSub: string | null = null;
+  private runtime401Used = false;
+  private clipboardFailure = false;
+  private readonly originalClipboardDescriptor = Object.getOwnPropertyDescriptor(
+    navigator,
+    "clipboard",
+  );
+
+  constructor() {
+    this.session = {
+      signIn: async () => this.signIn(),
+      requestPasswordReset: async () => undefined,
+      confirmPasswordReset: async () => undefined,
+      restore: async () => this.restore(),
+      accessToken: () => this.access,
+      idToken: () => this.id,
+      signOut: async () => this.signOut(),
+    };
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private changed() {
+    for (const listener of this.listeners) listener();
+  }
+
+  selectScenario(scenario: FixtureScenario) {
+    this.selectedScenario = scenario;
+    this.clipboardFailure = scenario === "clipboard-fail";
+    this.runtime401Used = false;
+    if (this.clipboardFailure) {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async () => Promise.reject(new Error("Fixture clipboard failure")) },
+      });
+    } else if (this.originalClipboardDescriptor) {
+      Object.defineProperty(navigator, "clipboard", this.originalClipboardDescriptor);
+    } else {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+    this.changed();
+  }
+
+  get scenario() {
+    return this.selectedScenario;
+  }
+
+  get copyFails() {
+    return this.clipboardFailure;
+  }
+
+  private issueTokens(): SessionTokens {
+    const accessToken = `fixture-access-${++this.nextToken}`;
+    const idToken = `fixture-id-${this.nextToken}`;
+    this.tokens.set(accessToken, identity.sub);
+    this.activeSub = identity.sub;
+    this.access = accessToken;
+    this.id = idToken;
+    this.changed();
+    return { accessToken, idToken };
+  }
+
+  private async restore(): Promise<SessionTokens | null> {
+    this.restoreCount += 1;
+    if (
+      this.selectedScenario === "runtime-expired" &&
+      this.runtime401Used &&
+      this.restoreCount > 1
+    ) {
+      this.restorable = false;
+      this.access = null;
+      this.id = null;
+      this.activeSub = null;
+      this.changed();
+      return null;
+    }
+    if (!this.restorable) {
+      this.access = null;
+      this.id = null;
+      this.activeSub = null;
+      this.changed();
+      return null;
+    }
+    return this.issueTokens();
+  }
+
+  private async signIn(): Promise<SessionTokens> {
+    this.restorable = true;
+    return this.issueTokens();
+  }
+
+  private async signOut() {
+    this.restorable = false;
+    this.access = null;
+    this.id = null;
+    this.activeSub = null;
+    this.changed();
+    if (this.selectedScenario === "signout-pending") {
+      await new Promise<void>((resolve) => this.pendingSignOuts.push({ release: resolve }));
+      this.changed();
+    }
+  }
+
+  private record(
+    method: string,
+    url: URL,
+    authenticated: boolean,
+    fields: Partial<Pick<FixtureRequest, "sessionId" | "accept" | "body">> = {},
+  ) {
+    const request: FixtureRequest = {
+      number: this.requests.length + 1,
+      method,
+      url: `${url.origin}${url.pathname}${url.search}`,
+      authenticated,
+      status: "pending",
+      outcome: "en curso",
+      ...fields,
+    };
+    this.requests.push(request);
+    this.changed();
+    return request;
+  }
+
+  private finish(request: FixtureRequest, status: FixtureStatus, outcome: string) {
+    request.status = status;
+    request.outcome = outcome;
+    this.changed();
+  }
+
+  private async profileResponse(request: FixtureRequest): Promise<Response> {
+    if (this.selectedScenario === "profile-pending") {
+      await new Promise<void>((resolve) => this.pendingProfiles.push({ release: resolve }));
+      this.selectedScenario = "ready";
+      this.changed();
+    }
+    if (this.selectedScenario === "profile-error") {
+      this.finish(request, 503, "error recuperable simulado");
+      return json({ code: "TEMPORARY_FAILURE" }, 503);
+    }
+    const profile = this.selectedScenario === "incomplete" ? null : fixtureProfile;
+    this.finish(request, 200, profile ? "perfil completo simulado" : "perfil ausente simulado");
+    return json({ sub: identity.sub, botId: "docentes", profile });
+  }
+
+  private async runtimeResponse(
+    request: FixtureRequest,
+    requestBody: unknown,
+    signal?: AbortSignal | null,
+  ): Promise<Response> {
+    const body = isRecord(requestBody) ? requestBody : {};
+    const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+
+    if (this.selectedScenario === "runtime-401" && !this.runtime401Used) {
+      this.runtime401Used = true;
+      this.finish(request, 401, "refresh de acceso activado");
+      return json({ code: "UNAUTHORIZED" }, 401);
+    }
+    if (this.selectedScenario === "runtime-expired" && !this.runtime401Used) {
+      this.runtime401Used = true;
+      this.finish(request, 401, "sesión vencida simulada");
+      return json({ code: "UNAUTHORIZED" }, 401);
+    }
+    if (this.selectedScenario === "runtime-forbidden") {
+      this.finish(request, 403, "acceso denegado simulado");
+      return json({ code: "FORBIDDEN" }, 403);
+    }
+
+    const encoder = new TextEncoder();
+    let stream: ControlledStream;
+    let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const responseBody = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        controllerRef = controller;
+        const queryId = `fixture-query-${request.number}`;
+        const admit = () => {
+          if (stream.closed || stream.admitted) return;
+          stream.admitted = true;
+          stream.push({ type: "accepted", conversationId, queryId, ordinal: 1 });
+          stream.push({
+            type: "text",
+            queryId,
+            index: stream.nextIndex++,
+            text: "Propuesta: abrí la clase con una situación cotidiana y pedí que expliquen sus ideas. ",
+          });
+          request.status = "pending";
+          request.outcome = "respuesta progresiva abierta; esperar un cierre manual";
+          this.changed();
+        };
+        stream = {
+          request,
+          queryId,
+          nextIndex: 0,
+          admitted: false,
+          closed: false,
+          admit,
+          push: (value) => {
+            if (!stream.closed) controller.enqueue(encoder.encode(sse(value)));
+          },
+          close: () => {
+            if (stream.closed) return;
+            stream.closed = true;
+            controller.close();
+            this.finish(request, 200, "stream completado manualmente");
+            this.changed();
+          },
+          cancel: () => {
+            if (stream.closed) return;
+            stream.closed = true;
+            this.finish(request, "cancelled", "lector cancelado al invalidar la vista");
+          },
+        };
+        this.streams.push(stream);
+        if (this.selectedScenario === "runtime-admission-pending") {
+          request.status = "pending";
+          request.outcome = "admisión retenida; esperar el control manual";
+          this.changed();
+        } else {
+          admit();
+        }
+      },
+      cancel: () => stream?.cancel(),
+    });
+    const abortStream = () => {
+      if (stream!.closed) return;
+      if (this.selectedScenario === "signout-pending") {
+        request.outcome = "aborto recibido; se retiene el fragmento para probar callback obsoleto";
+        this.changed();
+        return;
+      }
+      stream!.cancel();
+      try {
+        // The real fetch body errors its reader when AbortController aborts a request.
+        // The fixture mirrors that behavior so the production consumer can settle promptly.
+        controllerRef?.error(new DOMException("Fixture stream aborted", "AbortError"));
+      } catch {
+        // The reader may already have canceled or closed the body.
+      }
+    };
+    if (signal?.aborted) abortStream();
+    else signal?.addEventListener("abort", abortStream, { once: true });
+    return new Response(responseBody, { headers: { "content-type": "text/event-stream" } });
+  }
+
+  releaseProfile() {
+    this.pendingProfiles.shift()?.release();
+    this.changed();
+  }
+
+  releaseSignOut() {
+    this.pendingSignOuts.shift()?.release();
+    this.changed();
+  }
+
+  admitStream() {
+    this.streams.find((item) => !item.closed && !item.admitted)?.admit();
+  }
+
+  emitFragment() {
+    const stream = this.streams.find((item) => !item.closed && item.admitted);
+    if (!stream) return;
+    stream.push({
+      type: "text",
+      queryId: stream.queryId,
+      index: stream.nextIndex++,
+      text: "Después, resolvé una consigna breve.\n\nLuego comparen estrategias en parejas: ¿cuál es más clara para el grupo? ¡Buen trabajo!",
+    });
+  }
+
+  finishStream(mode: "complete" | "failed" | "unconfirmed") {
+    const stream = this.streams.find((item) => !item.closed && item.admitted);
+    if (!stream) return;
+    if (mode === "complete") {
+      stream.push({ type: "completed", queryId: stream.queryId });
+    } else if (mode === "failed") {
+      stream.push({
+        type: "failed",
+        code: "generation_failed",
+        message: "La generación terminó con un error simulado.",
+        recordStatus: "failed",
+        queryId: stream.queryId,
+      });
+    }
+    stream.close();
+  }
+
+  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const requestInput = input instanceof Request ? input : null;
+    const url = new URL(requestInput ? requestInput.url : String(input), window.location.href);
+    const method = (init?.method || requestInput?.method || "GET").toUpperCase();
+    const headers = new Headers(init?.headers || requestInput?.headers);
+    const bearer = headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+    const sub = this.tokens.get(bearer);
+    let body: unknown;
+    const bodyText = typeof init?.body === "string" ? init.body : "";
+    if (bodyText) {
+      try {
+        body = JSON.parse(bodyText) as unknown;
+      } catch {
+        body = { invalidJson: true };
+      }
+    }
+    const item = this.record(method, url, Boolean(bearer), {
+      ...(headers.has("x-amzn-bedrock-agentcore-runtime-session-id")
+        ? { sessionId: headers.get("x-amzn-bedrock-agentcore-runtime-session-id") || "" }
+        : {}),
+      ...(headers.has("accept") ? { accept: headers.get("accept") || "" } : {}),
+      ...(body === undefined ? {} : { body }),
+    });
+
+    if (url.pathname === "/public-config.json") {
+      this.finish(item, 200, "configuración pública simulada");
+      return json(this.publicConfig);
+    }
+    if (url.pathname === "/api/account/me" && method === "GET") {
+      if (!sub || this.selectedScenario === "membership-denied") {
+        const status = sub ? 403 : 401;
+        this.finish(item, status, status === 403 ? "membresía denegada" : "sin sesión");
+        return json({ code: status === 403 ? "FORBIDDEN" : "UNAUTHORIZED" }, status);
+      }
+      this.finish(item, 200, "membresía activa simulada");
+      return json({ sub, botId: this.publicConfig.botId });
+    }
+    if (url.pathname === "/api/profile" && method === "GET") {
+      if (!sub) {
+        this.finish(item, 401, "sin sesión");
+        return json({ code: "UNAUTHORIZED" }, 401);
+      }
+      return this.profileResponse(item);
+    }
+    if (url.hostname === "bedrock-agentcore.us-east-1.amazonaws.com") {
+      if (!sub) {
+        this.finish(item, 401, "sin sesión");
+        return json({ code: "UNAUTHORIZED" }, 401);
+      }
+      if (!isRecord(body) || body.operation !== "start") {
+        this.finish(item, 400, "payload de inicio inválido");
+        return json({ code: "INVALID_REQUEST" }, 400);
+      }
+      return this.runtimeResponse(item, body, init?.signal);
+    }
+    this.finish(item, 404, "ruta no simulada");
+    return json({ code: "NOT_FOUND" }, 404);
+  }
+
+  snapshot(route: string) {
+    return {
+      fixture: "chat-browser-local",
+      route,
+      scenario: this.selectedScenario,
+      session: { active: Boolean(this.activeSub), credentialsIncluded: false },
+      pendingProfiles: this.pendingProfiles.length,
+      pendingSignOuts: this.pendingSignOuts.length,
+      pendingAdmissions: this.streams.filter(({ closed, admitted }) => !closed && !admitted).length,
+      admittedStreams: this.streams.filter(({ closed, admitted }) => !closed && admitted).length,
+      openStreams: this.streams.filter(({ closed }) => !closed).length,
+      requestCount: this.requests.length,
+      requests: this.requests.map(({ ...item }) => ({ ...item })),
+    };
+  }
+}

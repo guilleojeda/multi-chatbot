@@ -22,6 +22,7 @@ function routeFromHash(hash: string): AccountRoute | null {
   const pathname = questionIndex < 0 ? route : route.slice(0, questionIndex);
   const query = questionIndex < 0 ? "" : route.slice(questionIndex + 1);
   if (pathname === "/login") return { kind: "login" };
+  if (pathname === "/chat") return { kind: "chat" };
   if (pathname === "/profile") return { kind: "profile" };
   if (pathname === "/recover") return { kind: "recover" };
   if (pathname === "/invite") {

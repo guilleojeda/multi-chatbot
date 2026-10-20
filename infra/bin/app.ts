@@ -2,6 +2,7 @@ import { App } from "aws-cdk-lib";
 import { resolveEnvironment } from "../../config/project.js";
 import { siteConfig } from "../../config/site.js";
 import { AccountStack } from "../lib/account-stack.js";
+import { ChatStack } from "../lib/chat-stack.js";
 import { PublicSiteStack } from "../lib/public-site-stack.js";
 import { SharedIdentityStack } from "../lib/shared-identity-stack.js";
 import { SetupStack } from "../lib/setup-stack.js";
@@ -26,10 +27,18 @@ const account = new AccountStack(
   resolvedSiteEnvironment,
   identity.userPool,
 );
+const chat = new ChatStack(
+  app,
+  `${resolvedSiteEnvironment.botResourcePrefix}-chat`,
+  resolvedSiteEnvironment,
+  identity,
+  account,
+);
 new PublicSiteStack(
   app,
   `${resolvedSiteEnvironment.botResourcePrefix}-site`,
   resolvedSiteEnvironment,
   identity,
   account,
+  chat,
 );

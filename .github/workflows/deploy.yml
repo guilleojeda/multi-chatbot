@@ -50,6 +50,7 @@ jobs:
         if: steps.deployment.outputs.deploy == 'true'
         env:
           DEPLOYMENT_ENVIRONMENT: ${{ steps.deployment.outputs.environment }}
+          REVISION: ${{ steps.deployment.outputs.commit }}
         run: npm run synth -- --context "environment=$DEPLOYMENT_ENVIRONMENT"
 
       - name: Name the checked assembly
@@ -114,6 +115,10 @@ jobs:
           DEPLOYMENT_TAG: ${{ github.ref_name }}
           DEPLOYMENT_COMMIT: ${{ needs.checks.outputs.commit }}
         run: node scripts/deployment-context.mjs current --tag "$DEPLOYMENT_TAG" --commit "$DEPLOYMENT_COMMIT"
+
+      - name: Set up Docker Buildx for the ARM64 Runtime asset
+        if: steps.current.outputs.current == 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Configure AWS credentials with OIDC
         if: steps.current.outputs.current == 'true'

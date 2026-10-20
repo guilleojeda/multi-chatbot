@@ -4,10 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { App } from "aws-cdk-lib";
 import { afterAll, describe, expect, it } from "vitest";
-import { resolveEnvironment } from "../../config/project.ts";
-import { AccountStack } from "../../infra/lib/account-stack.ts";
-import { PublicSiteStack } from "../../infra/lib/public-site-stack.ts";
-import { SharedIdentityStack } from "../../infra/lib/shared-identity-stack.ts";
+import { resolveEnvironment } from "../../dist/config/project.js";
+import { AccountStack } from "../../dist/infra/lib/account-stack.js";
+import { PublicSiteStack } from "../../dist/infra/lib/public-site-stack.js";
+import { SharedIdentityStack } from "../../dist/infra/lib/shared-identity-stack.js";
 
 const projectRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const chatStackSource = path.join(projectRoot, "infra/lib/chat-stack.ts");
@@ -180,7 +180,7 @@ async function scenarioFor(environment, botIds = ["docentes"]) {
   const cached = scenarioCache.get(cacheKey);
   if (cached) return cached;
 
-  const { ChatStack } = await import("../../infra/lib/chat-stack.ts");
+  const { ChatStack } = await import("../../dist/infra/lib/chat-stack.js");
   expect(typeof ChatStack, `ChatStack export is required for ${cacheKey}`).toBe("function");
   if (typeof ChatStack !== "function") return undefined;
 
@@ -625,7 +625,19 @@ describe("chat infrastructure acceptance", () => {
       ).toBeDefined();
       const runtimeArnSource = sourceMarkerValue(siteTemplate, runtimeArnMarker);
       expect(runtimeArnSource, "runtime ARN marker must be bound in site deployment").toBeDefined();
-      expect(referencedStrings(runtimeArnSource)).toContain(bot.chatId);
+      const chatTemplate = stackTemplate(scenario.assembly, bot.chatId);
+      expect(chatTemplate).toBeDefined();
+      if (!chatTemplate) return;
+      const runtime = onlyRecord(chatTemplate, "AWS::BedrockAgentCore::Runtime");
+      expect(
+        referencesExportedOutput(
+          runtimeArnSource,
+          chatTemplate,
+          bot.chat.stackName,
+          runtime.logicalId,
+        ),
+        "public config must reference this bot's Runtime output",
+      ).toBe(true);
       for (const key of ["userPoolId", "clientId"]) {
         const marker = sourceMarkerForJsonKey(contents, key);
         expect(marker, `${key} remains a deploy-time public identifier`).toBeDefined();

@@ -53,6 +53,75 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isCanonicalIsoDate(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value;
+}
+
+export function isStoredProfile(
+  value: unknown,
+  input: { sub: string; botId: string },
+  config: ProfileConfig,
+): value is StoredProfile {
+  if (!isRecord(value)) return false;
+  const allowedKeys = new Set(["sub", "botId", "fields", "responsePreferenceIds", "updatedAt"]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
+  if (
+    value.sub !== input.sub ||
+    value.botId !== input.botId ||
+    !isCanonicalIsoDate(value.updatedAt)
+  ) {
+    return false;
+  }
+  if (!isRecord(value.fields)) return false;
+
+  const configuredFieldIds = config.fields.map(({ id }) => id).sort();
+  const storedFieldIds = Object.keys(value.fields).sort();
+  if (
+    configuredFieldIds.length !== storedFieldIds.length ||
+    configuredFieldIds.some((id, index) => id !== storedFieldIds[index])
+  ) {
+    return false;
+  }
+
+  const responsePreferenceIds = value.responsePreferenceIds;
+  if (
+    responsePreferenceIds !== undefined &&
+    (!Array.isArray(responsePreferenceIds) ||
+      !responsePreferenceIds.every((id) => typeof id === "string"))
+  ) {
+    return false;
+  }
+
+  const draft = validateProfileInput(
+    {
+      fields: value.fields,
+      responsePreferenceIds: responsePreferenceIds ?? [],
+    },
+    config,
+  );
+  if (!draft.ok) return false;
+
+  for (const fieldId of configuredFieldIds) {
+    const storedValues = value.fields[fieldId];
+    const normalizedValues = draft.value.fields[fieldId];
+    if (
+      !Array.isArray(storedValues) ||
+      storedValues.length !== normalizedValues.length ||
+      storedValues.some((entry, index) => entry !== normalizedValues[index])
+    ) {
+      return false;
+    }
+  }
+
+  const storedPreferences = responsePreferenceIds ?? [];
+  return (
+    storedPreferences.length === draft.value.responsePreferenceIds.length &&
+    storedPreferences.every((id, index) => id === draft.value.responsePreferenceIds[index])
+  );
+}
+
 function unique(values: string[]): string[] {
   return [...new Set(values)];
 }

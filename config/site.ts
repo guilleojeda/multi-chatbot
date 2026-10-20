@@ -49,8 +49,8 @@ export const siteConfig = {
   botId: "docentes",
   projectName: "Asistente para docentes",
   purpose:
-    "Un proyecto de asistencia con inteligencia artificial para acompañar tareas de enseñanza: consultar información, explorar ideas y preparar materiales. El acceso a la cuenta está habilitado mediante invitación. El chat todavía no está disponible.",
+    "Un proyecto de asistencia con inteligencia artificial para acompañar tareas de enseñanza: consultar información, explorar ideas y preparar materiales. El acceso está habilitado mediante invitación. El chat permite iniciar una consulta nueva con conocimiento general, sin documentos del proyecto. Cada envío abre un hilo nuevo; los anteriores no se pueden retomar.",
   dataUse:
-    "Para iniciar sesión se usa tu email y se registra tu acceso a este asistente. Podés completar un perfil docente con tus niveles, materias y preferencias explícitas de respuesta; esos datos se guardan asociados a tu cuenta en este asistente. El chat todavía no está disponible. Cuando se habiliten las consultas, las preguntas y conversaciones se guardarán para prestar el servicio y permitir su revisión y análisis por el equipo del proyecto; quitar una conversación del historial no eliminará esos registros. Antes de usar el chat, revisá esta información actualizada y evitá incluir datos personales de estudiantes u otras personas.",
+    "Para iniciar sesión se usa tu email y se registra tu acceso a este asistente. Podés completar un perfil docente con tus niveles, materias y preferencias explícitas de respuesta; esos datos se guardan asociados a tu cuenta en este asistente. Al usar el chat, tus preguntas y respuestas se conservan para prestar el servicio y permitir su revisión y análisis por el equipo del proyecto. Cada consulta inicia una conversación nueva y, por ahora, no podés abrir conversaciones anteriores desde la aplicación. Antes de usar el chat, evitá incluir datos personales de estudiantes u otras personas.",
   profile,
 } as const;
