@@ -53,11 +53,15 @@ describe("the docentes profile configuration", () => {
     expect(siteConfig.profile).not.toHaveProperty("defaultResponsePreferenceIds");
   });
 
-  it("describes the enabled profile and still communicates that chat is unavailable", () => {
+  it("describes the teaching assistant and the data saved for conversations", () => {
     expect(siteConfig.dataUse).toMatch(/perfil/i);
     expect(siteConfig.dataUse).not.toMatch(/todavía no hay perfil|aún no hay perfil/i);
-    expect(siteConfig.purpose).toMatch(
+    expect(siteConfig.purpose).toMatch(/enseñanza|docente/i);
+    expect(siteConfig.purpose).toMatch(/chat/i);
+    expect(siteConfig.purpose).not.toMatch(
       /chat.*(?:no está disponible|no disponible|todavía no|aún no)/i,
     );
+    expect(siteConfig.dataUse).toMatch(/preguntas|consultas/i);
+    expect(siteConfig.dataUse).toMatch(/guardar|conserv/i);
   });
 });

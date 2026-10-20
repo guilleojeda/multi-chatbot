@@ -229,21 +229,24 @@ describe("the account screens", () => {
     ).toBe(true);
   });
 
-  it("shows the authorized account and sign-out without offering chat actions", async () => {
+  it("shows the authorized account and sign-out", async () => {
     const email = "teacher@example.edu";
     const html = await renderAccountScreen({ view: "ready", email });
     if (!assertAccountShell(html)) return;
 
     expect(plainText(html)).toContain(email);
     expect(
+      interactiveControls(html).some(
+        ({ kind, name, href }) => kind === "link" && /ir al chat/i.test(name) && href === "/#/chat",
+      ),
+      "Expected the authorized account to link to the chat route",
+    ).toBe(true);
+    expect(
       interactiveControls(html).some(({ name }) =>
         /sign\s*out|log\s*out|cerrar sesión|salir/i.test(name),
       ),
       "Expected the signed-in account to have a sign-out action",
     ).toBe(true);
-    for (const { name, href } of interactiveControls(html)) {
-      expect(`${name} ${href || ""}`).not.toMatch(/chat/i);
-    }
   });
 
   it("renders a useful denied message", async () => {
