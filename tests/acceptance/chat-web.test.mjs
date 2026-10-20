@@ -110,7 +110,7 @@ describe("the chat screen", () => {
     const failed = await render({
       profileStatus: "error",
       queryStatus: "idle",
-      error: "No pudimos cargar tu perfil.",
+      profileError: "No pudimos cargar tu perfil.",
     });
     if (![loading, incomplete, failed].every(expectRendered)) return;
 
@@ -235,7 +235,7 @@ describe("the chat screen", () => {
         queryStatus: "failed",
         question: "Armá una actividad.",
         answer: "Primer tramo guardado",
-        error: "La respuesta quedó incompleta.",
+        queryError: "La respuesta quedó incompleta.",
         previousTurns,
       }),
     );
@@ -244,7 +244,7 @@ describe("the chat screen", () => {
         queryStatus: "unconfirmed",
         question: "Armá otra actividad.",
         answer: "Texto sin cierre confirmado",
-        error: "No pudimos confirmar que la respuesta haya terminado.",
+        queryError: "No pudimos confirmar que la respuesta haya terminado.",
         previousTurns,
       }),
     );

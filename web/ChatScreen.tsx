@@ -16,7 +16,8 @@ export type ChatScreenState = {
   previousTurns?: PreviousChatTurn[];
   question?: string;
   answer?: string;
-  error?: string;
+  profileError?: string;
+  queryError?: string;
   projectName?: string;
 };
 
@@ -167,7 +168,7 @@ export function ChatScreen({
 
           {state.profileStatus === "error" ? (
             <div className="chat-profile-message" role="alert">
-              <p>{state.error || "No pudimos cargar tu perfil."}</p>
+              <p>{state.profileError || "No pudimos cargar tu perfil."}</p>
               <button className="account-button" type="button" onClick={onRetryProfile}>
                 Reintentar
               </button>
@@ -255,7 +256,7 @@ export function ChatScreen({
               {state.queryStatus === "failed" ? (
                 <>
                   <p className="chat-result-error" role="alert">
-                    {state.error || "La respuesta quedó incompleta."}
+                    {state.queryError || "La respuesta quedó incompleta."}
                   </p>
                   <p className="chat-context-note">
                     Este intercambio incompleto no se incluirá en el contexto del siguiente
@@ -265,13 +266,13 @@ export function ChatScreen({
               ) : null}
               {state.queryStatus === "rejected" ? (
                 <p className="chat-result-error" role="alert">
-                  {state.error ||
+                  {state.queryError ||
                     "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
                 </p>
               ) : null}
               {state.queryStatus === "unconfirmed" ? (
                 <p className="chat-result-error" role="alert">
-                  {state.error ||
+                  {state.queryError ||
                     "No pudimos confirmar que la respuesta haya terminado. Todavía no podés recuperar este envío desde esta pantalla."}
                 </p>
               ) : null}

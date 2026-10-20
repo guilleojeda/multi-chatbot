@@ -47,8 +47,8 @@ function FixtureControls() {
         <p className="profile-fixture-eyebrow">Control local</p>
         <h2>Fixture de navegador del chat</h2>
         <p>
-          Esta página monta AccountApp y ChatScreen reales. Cuenta, perfil y Runtime se simulan en
-          memoria; no se usan Cognito, AWS ni almacenamiento persistente.
+          Esta página monta AccountApp, ChatScreen y createSession reales. Cognito, perfil y Runtime
+          se simulan en memoria; no se usan servicios AWS ni almacenamiento persistente.
         </p>
       </header>
 
@@ -82,6 +82,22 @@ function FixtureControls() {
 
       <section className="profile-fixture-control-group" aria-labelledby="chat-fixture-stream">
         <h3 id="chat-fixture-stream">Controlar la respuesta abierta</h3>
+        <div className="profile-fixture-gates">
+          <button
+            type="button"
+            disabled={!state.pendingRuntime401s}
+            onClick={() => fixture.releaseRuntime401()}
+          >
+            Responder 401 de Runtime
+          </button>
+          <button
+            type="button"
+            disabled={!state.pendingRefreshes}
+            onClick={() => fixture.releaseRefresh()}
+          >
+            Liberar refresh Cognito
+          </button>
+        </div>
         <button
           type="button"
           disabled={!state.pendingAdmissions}
@@ -109,7 +125,14 @@ function FixtureControls() {
             disabled={!state.admittedStreams}
             onClick={() => fixture.finishStream("failed")}
           >
-            Fallar
+            Fallar generación
+          </button>
+          <button
+            type="button"
+            disabled={!state.admittedStreams}
+            onClick={() => fixture.finishStream("profile-required")}
+          >
+            Rechazar por perfil incompleto
           </button>
           <button
             type="button"
@@ -136,7 +159,8 @@ function FixtureControls() {
         <p className="profile-fixture-readout">
           Perfiles pendientes: {state.pendingProfiles} · logout pendiente: {state.pendingSignOuts} ·
           admisiones pendientes: {state.pendingAdmissions} · respuestas admitidas:{" "}
-          {state.admittedStreams}
+          {state.admittedStreams}· 401 Runtime pendiente: {state.pendingRuntime401s} · refresh
+          pendiente: {state.pendingRefreshes}
         </p>
       </section>
 

@@ -1,7 +1,8 @@
 # Chat browser fixture
 
-This local fixture mounts the production `AccountApp`, profile screen, and chat screen with a
-deterministic in-memory Session and fetch boundary. It does not contact AWS or persist data.
+This local fixture mounts the production `AccountApp`, profile screen, chat screen, and
+`createSession()` with deterministic in-memory Cognito, profile, and Runtime boundaries. It does not
+contact AWS or persist data.
 The mock Runtime accepts `start` once per new conversation ID and `message` for later turns with
 that same ID. The sanitized request list and state JSON show the operation, ID, ordinal, and mock
 turns. The profile route saves edits in fixture memory so navigation can exercise the real profile
@@ -37,6 +38,24 @@ fixture controls before opening “Mi perfil.” The profile GET returns 403, so
 clear the chat and invalidate the open stream. “Emitir fragmento” should not restore stale text.
 The same scenario rejects profile PUTs if a save is attempted directly.
 
+To verify that a terminal Runtime event cannot replace a profile-read error, submit a query and leave
+its stream open. Open “Mi perfil” while the stream is active, select `profile-error`, and return to
+chat so the chat's own profile read receives 503. Use “Fallar generación” and confirm both the
+profile error with “Reintentar” and the generation failure remain visible, with no composer. Retry
+the profile after selecting `ready`; the composer should return while the query failure remains
+visible. Repeat the open-stream sequence and use “Completar” instead; the profile error and retry
+must remain, and the completed answer stays visible. To verify the authoritative admission result,
+use “Rechazar por perfil incompleto”; the profile becomes incomplete and the composer stays hidden.
+
+To reproduce the profile-save/refresh race with the real session implementation, select
+`runtime-401-pending` and send a query. While its Runtime POST is held, open “Mi perfil” and wait for
+the form. Click “Responder 401 de Runtime”; wait for “refresh pendiente: 1.” Edit a field and save.
+The first PUT should receive 401 and wait for that same real `createSession().restore()` call. There
+must be no sign-out. Click “Liberar refresh Cognito”; the PUT should retry once and save, while the
+Runtime request retries once with the renewed token and resumes its stream. Complete it and return
+to chat to confirm the same turn remains visible. The request history records only redacted bearer
+presence and status, never token values.
+
 For reset during a pending profile read, complete a turn, select `profile-pending`, open “Mi perfil,”
 and return to chat before releasing either profile request. Click “Volver al inicio,” then release
 every pending profile request. The first result belongs to the canceled read; the new chat's profile
@@ -69,5 +88,6 @@ Append `?scenario=<name>` before the hash to select an initial scenario, for exa
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
-`runtime-401`, `runtime-expired`, `runtime-forbidden`, `signout-pending`, and `clipboard-fail`. The
-selector also changes the scenario for the next matching operation without reloading.
+`runtime-401`, `runtime-401-pending`, `runtime-expired`, `runtime-forbidden`, `signout-pending`, and
+`clipboard-fail`. The selector also changes the scenario for the next matching operation without
+reloading.

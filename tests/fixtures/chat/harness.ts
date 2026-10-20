@@ -4,7 +4,7 @@ import {
   type ProfileDraft,
 } from "../../../config/profile";
 import { siteConfig } from "../../../config/site";
-import type { Session, SessionTokens } from "../../../web/session";
+import { createSession, type Session, type SessionTokens } from "../../../web/session";
 
 export const fixtureScenarios = [
   { id: "ready", label: "Perfil completo; Runtime controlado" },
@@ -19,6 +19,7 @@ export const fixtureScenarios = [
   { id: "config-temporary", label: "Configuración pública: fallo temporal 503" },
   { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
   { id: "runtime-401", label: "Runtime: 401 y refresh correcto" },
+  { id: "runtime-401-pending", label: "Runtime: 401 y refresh retenidos" },
   { id: "runtime-expired", label: "Runtime: 401 y sesión vencida" },
   { id: "runtime-forbidden", label: "Runtime: acceso denegado" },
   { id: "signout-pending", label: "Logout: revocación retenida" },
@@ -41,8 +42,26 @@ type FixtureRequest = {
   body?: unknown;
 };
 
+class FixtureSessionStorage {
+  private readonly values = new Map<string, string>([["auth-refresh", "fixture-refresh"]]);
+
+  getItem(key: string) {
+    return this.values.get(String(key)) ?? null;
+  }
+
+  setItem(key: string, value: string) {
+    this.values.set(String(key), String(value));
+  }
+
+  removeItem(key: string) {
+    this.values.delete(String(key));
+  }
+}
+
 type PendingProfile = { release: () => void };
 type PendingSignOut = { release: () => void };
+type PendingRefresh = { release: () => void };
+type PendingRuntime401 = { request: FixtureRequest; release: () => void };
 
 type ControlledStream = {
   request: FixtureRequest;
@@ -126,17 +145,20 @@ export class ChatBrowserFixture {
   private readonly tokens = new Map<string, string>();
   private readonly pendingProfiles: PendingProfile[] = [];
   private readonly pendingSignOuts: PendingSignOut[] = [];
+  private readonly pendingRefreshes: PendingRefresh[] = [];
+  private readonly pendingRuntime401s: PendingRuntime401[] = [];
   private readonly streams: ControlledStream[] = [];
   private readonly conversations = new Map<string, FixtureConversation>();
+  private readonly sessionStorage = new FixtureSessionStorage();
   private storedProfile = cloneProfile(fixtureProfile);
   private selectedScenario = initialScenario();
   private nextToken = 0;
   private restoreCount = 0;
   private restorable = true;
-  private access: string | null = null;
-  private id: string | null = null;
   private activeSub: string | null = null;
   private runtime401Used = false;
+  private holdNextRefresh = false;
+  private profileRefresh401Used = false;
   private clipboardFailure = false;
   private readonly originalClipboardDescriptor = Object.getOwnPropertyDescriptor(
     navigator,
@@ -144,15 +166,12 @@ export class ChatBrowserFixture {
   );
 
   constructor() {
-    this.session = {
-      signIn: async () => this.signIn(),
-      requestPasswordReset: async () => undefined,
-      confirmPasswordReset: async () => undefined,
-      restore: async () => this.restore(),
-      accessToken: () => this.access,
-      idToken: () => this.id,
-      signOut: async () => this.signOut(),
-    };
+    this.session = createSession({
+      clientId: this.publicConfig.clientId,
+      region: this.publicConfig.region,
+      storage: this.sessionStorage,
+      fetch: (input, init) => this.cognitoFetch(input, init),
+    });
   }
 
   subscribe(listener: () => void): () => void {
@@ -170,6 +189,7 @@ export class ChatBrowserFixture {
     this.selectedScenario = scenario;
     this.clipboardFailure = scenario === "clipboard-fail";
     this.runtime401Used = false;
+    this.profileRefresh401Used = false;
     if (this.clipboardFailure) {
       Object.defineProperty(navigator, "clipboard", {
         configurable: true,
@@ -196,13 +216,50 @@ export class ChatBrowserFixture {
     const idToken = `fixture-id-${this.nextToken}`;
     this.tokens.set(accessToken, identity.sub);
     this.activeSub = identity.sub;
-    this.access = accessToken;
-    this.id = idToken;
     this.changed();
     return { accessToken, idToken };
   }
 
-  private async restore(): Promise<SessionTokens | null> {
+  private async cognitoFetch(_input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const target = new Headers(init?.headers).get("x-amz-target") || "";
+    let body: unknown;
+    try {
+      body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+    } catch {
+      body = {};
+    }
+
+    if (target.endsWith("RevokeToken")) {
+      this.restorable = false;
+      this.activeSub = null;
+      this.holdNextRefresh = false;
+      this.changed();
+      if (this.selectedScenario === "signout-pending") {
+        await new Promise<void>((resolve) => this.pendingSignOuts.push({ release: resolve }));
+        this.changed();
+      }
+      return new Response("", { status: 200 });
+    }
+    if (target.endsWith("ForgotPassword") || target.endsWith("ConfirmForgotPassword")) {
+      if (target.endsWith("ConfirmForgotPassword")) {
+        this.restorable = false;
+        this.activeSub = null;
+        this.changed();
+      }
+      return new Response("", { status: 200 });
+    }
+    if (!target.endsWith("InitiateAuth") || !isRecord(body)) {
+      throw new Error(`Unexpected Cognito operation: ${target}`);
+    }
+
+    if (body.AuthFlow === "USER_PASSWORD_AUTH") {
+      this.restorable = true;
+      return this.cognitoTokens(this.issueTokens());
+    }
+    if (body.AuthFlow !== "REFRESH_TOKEN_AUTH") {
+      return json({ __type: "NotAuthorizedException" }, 400);
+    }
+
     this.restoreCount += 1;
     if (
       this.selectedScenario === "runtime-expired" &&
@@ -210,37 +267,39 @@ export class ChatBrowserFixture {
       this.restoreCount > 1
     ) {
       this.restorable = false;
-      this.access = null;
-      this.id = null;
       this.activeSub = null;
       this.changed();
-      return null;
+      return json({ __type: "NotAuthorizedException" }, 400);
     }
     if (!this.restorable) {
-      this.access = null;
-      this.id = null;
       this.activeSub = null;
       this.changed();
-      return null;
+      return json({ __type: "NotAuthorizedException" }, 400);
     }
-    return this.issueTokens();
+
+    if (this.holdNextRefresh) {
+      this.holdNextRefresh = false;
+      await new Promise<void>((resolve) => {
+        this.pendingRefreshes.push({ release: resolve });
+        this.changed();
+      });
+      if (!this.restorable) {
+        this.activeSub = null;
+        this.changed();
+        return json({ __type: "NotAuthorizedException" }, 400);
+      }
+    }
+    return this.cognitoTokens(this.issueTokens());
   }
 
-  private async signIn(): Promise<SessionTokens> {
-    this.restorable = true;
-    return this.issueTokens();
-  }
-
-  private async signOut() {
-    this.restorable = false;
-    this.access = null;
-    this.id = null;
-    this.activeSub = null;
-    this.changed();
-    if (this.selectedScenario === "signout-pending") {
-      await new Promise<void>((resolve) => this.pendingSignOuts.push({ release: resolve }));
-      this.changed();
-    }
+  private cognitoTokens(tokens: SessionTokens) {
+    return json({
+      AuthenticationResult: {
+        AccessToken: tokens.accessToken,
+        IdToken: tokens.idToken,
+        RefreshToken: "fixture-refresh",
+      },
+    });
   }
 
   private record(
@@ -304,6 +363,18 @@ export class ChatBrowserFixture {
     const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
     const operation = body.operation;
 
+    if (this.selectedScenario === "runtime-401-pending" && !this.runtime401Used) {
+      this.runtime401Used = true;
+      request.outcome = "Runtime 401 retenido; liberar desde los controles";
+      this.changed();
+      return new Promise<Response>((resolve) => {
+        this.pendingRuntime401s.push({
+          request,
+          release: () => resolve(json({ code: "UNAUTHORIZED" }, 401)),
+        });
+        this.changed();
+      });
+    }
     if (this.selectedScenario === "runtime-401" && !this.runtime401Used) {
       this.runtime401Used = true;
       this.finish(request, 401, "refresh de acceso activado");
@@ -431,6 +502,19 @@ export class ChatBrowserFixture {
     this.changed();
   }
 
+  releaseRefresh() {
+    this.pendingRefreshes.shift()?.release();
+    this.changed();
+  }
+
+  releaseRuntime401() {
+    const pending = this.pendingRuntime401s.shift();
+    if (!pending) return;
+    this.holdNextRefresh = true;
+    this.finish(pending.request, 401, "401 Runtime liberado; renovar sesión");
+    pending.release();
+  }
+
   admitStream() {
     this.streams.find((item) => !item.closed && !item.admitted)?.admit();
   }
@@ -449,7 +533,7 @@ export class ChatBrowserFixture {
     stream.turn.answer += text;
   }
 
-  finishStream(mode: "complete" | "failed" | "unconfirmed") {
+  finishStream(mode: "complete" | "failed" | "profile-required" | "unconfirmed") {
     const stream = this.streams.find((item) => !item.closed && item.admitted);
     if (!stream) return;
     if (mode === "complete") {
@@ -461,6 +545,15 @@ export class ChatBrowserFixture {
         code: "generation_failed",
         message: "La generación terminó con un error simulado.",
         recordStatus: "failed",
+        queryId: stream.queryId,
+      });
+      stream.turn.status = "failed";
+    } else if (mode === "profile-required") {
+      stream.push({
+        type: "failed",
+        code: "profile_required",
+        message: "Completá tu perfil para iniciar esta consulta.",
+        recordStatus: "not_admitted",
         queryId: stream.queryId,
       });
       stream.turn.status = "failed";
@@ -545,6 +638,15 @@ export class ChatBrowserFixture {
           403,
         );
       }
+      if (
+        this.selectedScenario === "runtime-401-pending" &&
+        this.pendingRefreshes.length > 0 &&
+        !this.profileRefresh401Used
+      ) {
+        this.profileRefresh401Used = true;
+        this.finish(item, 401, "PUT de perfil espera la renovación ya iniciada por Runtime");
+        return json({ code: "UNAUTHORIZED" }, 401);
+      }
       const validation = validateProfileInput(body, siteConfig.profile);
       if (!validation.ok) {
         this.finish(item, 400, "perfil inválido");
@@ -608,6 +710,8 @@ export class ChatBrowserFixture {
       session: { active: Boolean(this.activeSub), credentialsIncluded: false },
       pendingProfiles: this.pendingProfiles.length,
       pendingSignOuts: this.pendingSignOuts.length,
+      pendingRefreshes: this.pendingRefreshes.length,
+      pendingRuntime401s: this.pendingRuntime401s.length,
       pendingAdmissions: this.streams.filter(({ closed, admitted }) => !closed && !admitted).length,
       admittedStreams: this.streams.filter(({ closed, admitted }) => !closed && admitted).length,
       openStreams: this.streams.filter(({ closed }) => !closed).length,

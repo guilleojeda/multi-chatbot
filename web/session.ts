@@ -225,9 +225,11 @@ export function createSession({
     if (refreshPromise) return refreshPromise;
 
     const generation = authGeneration;
-    clearMemory();
     const refreshToken = storage.getItem(refreshStorageKey);
-    if (!refreshToken) return null;
+    if (!refreshToken) {
+      clearMemory();
+      return null;
+    }
 
     const renewal = (async (): Promise<SessionTokens | null> => {
       try {
