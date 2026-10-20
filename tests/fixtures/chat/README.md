@@ -37,6 +37,21 @@ fixture controls before opening “Mi perfil.” The profile GET returns 403, so
 clear the chat and invalidate the open stream. “Emitir fragmento” should not restore stale text.
 The same scenario rejects profile PUTs if a save is attempted directly.
 
+For reset during a pending profile read, complete a turn, select `profile-pending`, open “Mi perfil,”
+and return to chat before releasing either profile request. Click “Volver al inicio,” then release
+every pending profile request. The first result belongs to the canceled read; the new chat's profile
+read must complete, leaving the composer available. Before the fix, the new chat stayed on
+“Cargando tu perfil” after both requests had settled.
+
+To check temporary route failures without losing the same chat, complete a turn, leave a Runtime
+stream open, select `membership-temporary`, and open “Mi perfil.” The account check returns 503 and
+the route should show a retryable error while the chat content and stream remain in memory. Select
+`ready`, retry, wait for the profile form, then return to chat; the prior turn and open stream should
+still be present. Repeat with `membership-network` to exercise a rejected fetch and with
+`config-temporary` to fail the public configuration request before membership checking. For
+definitive access loss, repeat with `membership-denied` (403) or `membership-unauthorized` (401);
+the route should clear chat content and abort the stream, and a retry must not restore it.
+
 Use “Fallar” to close a query with a confirmed failure, then submit a new question. The next request
 should be `message` on the same ID while the previous exchange stays visible. Use “Cerrar sin cierre”
 for an uncertain result: record the Runtime request count, let the stream reach EOF, and verify the
@@ -52,6 +67,7 @@ logout”. The pending-profile scenario waits for “Liberar perfil”.
 
 Append `?scenario=<name>` before the hash to select an initial scenario, for example
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `profile-error`,
-`profile-pending`, `profile-save-error`, `membership-denied`, `runtime-admission-pending`,
+`profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
+`membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-401`, `runtime-expired`, `runtime-forbidden`, `signout-pending`, and `clipboard-fail`. The
 selector also changes the scenario for the next matching operation without reloading.

@@ -68,16 +68,18 @@ describe("the Strands provider boundary", () => {
         },
       },
       {
+        type: "modelStreamUpdateEvent",
+        event: {
+          type: "modelMetadataEvent",
+          usage: { inputTokens: 73, outputTokens: 28, totalTokens: 101 },
+          metrics: { latencyMs: 412 },
+        },
+      },
+      {
         type: "agentResultEvent",
         result: {
           stopReason: "endTurn",
           lastMessage: { content: [{ type: "textBlock", text: "Actividad." }] },
-          metrics: {
-            latestAgentInvocation: {
-              usage: { inputTokens: 73, outputTokens: 28, totalTokens: 101 },
-              cycles: [{ duration: 412 }],
-            },
-          },
         },
       },
     ];
@@ -130,6 +132,59 @@ describe("the Strands provider boundary", () => {
     ]);
     expect(JSON.stringify(events)).not.toContain("private provider details");
     expect(doubles.shutdowns).toBe(1);
+  });
+
+  it("omits default zero usage when Strands has no model metadata event", async () => {
+    doubles.events = [
+      {
+        type: "agentResultEvent",
+        result: {
+          stopReason: "endTurn",
+          lastMessage: { content: [{ type: "textBlock", text: "Actividad." }] },
+          metrics: {
+            latestAgentInvocation: {
+              usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+              cycles: [{ duration: 18 }],
+            },
+          },
+        },
+      },
+    ];
+
+    const events = await collect(createStrandsGenerator({ region: "us-east-1" })(request));
+
+    expect(events).toEqual([{ type: "result", stopReason: "end_turn" }]);
+    expect(doubles.shutdowns).toBe(1);
+  });
+
+  it("preserves zero usage and latency when model metadata actually reports zero", async () => {
+    doubles.events = [
+      {
+        type: "modelStreamUpdateEvent",
+        event: {
+          type: "modelMetadataEvent",
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          metrics: { latencyMs: 0 },
+        },
+      },
+      {
+        type: "agentResultEvent",
+        result: {
+          stopReason: "endTurn",
+          lastMessage: { content: [{ type: "textBlock", text: "Actividad." }] },
+        },
+      },
+    ];
+
+    const events = await collect(createStrandsGenerator({ region: "us-east-1" })(request));
+
+    expect(events).toEqual([
+      {
+        type: "result",
+        stopReason: "end_turn",
+        metrics: { inputTokens: 0, outputTokens: 0, totalTokens: 0, latencyMs: 0 },
+      },
+    ]);
   });
 
   it("rejects non-text stream deltas instead of letting them complete as an answer", async () => {

@@ -41,7 +41,7 @@ describe("continuation store ownership guard", () => {
       tableName: "conversations-aurora-dev",
     });
 
-    await store.continueTurn(turn);
+    await store.continueTurn({ ...turn, contextReferences: [] });
 
     const commands = documentClient.send.mock.calls.map(([command]) => command);
     const transaction = commands.find((command) => command instanceof TransactWriteCommand);

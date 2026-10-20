@@ -12,21 +12,36 @@ type GenerationInput = {
 
 type ProviderEvent =
   | { type: "text"; text: string }
-  | { type: "result"; stopReason: string; metrics?: Record<string, number> }
+  | {
+      type: "result";
+      stopReason: string;
+      metrics?: Record<string, number>;
+    }
   | {
       type: "error";
       providerCode?: string;
       requestId?: string;
       httpStatusCode?: number;
       attempts?: number;
+      stopReason?: string;
+      metrics?: Record<string, number>;
     };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function safeProviderError(error: unknown): Extract<ProviderEvent, { type: "error" }> {
-  if (!isRecord(error)) return { type: "error" };
+function safeProviderError(
+  error: unknown,
+  outcome?: { stopReason?: string; metrics?: Record<string, number> },
+): Extract<ProviderEvent, { type: "error" }> {
+  if (!isRecord(error)) {
+    return {
+      type: "error",
+      ...(outcome?.stopReason ? { stopReason: outcome.stopReason } : {}),
+      ...(outcome?.metrics ? { metrics: outcome.metrics } : {}),
+    };
+  }
   const metadata = isRecord(error.$metadata) ? error.$metadata : {};
   const name = typeof error.name === "string" ? error.name : undefined;
   const requestId = typeof metadata.requestId === "string" ? metadata.requestId : undefined;
@@ -45,6 +60,8 @@ function safeProviderError(error: unknown): Extract<ProviderEvent, { type: "erro
     ...(typeof attempts === "number" && Number.isInteger(attempts) && attempts > 0
       ? { attempts }
       : {}),
+    ...(outcome?.stopReason ? { stopReason: outcome.stopReason } : {}),
+    ...(outcome?.metrics ? { metrics: outcome.metrics } : {}),
   };
 }
 
@@ -59,23 +76,24 @@ function stopReason(reason: string): string {
   }
 }
 
-function usageMetrics(
-  invocation:
-    | {
-        usage: { inputTokens: number; outputTokens: number; totalTokens: number };
-        cycles: { duration: number }[];
-      }
-    | undefined,
-): Record<string, number> | undefined {
-  if (!invocation) return undefined;
+function modelEventMetrics(event: unknown): Record<string, number> | undefined {
+  if (!isRecord(event)) return undefined;
   const metrics: Record<string, number> = {};
-  const usage = invocation.usage;
-  if (Number.isFinite(usage.inputTokens)) metrics.inputTokens = usage.inputTokens;
-  if (Number.isFinite(usage.outputTokens)) metrics.outputTokens = usage.outputTokens;
-  if (Number.isFinite(usage.totalTokens)) metrics.totalTokens = usage.totalTokens;
-  if (invocation.cycles.length > 0) {
-    const latencyMs = invocation.cycles.reduce((total, cycle) => total + cycle.duration, 0);
-    if (Number.isFinite(latencyMs)) metrics.latencyMs = latencyMs;
+  const usage = isRecord(event.usage) ? event.usage : undefined;
+  for (const name of [
+    "inputTokens",
+    "outputTokens",
+    "totalTokens",
+    "cacheReadInputTokens",
+    "cacheWriteInputTokens",
+  ]) {
+    const value = usage?.[name];
+    if (typeof value === "number" && Number.isFinite(value)) metrics[name] = value;
+  }
+  const performanceMetrics = isRecord(event.metrics) ? event.metrics : undefined;
+  for (const name of ["latencyMs", "timeToFirstByteMs"]) {
+    const value = performanceMetrics?.[name];
+    if (typeof value === "number" && Number.isFinite(value)) metrics[name] = value;
   }
   return Object.keys(metrics).length > 0 ? metrics : undefined;
 }
@@ -102,6 +120,8 @@ export function createStrandsGenerator(input: { region: string }) {
       printer: false,
     });
 
+    let observedStopReason: string | undefined;
+    let observedMetrics: Record<string, number> | undefined;
     try {
       for await (const event of agent.stream(request.text)) {
         switch (event.type) {
@@ -121,9 +141,15 @@ export function createStrandsGenerator(input: { region: string }) {
                 break;
               case "modelMessageStartEvent":
               case "modelContentBlockStopEvent":
-              case "modelMessageStopEvent":
-              case "modelMetadataEvent":
                 break;
+              case "modelMessageStopEvent":
+                observedStopReason = stopReason(modelEvent.stopReason);
+                break;
+              case "modelMetadataEvent": {
+                const metrics = modelEventMetrics(modelEvent);
+                if (metrics) observedMetrics = { ...observedMetrics, ...metrics };
+                break;
+              }
               default:
                 throw new Error("Strands returned an unsupported model event.");
             }
@@ -142,7 +168,10 @@ export function createStrandsGenerator(input: { region: string }) {
             break;
           case "afterModelCallEvent":
             if (event.error) {
-              yield safeProviderError(event.error);
+              yield safeProviderError(event.error, {
+                ...(observedStopReason ? { stopReason: observedStopReason } : {}),
+                ...(observedMetrics ? { metrics: observedMetrics } : {}),
+              });
               return;
             }
             break;
@@ -153,11 +182,11 @@ export function createStrandsGenerator(input: { region: string }) {
             if (event.result.stopReason === "toolUse") {
               throw new Error("Strands requested a tool.");
             }
-            const metrics = usageMetrics(event.result.metrics?.latestAgentInvocation);
+            const resultStopReason = stopReason(event.result.stopReason);
             yield {
               type: "result",
-              stopReason: stopReason(event.result.stopReason),
-              ...(metrics ? { metrics } : {}),
+              stopReason: resultStopReason,
+              ...(observedMetrics ? { metrics: observedMetrics } : {}),
             };
             break;
           }
@@ -178,7 +207,10 @@ export function createStrandsGenerator(input: { region: string }) {
         }
       }
     } catch (error) {
-      yield safeProviderError(error);
+      yield safeProviderError(error, {
+        ...(observedStopReason ? { stopReason: observedStopReason } : {}),
+        ...(observedMetrics ? { metrics: observedMetrics } : {}),
+      });
     } finally {
       await agent.shutdown();
     }

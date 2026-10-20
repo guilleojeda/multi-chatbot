@@ -237,7 +237,8 @@ describe("the DynamoDB conversation store adapter", () => {
       }),
     );
 
-    await expect(store.readContext({ conversationId })).resolves.toEqual([
+    const context = await store.readContext({ conversationId });
+    expect(context.messages).toEqual([
       message("user", "Armá una actividad de porcentajes."),
       message("assistant", "Empezamos con una compra. con descuentos."),
       message("user", "¿Cómo lo comprueban?"),
@@ -284,7 +285,8 @@ describe("the DynamoDB conversation store adapter", () => {
       }),
     );
 
-    await expect(store.readContext({ conversationId })).resolves.toEqual([]);
+    const context = await store.readContext({ conversationId });
+    expect(context.messages).toEqual([]);
   });
 
   it.each([
@@ -403,6 +405,7 @@ describe("the DynamoDB conversation store adapter", () => {
     const result = await store.continueTurn({
       ...startInput({ text: "Ahora adaptala para trabajar sin decimales." }),
       expectedLastOrdinal: 1,
+      contextReferences: [],
     });
 
     expect(result).toMatchObject({ queryId, ordinal: 2 });
@@ -526,6 +529,7 @@ describe("the DynamoDB conversation store adapter", () => {
       store.continueTurn({
         ...startInput({ queryId: requestId }),
         expectedLastOrdinal,
+        contextReferences: [],
       });
 
     const outcomes = await Promise.allSettled([

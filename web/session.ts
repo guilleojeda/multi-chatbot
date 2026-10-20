@@ -136,6 +136,7 @@ export function createSession({
   let currentIdToken: string | null = null;
   let authGeneration = 0;
   let passwordResetPending = false;
+  let refreshPromise: Promise<SessionTokens | null> | null = null;
 
   function clearMemory() {
     currentAccessToken = null;
@@ -154,6 +155,7 @@ export function createSession({
       );
     }
     const generation = ++authGeneration;
+    refreshPromise = null;
     clearMemory();
     storage.removeItem(refreshStorageKey);
     const response = await cognitoJson(fetcher, region, "InitiateAuth", {
@@ -203,6 +205,7 @@ export function createSession({
     }
     passwordResetPending = true;
     authGeneration += 1;
+    refreshPromise = null;
     try {
       await cognitoJson(fetcher, region, "ConfirmForgotPassword", {
         ClientId: clientId,
@@ -219,34 +222,45 @@ export function createSession({
 
   async function restore(): Promise<SessionTokens | null> {
     if (passwordResetPending) return null;
-    const generation = ++authGeneration;
+    if (refreshPromise) return refreshPromise;
+
+    const generation = authGeneration;
     clearMemory();
     const refreshToken = storage.getItem(refreshStorageKey);
     if (!refreshToken) return null;
 
-    try {
-      const response = await cognitoJson(fetcher, region, "InitiateAuth", {
-        AuthFlow: "REFRESH_TOKEN_AUTH",
-        ClientId: clientId,
-        AuthParameters: { REFRESH_TOKEN: refreshToken },
-      });
-      const tokens = authenticationResult(response);
-      if (passwordResetPending || generation !== authGeneration) return null;
-      currentAccessToken = tokens.accessToken;
-      currentIdToken = tokens.idToken;
-      saveRefreshToken(tokens.refreshToken);
-      return { accessToken: tokens.accessToken, idToken: tokens.idToken };
-    } catch {
-      if (passwordResetPending || generation !== authGeneration) return null;
-      clearMemory();
-      storage.removeItem(refreshStorageKey);
-      return null;
-    }
+    const renewal = (async (): Promise<SessionTokens | null> => {
+      try {
+        const response = await cognitoJson(fetcher, region, "InitiateAuth", {
+          AuthFlow: "REFRESH_TOKEN_AUTH",
+          ClientId: clientId,
+          AuthParameters: { REFRESH_TOKEN: refreshToken },
+        });
+        const tokens = authenticationResult(response);
+        if (passwordResetPending || generation !== authGeneration) return null;
+        currentAccessToken = tokens.accessToken;
+        currentIdToken = tokens.idToken;
+        saveRefreshToken(tokens.refreshToken);
+        return { accessToken: tokens.accessToken, idToken: tokens.idToken };
+      } catch {
+        if (passwordResetPending || generation !== authGeneration) return null;
+        clearMemory();
+        storage.removeItem(refreshStorageKey);
+        return null;
+      }
+    })();
+
+    const sharedRenewal = renewal.finally(() => {
+      if (refreshPromise === sharedRenewal) refreshPromise = null;
+    });
+    refreshPromise = sharedRenewal;
+    return sharedRenewal;
   }
 
   async function signOut(): Promise<void> {
     const refreshToken = storage.getItem(refreshStorageKey);
     authGeneration += 1;
+    refreshPromise = null;
     clearMemory();
     storage.removeItem(refreshStorageKey);
     if (!refreshToken) return;

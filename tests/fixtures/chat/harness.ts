@@ -13,6 +13,10 @@ export const fixtureScenarios = [
   { id: "profile-pending", label: "GET del perfil: mantener pendiente" },
   { id: "profile-save-error", label: "PUT del perfil: 503 sin aplicar el cambio" },
   { id: "membership-denied", label: "Membresía: acceso denegado" },
+  { id: "membership-unauthorized", label: "Membresía: sesión vencida (401)" },
+  { id: "membership-temporary", label: "Membresía: fallo temporal 503" },
+  { id: "membership-network", label: "Membresía: fallo de red" },
+  { id: "config-temporary", label: "Configuración pública: fallo temporal 503" },
   { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
   { id: "runtime-401", label: "Runtime: 401 y refresh correcto" },
   { id: "runtime-expired", label: "Runtime: 401 y sesión vencida" },
@@ -491,14 +495,30 @@ export class ChatBrowserFixture {
     });
 
     if (url.pathname === "/public-config.json") {
+      if (this.selectedScenario === "config-temporary") {
+        this.finish(item, 503, "fallo temporal de configuración");
+        return json({ code: "TRY_AGAIN" }, 503);
+      }
       this.finish(item, 200, "configuración pública simulada");
       return json(this.publicConfig);
     }
     if (url.pathname === "/api/account/me" && method === "GET") {
-      if (!sub || this.selectedScenario === "membership-denied") {
-        const status = sub ? 403 : 401;
+      if (
+        !sub ||
+        this.selectedScenario === "membership-denied" ||
+        this.selectedScenario === "membership-unauthorized"
+      ) {
+        const status = sub && this.selectedScenario === "membership-denied" ? 403 : 401;
         this.finish(item, status, status === 403 ? "membresía denegada" : "sin sesión");
         return json({ code: status === 403 ? "FORBIDDEN" : "UNAUTHORIZED" }, status);
+      }
+      if (this.selectedScenario === "membership-temporary") {
+        this.finish(item, 503, "fallo temporal de membresía");
+        return json({ code: "TRY_AGAIN" }, 503);
+      }
+      if (this.selectedScenario === "membership-network") {
+        this.finish(item, "network-error", "fallo de red de membresía");
+        throw new Error("Fixture membership network failure");
       }
       this.finish(item, 200, "membresía activa simulada");
       return json({ sub, botId: this.publicConfig.botId });

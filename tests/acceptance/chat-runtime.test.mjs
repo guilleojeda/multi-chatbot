@@ -192,7 +192,7 @@ function makeHarness({
     async readContext(input) {
       state.calls.push(["readContext", clone(input)]);
       if (state.contextFailure) throw state.contextFailure;
-      return clone(state.contextMessages);
+      return { messages: clone(state.contextMessages), references: [] };
     },
     async startTurn(input) {
       state.calls.push(["startTurn", clone(input)]);
