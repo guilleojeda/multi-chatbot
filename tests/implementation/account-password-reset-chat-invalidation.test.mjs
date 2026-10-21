@@ -156,6 +156,7 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false, authOption
   vi.stubGlobal("window", {
     location: { hash: "#/chat", pathname: "/", search: "" },
     history: { replaceState() {} },
+    sessionStorage: storage,
     crypto: {
       randomUUID: () =>
         `550e8400-e29b-41d4-a716-44665544${String(++nextConversation).padStart(4, "0")}`,

@@ -42,6 +42,14 @@ const profileConfig = {
   ],
 };
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 function bearer(claims = { sub: "teacher-123", token_use: "access" }) {
   const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
   return `Bearer e30.${encoded}.runtime-validated`;
@@ -224,7 +232,7 @@ function makeHarness({
     generate(input) {
       state.providerCalls += 1;
       state.providerInput = input;
-      return generate();
+      return generate(input, state);
     },
     now: clock,
   });
@@ -545,6 +553,64 @@ describe("chat Runtime implementation regressions", () => {
       await stream.return();
     } finally {
       dispatch.mockRestore();
+    }
+  });
+
+  it("signals local provider cancellation at the deadline and closes without remote terminal evidence", async () => {
+    const admittedAt = Date.parse("2026-10-19T16:00:00.000Z");
+    const deadlineMs = 60 * 60 * 1000;
+    const providerStarted = deferred();
+    const signalObserved = deferred();
+    const harness = makeHarness({
+      clock: () => admittedAt,
+      generate: (input) => {
+        providerStarted.resolve(input);
+        return (async function* () {
+          await new Promise((resolve) => {
+            if (input.cancelSignal.aborted) {
+              resolve();
+              return;
+            }
+            input.cancelSignal.addEventListener("abort", resolve, { once: true });
+          });
+          signalObserved.resolve();
+          yield { type: "error", providerCode: "local_cancellation" };
+        })();
+      },
+    });
+    vi.useFakeTimers();
+
+    try {
+      const response = await request(harness);
+      const stream = response[Symbol.asyncIterator]();
+      expect((await stream.next()).value).toMatchObject({ type: "accepted", queryId });
+      const terminal = stream.next();
+      const generation = await providerStarted.promise;
+      expect(generation.cancelSignal).toBeInstanceOf(AbortSignal);
+      expect(generation.cancelSignal.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(deadlineMs);
+      await signalObserved.promise;
+      expect((await terminal).value).toMatchObject({
+        type: "failed",
+        code: "result_timeout",
+        canContinue: false,
+      });
+      expect(harness.state.failed).toHaveLength(1);
+      expect(harness.state.failed[0]).toMatchObject({
+        code: "result_timeout",
+        invocationClaimed: true,
+        providerFinished: false,
+      });
+      expect(harness.state.meta.closed).toBe(true);
+      expect(harness.state.submissions.get("teacher-123/bot-aurora/" + queryId)).toMatchObject({
+        status: "failed",
+        canContinue: false,
+      });
+      await stream.return();
+    } finally {
+      await vi.advanceTimersByTimeAsync(deadlineMs);
+      vi.useRealTimers();
     }
   });
 

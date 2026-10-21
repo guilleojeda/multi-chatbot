@@ -1078,7 +1078,11 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
       expect(harness.state.providerCalls).toBe(1);
 
       continueGeneration.resolve();
-      await vi.waitFor(() => expect(harness.state.completed).toBe(true));
+      await vi.waitFor(() =>
+        expect(harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }))?.status).toBe(
+          "completed",
+        ),
+      );
       await vi.waitFor(() => expect(app.getAsyncTaskInfo().activeCount).toBe(0));
       const completed = await invocationHandler.process(recoverPayload, makeContext());
 
@@ -1143,9 +1147,17 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
 
         finishGeneration.resolve();
         if (status === "completed") {
-          await vi.waitFor(() => expect(harness.state.completed).toBe(true));
+          await vi.waitFor(() =>
+            expect(harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }))?.status).toBe(
+              "completed",
+            ),
+          );
         } else {
-          await vi.waitFor(() => expect(harness.state.failed).toBe(true));
+          await vi.waitFor(() =>
+            expect(harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }))?.status).toBe(
+              "failed",
+            ),
+          );
         }
         await vi.waitFor(() => expect(app.getAsyncTaskInfo().activeCount).toBe(0));
 

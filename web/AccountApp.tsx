@@ -17,7 +17,15 @@ import { ProfileApp } from "./ProfileApp";
 import { siteConfig } from "../config/site";
 import type { ProfileConfig } from "../config/profile";
 import { ChatScreen, type ChatScreenState, type PreviousChatTurn } from "./ChatScreen";
-import { streamChat } from "./chat-api";
+import { recoverChat, streamChat, type ChatRequest } from "./chat-api";
+import {
+  clearChatJournal,
+  clearChatJournalForConfiguredBot,
+  markChatJournalAdmitted,
+  readChatJournal,
+  writePendingChatJournal,
+  type ChatJournalEntry,
+} from "./chat-journal";
 import { parseProfileEnvelope } from "./profile-data";
 
 export type AccountRoute =
@@ -210,6 +218,7 @@ export function AccountApp({
   const [retryCount, setRetryCount] = useState(0);
   const [chatScreenState, setChatScreenState] = useState<ChatScreenState>(emptyChatState);
   const [chatProfileRetryCount, setChatProfileRetryCount] = useState(0);
+  const [chatRecoveryRevision, setChatRecoveryRevision] = useState(0);
   const chatScreenStateRef = useRef(chatScreenState);
   const chatOwnerKeyRef = useRef<string | null>(null);
   const chatConversationIdRef = useRef<string | null>(null);
@@ -217,6 +226,16 @@ export function AccountApp({
   const chatProfileSequenceRef = useRef(0);
   const chatRequestRef = useRef<AbortController | null>(null);
   const chatSubmissionInFlightRef = useRef(false);
+  const chatJournalRef = useRef<ChatJournalEntry | null>(null);
+  const chatJournalOwnerRef = useRef<{
+    config: PublicConfig;
+    identity: { sub: string; botId: string };
+  } | null>(null);
+  const chatDisplayedQueryIdRef = useRef<string | null>(null);
+  const chatRecoveryGenerationRef = useRef(0);
+  const chatRecoveryControllerRef = useRef<AbortController | null>(null);
+  const chatRecoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chatRecoveryStopRef = useRef<(() => void) | null>(null);
   const configRef = useRef<PublicConfig | null>(null);
   const sessionRef = useRef<Session | null>(null);
   const retryOperationRef = useRef<RetryOperation | null>(null);
@@ -239,16 +258,44 @@ export function AccountApp({
     setChatScreenState(next);
   }, []);
 
+  const stopChatRecovery = useCallback(() => {
+    chatRecoveryGenerationRef.current += 1;
+    if (chatRecoveryTimerRef.current !== null) {
+      globalThis.clearTimeout(chatRecoveryTimerRef.current);
+      chatRecoveryTimerRef.current = null;
+    }
+    chatRecoveryControllerRef.current?.abort();
+    chatRecoveryControllerRef.current = null;
+    chatRecoveryStopRef.current?.();
+    chatRecoveryStopRef.current = null;
+  }, []);
+
+  const clearCurrentChatJournal = useCallback(() => {
+    const scope = chatJournalOwnerRef.current;
+    if (scope) {
+      try {
+        clearChatJournal(scope.config, scope.identity);
+      } catch {
+        // Access revocation still clears the in-memory reference when storage is unavailable.
+      }
+    }
+    chatJournalRef.current = null;
+    chatJournalOwnerRef.current = null;
+    chatDisplayedQueryIdRef.current = null;
+  }, []);
+
   const invalidateChat = useCallback(() => {
     chatEpochRef.current += 1;
     chatProfileSequenceRef.current += 1;
+    stopChatRecovery();
     chatRequestRef.current?.abort();
     chatRequestRef.current = null;
     chatSubmissionInFlightRef.current = false;
     chatOwnerKeyRef.current = null;
     chatConversationIdRef.current = null;
+    clearCurrentChatJournal();
     setChat(emptyChatState());
-  }, [setChat]);
+  }, [clearCurrentChatJournal, setChat, stopChatRecovery]);
 
   const activateChatIdentity = useCallback(
     (identity: { sub: string; botId: string }) => {
@@ -263,13 +310,15 @@ export function AccountApp({
 
   const resetChat = useCallback(() => {
     chatEpochRef.current += 1;
+    stopChatRecovery();
     chatRequestRef.current?.abort();
     chatRequestRef.current = null;
     chatSubmissionInFlightRef.current = false;
     chatConversationIdRef.current = null;
+    clearCurrentChatJournal();
     setChat({ profileStatus: "loading", queryStatus: "idle" });
     setChatProfileRetryCount((count) => count + 1);
-  }, [setChat]);
+  }, [clearCurrentChatJournal, setChat, stopChatRecovery]);
 
   function isCurrentRoute(identity: RouteIdentity) {
     return (
@@ -290,13 +339,14 @@ export function AccountApp({
     () => () => {
       chatEpochRef.current += 1;
       chatProfileSequenceRef.current += 1;
+      stopChatRecovery();
       chatRequestRef.current?.abort();
       chatRequestRef.current = null;
       chatSubmissionInFlightRef.current = false;
       chatOwnerKeyRef.current = null;
       chatConversationIdRef.current = null;
     },
-    [],
+    [stopChatRecovery],
   );
 
   const inspectInvitation = useCallback(
@@ -369,8 +419,14 @@ export function AccountApp({
           if (!isActive()) return;
           authorizedRouteRef.current = null;
           const apiError = asApiError(error);
-          if (apiError.status === 401 || apiError.status === 403 || apiError.refreshFailed)
+          if (apiError.status === 401 || apiError.status === 403 || apiError.refreshFailed) {
+            try {
+              clearChatJournalForConfiguredBot(config);
+            } catch {
+              // Authentication failure still invalidates the in-memory chat state.
+            }
             invalidateChat();
+          }
           setState({
             view: "denied",
             email,
@@ -474,6 +530,11 @@ export function AccountApp({
           return;
         }
         if (!restored) {
+          try {
+            clearChatJournalForConfiguredBot(config);
+          } catch {
+            // A missing session still invalidates the in-memory chat state.
+          }
           invalidateChat();
           setState({
             view: "login",
@@ -486,8 +547,16 @@ export function AccountApp({
       } catch (error) {
         if (!isActive()) return;
         const apiError = asApiError(error);
-        if (apiError.status === 401 || apiError.status === 403 || apiError.refreshFailed)
+        if (apiError.status === 401 || apiError.status === 403 || apiError.refreshFailed) {
+          if (configRef.current) {
+            try {
+              clearChatJournalForConfiguredBot(configRef.current);
+            } catch {
+              // Authentication failure still invalidates the in-memory chat state.
+            }
+          }
           invalidateChat();
+        }
         const context = configRef.current ? "inspect" : "config";
         setState({
           view: "denied",
@@ -838,7 +907,6 @@ export function AccountApp({
     ) {
       return;
     }
-
     const identity = readyIdentity;
     const identityKey = chatOwnerKey(identity);
     const chatEpoch = chatEpochRef.current;
@@ -903,34 +971,411 @@ export function AccountApp({
     state.view,
   ]);
 
+  useEffect(() => {
+    if (
+      route.kind !== "chat" ||
+      !authorizedRouteIsCurrent ||
+      state.view !== "ready" ||
+      !readyIdentity ||
+      !apiConfig ||
+      !session ||
+      chatOwnerKeyRef.current !== chatOwnerKey(readyIdentity)
+    ) {
+      return;
+    }
+    if (chatRequestRef.current && !chatRequestRef.current.signal.aborted) {
+      return;
+    }
+
+    const recoveryConfig = apiConfig;
+    const recoverySession = session;
+    if (!recoveryConfig || !recoverySession) return;
+
+    const identity = { sub: readyIdentity.sub, botId: readyIdentity.botId };
+    const identityKey = chatOwnerKey(identity);
+    const chatEpoch = chatEpochRef.current;
+    const generation = ++chatRecoveryGenerationRef.current;
+    let active = true;
+    let failures = 0;
+    let currentController: AbortController | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let onOnline: (() => void) | null = null;
+    const isActive = () =>
+      active &&
+      generation === chatRecoveryGenerationRef.current &&
+      chatEpochRef.current === chatEpoch &&
+      chatOwnerKeyRef.current === identityKey &&
+      currentRouteKeyRef.current === "chat";
+    const clearTimer = () => {
+      if (timer !== null) globalThis.clearTimeout(timer);
+      if (chatRecoveryTimerRef.current === timer) chatRecoveryTimerRef.current = null;
+      timer = null;
+    };
+    const schedule = (delay: number) => {
+      if (!isActive() || timer !== null) return;
+      timer = globalThis.setTimeout(() => {
+        timer = null;
+        if (chatRecoveryTimerRef.current !== null) chatRecoveryTimerRef.current = null;
+        void poll();
+      }, delay);
+      chatRecoveryTimerRef.current = timer;
+    };
+    const stopCycle = () => {
+      if (!active) return;
+      active = false;
+      clearTimer();
+      if (onOnline) window.removeEventListener?.("online", onOnline);
+      if (chatRecoveryStopRef.current === stopCycle) chatRecoveryStopRef.current = null;
+      if (chatRecoveryGenerationRef.current === generation) chatRecoveryGenerationRef.current += 1;
+      currentController?.abort();
+      if (chatRecoveryControllerRef.current === currentController)
+        chatRecoveryControllerRef.current = null;
+    };
+
+    let loadedJournal: ChatJournalEntry | null;
+    try {
+      loadedJournal = readChatJournal(recoveryConfig, identity);
+    } catch {
+      setChat({
+        ...chatScreenStateRef.current,
+        queryError: "No pudimos leer la referencia de recuperación de esta pestaña.",
+      });
+      return () => {
+        active = false;
+        clearTimer();
+      };
+    }
+
+    chatJournalOwnerRef.current = { config: recoveryConfig, identity };
+    chatJournalRef.current = loadedJournal;
+    if (!loadedJournal) {
+      chatConversationIdRef.current = null;
+      return () => {
+        active = false;
+        clearTimer();
+      };
+    }
+
+    const journal = loadedJournal;
+    const request = journal.request;
+    const pendingText = journal.admitted ? undefined : journal.request.text;
+    chatConversationIdRef.current = request.conversationId;
+    const current = chatScreenStateRef.current;
+    const terminalAlreadyVisible =
+      chatDisplayedQueryIdRef.current === request.queryId &&
+      (current.queryStatus === "completed" || current.queryStatus === "failed");
+    if (terminalAlreadyVisible) {
+      return () => {
+        active = false;
+        clearTimer();
+      };
+    }
+
+    chatDisplayedQueryIdRef.current = request.queryId;
+    setChat({
+      ...current,
+      queryStatus: journal.admitted ? "streaming" : "unconfirmed",
+      question: journal.admitted ? current.question : pendingText,
+      answer: journal.admitted ? current.answer || "" : "",
+      canContinue: journal.admitted ? current.canContinue : false,
+      canRetry: !journal.admitted,
+      recovered: false,
+      recoveryLoading: true,
+      queryError: undefined,
+    });
+
+    const applySnapshot = (
+      snapshot: Extract<Awaited<ReturnType<typeof recoverChat>>, { version: 2 }>,
+    ) => {
+      if (!isActive() || chatJournalRef.current?.request.queryId !== request.queryId) return;
+      const reference = {
+        version: 2 as const,
+        operation: request.operation,
+        conversationId: request.conversationId,
+        queryId: request.queryId,
+        baseOrdinal: request.baseOrdinal,
+      };
+      try {
+        markChatJournalAdmitted(recoveryConfig, identity, reference, snapshot.ordinal);
+      } catch {
+        // The current page can still render the authorized snapshot; the helper removes plaintext on failure.
+      }
+      chatJournalRef.current = {
+        request: reference,
+        admitted: true,
+        ordinal: snapshot.ordinal,
+      };
+      chatConversationIdRef.current = snapshot.conversationId;
+      const before = chatScreenStateRef.current;
+      const isTerminal = snapshot.status === "completed" || snapshot.status === "failed";
+      if (
+        (before.queryStatus === "completed" || before.queryStatus === "failed") &&
+        chatDisplayedQueryIdRef.current === snapshot.queryId &&
+        !isTerminal
+      ) {
+        return;
+      }
+      chatDisplayedQueryIdRef.current = snapshot.queryId;
+      setChat({
+        ...before,
+        question: snapshot.question,
+        answer: snapshot.answer,
+        ordinal: snapshot.ordinal,
+        canContinue: snapshot.canContinue,
+        quota: snapshot.quota,
+        quotaReceivedAt: snapshot.quota ? performance.now() : undefined,
+        queryStatus: snapshot.status === "in_progress" ? "streaming" : snapshot.status,
+        queryError: undefined,
+        recovered: true,
+        recoveryLoading: false,
+        canRetry: false,
+      });
+    };
+
+    async function poll() {
+      if (!isActive() || currentController) return;
+      const controller = new AbortController();
+      currentController = controller;
+      chatRecoveryControllerRef.current = controller;
+      try {
+        const result = await recoverChat(
+          recoveryConfig,
+          recoverySession,
+          {
+            version: 2,
+            operation: "recover",
+            conversationId: request.conversationId,
+            queryId: request.queryId,
+          },
+          { isActive, signal: controller.signal },
+        );
+        if (!isActive() || chatJournalRef.current?.request.queryId !== request.queryId) return;
+        if ("version" in result) {
+          failures = 0;
+          applySnapshot(result);
+          if (result.status === "in_progress") schedule(1_000);
+          else stopCycle();
+          return;
+        }
+
+        if (result.status === "completed") {
+          failures = 0;
+          const reference = {
+            version: 2 as const,
+            operation: request.operation,
+            conversationId: request.conversationId,
+            queryId: request.queryId,
+            baseOrdinal: request.baseOrdinal,
+          };
+          try {
+            markChatJournalAdmitted(recoveryConfig, identity, reference, result.ordinal);
+          } catch {
+            // The terminal result is still displayed; plaintext removal is attempted by the helper.
+          }
+          chatJournalRef.current = {
+            request: reference,
+            admitted: true,
+            ordinal: result.ordinal,
+          };
+          chatDisplayedQueryIdRef.current = result.queryId;
+          setChat({
+            ...chatScreenStateRef.current,
+            queryStatus: "completed",
+            ordinal: result.ordinal,
+            canContinue: true,
+            recovered: true,
+            recoveryLoading: false,
+            canRetry: false,
+          });
+          stopCycle();
+          return;
+        }
+
+        if (result.status !== "failed") return;
+
+        const failureCode = result.code.toLowerCase();
+        if (failureCode === "access_denied") {
+          invalidateChat();
+          profileForbidden();
+          return;
+        }
+        if (failureCode === "unauthorized") {
+          invalidateChat();
+          profileUnauthorized();
+          return;
+        }
+
+        if (
+          result.code === "conversation_unavailable" &&
+          result.recordStatus === "not_admitted" &&
+          !journal.admitted
+        ) {
+          setChat({
+            ...chatScreenStateRef.current,
+            queryStatus: "unconfirmed",
+            question: pendingText,
+            answer: "",
+            recovered: false,
+            recoveryLoading: false,
+            canRetry: true,
+            queryError:
+              "No pudimos confirmar si se admitió el envío. Todavía no encontramos una referencia; podés reintentar el mismo pedido.",
+          });
+          stopCycle();
+          return;
+        }
+
+        if (result.recordStatus === "failed") {
+          const reference = {
+            version: 2 as const,
+            operation: request.operation,
+            conversationId: request.conversationId,
+            queryId: request.queryId,
+            baseOrdinal: request.baseOrdinal,
+          };
+          try {
+            markChatJournalAdmitted(recoveryConfig, identity, reference, request.baseOrdinal + 1);
+          } catch {
+            // The failure response is still displayed; plaintext removal is attempted by the helper.
+          }
+          chatJournalRef.current = {
+            request: reference,
+            admitted: true,
+            ordinal: request.baseOrdinal + 1,
+          };
+          setChat({
+            ...chatScreenStateRef.current,
+            question: journal.admitted ? chatScreenStateRef.current.question : pendingText,
+            queryStatus: "failed",
+            canContinue: result.canContinue ?? false,
+            canRetry: false,
+            recovered: true,
+            recoveryLoading: false,
+            queryError: result.message,
+          });
+          stopCycle();
+          return;
+        }
+
+        setChat({
+          ...chatScreenStateRef.current,
+          queryStatus: journal.admitted ? "streaming" : "unconfirmed",
+          recoveryLoading: false,
+          canRetry: false,
+          queryError: result.message,
+        });
+        failures += 1;
+        schedule(Math.min(1_000 * 2 ** Math.min(failures - 1, 5), 30_000));
+      } catch (error) {
+        if (!isActive()) return;
+        const apiError = asApiError(error);
+        if (apiError.status === 401 || apiError.refreshFailed) {
+          invalidateChat();
+          profileUnauthorized();
+          return;
+        }
+        if (apiError.status === 403) {
+          invalidateChat();
+          profileForbidden();
+          return;
+        }
+        failures += 1;
+        setChat({
+          ...chatScreenStateRef.current,
+          queryStatus: journal.admitted ? "streaming" : "unconfirmed",
+          recoveryLoading: false,
+          canRetry: !journal.admitted,
+          queryError: "No pudimos actualizar el estado. Vamos a volver a consultarlo.",
+        });
+        schedule(Math.min(1_000 * 2 ** Math.min(failures - 1, 5), 30_000));
+      } finally {
+        if (currentController === controller) currentController = null;
+        if (chatRecoveryControllerRef.current === controller)
+          chatRecoveryControllerRef.current = null;
+      }
+    }
+
+    onOnline = () => {
+      clearTimer();
+      void poll();
+    };
+    chatRecoveryStopRef.current = stopCycle;
+    window.addEventListener?.("online", onOnline);
+    void poll();
+
+    return () => {
+      stopCycle();
+    };
+  }, [
+    apiConfig,
+    authorizedRouteIsCurrent,
+    invalidateChat,
+    profileForbidden,
+    profileUnauthorized,
+    readyIdentity,
+    route.kind,
+    session,
+    setChat,
+    chatRecoveryRevision,
+    state.view,
+  ]);
+
   function submitChat(text: string): boolean {
     const identity = state.view === "ready" ? state.identity : undefined;
     const current = chatScreenStateRef.current;
     const ownerKey = identity ? chatOwnerKey(identity) : null;
+    const previousJournal = chatJournalRef.current;
+    const retrying =
+      current.queryStatus === "unconfirmed" &&
+      previousJournal !== null &&
+      !previousJournal.admitted &&
+      previousJournal.request.text === text;
+    const canStartNewRequest =
+      current.queryStatus === "idle" ||
+      ((current.queryStatus === "completed" || current.queryStatus === "failed") &&
+        current.canContinue !== false) ||
+      (current.queryStatus === "rejected" && Boolean(current.quota));
     if (
       !identity ||
       !ownerKey ||
       !apiConfig ||
       !session ||
       chatOwnerKeyRef.current !== ownerKey ||
-      current.profileStatus !== "complete" ||
-      (current.queryStatus !== "idle" &&
-        !(
-          (current.queryStatus === "completed" || current.queryStatus === "failed") &&
-          current.canContinue !== false
-        ) &&
-        !(current.queryStatus === "rejected" && Boolean(current.quota))) ||
+      (current.profileStatus !== "complete" && !retrying) ||
+      (!retrying && !canStartNewRequest) ||
+      (previousJournal && !previousJournal.admitted && !retrying) ||
       chatSubmissionInFlightRef.current ||
       !text.trim()
     ) {
       return false;
     }
 
-    const operation = chatConversationIdRef.current ? "message" : "start";
-    const conversationId = chatConversationIdRef.current || window.crypto.randomUUID();
-    const queryId = window.crypto.randomUUID();
-    const baseOrdinal =
-      operation === "start" ? 0 : (current.ordinal ?? priorTurnsIncludingCurrent(current).length);
+    const request: ChatRequest = retrying
+      ? previousJournal.request
+      : {
+          version: 2,
+          operation: chatConversationIdRef.current ? "message" : "start",
+          conversationId: chatConversationIdRef.current || window.crypto.randomUUID(),
+          queryId: window.crypto.randomUUID(),
+          baseOrdinal: chatConversationIdRef.current
+            ? (current.ordinal ?? priorTurnsIncludingCurrent(current).length)
+            : 0,
+          text,
+        };
+    const { operation, conversationId, queryId, baseOrdinal } = request;
+    try {
+      writePendingChatJournal(apiConfig, identity, request);
+    } catch {
+      setChat({
+        ...current,
+        queryError: "No pudimos guardar temporalmente la consulta; no se envió al asistente.",
+      });
+      return false;
+    }
+    stopChatRecovery();
+    chatJournalRef.current = { request, admitted: false };
+    chatJournalOwnerRef.current = { config: apiConfig, identity };
+    chatDisplayedQueryIdRef.current = queryId;
     chatConversationIdRef.current = conversationId;
     const controller = new AbortController();
     const chatEpoch = chatEpochRef.current;
@@ -949,41 +1394,74 @@ export function AccountApp({
       answer: "",
       quota: undefined,
       quotaReceivedAt: undefined,
+      queryError: undefined,
+      recovered: false,
+      recoveryLoading: false,
+      canRetry: false,
     });
 
-    void streamChat(
-      apiConfig,
-      session,
-      { version: 2, operation, conversationId, queryId, baseOrdinal, text },
-      {
-        signal: controller.signal,
-        isActive,
-        onEvent: (event) => {
-          if (!isActive()) return;
-          const before = chatScreenStateRef.current;
-          if (event.type === "accepted") {
-            setChat({ ...before, queryStatus: "streaming", ordinal: event.ordinal });
-          } else if (event.type === "text") {
-            setChat({
-              ...before,
-              queryStatus: "streaming",
-              answer: (before.answer || "") + event.text,
-            });
-          } else if (event.type === "completed") {
-            setChat({
-              ...before,
-              queryStatus: "completed",
-              canContinue: true,
-              queryError: undefined,
-            });
+    void streamChat(apiConfig, session, request, {
+      signal: controller.signal,
+      isActive,
+      onEvent: (event) => {
+        if (!isActive()) return;
+        const before = chatScreenStateRef.current;
+        if (event.type === "accepted") {
+          const admittedRequest = {
+            version: 2 as const,
+            operation,
+            conversationId,
+            queryId,
+            baseOrdinal,
+          };
+          try {
+            markChatJournalAdmitted(apiConfig, identity, admittedRequest, event.ordinal);
+          } catch {
+            // The in-memory result remains usable; the helper removes plaintext on failure.
           }
-        },
+          chatJournalRef.current = {
+            request: admittedRequest,
+            admitted: true,
+            ordinal: event.ordinal,
+          };
+          setChat({ ...before, queryStatus: "streaming", ordinal: event.ordinal });
+        } else if (event.type === "text") {
+          setChat({
+            ...before,
+            queryStatus: "streaming",
+            answer: (before.answer || "") + event.text,
+          });
+        } else if (event.type === "completed") {
+          setChat({
+            ...before,
+            queryStatus: "completed",
+            canContinue: true,
+            queryError: undefined,
+          });
+        }
       },
-    )
+    })
       .then((result) => {
         if (!isActive()) return;
         const before = chatScreenStateRef.current;
         if ("version" in result) {
+          const admittedRequest = {
+            version: 2 as const,
+            operation,
+            conversationId,
+            queryId,
+            baseOrdinal,
+          };
+          try {
+            markChatJournalAdmitted(apiConfig, identity, admittedRequest, result.ordinal);
+          } catch {
+            // The in-memory result remains usable; the helper removes plaintext on failure.
+          }
+          chatJournalRef.current = {
+            request: admittedRequest,
+            admitted: true,
+            ordinal: result.ordinal,
+          };
           setChat({
             ...before,
             question: result.question,
@@ -993,16 +1471,38 @@ export function AccountApp({
             quota: result.quota,
             quotaReceivedAt: result.quota ? performance.now() : undefined,
             queryStatus: result.status === "in_progress" ? "streaming" : result.status,
-            queryError: result.status === "failed" ? before.queryError : undefined,
+            queryError: undefined,
+            recovered: retrying,
+            recoveryLoading: false,
+            canRetry: false,
           });
           return;
         }
         if (result.status === "completed") {
+          const admittedRequest = {
+            version: 2 as const,
+            operation,
+            conversationId,
+            queryId,
+            baseOrdinal,
+          };
+          try {
+            markChatJournalAdmitted(apiConfig, identity, admittedRequest, result.ordinal);
+          } catch {
+            // The in-memory result remains usable; the helper removes plaintext on failure.
+          }
+          chatJournalRef.current = {
+            request: admittedRequest,
+            admitted: true,
+            ordinal: result.ordinal,
+          };
           setChat({
             ...before,
             queryStatus: "completed",
             canContinue: true,
             queryError: undefined,
+            recoveryLoading: false,
+            canRetry: false,
           });
           return;
         }
@@ -1012,12 +1512,47 @@ export function AccountApp({
           profileForbidden();
           return;
         }
-        if (
-          operation === "start" &&
-          result.recordStatus === "not_admitted" &&
-          chatConversationIdRef.current === conversationId
-        ) {
-          chatConversationIdRef.current = null;
+        if (result.recordStatus === "not_admitted") {
+          if (previousJournal?.admitted) {
+            try {
+              markChatJournalAdmitted(
+                apiConfig,
+                identity,
+                previousJournal.request,
+                previousJournal.ordinal,
+              );
+            } catch {
+              // The rejected request does not replace the previous durable turn in memory.
+            }
+            chatJournalRef.current = previousJournal;
+            chatConversationIdRef.current = previousJournal.request.conversationId;
+          } else {
+            try {
+              clearChatJournal(apiConfig, identity);
+            } catch {
+              // A definitive pre-admission rejection still clears the in-memory reference.
+            }
+            chatJournalRef.current = null;
+            if (operation === "start") chatConversationIdRef.current = null;
+          }
+        } else if (result.recordStatus === "failed") {
+          const admittedRequest = {
+            version: 2 as const,
+            operation,
+            conversationId,
+            queryId,
+            baseOrdinal,
+          };
+          try {
+            markChatJournalAdmitted(apiConfig, identity, admittedRequest, baseOrdinal + 1);
+          } catch {
+            // The terminal result is still shown; plaintext removal is attempted by the helper.
+          }
+          chatJournalRef.current = {
+            request: admittedRequest,
+            admitted: true,
+            ordinal: baseOrdinal + 1,
+          };
         }
         setChat({
           ...before,
@@ -1033,6 +1568,9 @@ export function AccountApp({
           quota: result.quota,
           quotaReceivedAt: result.quota ? performance.now() : undefined,
           queryError: result.code.toLowerCase() === "quota_exceeded" ? undefined : result.message,
+          recovered: retrying && result.recordStatus !== "not_admitted",
+          recoveryLoading: false,
+          canRetry: result.recordStatus === "unconfirmed" && !chatJournalRef.current?.admitted,
         });
       })
       .catch((error: unknown) => {
@@ -1051,16 +1589,25 @@ export function AccountApp({
         setChat({
           ...chatScreenStateRef.current,
           queryStatus: "unconfirmed",
+          canRetry: Boolean(chatJournalRef.current && !chatJournalRef.current.admitted),
+          recoveryLoading: false,
           queryError:
             apiError.code === "UNCONFIRMED"
-              ? "No pudimos confirmar que la respuesta haya terminado. Todavía no podés recuperar este envío desde esta pantalla."
-              : "No pudimos confirmar el resultado de esta consulta. Todavía no podés recuperar este envío desde esta pantalla.",
+              ? "No pudimos confirmar que la respuesta haya terminado. Vamos a conservar el mismo envío para recuperarlo."
+              : "No pudimos confirmar el resultado de esta consulta. Vamos a conservar el mismo envío para recuperarlo.",
         });
       })
       .finally(() => {
         if (chatRequestRef.current !== controller) return;
         chatRequestRef.current = null;
         chatSubmissionInFlightRef.current = false;
+        if (
+          chatJournalRef.current &&
+          (chatScreenStateRef.current.queryStatus === "unconfirmed" ||
+            chatScreenStateRef.current.queryStatus === "streaming")
+        ) {
+          setChatRecoveryRevision((revision) => revision + 1);
+        }
       });
     return true;
   }

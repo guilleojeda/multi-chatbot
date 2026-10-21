@@ -21,6 +21,9 @@ export type ChatScreenState = {
   canContinue?: boolean;
   quota?: QuotaView;
   quotaReceivedAt?: number;
+  recovered?: boolean;
+  recoveryLoading?: boolean;
+  canRetry?: boolean;
   profileError?: string;
   queryError?: string;
   projectName?: string;
@@ -140,11 +143,14 @@ export function ChatScreen({
   const quotaMessage = quotaTime
     ? `Llegaste al límite de uso, vas a poder seguir usando la aplicación en ${quotaTime}`
     : null;
-  const progressMessage =
-    state.queryStatus === "sending"
+  const progressMessage = state.recoveryLoading
+    ? "Recuperando el último envío…"
+    : state.queryStatus === "sending"
       ? "Enviando consulta…"
       : state.queryStatus === "streaming"
-        ? "Generando respuesta…"
+        ? state.recoveryLoading
+          ? "Recuperando el último envío…"
+          : "Generando respuesta…"
         : state.queryStatus === "idle"
           ? previousTurns.length > 0
             ? "Escribí un seguimiento para continuar este hilo."
@@ -190,13 +196,14 @@ export function ChatScreen({
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canSubmit) return;
+    if (onSubmit(draft) === false) return;
     while (previousCopyTargetsRef.current.length < previousTurns.length) {
       previousCopyTargetsRef.current.push(null);
     }
     previousCopyTargetsRef.current[previousTurns.length] =
       state.queryStatus === "completed" && state.answer ? currentCopyTargetRef.current : null;
     currentCopyTargetRef.current = null;
-    if (onSubmit(draft) !== false) setDraft("");
+    setDraft("");
   }
 
   function restart() {
@@ -249,8 +256,8 @@ export function ChatScreen({
             proyecto.
           </p>
           <p className="chat-limit-note">
-            Podés continuar este hilo mientras siga abierta tu sesión. Al recargar o cerrar sesión,
-            el chat empieza vacío; todavía no podés abrir hilos anteriores.
+            Se conserva el último envío de esta pestaña para recuperar su estado. Antes de que se
+            admita, la consulta se guarda temporalmente; después se conserva solo su referencia.
           </p>
 
           <nav className="chat-account-actions" aria-label="Acciones de cuenta">
@@ -290,8 +297,26 @@ export function ChatScreen({
             </div>
           ) : null}
 
+          {(state.queryStatus === "idle" || state.queryStatus === "completed") &&
+          state.queryError ? (
+            <p className="chat-result-error" role="alert">
+              {state.queryError}
+            </p>
+          ) : null}
+
           {showConversation ? (
             <div className="chat-conversation">
+              {state.recovered ? (
+                <p className="chat-context-note" role="status">
+                  Recuperamos el último envío de esta conversación
+                </p>
+              ) : null}
+              {sending ? (
+                <p className="chat-context-note" role="status">
+                  El trabajo puede continuar aunque dejes esta pantalla o cierres sesión. El cupo
+                  consumido no se devuelve.
+                </p>
+              ) : null}
               {previousTurns.length > 0 ? (
                 <ol className="chat-previous-turns" aria-label="Intercambios anteriores">
                   {previousTurns.map((turn, index) => {
@@ -351,13 +376,15 @@ export function ChatScreen({
                 <div className="chat-answer-block">
                   <p className="chat-message-label">Respuesta</p>
                   <div className="chat-answer">{state.answer}</div>
-                  {state.queryStatus === "completed" ? (
+                  {state.queryStatus === "completed" || state.queryStatus === "failed" ? (
                     <button
                       className="account-button chat-copy-button"
                       type="button"
                       onClick={() => void copyAnswer(state.answer || "", copyTargetForCurrent())}
                     >
-                      Copiar respuesta
+                      {state.queryStatus === "completed"
+                        ? "Copiar respuesta"
+                        : "Copiar texto parcial"}
                     </button>
                   ) : null}
                   {currentCopyTargetRef.current?.error ? (
@@ -393,15 +420,33 @@ export function ChatScreen({
                   </p>
                 )
               ) : null}
-              {state.queryStatus === "unconfirmed" ? (
+              {state.queryStatus === "unconfirmed" && !state.recoveryLoading ? (
+                <>
+                  <p className="chat-result-error" role="alert">
+                    {state.queryError || "No pudimos confirmar el estado de esta consulta."}
+                  </p>
+                  {state.canRetry && state.question ? (
+                    <button
+                      className="account-button account-button--secondary chat-restart-button"
+                      type="button"
+                      onClick={() => {
+                        if (onSubmit(state.question || "") !== false) setDraft("");
+                      }}
+                    >
+                      Reintentar el mismo envío
+                    </button>
+                  ) : null}
+                </>
+              ) : null}
+              {state.queryStatus === "streaming" && state.queryError ? (
                 <p className="chat-result-error" role="alert">
-                  {state.queryError ||
-                    "No pudimos confirmar que la respuesta haya terminado. Todavía no podés recuperar este envío desde esta pantalla."}
+                  {state.queryError}
                 </p>
               ) : null}
 
               {state.queryStatus === "completed" ||
               state.queryStatus === "failed" ||
+              sending ||
               (state.queryStatus === "rejected" && !state.quota) ||
               state.queryStatus === "unconfirmed" ? (
                 <button

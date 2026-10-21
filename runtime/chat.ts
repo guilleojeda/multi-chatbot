@@ -14,7 +14,7 @@ import type {
   ContinueTurnInput,
   SubmissionSnapshot,
 } from "./contracts.js";
-import { splitUtf8Text } from "./text.js";
+import { maxDynamoTextChunkBytes, splitUtf8Text } from "./text.js";
 
 type ChatConfig = {
   botId: string;
@@ -58,6 +58,12 @@ type ProviderInput = {
   messages: MessageData[];
   modelId: string;
   revision: string;
+  cancelSignal: AbortSignal;
+};
+
+type AsyncTaskRegistry = {
+  addAsyncTask(name: string, metadata?: Record<string, unknown>): number;
+  completeAsyncTask(taskId: number): boolean;
 };
 
 type ChatDependencies = {
@@ -108,6 +114,8 @@ const recoverPayloadKeys = new Set(["version", "operation", "conversationId", "q
 const responseBatchBytes = 8 * 1024;
 const responseBatchIntervalMs = 250;
 const resultDeadlineMs = 60 * 60 * 1000;
+const observerQueueMaxEvents = 32;
+const observerQueueMaxBytes = 2 * maxDynamoTextChunkBytes + 16 * 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -672,7 +680,97 @@ export function createChatHandler(dependencies: ChatDependencies) {
   };
 }
 
-export function createChatInvocationHandler(chat: ReturnType<typeof createChatHandler>) {
+type ChatEventChannel = ReturnType<typeof createChatEventChannel>;
+type RuntimeInvocationEvent = { event: ChatEvent["type"]; data: ChatEvent };
+
+function createChatEventChannel() {
+  const queue: { event: ChatEvent; bytes: number }[] = [];
+  const waitingReaders: (() => void)[] = [];
+  let queuedBytes = 0;
+  let closed = false;
+  let detached = false;
+
+  function wakeReaders(): void {
+    for (const wake of waitingReaders.splice(0)) wake();
+  }
+
+  function close(): void {
+    closed = true;
+    wakeReaders();
+  }
+
+  function detach(): void {
+    detached = true;
+    closed = true;
+    queue.length = 0;
+    queuedBytes = 0;
+    wakeReaders();
+  }
+
+  function publish(event: ChatEvent): boolean {
+    if (closed || detached) return false;
+    const bytes = event.type === "text" ? Buffer.byteLength(event.text, "utf8") + 512 : 1024;
+    if (queue.length >= observerQueueMaxEvents || queuedBytes + bytes > observerQueueMaxBytes) {
+      // Durable output continues; the observer must recover because this stream lost continuity.
+      detach();
+      return false;
+    }
+    queue.push({ event, bytes });
+    queuedBytes += bytes;
+    wakeReaders();
+    return true;
+  }
+
+  async function next(): Promise<IteratorResult<ChatEvent>> {
+    while (queue.length === 0 && !closed) {
+      await new Promise<void>((resolve) => waitingReaders.push(resolve));
+    }
+    const buffered = queue.shift();
+    if (buffered) {
+      queuedBytes -= buffered.bytes;
+      return { done: false, value: buffered.event };
+    }
+    return { done: true, value: undefined };
+  }
+
+  return { publish, close, detach, next };
+}
+
+function observeChatEvents(
+  channel: ChatEventChannel,
+): AsyncGenerator<RuntimeInvocationEvent, void, unknown> {
+  const iterator: AsyncGenerator<RuntimeInvocationEvent, void, unknown> = {
+    async next() {
+      const next = await channel.next();
+      if (next.done) return { done: true, value: undefined };
+      return { done: false, value: { event: next.value.type, data: next.value } };
+    },
+    async return(value?: void | PromiseLike<void>) {
+      channel.detach();
+      return { done: true, value: await value };
+    },
+    async throw(error?: unknown) {
+      channel.detach();
+      throw error;
+    },
+    [Symbol.asyncIterator]() {
+      return iterator;
+    },
+  };
+  return iterator;
+}
+
+function oneChatEvent(event: ChatEvent): AsyncIterable<RuntimeInvocationEvent> {
+  const channel = createChatEventChannel();
+  channel.publish(event);
+  channel.close();
+  return observeChatEvents(channel);
+}
+
+export function createChatInvocationHandler(
+  chat: ReturnType<typeof createChatHandler>,
+  tasks: AsyncTaskRegistry,
+) {
   return {
     async process(payload: unknown, context: ChatContext) {
       const result = await chat(payload, context);
@@ -684,11 +782,69 @@ export function createChatInvocationHandler(chat: ReturnType<typeof createChatHa
       ) {
         return result;
       }
-      return (async function* () {
-        for await (const event of result) {
-          yield { event: event.type, data: event };
+
+      const producer = result[Symbol.asyncIterator]();
+      let first: IteratorResult<ChatEvent>;
+      try {
+        first = await producer.next();
+      } catch {
+        return oneChatEvent(
+          safeFailure(
+            "temporarily_unavailable",
+            "unconfirmed",
+            isRecord(payload) && typeof payload.queryId === "string" ? payload.queryId : undefined,
+          ),
+        );
+      }
+      if (first.done) return oneChatEvent(safeFailure("temporarily_unavailable", "unconfirmed"));
+      if (first.value.type !== "accepted") {
+        try {
+          await producer.return?.();
+        } catch {
+          // This response did not admit a turn and has no producer to keep running.
+        }
+        return oneChatEvent(first.value);
+      }
+
+      let taskId: number;
+      try {
+        taskId = tasks.addAsyncTask("chat-turn");
+      } catch {
+        try {
+          await producer.return?.();
+        } catch {
+          // Returning before invocation claim releases the admitted turn when the store is available.
+        }
+        return oneChatEvent(
+          safeFailure("temporarily_unavailable", "unconfirmed", first.value.queryId, {
+            canContinue: false,
+          }),
+        );
+      }
+
+      const channel = createChatEventChannel();
+      channel.publish(first.value);
+      void (async () => {
+        try {
+          while (true) {
+            const next = await producer.next();
+            if (next.done) break;
+            channel.publish(next.value);
+          }
+        } catch {
+          // The durable record is authoritative; EOF makes the caller recover it.
+        } finally {
+          channel.close();
+          try {
+            if (!tasks.completeAsyncTask(taskId)) {
+              console.error(JSON.stringify({ event: "chat_async_task_cleanup_failed" }));
+            }
+          } catch {
+            console.error(JSON.stringify({ event: "chat_async_task_cleanup_failed" }));
+          }
         }
       })();
+      return observeChatEvents(channel);
     },
   };
 }
@@ -813,6 +969,7 @@ function admittedStream(input: {
     let hasNonWhitespaceOutput = false;
     let lastFlushAt = performance.now();
     let durableAnswer = "";
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 
     async function* flushText(): AsyncGenerator<Extract<ChatEvent, { type: "text" }>> {
       const batch = bufferedText;
@@ -960,6 +1117,16 @@ function admittedStream(input: {
         return;
       }
 
+      const cancellation = new AbortController();
+      let deadlineExpired = false;
+      deadlineTimer = setTimeout(
+        () => {
+          deadlineExpired = true;
+          failureCode = "result_timeout";
+          cancellation.abort();
+        },
+        Math.max(0, resultDeadlineAt - now()),
+      );
       providerDispatch({
         revision: config.revision,
         botId: config.botId,
@@ -975,15 +1142,24 @@ function admittedStream(input: {
         messages,
         modelId: config.modelId,
         revision: config.revision,
+        cancelSignal: cancellation.signal,
       })) {
         if (!isRecord(event) || typeof event.type !== "string") {
           throw new Error("Unexpected provider event.");
         }
+        if (deadlineExpired && event.type === "text") {
+          failureCode = "result_timeout";
+          throw new Error("Provider emitted text after the result deadline.");
+        }
         if (providerResult(event)) {
           if (finalResult) throw new Error("Provider returned more than one result.");
+          if (typeof event.stopReason !== "string") throw new Error("Invalid provider result.");
+          if (event.stopReason === "cancelled") {
+            failureCode = deadlineExpired ? "result_timeout" : "provider_error";
+            throw new Error("Provider invocation was cancelled locally.");
+          }
           finalResult = event;
           providerFinished = true;
-          if (typeof event.stopReason !== "string") throw new Error("Invalid provider result.");
           const metrics = providerMetrics(event.metrics);
           providerOutcome = {
             stopReason: providerStopReason(event.stopReason),
@@ -997,7 +1173,7 @@ function admittedStream(input: {
         }
         if (event.type === "error") {
           const stopReason = providerStopReason(event.stopReason);
-          if (stopReason) providerFinished = true;
+          if (stopReason && stopReason !== "cancelled") providerFinished = true;
           const metrics = providerMetrics(event.metrics);
           providerOutcome = {
             ...(stopReason ? { stopReason } : {}),
@@ -1045,8 +1221,14 @@ function admittedStream(input: {
           yield* flushText();
         }
       }
+      clearTimeout(deadlineTimer);
+      deadlineTimer = undefined;
 
       yield* flushText();
+      if (deadlineExpired || now() >= resultDeadlineAt) {
+        failureCode = "result_timeout";
+        throw new Error("Provider completed after the result deadline.");
+      }
       if (!finalResult || finalResult.stopReason !== "end_turn" || !hasNonWhitespaceOutput) {
         failureCode = "incomplete_response";
         throw new Error("Provider did not complete a non-empty answer.");
@@ -1082,6 +1264,8 @@ function admittedStream(input: {
       }
       yield { type: "completed", queryId: admitted.queryId };
     } catch {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      deadlineTimer = undefined;
       try {
         yield* flushText();
       } catch {
@@ -1099,6 +1283,7 @@ function admittedStream(input: {
         });
       }
     } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
       if (!completed && !failureRecorded) {
         await persistFailure("stream_interrupted");
       }

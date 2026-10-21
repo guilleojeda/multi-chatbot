@@ -2,12 +2,19 @@
 
 This local fixture mounts the production `AccountApp`, profile screen, chat screen, and
 `createSession()` with deterministic in-memory Cognito, profile, and Runtime boundaries. It does not
-contact AWS or persist data.
+contact AWS. Cognito and profile state remain in the fixture instance; the fake Runtime stores its
+conversation records in a fixture-only `sessionStorage` key for the lifetime of the browser tab.
+That key is separate from the product recovery journal and contains only the simulated conversation,
+question, answer prefix, and status.
 The mock Runtime accepts `start` once per new conversation ID and `message` for later turns with
 that same ID. The sanitized request list and state JSON show the operation, ID, ordinal, and mock
 turns. The profile route saves edits in fixture memory so navigation can exercise the real profile
 form. Those saved values are not sent by the browser to Runtime; this fixture cannot prove which
 profile snapshot the deployed server used to build model context.
+The state JSON also shows `productJournal`, read only from the product's `chat-journal:v2` prefix
+for this fixture scope. A pending entry includes the exact request text; an admitted entry shows
+only its IDs and base ordinal. It never exposes refresh/access tokens or unrelated `sessionStorage`
+keys.
 
 Run the repository's existing Vite executable from the repository root:
 
@@ -16,13 +23,34 @@ npx vite --config tests/fixtures/chat/vite.config.ts --host 127.0.0.1
 ```
 
 Open the local server URL printed by Vite. For navigation sequences, use a plain URL without a
-query string and select the scenario in the fixture controls; product links drop query parameters,
-which would reload this in-memory fixture. The fixture opens `/#/chat` with a restored test
-identity and complete profile. Choose a scenario before retrying an operation. The Runtime stream
-emits an accepted event and a text fragment immediately; use the fixture controls to emit more
+query string and select the scenario in the fixture controls. The fixture opens `/#/chat` with a
+restored test identity and complete profile. Choose a scenario before retrying an operation. The
+Runtime stream emits an accepted event and a text fragment immediately; use the fixture controls to emit more
 text, complete, fail, or close without a terminal event. `runtime-admission-pending` waits before
 accepted so “Enviando consulta…” and the submit lock can be inspected; click “Admitir consulta” to
 continue. The emitted answer includes accented text and blank lines for an exact copy check.
+The fake producer records the question, answer prefix, and status before emitting each controlled
+event. Closing the route or aborting its SSE consumer leaves that producer and record available in
+the current fixture instance; a transport cancellation does not turn the record into a failure.
+To exercise recovery, submit a query, click “Recargar pestaña y probar recuperación,” and inspect the
+request history after the page returns. The product journal should issue `recover` with the same
+conversation ID and query ID, receive JSON with the stored question/prefix/status, and avoid a new
+`start`. Reloading an active record shows `in_progress`; reloading a completed or failed record
+shows its terminal snapshot. After an active record is restored, the same “Emitir fragmento” and
+terminal controls update that durable fixture record even though the prior SSE object no longer
+exists; the next `recover` poll observes the new prefix or terminal state. This control bridge is a
+local fixture aid, not survival of JavaScript or an AWS process. A follow-up after a completed
+snapshot uses the recovered ordinal and a new query ID.
+If the fake Runtime has no conversation or turn for the same IDs, it returns JSON
+`conversation_unavailable` with `recordStatus: "not_admitted"` and HTTP 200, so the product keeps
+the reference for an explicit retry. A record belonging to the other fixture identity remains a
+403 without exposing its question or answer.
+To inspect a temporarily unavailable state, start a query with `ready`, let it become active, and
+reload the tab. Select `runtime-temporary`; the `recover` request returns HTTP 503, so the chat keeps
+the same `streaming` state and shows the retryable status error while retaining its reference. Select
+`ready` again; the next poll recovers the same prefix or terminal snapshot without a new `start`.
+This scenario applies the one 503 control to Runtime requests, including `recover`; it does not
+simulate a lost AWS process.
 After a completed exchange, send a follow-up and confirm the request list shows `message` with the
 same conversation ID and the next ordinal. While a stream is open, open “Mi perfil,” wait for the
 profile form, then return to chat and confirm the same partial answer and pending request remain;
@@ -75,10 +103,13 @@ Use “Fallar” to close a query with a confirmed failure, then submit a new qu
 should be `message` on the same ID while the previous exchange stays visible. Use “Cerrar sin cierre”
 for an uncertain result: record the Runtime request count, let the stream reach EOF, and verify the
 count stays unchanged when the error appears and after choosing restart. Only submitting a new
-question should issue a `start` with a fresh ID. Reload or sign out after a completed exchange to
-confirm the fixture starts without restored conversation content. The fixture reset is volatile;
-the deployed development verification must independently confirm no history restore and inspect
-the real saved query context.
+question should issue a `start` with a fresh ID. “Volver al inicio,” logout, a successful password
+reset, or definitive access loss clears the product's recovery reference; a late producer callback
+must not repopulate the visible chat. The fixture-only Runtime record remains owner-bound in the tab
+storage so a new reference can recover it during the same local run. Closing the browser tab clears
+that simulation. This behavior demonstrates the client/runtime contract locally; it does not prove
+that an AWS task survives a process loss, and the deployed development verification must inspect the
+real saved query context independently.
 
 To inspect cupo presentation and draft retention without contacting the Runtime, select
 `runtime-quota-daily`, `runtime-quota-monthly`, or `runtime-quota-both`, submit a question, and confirm
@@ -145,7 +176,7 @@ Append `?scenario=<name>` before the hash to select an initial scenario, for exa
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
-`runtime-quota-daily`, `runtime-quota-monthly`, `runtime-quota-both`,
+`runtime-temporary`, `runtime-quota-daily`, `runtime-quota-monthly`, `runtime-quota-both`,
 `runtime-conversation-busy`, `runtime-stale-base`, `runtime-401`, `runtime-401-pending`,
 `runtime-expired`, `runtime-forbidden`,
 `password-reset-pending`, `password-reset-failure`, `signout-pending`, `sign-in-pending`,

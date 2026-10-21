@@ -53,13 +53,14 @@ async function collect(source) {
   return events;
 }
 
-async function withModelStream(events, run, streamError) {
+async function withModelStream(events, run, streamError, onStream) {
   const original = Object.getOwnPropertyDescriptor(BedrockModel.prototype, "stream");
   let calls = 0;
   Object.defineProperty(BedrockModel.prototype, "stream", {
     configurable: true,
-    value: async function* () {
+    value: async function* (_messages, options) {
       calls += 1;
+      onStream?.(options);
       yield* events;
       if (streamError) throw streamError;
     },
@@ -273,6 +274,33 @@ describe("the real Strands/Bedrock provider stream contract", () => {
         /"(?:inputTokens|outputTokens|totalTokens|latencyMs)":0/,
       );
     });
+  });
+
+  it("forwards local cancellation through Strands without reporting it as a provider terminal", async () => {
+    const controller = new AbortController();
+    let modelSignal;
+    await withModelStream(
+      [],
+      async (streamCalls) => {
+        const events = await collect(
+          createStrandsGenerator({ region: "us-east-1" })({
+            ...request,
+            cancelSignal: controller.signal,
+          }),
+        );
+        expect(streamCalls()).toBe(1);
+        expect(modelSignal).toBeInstanceOf(AbortSignal);
+        expect(modelSignal.aborted).toBe(true);
+        expect(events).toMatchObject([{ type: "error", providerCode: "local_cancellation" }]);
+        expect(events[0]).not.toHaveProperty("stopReason");
+        expect(events.some(({ type }) => type === "result")).toBe(false);
+      },
+      new Error("synthetic interruption"),
+      (options) => {
+        modelSignal = options?.cancelSignal;
+        controller.abort();
+      },
+    );
   });
 
   it("persists the real Strands max-token failure metadata on the failed turn", async () => {
