@@ -54,6 +54,29 @@ function conditionValue(command, attribute) {
 }
 
 describe("continuation store ownership guard", () => {
+  it("rejects a stored META record without its required owner fields", async () => {
+    const malformedMeta = {
+      pk: `CONV#${turn.conversationId}`,
+      sk: "META",
+      conversationId: turn.conversationId,
+      sub: turn.sub,
+      lastOrdinal: 3,
+    };
+    const documentClient = {
+      send: vi.fn(async (command) =>
+        command instanceof GetCommand ? { Item: malformedMeta } : {},
+      ),
+    };
+    const store = createConversationStoreAdapter({
+      documentClient,
+      tableName: "conversations-aurora-dev",
+    });
+
+    await expect(store.getMeta({ conversationId: turn.conversationId })).rejects.toThrow(
+      "Conversation META record is malformed",
+    );
+  });
+
   it("compares the same owner, chatbot, conversation, and observed ordinal in its allocation transaction", async () => {
     const meta = {
       pk: `CONV#${turn.conversationId}`,

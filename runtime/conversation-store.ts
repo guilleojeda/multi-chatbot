@@ -11,6 +11,7 @@ import type {
   CompleteTurnInput,
   ContextReference,
   ConversationContext,
+  ConversationMeta,
   ContinueTurnInput,
   FailTurnInput,
   QuotaView,
@@ -35,6 +36,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isPositiveSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isConversationMeta(value: unknown, conversationId: string): value is ConversationMeta {
+  return (
+    isRecord(value) &&
+    value.pk === `CONV#${conversationId}` &&
+    value.sk === "META" &&
+    value.conversationId === conversationId &&
+    typeof value.sub === "string" &&
+    value.sub.length > 0 &&
+    typeof value.botId === "string" &&
+    value.botId.length > 0 &&
+    isPositiveSafeInteger(value.lastOrdinal) &&
+    (value.lastQueryId === undefined ||
+      (typeof value.lastQueryId === "string" && value.lastQueryId.length > 0)) &&
+    (value.activeQueryId === undefined ||
+      (typeof value.activeQueryId === "string" && value.activeQueryId.length > 0)) &&
+    (value.closed === undefined || typeof value.closed === "boolean")
+  );
 }
 
 function manifestCount(value: unknown): number | null {
@@ -1449,8 +1469,17 @@ export function createConversationStoreAdapter(input: {
   }
 
   const adapter = {
-    async getMeta({ conversationId }: { conversationId: string }) {
-      return (await getItem({ ...conversationKey(conversationId), sk: "META" })) ?? null;
+    async getMeta({
+      conversationId,
+    }: {
+      conversationId: string;
+    }): Promise<ConversationMeta | null> {
+      const item = await getItem({ ...conversationKey(conversationId), sk: "META" });
+      if (!item) return null;
+      if (!isConversationMeta(item, conversationId)) {
+        throw new Error("Conversation META record is malformed; refusing to use it.");
+      }
+      return item;
     },
 
     async readContext({
