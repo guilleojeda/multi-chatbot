@@ -76,6 +76,8 @@ describe("the Strands follow-up provider", () => {
       fields: { educationLevels: ["primario"], subjects: ["Historia"] },
       responsePreferenceIds: ["ready-material"],
     };
+    const resultDeadlineAt = Date.now() + 60 * 60 * 1000;
+    const remainingDeadlineMs = resultDeadlineAt - Date.now();
     const request = {
       systemPrompt: "Ayudá con tareas de enseñanza. Perfil de Matemática.",
       profileSnapshot: firstProfile,
@@ -83,6 +85,7 @@ describe("the Strands follow-up provider", () => {
       messages,
       modelId: "global.anthropic.claude-sonnet-4-6",
       revision: "reviewed-revision-123",
+      resultDeadlineAt,
     };
     const originalRequest = structuredClone(request);
 
@@ -108,6 +111,18 @@ describe("the Strands follow-up provider", () => {
 
     expect(sdk.Agent).toHaveBeenCalledTimes(2);
     expect(sdk.BedrockModel).toHaveBeenCalledTimes(2);
+    expect(sdk.BedrockModel.mock.calls.map(([options]) => options.maxTokens)).toEqual([
+      64_000, 64_000,
+    ]);
+    expect(sdk.BedrockModel.mock.calls[0][0].requestTimeout).toBeGreaterThan(
+      remainingDeadlineMs - 100,
+    );
+    expect(sdk.BedrockModel.mock.calls[0][0].requestTimeout).toBeLessThanOrEqual(
+      remainingDeadlineMs,
+    );
+    expect(sdk.BedrockModel.mock.calls[1][0].requestTimeout).toBeLessThanOrEqual(
+      remainingDeadlineMs,
+    );
     expect(sdk.state.agents).toHaveLength(2);
     expect(sdk.state.agents[0]).not.toBe(sdk.state.agents[1]);
     expect(sdk.state.agents.map(({ options }) => options.messages)).toEqual([

@@ -21,6 +21,7 @@ export type ChatScreenState = {
   canContinue?: boolean;
   quota?: QuotaView;
   quotaReceivedAt?: number;
+  queryErrorCode?: string;
   recovered?: boolean;
   recoveryLoading?: boolean;
   canRetry?: boolean;
@@ -124,7 +125,8 @@ export function ChatScreen({
     state.queryStatus === "idle" ||
     (state.queryStatus === "completed" && state.canContinue !== false) ||
     (state.queryStatus === "failed" && state.canContinue !== false) ||
-    (state.queryStatus === "rejected" && Boolean(state.quota));
+    (state.queryStatus === "rejected" && Boolean(state.quota)) ||
+    (state.queryStatus === "rejected" && state.queryErrorCode === "storage_capacity_exceeded");
   const canSubmit =
     state.profileStatus === "complete" && canSubmitForState && draft.trim().length > 0;
   const showConversation =
@@ -135,7 +137,9 @@ export function ChatScreen({
   const showComposer =
     state.profileStatus === "complete" &&
     state.queryStatus !== "unconfirmed" &&
-    (state.queryStatus !== "rejected" || Boolean(state.quota)) &&
+    (state.queryStatus !== "rejected" ||
+      Boolean(state.quota) ||
+      state.queryErrorCode === "storage_capacity_exceeded") &&
     (state.queryStatus !== "failed" || state.canContinue !== false);
   const quotaElapsed =
     state.quotaReceivedAt === undefined ? 0 : Math.max(0, quotaNow - state.quotaReceivedAt);
@@ -175,10 +179,10 @@ export function ChatScreen({
   }, [state.profileStatus, state.queryStatus]);
 
   useEffect(() => {
-    if (state.queryStatus === "rejected" && state.quota && state.question) {
+    if (state.queryStatus === "rejected" && state.question) {
       setDraft(state.question);
     }
-  }, [state.queryStatus, state.question, state.quota]);
+  }, [state.queryStatus, state.question]);
 
   useEffect(() => {
     if (!state.quota || state.quota.blockedUntil === null || state.quotaReceivedAt === undefined) {
@@ -208,7 +212,11 @@ export function ChatScreen({
 
   function restart() {
     focusQueryAfterResetRef.current = true;
-    setDraft("");
+    const preserveRejectedDraft =
+      state.queryStatus === "rejected" &&
+      (state.queryErrorCode === "capacity_exceeded" ||
+        state.queryErrorCode === "storage_capacity_exceeded");
+    setDraft(preserveRejectedDraft ? draft || state.question || "" : "");
     copyEpochRef.current += 1;
     previousCopyTargetsRef.current = [];
     currentCopyTargetRef.current = null;
@@ -414,10 +422,23 @@ export function ChatScreen({
               ) : null}
               {state.queryStatus === "rejected" ? (
                 state.quota ? null : (
-                  <p className="chat-result-error" role="alert">
-                    {state.queryError ||
-                      "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
-                  </p>
+                  <>
+                    <p className="chat-result-error" role="alert">
+                      {state.queryError ||
+                        "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
+                    </p>
+                    {state.canRetry && state.question ? (
+                      <button
+                        className="account-button account-button--secondary chat-restart-button"
+                        type="button"
+                        onClick={() => {
+                          if (onSubmit(state.question || "") !== false) setDraft("");
+                        }}
+                      >
+                        Reintentar el mismo envío
+                      </button>
+                    ) : null}
+                  </>
                 )
               ) : null}
               {state.queryStatus === "unconfirmed" && !state.recoveryLoading ? (
@@ -447,7 +468,7 @@ export function ChatScreen({
               {state.queryStatus === "completed" ||
               state.queryStatus === "failed" ||
               sending ||
-              (state.queryStatus === "rejected" && !state.quota) ||
+              (state.queryStatus === "rejected" && !state.quota && !state.canRetry) ||
               state.queryStatus === "unconfirmed" ? (
                 <button
                   className="account-button account-button--secondary chat-restart-button"

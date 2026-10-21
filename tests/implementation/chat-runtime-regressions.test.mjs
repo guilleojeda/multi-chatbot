@@ -229,6 +229,9 @@ function makeHarness({
       },
       ...storeOverrides,
     },
+    async countInputTokens() {
+      return { inputTokens: 0 };
+    },
     generate(input) {
       state.providerCalls += 1;
       state.providerInput = input;
@@ -560,7 +563,7 @@ describe("chat Runtime implementation regressions", () => {
     const deadline = admittedAt + 60 * 60 * 1000;
     const clockValues = [admittedAt, admittedAt, admittedAt, deadline - 1, deadline];
     let clockIndex = 0;
-    const dispatch = vi.spyOn(console, "info").mockImplementation(() => {});
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
     const harness = makeHarness({
       clock: () => clockValues[Math.min(clockIndex++, clockValues.length - 1)],
       generate: () =>
@@ -581,7 +584,9 @@ describe("chat Runtime implementation regressions", () => {
       });
 
       expect(harness.state.providerCalls).toBe(0);
-      expect(dispatch).not.toHaveBeenCalled();
+      expect(log.mock.calls.map(([entry]) => JSON.parse(entry).event)).toEqual([
+        "chat_input_token_count",
+      ]);
       expect(harness.state.failed).toHaveLength(1);
       expect(harness.state.failed[0]).toMatchObject({
         invocationClaimed: true,
@@ -594,7 +599,7 @@ describe("chat Runtime implementation regressions", () => {
       });
       await stream.return();
     } finally {
-      dispatch.mockRestore();
+      log.mockRestore();
     }
   });
 
@@ -683,7 +688,15 @@ describe("chat Runtime implementation regressions", () => {
       });
       await stream.return();
 
-      const dispatch = JSON.parse(log.mock.calls[0][0]);
+      const countLog = JSON.parse(log.mock.calls[0][0]);
+      const dispatch = JSON.parse(log.mock.calls[1][0]);
+      expect(countLog).toEqual({
+        event: "chat_input_token_count",
+        revision: "revision-123",
+        botId: "bot-aurora",
+        queryId,
+        inputTokens: 0,
+      });
       expect(dispatch).toMatchObject({
         event: "chat_provider_dispatch",
         revision: "revision-123",
@@ -693,7 +706,7 @@ describe("chat Runtime implementation regressions", () => {
         queryId,
         ownerAttemptId: expect.any(String),
       });
-      expect(dispatchOrder.map(([kind]) => kind)).toEqual(["log", "provider"]);
+      expect(dispatchOrder.map(([kind]) => kind)).toEqual(["log", "log", "provider"]);
       expect(JSON.stringify(dispatch)).not.toMatch(/Armá una actividad|Matemática|text|tokens/i);
       expect(harness.state.appended.map(({ text }) => text).join("")).toBe(
         "Prefijo durable. Último fragmento.",

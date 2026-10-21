@@ -1,8 +1,11 @@
-import { build } from "esbuild";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
-import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { build } from "esbuild";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 const streamConversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const streamQueryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
@@ -10,8 +13,60 @@ const savedConversationId = "1c6a7943-c1cb-4c88-a378-fb14655bc35a";
 const savedQueryId = "ecf57adf-a0c0-4901-8f0f-cc7993da4bb2";
 const quotaConversationId = "8b6e9274-1b77-47f2-b837-6d3f6a26715b";
 const quotaQueryId = "a81fed69-2694-40a7-8c27-76a31f0361d8";
+const jsonBodyLimitBytes = 32 * 1024 * 1024;
 
 const workers = new Set();
+const runtimeEntryBundleDirectories = new Set();
+let runtimeEntryModulePromise;
+
+const projectRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
+
+async function runtimeEntryBundleUrl() {
+  if (!runtimeEntryModulePromise) {
+    runtimeEntryModulePromise = (async () => {
+      const entryPath = path.join(projectRoot, "runtime/entry.ts");
+      const outputParentDirectory = path.join(projectRoot, ".work/test-artifacts");
+      mkdirSync(outputParentDirectory, { recursive: true });
+      const outputDirectory = mkdtempSync(path.join(outputParentDirectory, "http-entry-config-"));
+      runtimeEntryBundleDirectories.add(outputDirectory);
+      const result = await build({
+        entryPoints: [entryPath],
+        bundle: true,
+        packages: "external",
+        platform: "node",
+        target: "node24",
+        format: "esm",
+        write: false,
+        plugins: [
+          {
+            name: "capture-agentcore-entry-config",
+            setup(build) {
+              build.onResolve({ filter: /^bedrock-agentcore\/runtime$/ }, () => ({
+                path: "agentcore-runtime-capture",
+                namespace: "entry-capture",
+              }));
+              build.onLoad({ filter: /.*/, namespace: "entry-capture" }, () => ({
+                contents: `
+                    export class BedrockAgentCoreApp {
+                      constructor(params) { globalThis.__capturedAgentCoreConfig = params.config; }
+                      run() {}
+                      addAsyncTask() { return 1; }
+                      completeAsyncTask() { return true; }
+                    }
+                  `,
+                loader: "js",
+              }));
+            },
+          },
+        ],
+      });
+      const outputPath = path.join(outputDirectory, "entry.mjs");
+      writeFileSync(outputPath, result.outputFiles[0].contents);
+      return pathToFileURL(outputPath).href;
+    })();
+  }
+  return runtimeEntryModulePromise;
+}
 
 async function freePort() {
   const server = createServer();
@@ -26,7 +81,7 @@ async function freePort() {
   return address.port;
 }
 
-async function makeServer({ detached = false } = {}) {
+async function makeServer({ detached = false, useRuntimeEntryConfig = false } = {}) {
   const port = await freePort();
   const chatPath = fileURLToPath(new URL("../../runtime/chat.ts", import.meta.url));
   const bundle = await build({
@@ -39,11 +94,34 @@ async function makeServer({ detached = false } = {}) {
   });
   const chatModule = `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`;
   const agentCoreModule = import.meta.resolve("bedrock-agentcore/runtime");
+  const runtimeEntryModule = useRuntimeEntryConfig ? await runtimeEntryBundleUrl() : undefined;
   const workerCode = `
     import { parentPort, workerData } from "node:worker_threads";
     import { createHash } from "node:crypto";
     import { BedrockAgentCoreApp } from ${JSON.stringify(agentCoreModule)};
     const { createChatHandler, createChatInvocationHandler } = await import(workerData.chatModule);
+    let appConfig = { logging: { enabled: false } };
+    if (workerData.runtimeEntryModule) {
+      Object.assign(process.env, {
+        BOT_ID: "bot-aurora",
+        ACCOUNT_TABLE_NAME: "account-table",
+        CONVERSATION_TABLE_NAME: "conversation-table",
+        MODEL_ID: "global.anthropic.claude-sonnet-4-6",
+        REVISION: "http-acceptance",
+        AWS_REGION: "us-east-1",
+      });
+      await import(workerData.runtimeEntryModule);
+      appConfig = globalThis.__capturedAgentCoreConfig;
+      parentPort.postMessage({
+        type: "runtime-config",
+        config: {
+          logging: appConfig?.logging,
+          contentTypeParsers: appConfig?.contentTypeParsers?.map(({ contentType, parseAs, bodyLimit }) => ({
+            contentType, parseAs, bodyLimit,
+          })),
+        },
+      });
+    }
     console.info = () => {};
 
     const streamConversationId = ${JSON.stringify(streamConversationId)};
@@ -137,6 +215,9 @@ async function makeServer({ detached = false } = {}) {
       async reconcileTurn({ queryId }) { return submissions.get(queryId) ?? null; },
       async startTurn(input) {
         admissionCount += 1;
+        if (input.text.length > 100_000) {
+          parentPort.postMessage({ type: "large-text-observed", text: input.text });
+        }
         if (input.conversationId === quotaConversationId) {
           const error = new Error("quota exceeded");
           error.code = "quota_exceeded";
@@ -227,6 +308,7 @@ async function makeServer({ detached = false } = {}) {
       accounts: { async hasMember() { return true; } },
       profiles: { async getProfile() { return profile; } },
       store,
+      async countInputTokens() { return { inputTokens: 42 }; },
       async *generate() {
         providerDispatchCount += 1;
         parentPort.postMessage({
@@ -250,14 +332,14 @@ async function makeServer({ detached = false } = {}) {
     };
     app = new BedrockAgentCoreApp({
       invocationHandler: createChatInvocationHandler(chat, tasks),
-      config: { logging: { enabled: false } },
+      config: appConfig,
     });
     app.run({ port: workerData.port, host: "127.0.0.1" });
   `;
   const workerUrl = `data:text/javascript;base64,${Buffer.from(workerCode).toString("base64")}`;
   const worker = new Worker(new URL(workerUrl), {
     type: "module",
-    workerData: { port, chatModule, detached },
+    workerData: { port, chatModule, detached, runtimeEntryModule },
   });
   workers.add(worker);
 
@@ -331,6 +413,63 @@ async function post(origin, payload, accept, signal) {
   });
 }
 
+async function postRawJson(origin, body) {
+  return fetch(`${origin}/invocations`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body,
+  });
+}
+
+function postOversizedJson(origin, body) {
+  const url = new URL(origin);
+  return new Promise((resolve, reject) => {
+    let receivedResponse = false;
+    const request = httpRequest(
+      {
+        host: url.hostname,
+        port: Number(url.port),
+        path: "/invocations",
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body, "utf8"),
+        },
+      },
+      (response) => {
+        receivedResponse = true;
+        response.resume();
+        resolve({ status: response.statusCode });
+      },
+    );
+    request.on("error", (error) => {
+      if (receivedResponse) return;
+      if (error.code === "EPIPE" || error.code === "ECONNRESET") {
+        resolve({ connectionClosed: true, errorCode: error.code });
+        return;
+      }
+      reject(error);
+    });
+    request.end(body);
+  });
+}
+
+function expectRuntimeJsonParser(config) {
+  expect.soft(config?.contentTypeParsers).toEqual(
+    expect.arrayContaining([
+      {
+        contentType: "application/json",
+        parseAs: "string",
+        bodyLimit: jsonBodyLimitBytes,
+      },
+    ]),
+  );
+}
+
 async function readSseUntil(reader, predicate) {
   const decoder = new TextDecoder();
   let text = "";
@@ -364,7 +503,88 @@ afterEach(async () => {
   workers.clear();
 });
 
+afterAll(() => {
+  for (const directory of runtimeEntryBundleDirectories) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 describe("the real AgentCore HTTP response boundary", () => {
+  it("parses escaped JSON over 1 MiB and delivers the exact decoded text to the chat handler", async () => {
+    const { worker, origin, messages } = await makeServer({ useRuntimeEntryConfig: true });
+    const runtimeConfig = await waitForWorkerMessage(worker, messages, "runtime-config");
+    const text = `${"\u0000".repeat(180_000)}\u0001"\\ café 😀`;
+    const request = {
+      version: 2,
+      operation: "start",
+      conversationId: "d90fdf5e-2c77-4a9f-b851-5e16aa26715b",
+      queryId: "e90fdf5e-2c77-4a9f-b851-5e16aa26715c",
+      baseOrdinal: 0,
+      text,
+    };
+    const json = JSON.stringify(request);
+
+    expectRuntimeJsonParser(runtimeConfig.config);
+    expect(Buffer.byteLength(json, "utf8")).toBeGreaterThan(1024 * 1024);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThan(400 * 1024);
+
+    const observedText = waitForWorkerMessage(worker, messages, "large-text-observed");
+    const response = await post(origin, request, "text/event-stream");
+    expect.soft(response.status).toBe(200);
+    if (response.status === 200) {
+      expect.soft(response.headers.get("content-type")).toContain("text/event-stream");
+      expect.soft(await observedText).toMatchObject({ type: "large-text-observed", text });
+      expect
+        .soft(parseSse(await response.text()).map(({ event }) => event))
+        .toEqual(["accepted", "text", "completed"]);
+      expect
+        .soft(messages.filter((message) => message?.type === "provider-dispatch"))
+        .toHaveLength(1);
+    } else {
+      expect.soft(await inspectState(worker, messages)).toMatchObject({
+        admissionCount: 0,
+        quotaReadCount: 0,
+        providerDispatchCount: 0,
+      });
+    }
+  });
+
+  it.each([
+    ["malformed JSON", '{"version":2,"text":'],
+    ["empty JSON", ""],
+    ["prototype-poison JSON", '{"__proto__":{"polluted":true}}'],
+    ["constructor-poison JSON", '{"constructor":{"prototype":{"polluted":true}}}'],
+  ])("rejects %s before admission or model dispatch", async (_name, body) => {
+    const { worker, origin, messages } = await makeServer({ useRuntimeEntryConfig: true });
+    const runtimeConfig = await waitForWorkerMessage(worker, messages, "runtime-config");
+    expectRuntimeJsonParser(runtimeConfig.config);
+
+    const response = await postRawJson(origin, body);
+    expect.soft(response.status).toBe(400);
+    expect.soft(await inspectState(worker, messages)).toMatchObject({
+      admissionCount: 0,
+      quotaReadCount: 0,
+      providerDispatchCount: 0,
+    });
+  });
+
+  it("rejects application/json beyond the configured 32 MiB parser limit before admission", async () => {
+    const { worker, origin, messages } = await makeServer({ useRuntimeEntryConfig: true });
+    const runtimeConfig = await waitForWorkerMessage(worker, messages, "runtime-config");
+    expectRuntimeJsonParser(runtimeConfig.config);
+    const oversizedBody = `{"text":"${"x".repeat(jsonBodyLimitBytes)}"}`;
+    expect(Buffer.byteLength(oversizedBody, "utf8")).toBeGreaterThan(jsonBodyLimitBytes);
+
+    const response = await postOversizedJson(origin, oversizedBody);
+    expect.soft(response.status === 413 || response.connectionClosed === true).toBe(true);
+    expect.soft((await fetch(`${origin}/ping`)).status).toBe(200);
+    expect.soft(await inspectState(worker, messages)).toMatchObject({
+      admissionCount: 0,
+      quotaReadCount: 0,
+      providerDispatchCount: 0,
+    });
+  });
+
   it("waits for admission, streams a new turn, and preserves duplicate, recover, and quota fields", async () => {
     const { worker, origin, messages } = await makeServer();
 

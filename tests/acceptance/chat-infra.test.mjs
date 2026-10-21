@@ -536,26 +536,38 @@ describe("chat infrastructure acceptance", () => {
       const roleId = runtimeRoleId(chatTemplate);
       expect(roleId).toBeDefined();
       if (!roleId) return;
-      const modelStatements = rolePolicies(chatTemplate, roleId).filter(
+      const bedrockStatements = rolePolicies(chatTemplate, roleId).filter(
         (statement) => matchingActions([statement], "bedrock:").length > 0,
       );
-      const modelActions = new Set(matchingActions(modelStatements, "bedrock:"));
-      const resources = new Set(modelStatements.flatMap(resourceArns));
+      const modelActions = new Set(matchingActions(bedrockStatements, "bedrock:"));
       const profileArn =
         "arn:aws:bedrock:us-east-1:118903272638:inference-profile/global.anthropic.claude-sonnet-4-6";
       const sourceModelArn =
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6";
       const globalModelArn = "arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-4-6";
+      const generationStatements = bedrockStatements.filter((statement) =>
+        matchingActions([statement], "bedrock:").includes("bedrock:InvokeModelWithResponseStream"),
+      );
+      const countTokenStatements = bedrockStatements.filter((statement) =>
+        matchingActions([statement], "bedrock:").includes("bedrock:CountTokens"),
+      );
+      const generationResources = new Set(generationStatements.flatMap(resourceArns));
+      const countTokenResources = new Set(countTokenStatements.flatMap(resourceArns));
+      const resources = new Set(bedrockStatements.flatMap(resourceArns));
 
-      expect(modelActions).toEqual(new Set(["bedrock:InvokeModelWithResponseStream"]));
+      expect(modelActions).toEqual(
+        new Set(["bedrock:InvokeModelWithResponseStream", "bedrock:CountTokens"]),
+      );
+      expect(generationResources).toEqual(new Set([profileArn, sourceModelArn, globalModelArn]));
+      expect(countTokenResources).toEqual(new Set([sourceModelArn]));
       expect(resources).toEqual(new Set([profileArn, sourceModelArn, globalModelArn]));
       expect(
         [...resources].every((resource) => !resource.includes("*")),
         "Bedrock grants may not name other models, profiles, or wildcard resources",
       ).toBe(true);
-      expect(modelStatements.every((statement) => statement.Effect === "Allow")).toBe(true);
+      expect(bedrockStatements.every((statement) => statement.Effect === "Allow")).toBe(true);
       const statementsFor = (arn) =>
-        modelStatements.filter((statement) => resourceArns(statement).includes(arn));
+        generationStatements.filter((statement) => resourceArns(statement).includes(arn));
       const profileStatements = statementsFor(profileArn);
       const sourceModelStatements = statementsFor(sourceModelArn);
       const globalModelStatements = statementsFor(globalModelArn);

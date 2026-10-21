@@ -23,6 +23,12 @@ export const fixtureScenarios = [
   { id: "runtime-quota-daily", label: "Runtime: cupo diario agotado" },
   { id: "runtime-quota-monthly", label: "Runtime: cupo mensual agotado" },
   { id: "runtime-quota-both", label: "Runtime: cupos diario y mensual agotados" },
+  { id: "runtime-capacity-exceeded", label: "Runtime: contexto supera la ventana del modelo" },
+  { id: "runtime-token-count-unavailable", label: "Runtime: conteo nativo no disponible" },
+  {
+    id: "runtime-storage-capacity-exceeded",
+    label: "Runtime: preflight de almacenamiento excedido",
+  },
   { id: "runtime-conversation-busy", label: "Runtime: hilo ocupado (sin admisión)" },
   { id: "runtime-stale-base", label: "Runtime: ordinal base desactualizado (sin admisión)" },
   { id: "runtime-401", label: "Runtime: 401 y refresh correcto" },
@@ -811,6 +817,47 @@ export class ChatBrowserFixture {
     }
 
     if (operation === "recover") return this.recoverResponse(request, conversationId, queryId, sub);
+
+    if (this.selectedScenario === "runtime-capacity-exceeded" && operation === "message") {
+      this.finish(request, 200, "contexto excedido simulado antes de admitir; sin consumo");
+      return sseResponse({
+        type: "failed",
+        code: "capacity_exceeded",
+        message:
+          "La conversación y este pedido no caben en la ventana del modelo. Empezá una conversación nueva para conservar el pedido.",
+        recordStatus: "not_admitted",
+        queryId,
+        canContinue: true,
+      });
+    }
+
+    if (this.selectedScenario === "runtime-token-count-unavailable") {
+      this.finish(
+        request,
+        200,
+        "conteo nativo no disponible simulado antes de admitir; sin consumo",
+      );
+      return sseResponse({
+        type: "failed",
+        code: "token_count_unavailable",
+        message:
+          "No pudimos comprobar el conteo de tokens. La consulta no fue admitida; podés reintentar el mismo envío.",
+        recordStatus: "not_admitted",
+        queryId,
+      });
+    }
+
+    if (this.selectedScenario === "runtime-storage-capacity-exceeded") {
+      this.finish(request, 200, "preflight de almacenamiento excedido simulado; sin consumo");
+      return sseResponse({
+        type: "failed",
+        code: "storage_capacity_exceeded",
+        message:
+          "El pedido no cabe en una admisión de almacenamiento. La consulta no fue admitida; podés editarla y volver a intentar.",
+        recordStatus: "not_admitted",
+        queryId,
+      });
+    }
 
     if (
       this.selectedScenario === "runtime-quota-daily" ||

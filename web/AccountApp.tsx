@@ -1325,16 +1325,23 @@ export function AccountApp({
     const current = chatScreenStateRef.current;
     const ownerKey = identity ? chatOwnerKey(identity) : null;
     const previousJournal = chatJournalRef.current;
-    const retrying =
-      current.queryStatus === "unconfirmed" &&
+    const pendingRequestMatches =
       previousJournal !== null &&
       !previousJournal.admitted &&
       previousJournal.request.text === text;
+    const retrying =
+      pendingRequestMatches &&
+      (current.queryStatus === "unconfirmed" ||
+        (current.queryStatus === "rejected" &&
+          current.canRetry === true &&
+          current.queryErrorCode === "token_count_unavailable"));
     const canStartNewRequest =
       current.queryStatus === "idle" ||
       ((current.queryStatus === "completed" || current.queryStatus === "failed") &&
         current.canContinue !== false) ||
-      (current.queryStatus === "rejected" && Boolean(current.quota));
+      (current.queryStatus === "rejected" && Boolean(current.quota)) ||
+      (current.queryStatus === "rejected" &&
+        current.queryErrorCode === "storage_capacity_exceeded");
     if (
       !identity ||
       !ownerKey ||
@@ -1392,9 +1399,11 @@ export function AccountApp({
       queryStatus: "sending",
       question: text,
       answer: "",
+      ordinal: current.ordinal,
       quota: undefined,
       quotaReceivedAt: undefined,
       queryError: undefined,
+      queryErrorCode: undefined,
       recovered: false,
       recoveryLoading: false,
       canRetry: false,
@@ -1424,12 +1433,18 @@ export function AccountApp({
             admitted: true,
             ordinal: event.ordinal,
           };
-          setChat({ ...before, queryStatus: "streaming", ordinal: event.ordinal });
+          setChat({
+            ...before,
+            queryStatus: "streaming",
+            ordinal: event.ordinal,
+            queryErrorCode: undefined,
+          });
         } else if (event.type === "text") {
           setChat({
             ...before,
             queryStatus: "streaming",
             answer: (before.answer || "") + event.text,
+            queryErrorCode: undefined,
           });
         } else if (event.type === "completed") {
           setChat({
@@ -1437,6 +1452,7 @@ export function AccountApp({
             queryStatus: "completed",
             canContinue: true,
             queryError: undefined,
+            queryErrorCode: undefined,
           });
         }
       },
@@ -1472,6 +1488,7 @@ export function AccountApp({
             quotaReceivedAt: result.quota ? performance.now() : undefined,
             queryStatus: result.status === "in_progress" ? "streaming" : result.status,
             queryError: undefined,
+            queryErrorCode: undefined,
             recovered: retrying,
             recoveryLoading: false,
             canRetry: false,
@@ -1501,19 +1518,27 @@ export function AccountApp({
             queryStatus: "completed",
             canContinue: true,
             queryError: undefined,
+            queryErrorCode: undefined,
             recoveryLoading: false,
             canRetry: false,
           });
           return;
         }
         const failureCode = result.code.toLowerCase();
+        const retryableCountFailure =
+          failureCode === "token_count_unavailable" && result.recordStatus === "not_admitted";
         if (failureCode === "access_denied") {
           invalidateChat();
           profileForbidden();
           return;
         }
         if (result.recordStatus === "not_admitted") {
-          if (previousJournal?.admitted) {
+          if (retryableCountFailure) {
+            // CountTokens failed before admission. Keep this exact body and ID for an explicit
+            // retry, even when the attempted request was a follow-up to an admitted turn.
+            chatJournalRef.current = { request, admitted: false };
+            chatConversationIdRef.current = conversationId;
+          } else if (previousJournal?.admitted) {
             try {
               markChatJournalAdmitted(
                 apiConfig,
@@ -1568,9 +1593,12 @@ export function AccountApp({
           quota: result.quota,
           quotaReceivedAt: result.quota ? performance.now() : undefined,
           queryError: result.code.toLowerCase() === "quota_exceeded" ? undefined : result.message,
+          queryErrorCode: result.code,
           recovered: retrying && result.recordStatus !== "not_admitted",
           recoveryLoading: false,
-          canRetry: result.recordStatus === "unconfirmed" && !chatJournalRef.current?.admitted,
+          canRetry:
+            retryableCountFailure ||
+            (result.recordStatus === "unconfirmed" && !chatJournalRef.current?.admitted),
         });
       })
       .catch((error: unknown) => {
@@ -1591,6 +1619,7 @@ export function AccountApp({
           queryStatus: "unconfirmed",
           canRetry: Boolean(chatJournalRef.current && !chatJournalRef.current.admitted),
           recoveryLoading: false,
+          queryErrorCode: undefined,
           queryError:
             apiError.code === "UNCONFIRMED"
               ? "No pudimos confirmar que la respuesta haya terminado. Vamos a conservar el mismo envío para recuperarlo."
