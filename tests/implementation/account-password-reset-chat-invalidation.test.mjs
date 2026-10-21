@@ -1,15 +1,9 @@
-import { build } from "esbuild";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import React from "react";
-import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { AccountScreen } from "../../web/AccountScreen.tsx";
-import { ChatScreen } from "../../web/ChatScreen.tsx";
+import {
+  createAccountAppHookHarness,
+  loadAccountAppForHookTests,
+} from "../support/account-app-hook-harness.mjs";
 
-const root = process.cwd();
 const conversationId = "550e8400-e29b-41d4-a716-446655440000";
 const identity = { sub: "teacher-a", botId: "docentes" };
 const secondIdentity = { sub: "teacher-b", botId: "docentes" };
@@ -23,69 +17,16 @@ const config = {
   runtimeQualifier: "DEFAULT",
 };
 
-let tempDirectory;
 let AccountApp;
 let createSession;
+let disposeAccountApp;
 
 beforeAll(async () => {
-  globalThis.__accountScreens = {
-    AccountScreen,
-    ChatScreen,
-    ProfileApp: () =>
-      React.createElement("main", { "aria-label": "Perfil docente" }, "Perfil docente autorizado"),
-  };
-  tempDirectory = await mkdtemp(join(tmpdir(), "account-reset-chat-"));
-  const outputFile = join(tempDirectory, "account-app.mjs");
-  const hookModule = `
-    export const useState = (...args) => globalThis.__accountHooks.useState(...args);
-    export const useRef = (...args) => globalThis.__accountHooks.useRef(...args);
-    export const useEffect = (...args) => globalThis.__accountHooks.useEffect(...args);
-    export const useCallback = (...args) => globalThis.__accountHooks.useCallback(...args);
-  `;
-  await build({
-    stdin: {
-      contents:
-        'export { AccountApp } from "./web/AccountApp.tsx"; export { createSession } from "./web/session.ts";',
-      resolveDir: root,
-      sourcefile: "account-app-entry.tsx",
-      loader: "tsx",
-    },
-    bundle: true,
-    platform: "node",
-    format: "esm",
-    jsx: "transform",
-    outfile: outputFile,
-    plugins: [
-      {
-        name: "account-hook-runtime",
-        setup(esbuild) {
-          esbuild.onResolve({ filter: /^react$/ }, () => ({
-            path: "react-hooks",
-            namespace: "test",
-          }));
-          esbuild.onLoad({ filter: /.*/, namespace: "test" }, () => ({
-            contents: hookModule,
-            loader: "js",
-          }));
-          esbuild.onLoad({ filter: /\/(AccountScreen|ChatScreen|ProfileApp)\.tsx$/ }, (args) => {
-            const exportName = args.path.match(
-              /\/(AccountScreen|ChatScreen|ProfileApp)\.tsx$/,
-            )?.[1];
-            if (!exportName) return;
-            return {
-              contents: `export const ${exportName} = globalThis.__accountScreens.${exportName};`,
-              loader: "js",
-            };
-          });
-        },
-      },
-    ],
-  });
-  ({ AccountApp, createSession } = await import(pathToFileURL(outputFile).href));
+  ({ AccountApp, createSession, dispose: disposeAccountApp } = await loadAccountAppForHookTests());
 });
 
 afterAll(async () => {
-  if (tempDirectory) await rm(tempDirectory, { recursive: true, force: true });
+  await disposeAccountApp?.();
 });
 
 afterEach(() => {
@@ -142,109 +83,9 @@ function frame(type, fields) {
   return `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
 }
 
-function sameDependencies(left, right) {
-  return (
-    left &&
-    right &&
-    left.length === right.length &&
-    left.every((value, index) => Object.is(value, right[index]))
-  );
-}
-
 // Drive AccountApp's public callbacks without a DOM; render its real screens to HTML below.
 function createHookRuntime() {
-  const slots = [];
-  let cursor = 0;
-  let dirty = true;
-  let effects = [];
-  let output;
-  let route = { kind: "chat" };
-  const getSession = () => globalThis.__accountSession;
-
-  const hooks = {
-    useState(initial) {
-      const index = cursor++;
-      if (!slots[index]) {
-        const slot = { value: typeof initial === "function" ? initial() : initial };
-        slot.set = (next) => {
-          slot.value = typeof next === "function" ? next(slot.value) : next;
-          dirty = true;
-        };
-        slots[index] = slot;
-      }
-      return [slots[index].value, slots[index].set];
-    },
-    useRef(initial) {
-      const index = cursor++;
-      if (!slots[index]) slots[index] = { current: initial };
-      return slots[index];
-    },
-    useCallback(callback, dependencies) {
-      const index = cursor++;
-      if (!slots[index] || !sameDependencies(slots[index].dependencies, dependencies)) {
-        slots[index] = { callback, dependencies };
-      }
-      return slots[index].callback;
-    },
-    useEffect(callback, dependencies) {
-      const index = cursor++;
-      const previous = slots[index];
-      if (!previous || !sameDependencies(previous.dependencies, dependencies)) {
-        const next = { dependencies, cleanup: previous?.cleanup };
-        slots[index] = next;
-        effects.push(() => {
-          previous?.cleanup?.();
-          next.cleanup = callback();
-        });
-      }
-    },
-  };
-
-  function render() {
-    dirty = false;
-    cursor = 0;
-    output = AccountApp({
-      route,
-      projectName: "Docentes",
-      getSession,
-    });
-    const pending = effects;
-    effects = [];
-    for (const runEffect of pending) runEffect();
-  }
-
-  globalThis.__accountHooks = hooks;
-  vi.stubGlobal("React", React);
-  render();
-
-  return {
-    current() {
-      return output;
-    },
-    async flush() {
-      for (let attempt = 0; attempt < 80; attempt += 1) {
-        await Promise.resolve();
-        if (dirty || effects.length) render();
-        await new Promise((resolve) => setImmediate(resolve));
-        if (!dirty && effects.length === 0) {
-          await Promise.resolve();
-          if (!dirty && effects.length === 0) return;
-        }
-      }
-      throw new Error("AccountApp did not settle");
-    },
-    async setRoute(kind) {
-      route = kind === "invite" ? { kind, token: "valid-invite" } : { kind };
-      globalThis.window.location.hash =
-        kind === "invite" ? "#/invite?token=valid-invite" : `#/${kind}`;
-      dirty = true;
-      await this.flush();
-    },
-    async html() {
-      await this.flush();
-      return renderToStaticMarkup(output);
-    },
-  };
+  return createAccountAppHookHarness({ AccountApp });
 }
 
 function createEnvironment(confirmSucceeds, holdConfirmation = false, authOptions = {}) {

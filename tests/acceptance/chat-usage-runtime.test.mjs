@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { createChatHandler } from "../../runtime/chat.ts";
+import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
+import { createChatHandler, createChatInvocationHandler } from "../../runtime/chat.ts";
 
 // This double records the Runtime/store contract; it does not prove DynamoDB transaction behavior.
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
@@ -1010,6 +1011,170 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     expect(harness.store.reconcileTurn).not.toHaveBeenCalled();
     expect(harness.state.providerCalls).toBe(callsBefore);
   });
+
+  it("keeps producing after SSE return and recovers the active prefix and terminal through the SDK task", async () => {
+    const continueGeneration = deferred();
+    const app = new BedrockAgentCoreApp({
+      config: { logging: { enabled: false } },
+      invocationHandler: {
+        async process() {
+          return null;
+        },
+      },
+    });
+    let activeTasksAtProviderStart;
+    const harness = makeHarness({
+      generate: () => {
+        activeTasksAtProviderStart = app.getAsyncTaskInfo().activeCount;
+        return (async function* () {
+          yield { type: "text", text: "Prefijo durable." };
+          await continueGeneration.promise;
+          yield { type: "text", text: " Continuación durable." };
+          yield { type: "result", stopReason: "end_turn" };
+        })();
+      },
+    });
+    const invocationHandler = createChatInvocationHandler(harness.handler, app);
+    const response = await invocationHandler.process(startPayload(), makeContext());
+    expect(isAsyncIterable(response)).toBe(true);
+    const stream = response[Symbol.asyncIterator]();
+
+    try {
+      expect((await stream.next()).value).toMatchObject({
+        event: "accepted",
+        data: { type: "accepted", queryId },
+      });
+      const firstTextPromise = stream.next();
+      expect(await waitFor(firstTextPromise)).toBe(true);
+      expect((await firstTextPromise).value).toMatchObject({
+        event: "text",
+        data: { type: "text", text: "Prefijo durable." },
+      });
+      expect(activeTasksAtProviderStart).toBe(1);
+      expect(app.getAsyncTaskInfo().activeCount).toBe(1);
+
+      await stream.return();
+      expect(app.getAsyncTaskInfo().activeCount).toBe(1);
+      const profileReads = harness.state.calls.filter(([name]) => name === "getProfile").length;
+      const quotaReads = harness.store.readQuota.mock.calls.length;
+      const recoverPayload = { version: 2, operation: "recover", conversationId, queryId };
+      const active = await invocationHandler.process(recoverPayload, makeContext());
+
+      expect(active).toMatchObject({
+        version: 2,
+        conversationId,
+        queryId,
+        status: "in_progress",
+        question: startPayload().text,
+        answer: "Prefijo durable.",
+        canContinue: false,
+      });
+      expect(harness.state.calls.filter(([name]) => name === "getProfile")).toHaveLength(
+        profileReads,
+      );
+      expect(harness.store.readQuota).toHaveBeenCalledTimes(quotaReads);
+      expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+      expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
+      expect(harness.state.providerCalls).toBe(1);
+
+      continueGeneration.resolve();
+      await vi.waitFor(() => expect(harness.state.completed).toBe(true));
+      await vi.waitFor(() => expect(app.getAsyncTaskInfo().activeCount).toBe(0));
+      const completed = await invocationHandler.process(recoverPayload, makeContext());
+
+      expect(completed).toMatchObject({
+        version: 2,
+        conversationId,
+        queryId,
+        status: "completed",
+        question: startPayload().text,
+        answer: "Prefijo durable. Continuación durable.",
+        canContinue: true,
+      });
+      expect(harness.store.failTurn).not.toHaveBeenCalled();
+      expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+      expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
+      expect(harness.state.providerCalls).toBe(1);
+      expect(harness.store.readQuota).toHaveBeenCalledTimes(quotaReads);
+    } finally {
+      continueGeneration.resolve();
+      await stream.return();
+    }
+  });
+
+  it.each([
+    ["success", "completed"],
+    ["provider error", "failed"],
+  ])(
+    "registers work before generation and releases the SDK task after %s when SSE is unread",
+    async (outcome, status) => {
+      const generationStarted = deferred();
+      const finishGeneration = deferred();
+      const app = new BedrockAgentCoreApp({
+        config: { logging: { enabled: false } },
+        invocationHandler: {
+          async process() {
+            return null;
+          },
+        },
+      });
+      let activeTasksAtProviderStart;
+      const harness = makeHarness({
+        generate: () => {
+          activeTasksAtProviderStart = app.getAsyncTaskInfo().activeCount;
+          generationStarted.resolve();
+          return (async function* () {
+            yield { type: "text", text: "Fragmento durable." };
+            await finishGeneration.promise;
+            if (outcome === "provider error") throw new Error("synthetic provider failure");
+            yield { type: "result", stopReason: "end_turn" };
+          })();
+        },
+      });
+      const invocationHandler = createChatInvocationHandler(harness.handler, app);
+
+      try {
+        const response = await invocationHandler.process(startPayload(), makeContext());
+        expect(isAsyncIterable(response)).toBe(true);
+        expect(await waitFor(generationStarted.promise)).toBe(true);
+        expect(activeTasksAtProviderStart).toBe(1);
+        expect(app.getAsyncTaskInfo().activeCount).toBe(1);
+        expect(harness.state.providerCalls).toBe(1);
+
+        finishGeneration.resolve();
+        if (status === "completed") {
+          await vi.waitFor(() => expect(harness.state.completed).toBe(true));
+        } else {
+          await vi.waitFor(() => expect(harness.state.failed).toBe(true));
+        }
+        await vi.waitFor(() => expect(app.getAsyncTaskInfo().activeCount).toBe(0));
+
+        const recovered = await invocationHandler.process(
+          { version: 2, operation: "recover", conversationId, queryId },
+          makeContext(),
+        );
+        expect(recovered).toMatchObject({
+          version: 2,
+          conversationId,
+          queryId,
+          status,
+          question: startPayload().text,
+          answer: "Fragmento durable.",
+        });
+        if (status === "failed") expect(recovered.canContinue).toBe(false);
+        expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+        expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
+        expect(harness.state.providerCalls).toBe(1);
+        if (status === "completed") {
+          expect(harness.store.failTurn).not.toHaveBeenCalled();
+        } else {
+          expect(harness.store.failTurn).toHaveBeenCalledTimes(1);
+        }
+      } finally {
+        finishGeneration.resolve();
+      }
+    },
+  );
 
   it("reconciles an active submission at 60 minutes to failed and closes without reinvoking", async () => {
     const harness = makeHarness();
