@@ -146,5 +146,11 @@ export class ChatStack extends Stack {
         },
       }),
     );
+    this.runtime.role.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:CountTokens"],
+        resources: [sourceModelArn],
+      }),
+    );
   }
 }

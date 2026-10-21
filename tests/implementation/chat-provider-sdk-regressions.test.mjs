@@ -1,8 +1,9 @@
 import { BedrockModel } from "@strands-agents/sdk";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createStrandsGenerator } from "../../runtime/provider.ts";
 import { createChatHandler } from "../../runtime/chat.ts";
 
+const fixedNow = Date.parse("2026-10-20T12:00:00.000Z");
 const request = {
   systemPrompt: "Instrucciones y perfil del servidor.",
   profileSnapshot: { fields: { subjects: ["Matemática"] } },
@@ -10,10 +11,10 @@ const request = {
   messages: [],
   modelId: "global.anthropic.claude-sonnet-4-6",
   revision: "revision-123",
+  resultDeadlineAt: fixedNow + 60 * 60 * 1000,
 };
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
-const fixedNow = Date.parse("2026-10-20T12:00:00.000Z");
 const quota = {
   daily: {
     used: 0,
@@ -234,6 +235,7 @@ function makeHandler() {
         }
       },
     },
+    countInputTokens: async () => ({ inputTokens: 42 }),
     generate: createStrandsGenerator({ region: "us-east-1" }),
     now: () => fixedNow,
   });
@@ -241,6 +243,14 @@ function makeHandler() {
 }
 
 describe("the real Strands/Bedrock provider stream contract", () => {
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("retains max-token stop reason and provider metrics when Strands throws before AgentResult", async () => {
     await withModelStream(modelMessageEvents("maxTokens", true), async (streamCalls) => {
       const events = await collect(createStrandsGenerator({ region: "us-east-1" })(request));

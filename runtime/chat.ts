@@ -1,7 +1,6 @@
 import { accessTokenSubject } from "../api/auth.js";
 import { createHash, randomUUID } from "node:crypto";
 import { isStoredProfile, type ProfileConfig, type StoredProfile } from "../config/profile.js";
-import type { MessageData } from "@strands-agents/sdk";
 import type {
   AppendChunkInput,
   CompleteTurnInput,
@@ -9,11 +8,15 @@ import type {
   ConversationStore,
   ContextReference,
   FailTurnInput,
+  GenerationInput,
+  ModelInput,
   QuotaView,
   StartTurnInput,
   ContinueTurnInput,
   SubmissionSnapshot,
+  TokenCountResult,
 } from "./contracts.js";
+import { maxInputTokens } from "./model-capacity.js";
 import { maxDynamoTextChunkBytes, splitUtf8Text } from "./text.js";
 
 type ChatConfig = {
@@ -51,16 +54,6 @@ type ProviderEvent =
       metrics?: Record<string, number>;
     };
 
-type ProviderInput = {
-  systemPrompt: string;
-  profileSnapshot: Record<string, unknown>;
-  text: string;
-  messages: MessageData[];
-  modelId: string;
-  revision: string;
-  cancelSignal: AbortSignal;
-};
-
 type AsyncTaskRegistry = {
   addAsyncTask(name: string, metadata?: Record<string, unknown>): number;
   completeAsyncTask(taskId: number): boolean;
@@ -71,7 +64,8 @@ type ChatDependencies = {
   accounts: { hasMember(input: { sub: string; botId: string }): Promise<boolean> };
   profiles: ProfileStore;
   store: ConversationStore;
-  generate(input: ProviderInput): AsyncIterable<ProviderEvent>;
+  countInputTokens(input: ModelInput): Promise<TokenCountResult>;
+  generate(input: GenerationInput): AsyncIterable<ProviderEvent>;
   now(): number;
 };
 
@@ -236,12 +230,14 @@ function safeFailure(
   code: string,
   recordStatus: "not_admitted" | "failed" | "unconfirmed",
   queryId?: string,
-  details: { canContinue?: boolean; quota?: QuotaView } = {},
+  details: { canContinue?: boolean; quota?: QuotaView; message?: string } = {},
 ) {
   return {
     type: "failed" as const,
     code,
-    message: "No pudimos completar la consulta. Podés volver a intentarlo desde un hilo nuevo.",
+    message:
+      details.message ??
+      "No pudimos completar la consulta. Podés volver a intentarlo desde un hilo nuevo.",
     recordStatus,
     ...(queryId ? { queryId } : {}),
     ...(details.canContinue === undefined ? {} : { canContinue: details.canContinue }),
@@ -352,6 +348,19 @@ function errorCode(error: unknown): string | undefined {
   return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
 }
 
+function isNativeTokenCount(value: unknown): value is TokenCountResult {
+  return (
+    isRecord(value) &&
+    typeof value.inputTokens === "number" &&
+    Number.isSafeInteger(value.inputTokens) &&
+    value.inputTokens >= 0
+  );
+}
+
+function nativeCountRequestId(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,256}$/.test(value) ? value : undefined;
+}
+
 function providerDispatch(input: {
   revision: string;
   botId: string;
@@ -364,7 +373,7 @@ function providerDispatch(input: {
 }
 
 export function createChatHandler(dependencies: ChatDependencies) {
-  const { config, accounts, profiles, store, generate, now } = dependencies;
+  const { config, accounts, profiles, store, countInputTokens, generate, now } = dependencies;
 
   return async function handler(payload: unknown, context: ChatContext): Promise<ChatResponse> {
     if (!isChatRequest(payload)) {
@@ -524,24 +533,71 @@ export function createChatHandler(dependencies: ChatDependencies) {
       return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
     }
 
-    let messages: MessageData[] = [];
+    let messages: ModelInput["messages"] = [];
     let contextReferences: ContextReference[] = [];
     if (request.operation === "message") {
       try {
         const context = await store.readContext({ conversationId: request.conversationId });
-        messages = context.messages;
-        contextReferences = context.references;
+        messages = structuredClone(context.messages);
+        contextReferences = structuredClone(context.references);
       } catch {
         return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
       }
     }
 
-    const profileSnapshot = makeProfileSnapshot(
-      storedProfile,
-      config.profile,
-      config.botId,
-      config.revision,
+    const profileSnapshot = structuredClone(
+      makeProfileSnapshot(storedProfile, config.profile, config.botId, config.revision),
     );
+    const modelInput: ModelInput = {
+      systemPrompt: profilePrompt(profileSnapshot, config),
+      profileSnapshot,
+      text: request.text,
+      messages,
+      modelId: config.modelId,
+      revision: config.revision,
+    };
+    let tokenCount: TokenCountResult;
+    try {
+      tokenCount = await countInputTokens(modelInput);
+    } catch {
+      return failureResponse(
+        request,
+        safeFailure("token_count_unavailable", "not_admitted", request.queryId, {
+          message:
+            "No pudimos comprobar si el pedido y el contexto caben en el modelo. Conservá el pedido y volvé a intentarlo.",
+        }),
+      );
+    }
+    if (!isNativeTokenCount(tokenCount)) {
+      return failureResponse(
+        request,
+        safeFailure("token_count_unavailable", "not_admitted", request.queryId, {
+          message:
+            "No pudimos comprobar si el pedido y el contexto caben en el modelo. Conservá el pedido y volvé a intentarlo.",
+        }),
+      );
+    }
+    const countRequestId = nativeCountRequestId(tokenCount.requestId);
+    console.info(
+      JSON.stringify({
+        event: "chat_input_token_count",
+        botId: config.botId,
+        queryId: request.queryId,
+        revision: config.revision,
+        inputTokens: tokenCount.inputTokens,
+        ...(countRequestId ? { requestId: countRequestId } : {}),
+      }),
+    );
+    if (tokenCount.inputTokens > maxInputTokens) {
+      return failureResponse(
+        request,
+        safeFailure("capacity_exceeded", "not_admitted", request.queryId, {
+          message:
+            "El pedido y el contexto superan la capacidad del modelo. Acortá el pedido o iniciá una conversación nueva si el historial ocupa demasiado.",
+        }),
+      );
+    }
+
     const invocation = { modelId: config.modelId, revision: config.revision };
     const requestFingerprint = fingerprint(request);
     const ownerAttemptId = randomUUID();
@@ -654,6 +710,15 @@ export function createChatHandler(dependencies: ChatDependencies) {
           safeFailure(code, "not_admitted", request.queryId, { quota: suppliedQuota }),
         );
       }
+      if (code === "storage_capacity_exceeded") {
+        return failureResponse(
+          request,
+          safeFailure("storage_capacity_exceeded", "not_admitted", request.queryId, {
+            message:
+              "No pudimos admitir el pedido porque supera el límite técnico de almacenamiento de la conversación.",
+          }),
+        );
+      }
       if (code === "conversation_busy" || code === "stale_base" || code === "conflict") {
         return failureResponse(request, safeFailure(code, "not_admitted", request.queryId));
       }
@@ -672,9 +737,8 @@ export function createChatHandler(dependencies: ChatDependencies) {
       sub,
       ownerAttemptId,
       admitted,
-      profileSnapshot,
+      modelInput,
       invocation,
-      messages,
       resultDeadlineAt,
     });
   };
@@ -930,15 +994,14 @@ async function recoverSnapshot(
 function admittedStream(input: {
   config: ChatConfig;
   store: ConversationStore;
-  generate(input: ProviderInput): AsyncIterable<ProviderEvent>;
+  generate(input: GenerationInput): AsyncIterable<ProviderEvent>;
   now(): number;
   request: NewChatRequest;
   sub: string;
   ownerAttemptId: string;
   admitted: { queryId: string; ordinal: number };
-  profileSnapshot: Record<string, unknown>;
+  modelInput: ModelInput;
   invocation: { modelId: string; revision: string };
-  messages: MessageData[];
   resultDeadlineAt: number;
 }): AsyncGenerator<ChatEvent, void, unknown> {
   const {
@@ -950,9 +1013,8 @@ function admittedStream(input: {
     sub,
     ownerAttemptId,
     admitted,
-    profileSnapshot,
+    modelInput,
     invocation,
-    messages,
     resultDeadlineAt,
   } = input;
 
@@ -1139,12 +1201,8 @@ function admittedStream(input: {
         ownerAttemptId,
       });
       for await (const event of generate({
-        systemPrompt: profilePrompt(profileSnapshot, config),
-        profileSnapshot,
-        text: request.text,
-        messages,
-        modelId: config.modelId,
-        revision: config.revision,
+        ...modelInput,
+        resultDeadlineAt,
         cancelSignal: cancellation.signal,
       })) {
         if (!isRecord(event) || typeof event.type !== "string") {

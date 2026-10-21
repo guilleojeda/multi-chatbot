@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
 import path from "node:path";
 import { build } from "esbuild";
@@ -423,6 +424,40 @@ async function postRawJson(origin, body) {
   });
 }
 
+function postOversizedJson(origin, body) {
+  const url = new URL(origin);
+  return new Promise((resolve, reject) => {
+    let receivedResponse = false;
+    const request = httpRequest(
+      {
+        host: url.hostname,
+        port: Number(url.port),
+        path: "/invocations",
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body, "utf8"),
+        },
+      },
+      (response) => {
+        receivedResponse = true;
+        response.resume();
+        resolve({ status: response.statusCode });
+      },
+    );
+    request.on("error", (error) => {
+      if (receivedResponse) return;
+      if (error.code === "EPIPE" || error.code === "ECONNRESET") {
+        resolve({ connectionClosed: true, errorCode: error.code });
+        return;
+      }
+      reject(error);
+    });
+    request.end(body);
+  });
+}
+
 function expectRuntimeJsonParser(config) {
   expect.soft(config?.contentTypeParsers).toEqual(
     expect.arrayContaining([
@@ -540,8 +575,9 @@ describe("the real AgentCore HTTP response boundary", () => {
     const oversizedBody = `{"text":"${"x".repeat(jsonBodyLimitBytes)}"}`;
     expect(Buffer.byteLength(oversizedBody, "utf8")).toBeGreaterThan(jsonBodyLimitBytes);
 
-    const response = await postRawJson(origin, oversizedBody);
-    expect.soft(response.status).toBe(413);
+    const response = await postOversizedJson(origin, oversizedBody);
+    expect.soft(response.status === 413 || response.connectionClosed === true).toBe(true);
+    expect.soft((await fetch(`${origin}/ping`)).status).toBe(200);
     expect.soft(await inspectState(worker, messages)).toMatchObject({
       admissionCount: 0,
       quotaReadCount: 0,

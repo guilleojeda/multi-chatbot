@@ -7,6 +7,25 @@ export type ConversationContext = {
   references: ContextReference[];
 };
 
+export type ModelInput = {
+  systemPrompt: string;
+  profileSnapshot: Record<string, unknown>;
+  text: string;
+  messages: MessageData[];
+  modelId: string;
+  revision: string;
+};
+
+export type GenerationInput = ModelInput & {
+  resultDeadlineAt: number;
+  cancelSignal?: AbortSignal;
+};
+
+export type TokenCountResult = {
+  inputTokens: number;
+  requestId?: string;
+};
+
 export type QuotaPeriod = {
   used: number;
   limit: number;
@@ -100,7 +119,8 @@ export type ConversationStoreErrorCode =
   | "submission_exists"
   | "conversation_busy"
   | "stale_base"
-  | "conflict";
+  | "conflict"
+  | "storage_capacity_exceeded";
 
 export type ConversationStoreError = Error & {
   code: ConversationStoreErrorCode;

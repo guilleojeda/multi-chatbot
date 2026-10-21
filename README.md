@@ -35,6 +35,8 @@ Las pruebas con errores intencionales trabajan en copias y repositorios Git temp
 
 La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes` y define sus campos y opciones de perfil. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo. Una persona autorizada guarda su perfil y hace una consulta docente o pide un material como texto copiable. Puede continuar el mismo hilo y navegar a su perfil sin perder una respuesta en curso. El siguiente envío usa los cambios de perfil ya guardados. Cada persona dispone inicialmente de 20 consultas diarias y 200 mensuales por chatbot, con períodos de Argentina. Un envío admitido consume aunque falle; repetir el mismo ID no vuelve a consumir ni generar. Al recargar, la pestaña recupera el último envío y su estado sin volver a generar ni consumir. La tarea sigue aunque se corte su conexión; todavía no hay un historial navegable. La pregunta pendiente se guarda temporalmente en la pestaña hasta confirmar admisión; luego solo queda la referencia. Ver [cuenta e invitaciones](docs/intent/account.md), [perfil y preferencias](docs/intent/profile.md) y [chat, datos y fallos](docs/intent/chat.md).
 
+Antes de admitir, el servidor cuenta la entrada completa con `CountTokens`: hasta 936.000 tokens de entrada dentro de una ventana de 1.000.000, reservando 64.000 para salida. Un fallo de conteo o un exceso de capacidad conserva el borrador sin consumir. El cuerpo JSON puede ocupar hasta 32 MiB para transporte; la admisión completa sigue sujeta a los límites atómicos de DynamoDB. Los detalles de conteo, rechazos y plazo están en el [contrato del chat](docs/intent/chat.md).
+
 Para usar el sitio localmente:
 
 ```sh
@@ -68,7 +70,7 @@ La configuración pública utilizada por CDK y los scripts vive en `config/proje
 - Cuenta **118903272638**, región **us-east-1**.
 - Ambientes `dev` y `prod`, con prefijos distintos y tags AWS `environment=dev` o `environment=prod` para sus recursos propios.
 - `resolveEnvironment(environment, botId?)` valida la selección y deriva nombres por chatbot. No crea instancias de aplicación.
-- Modelo inicial: Sonnet 4.6 mediante `global.anthropic.claude-sonnet-4-6`, con cliente Bedrock en `us-east-1`. Haiku 5.5 y GPT-6 Luna permanecen como candidatos posteriores; no hay fallback automático.
+- Modelo inicial: generación Sonnet 4.6 mediante `global.anthropic.claude-sonnet-4-6` y cliente Bedrock en `us-east-1`; el conteo previo usa `CountTokens` con el modelo base `anthropic.claude-sonnet-4-6` en esa región. Haiku 5.5 y GPT-6 Luna permanecen como candidatos posteriores; no hay fallback automático.
 
 El acceso humano usa una sesión temporal de la identidad autorizada de esta cuenta. Obtenerla o renovarla desde el acceso AWS de la organización y cargar sus variables en la terminal, o utilizar un perfil propio de IAM Identity Center con AWS CLI v2. El start URL y el acceso de cada integrante los suministra la organización; no se comparten credenciales entre integrantes. Para un perfil configurado:
 

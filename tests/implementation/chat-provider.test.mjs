@@ -42,6 +42,7 @@ const request = {
   messages: [],
   modelId: "global.anthropic.claude-sonnet-4-6",
   revision: "revision-123",
+  resultDeadlineAt: Date.now() + 60 * 60 * 1000,
 };
 
 function collect(source) {
@@ -59,6 +60,7 @@ beforeEach(() => {
 
 describe("the Strands provider boundary", () => {
   it("streams only text and returns real stop and usage metadata with retries and tools disabled", async () => {
+    const remainingDeadlineMs = request.resultDeadlineAt - Date.now();
     doubles.events = [
       {
         type: "modelStreamUpdateEvent",
@@ -99,8 +101,11 @@ describe("the Strands provider boundary", () => {
       modelId: request.modelId,
       region: "us-east-1",
       stream: true,
+      maxTokens: 64_000,
       clientConfig: { maxAttempts: 1 },
     });
+    expect(doubles.modelConfig.requestTimeout).toBeGreaterThan(remainingDeadlineMs - 100);
+    expect(doubles.modelConfig.requestTimeout).toBeLessThanOrEqual(remainingDeadlineMs);
     expect(doubles.agentConfig).toMatchObject({
       systemPrompt: request.systemPrompt,
       messages: [],

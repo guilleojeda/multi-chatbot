@@ -1,14 +1,29 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
+import type { ContentTypeParserConfig } from "bedrock-agentcore/runtime";
 import { createAccountStoreAdapter } from "../api/aws-adapters.js";
 import { createProfileStoreAdapter } from "../api/profile-store.js";
 import { siteConfig } from "../config/site.js";
 import { createChatHandler, createChatInvocationHandler } from "./chat.js";
 import { createConversationStoreAdapter } from "./conversation-store.js";
-import { createStrandsGenerator } from "./provider.js";
+import { createBedrockTokenCounter, createStrandsGenerator } from "./provider.js";
 
 const approvedModelId = "global.anthropic.claude-sonnet-4-6";
+type JsonParserRequest = Parameters<ContentTypeParserConfig["parser"]>[0];
+type JsonParserCallback = NonNullable<Parameters<ContentTypeParserConfig["parser"]>[2]>;
+
+function parseApplicationJson(
+  request: JsonParserRequest,
+  body: string | Buffer,
+  done: JsonParserCallback,
+): void {
+  if (typeof body !== "string") {
+    done(new TypeError("Expected an application/json string body."));
+    return;
+  }
+  request.server.getDefaultJsonParser("error", "error")(request, body, done);
+}
 
 function requiredEnv(name: string): string {
   const value = process.env[name];
@@ -33,6 +48,7 @@ const store = createConversationStoreAdapter({
   documentClient,
   tableName: conversationTableName,
 });
+const countInputTokens = createBedrockTokenCounter({ region });
 const generate = createStrandsGenerator({ region });
 const chat = createChatHandler({
   config: {
@@ -46,6 +62,7 @@ const chat = createChatHandler({
   accounts,
   profiles,
   store,
+  countInputTokens,
   generate,
   now: Date.now,
 });
@@ -64,7 +81,17 @@ const taskRegistry = {
 
 const app = new BedrockAgentCoreApp({
   invocationHandler: createChatInvocationHandler(chat, taskRegistry),
-  config: { logging: { enabled: false } },
+  config: {
+    logging: { enabled: false },
+    contentTypeParsers: [
+      {
+        contentType: "application/json",
+        parseAs: "string",
+        bodyLimit: 32 * 1024 * 1024,
+        parser: parseApplicationJson,
+      },
+    ],
+  },
 });
 
 runtimeApp.instance = app;

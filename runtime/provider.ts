@@ -1,15 +1,25 @@
+import { BedrockRuntimeClient, CountTokensCommand } from "@aws-sdk/client-bedrock-runtime";
+import type {
+  ContentBlock as BedrockContentBlock,
+  Message as BedrockMessage,
+} from "@aws-sdk/client-bedrock-runtime";
 import { Agent, BedrockModel, configureLogging } from "@strands-agents/sdk";
-import type { MessageData } from "@strands-agents/sdk";
+import { maxOutputTokens } from "./model-capacity.js";
+import type { GenerationInput, ModelInput, TokenCountResult } from "./contracts.js";
 
-type GenerationInput = {
-  systemPrompt: string;
-  profileSnapshot: Record<string, unknown>;
-  text: string;
-  messages: MessageData[];
-  modelId: string;
-  revision: string;
-  cancelSignal?: AbortSignal;
-};
+const countModelId = "anthropic.claude-sonnet-4-6";
+
+function toConverseMessage(message: ModelInput["messages"][number]): BedrockMessage {
+  return {
+    role: message.role,
+    content: message.content.map((block): BedrockContentBlock => {
+      if (!("text" in block)) {
+        throw new Error("Bedrock input counting supports text messages only.");
+      }
+      return { text: block.text };
+    }),
+  };
+}
 
 type ProviderEvent =
   | { type: "text"; text: string }
@@ -138,10 +148,13 @@ export function createStrandsGenerator(input: { region: string }) {
   configureLogging({ debug() {}, info() {}, warn() {}, error() {} });
 
   return async function* generate(request: GenerationInput): AsyncGenerator<ProviderEvent> {
+    const remainingDeadlineMs = Math.max(1, request.resultDeadlineAt - Date.now());
     const model = new BedrockModel({
       modelId: request.modelId,
       region: input.region,
       stream: true,
+      maxTokens: maxOutputTokens,
+      requestTimeout: remainingDeadlineMs,
       clientConfig: { maxAttempts: 1 },
     });
     const agent = new Agent({
@@ -263,5 +276,41 @@ export function createStrandsGenerator(input: { region: string }) {
     } finally {
       await agent.shutdown();
     }
+  };
+}
+
+export function createBedrockTokenCounter(input: { region: string }) {
+  const client = new BedrockRuntimeClient({ region: input.region, maxAttempts: 1 });
+
+  return async function countInputTokens(request: ModelInput): Promise<TokenCountResult> {
+    const command = new CountTokensCommand({
+      modelId: countModelId,
+      input: {
+        converse: {
+          system: [{ text: request.systemPrompt }],
+          messages: [
+            ...request.messages.map(toConverseMessage),
+            { role: "user", content: [{ text: request.text }] },
+          ],
+        },
+      },
+    });
+    const result = await client.send(command);
+    if (
+      !isRecord(result) ||
+      typeof result.inputTokens !== "number" ||
+      !Number.isInteger(result.inputTokens) ||
+      result.inputTokens < 0
+    ) {
+      throw new Error("Bedrock returned an invalid native input-token count.");
+    }
+
+    const requestId = result.$metadata.requestId;
+    return {
+      inputTokens: result.inputTokens,
+      ...(typeof requestId === "string" && /^[A-Za-z0-9_.:-]{1,256}$/.test(requestId)
+        ? { requestId }
+        : {}),
+    };
   };
 }

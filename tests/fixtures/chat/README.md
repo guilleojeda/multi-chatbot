@@ -120,6 +120,28 @@ completed turn, select `runtime-conversation-busy` or `runtime-stale-base` befor
 the corresponding public `conversation_busy` or `stale_base` rejection; neither creates an admitted
 stream or advances the fixture's ordinal. These two selections exercise the web response handling;
 runtime/store tests cover the actual occupied-thread and stale-base conditions.
+For C's input-capacity flows, these local scenarios simulate public Runtime failures before any
+fixture conversation turn or usage record is created; they do not call AWS or run the native token
+counter:
+
+- To check a native-count failure, select `runtime-token-count-unavailable`, submit a question, and
+  confirm the message says that the count could not be checked, no quota notice appears, and the
+  composer keeps the exact text. The request list and product-journal JSON show the same query ID
+  and body. Select `ready`, then click “Reintentar el mismo envío”; compare the second request's
+  query ID, conversation ID, operation, ordinal, and text with the first. No second request should
+  appear before that explicit click.
+- To check history capacity, complete a turn under `ready`, select
+  `runtime-capacity-exceeded`, and send a follow-up. The simulated failure applies only to
+  `message`, so the completed turn remains in the fixture's stored conversation. Confirm the
+  rejected follow-up remains in the composer state, then click “Volver al inicio.” The new chat
+  should retain that draft. Submit it and inspect the request list: the operation should be `start`
+  with a different conversation ID, while the old simulated conversation and turn remain in the
+  fixture state. No remote delete operation is available in this fixture.
+- To check the DynamoDB preflight distinction, select `runtime-storage-capacity-exceeded` before
+  submitting. The mock returns `storage_capacity_exceeded` without a quota view or admitted turn;
+  the original text remains editable so it can be corrected. This local response exercises the web
+  state only; the acceptance tests exercise the actual storage preflight.
+
 `signout-pending` clears the session immediately while holding the simulated sign-out promise.
 After clicking “Cerrar sesión”, use “Emitir fragmento (o tardío tras logout)” to release an old
 stream callback and confirm that the login screen stays clear; then release “Liberar promesa de
@@ -177,7 +199,9 @@ Append `?scenario=<name>` before the hash to select an initial scenario, for exa
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-temporary`, `runtime-quota-daily`, `runtime-quota-monthly`, `runtime-quota-both`,
-`runtime-conversation-busy`, `runtime-stale-base`, `runtime-401`, `runtime-401-pending`,
+`runtime-capacity-exceeded`, `runtime-token-count-unavailable`,
+`runtime-storage-capacity-exceeded`, `runtime-conversation-busy`, `runtime-stale-base`,
+`runtime-401`, `runtime-401-pending`,
 `runtime-expired`, `runtime-forbidden`,
 `password-reset-pending`, `password-reset-failure`, `signout-pending`, `sign-in-pending`,
 `clipboard-fail`, and `clipboard-pending`. The selector also changes the scenario for the next

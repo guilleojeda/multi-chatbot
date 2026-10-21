@@ -306,6 +306,9 @@ function makeHarness({
       },
     },
     store,
+    async countInputTokens() {
+      return { inputTokens: 0 };
+    },
     generate(input) {
       state.providerCalls += 1;
       state.providerInputs.push(clone(input));

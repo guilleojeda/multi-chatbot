@@ -75,6 +75,11 @@ function FixtureControls() {
             </option>
           ))}
         </select>
+        <p className="profile-fixture-readout">
+          Para C, el conteo y el preflight de almacenamiento se simulan antes de admitir. El error
+          de contexto afecta solo seguimientos; el historial de peticiones conserva cuerpo e IDs
+          para comprobar el reintento y el inicio nuevo.
+        </p>
         <nav className="profile-fixture-links" aria-label="Rutas locales">
           <a href="#/chat">Abrir chat</a>
           <a href="#/profile">Abrir perfil</a>

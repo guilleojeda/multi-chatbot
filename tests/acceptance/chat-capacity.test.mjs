@@ -485,7 +485,10 @@ describe("native model capacity admission", () => {
       profileSnapshot: {
         sub: caller.sub,
         botId,
-        fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
+        fields: {
+          educationLevels: [{ id: "secundario", label: "Secundario" }],
+          subjects: ["Matemática"],
+        },
         responsePreferenceIds: ["ready-material"],
         promptTexts: ["Incluí materiales completos y listos para usar en clase."],
       },

@@ -573,12 +573,18 @@ export function createConversationStoreAdapter(input: {
     return item.pk + "\u0000" + item.sk;
   }
 
+  function storageCapacityError(message: string): RangeError & {
+    code: "storage_capacity_exceeded";
+  } {
+    return Object.assign(new RangeError(message), { code: "storage_capacity_exceeded" as const });
+  }
+
   function preflight(
     actions: Record<string, unknown>[],
     affectedItems: Record<string, unknown>[],
   ): void {
     if (actions.length > actionLimit)
-      throw new RangeError("DynamoDB transaction exceeds 100 actions.");
+      throw storageCapacityError("DynamoDB transaction exceeds 100 actions.");
     const keys = new Set<string>();
     for (const item of affectedItems) {
       const key = itemKey(item);
@@ -586,10 +592,10 @@ export function createConversationStoreAdapter(input: {
         throw new TypeError("DynamoDB transactions cannot target an item more than once.");
       keys.add(key);
       if (itemSize(item) > itemLimit)
-        throw new RangeError("DynamoDB transaction item exceeds 400 KiB.");
+        throw storageCapacityError("DynamoDB transaction item exceeds 400 KiB.");
     }
     if (affectedItems.reduce((total, item) => total + itemSize(item), 0) > transactionLimit) {
-      throw new RangeError("DynamoDB transaction exceeds 4 MiB.");
+      throw storageCapacityError("DynamoDB transaction exceeds 4 MiB.");
     }
   }
 
