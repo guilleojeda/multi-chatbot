@@ -11,7 +11,6 @@ import { ChatScreen } from "../../web/ChatScreen.tsx";
 
 const root = process.cwd();
 const conversationId = "550e8400-e29b-41d4-a716-446655440000";
-const queryId = "reset-chat-query";
 const identity = { sub: "teacher-a", botId: "docentes" };
 const secondIdentity = { sub: "teacher-b", botId: "docentes" };
 const config = {
@@ -256,6 +255,7 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false, authOption
   let refreshCount = 0;
   let streamController;
   let streamSignal;
+  let streamQueryId;
   let streamWasCancelled = false;
   let nextConversation = -1;
   const runtimeRequests = [];
@@ -360,7 +360,7 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false, authOption
         return new Response("{}", { status: 401 });
       }
       if (runtimeRequests.length > 1) {
-        const query = "after-reset-query";
+        const query = request.queryId;
         const body = new ReadableStream({
           start(controller) {
             controller.enqueue(
@@ -369,7 +369,7 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false, authOption
                   frame("accepted", {
                     conversationId: request.conversationId,
                     queryId: query,
-                    ordinal: request.operation === "message" ? 2 : 1,
+                    ordinal: request.baseOrdinal + 1,
                   }),
                   frame("text", { queryId: query, index: 0, text: "Respuesta nueva" }),
                   frame("completed", { queryId: query }),
@@ -382,14 +382,23 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false, authOption
         return new Response(body, { headers: { "content-type": "text/event-stream" } });
       }
       streamSignal = init.signal;
+      streamQueryId = request.queryId;
       const body = new ReadableStream({
         start(controller) {
           streamController = controller;
           controller.enqueue(
             new TextEncoder().encode(
               [
-                frame("accepted", { conversationId: request.conversationId, queryId, ordinal: 1 }),
-                frame("text", { queryId, index: 0, text: "Respuesta inicial del hilo" }),
+                frame("accepted", {
+                  conversationId: request.conversationId,
+                  queryId: request.queryId,
+                  ordinal: request.baseOrdinal + 1,
+                }),
+                frame("text", {
+                  queryId: request.queryId,
+                  index: 0,
+                  text: "Respuesta inicial del hilo",
+                }),
               ].join(""),
             ),
           );
@@ -429,13 +438,19 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false, authOption
     sendLateChunk() {
       streamController.enqueue(
         new TextEncoder().encode(
-          frame("text", { queryId, index: 1, text: "; fragmento posterior al reset" }),
+          frame("text", {
+            queryId: streamQueryId,
+            index: 1,
+            text: "; fragmento posterior al reset",
+          }),
         ),
       );
     },
     finishStream() {
       try {
-        streamController.enqueue(new TextEncoder().encode(frame("completed", { queryId })));
+        streamController.enqueue(
+          new TextEncoder().encode(frame("completed", { queryId: streamQueryId })),
+        );
         streamController.close();
       } catch {
         // A canceled response has no remaining stream to close.
@@ -455,6 +470,16 @@ async function startStream(app, environment) {
   await initializeChat(app);
   app.current().props.onSubmit("Prepará una actividad para la clase.");
   await environment.streamStarted;
+  expect(environment.runtimeRequests[0]).toMatchObject({
+    version: 2,
+    operation: "start",
+    conversationId,
+    baseOrdinal: 0,
+    text: "Prepará una actividad para la clase.",
+  });
+  expect(environment.runtimeRequests[0].queryId).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  );
   await vi.waitFor(async () => {
     expect(await app.html()).toContain("Respuesta inicial del hilo");
   });
@@ -656,9 +681,16 @@ describe("password reset and the in-memory chat", () => {
       app.current().props.onSubmit("Un seguimiento en el mismo hilo.");
       await vi.waitFor(() => expect(environment.runtimeRequests).toHaveLength(2));
       expect(environment.runtimeRequests[1]).toMatchObject({
+        version: 2,
         operation: "message",
         conversationId,
+        queryId: expect.any(String),
+        baseOrdinal: 1,
+        text: "Un seguimiento en el mismo hilo.",
       });
+      expect(environment.runtimeRequests[1].queryId).not.toBe(
+        environment.runtimeRequests[0].queryId,
+      );
     });
   }
 });

@@ -4,6 +4,7 @@ import {
   type ProfileDraft,
 } from "../../../config/profile";
 import { siteConfig } from "../../../config/site";
+import type { QuotaView } from "../../../runtime/contracts";
 import { createSession, type Session, type SessionTokens } from "../../../web/session";
 
 export const fixtureScenarios = [
@@ -18,6 +19,11 @@ export const fixtureScenarios = [
   { id: "membership-network", label: "Membresía: fallo de red" },
   { id: "config-temporary", label: "Configuración pública: fallo temporal 503" },
   { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
+  { id: "runtime-quota-daily", label: "Runtime: cupo diario agotado" },
+  { id: "runtime-quota-monthly", label: "Runtime: cupo mensual agotado" },
+  { id: "runtime-quota-both", label: "Runtime: cupos diario y mensual agotados" },
+  { id: "runtime-conversation-busy", label: "Runtime: hilo ocupado (sin admisión)" },
+  { id: "runtime-stale-base", label: "Runtime: ordinal base desactualizado (sin admisión)" },
   { id: "runtime-401", label: "Runtime: 401 y refresh correcto" },
   { id: "runtime-401-pending", label: "Runtime: 401 y refresh retenidos" },
   { id: "sign-in-pending", label: "Cognito: retener nuevo inicio de sesión" },
@@ -143,6 +149,41 @@ function json(value: unknown, status = 200) {
 function sse(value: unknown) {
   const type = isRecord(value) && typeof value.type === "string" ? value.type : "message";
   return `event: ${type}\ndata: ${JSON.stringify(value)}\n\n`;
+}
+
+function sseResponse(value: unknown) {
+  return new Response(sse(value), { headers: { "content-type": "text/event-stream" } });
+}
+
+function fixtureQuota(scenario: FixtureScenario): QuotaView {
+  const serverNow = Date.now();
+  const dailyReset = serverNow + 8 * 60 * 60 * 1000;
+  const monthlyReset = serverNow + 21 * 24 * 60 * 60 * 1000;
+  const dailyExhausted = scenario === "runtime-quota-daily" || scenario === "runtime-quota-both";
+  const monthlyExhausted =
+    scenario === "runtime-quota-monthly" || scenario === "runtime-quota-both";
+  const blockedUntil = Math.max(
+    ...(dailyExhausted ? [dailyReset] : []),
+    ...(monthlyExhausted ? [monthlyReset] : []),
+  );
+
+  return {
+    daily: {
+      used: dailyExhausted ? 20 : 0,
+      limit: 20,
+      resetAt: dailyReset,
+      period: "fixture-day",
+    },
+    monthly: {
+      used: monthlyExhausted ? 200 : 0,
+      limit: 200,
+      resetAt: monthlyReset,
+      period: "fixture-month",
+    },
+    serverNow,
+    blockedUntil,
+    policyRevision: "fixture-20-200-v1",
+  };
 }
 
 function initialScenario(): FixtureScenario {
@@ -446,7 +487,24 @@ export class ChatBrowserFixture {
   ): Promise<Response> {
     const body = isRecord(requestBody) ? requestBody : {};
     const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+    const queryId = typeof body.queryId === "string" ? body.queryId : "";
     const operation = body.operation;
+
+    if (
+      body.version !== 2 ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        conversationId,
+      ) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(queryId) ||
+      typeof body.baseOrdinal !== "number" ||
+      !Number.isSafeInteger(body.baseOrdinal) ||
+      body.baseOrdinal < 0 ||
+      typeof body.text !== "string" ||
+      !body.text.trim()
+    ) {
+      this.finish(request, 400, "la solicitud no cumple el contrato v2");
+      return json({ code: "INVALID_REQUEST" }, 400);
+    }
 
     if (this.selectedScenario === "runtime-401-pending" && !this.runtime401Used) {
       this.runtime401Used = true;
@@ -475,15 +533,52 @@ export class ChatBrowserFixture {
       return json({ code: "FORBIDDEN" }, 403);
     }
 
+    if (
+      this.selectedScenario === "runtime-quota-daily" ||
+      this.selectedScenario === "runtime-quota-monthly" ||
+      this.selectedScenario === "runtime-quota-both"
+    ) {
+      this.finish(request, 200, "rechazo de cupo simulado antes de admitir");
+      return sseResponse({
+        type: "failed",
+        code: "quota_exceeded",
+        message: "No pudimos completar la consulta. Podés volver a intentarlo desde un hilo nuevo.",
+        recordStatus: "not_admitted",
+        queryId,
+        quota: fixtureQuota(this.selectedScenario),
+      });
+    }
+
+    if (
+      this.selectedScenario === "runtime-conversation-busy" ||
+      this.selectedScenario === "runtime-stale-base"
+    ) {
+      const code =
+        this.selectedScenario === "runtime-conversation-busy" ? "conversation_busy" : "stale_base";
+      this.finish(request, 200, `rechazo ${code} simulado antes de admitir`);
+      return sseResponse({
+        type: "failed",
+        code,
+        message: "No pudimos completar la consulta. Podés volver a intentarlo desde un hilo nuevo.",
+        recordStatus: "not_admitted",
+        queryId,
+      });
+    }
+
     let conversation = this.conversations.get(conversationId);
     if (operation === "start") {
-      if (conversation) {
+      if (conversation || body.baseOrdinal !== 0) {
         this.finish(request, 409, "el ID ya pertenece a una conversación");
         return json({ code: "CONVERSATION_EXISTS" }, 409);
       }
       conversation = { nextOrdinal: 1, turns: [] };
       this.conversations.set(conversationId, conversation);
-    } else if (operation !== "message" || !conversation || conversation.turns.length === 0) {
+    } else if (
+      operation !== "message" ||
+      !conversation ||
+      conversation.turns.length === 0 ||
+      body.baseOrdinal !== conversation.nextOrdinal - 1
+    ) {
       this.finish(request, 400, "la operación no coincide con la conversación");
       return json({ code: "INVALID_CONVERSATION" }, 400);
     }
@@ -494,9 +589,8 @@ export class ChatBrowserFixture {
     const responseBody = new ReadableStream<Uint8Array>({
       start: (controller) => {
         controllerRef = controller;
-        const queryId = `fixture-query-${request.number}`;
         const turn: FixtureTurn = {
-          ordinal: 0,
+          ordinal: body.baseOrdinal as number,
           question: typeof body.text === "string" ? body.text : "",
           answer: "",
           status: "pending",
@@ -504,7 +598,8 @@ export class ChatBrowserFixture {
         const admit = () => {
           if (stream.closed || stream.admitted) return;
           stream.admitted = true;
-          turn.ordinal = conversation!.nextOrdinal++;
+          turn.ordinal += 1;
+          conversation!.nextOrdinal = turn.ordinal + 1;
           turn.status = "streaming";
           conversation!.turns.push(turn);
           stream.push({ type: "accepted", conversationId, queryId, ordinal: turn.ordinal });

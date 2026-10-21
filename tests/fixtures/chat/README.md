@@ -79,6 +79,16 @@ question should issue a `start` with a fresh ID. Reload or sign out after a comp
 confirm the fixture starts without restored conversation content. The fixture reset is volatile;
 the deployed development verification must independently confirm no history restore and inspect
 the real saved query context.
+
+To inspect cupo presentation and draft retention without contacting the Runtime, select
+`runtime-quota-daily`, `runtime-quota-monthly`, or `runtime-quota-both`, submit a question, and confirm
+the request is rejected before admission. The daily fixture resets in 8 hours; the monthly fixture
+resets in 21 days; when both are exhausted the message uses the later reset. The rejected question
+stays in the composer. Select `ready` before an explicit retry to exercise fresh admission. After a
+completed turn, select `runtime-conversation-busy` or `runtime-stale-base` before a follow-up to force
+the corresponding public `conversation_busy` or `stale_base` rejection; neither creates an admitted
+stream or advances the fixture's ordinal. These two selections exercise the web response handling;
+runtime/store tests cover the actual occupied-thread and stale-base conditions.
 `signout-pending` clears the session immediately while holding the simulated sign-out promise.
 After clicking “Cerrar sesión”, use “Emitir fragmento (o tardío tras logout)” to release an old
 stream callback and confirm that the login screen stays clear; then release “Liberar promesa de
@@ -135,7 +145,9 @@ Append `?scenario=<name>` before the hash to select an initial scenario, for exa
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
-`runtime-401`, `runtime-401-pending`, `runtime-expired`, `runtime-forbidden`,
+`runtime-quota-daily`, `runtime-quota-monthly`, `runtime-quota-both`,
+`runtime-conversation-busy`, `runtime-stale-base`, `runtime-401`, `runtime-401-pending`,
+`runtime-expired`, `runtime-forbidden`,
 `password-reset-pending`, `password-reset-failure`, `signout-pending`, `sign-in-pending`,
 `clipboard-fail`, and `clipboard-pending`. The selector also changes the scenario for the next
 matching operation without reloading; pending operations keep their own controls when the selection

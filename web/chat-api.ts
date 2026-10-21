@@ -1,10 +1,33 @@
 import type { PublicConfig } from "./api";
 import type { Session } from "./session";
+import type { QuotaView } from "../runtime/contracts";
 
 export type ChatRequest = {
+  version: 2;
   operation: "start" | "message";
   conversationId: string;
+  queryId: string;
+  baseOrdinal: number;
   text: string;
+};
+
+export type RecoverRequest = {
+  version: 2;
+  operation: "recover";
+  conversationId: string;
+  queryId: string;
+};
+
+export type ChatSubmissionSnapshot = {
+  version: 2;
+  conversationId: string;
+  queryId: string;
+  ordinal: number;
+  status: "in_progress" | "completed" | "failed";
+  question: string;
+  answer: string;
+  canContinue: boolean;
+  quota?: QuotaView;
 };
 
 export type ChatApplicationEvent =
@@ -22,11 +45,14 @@ export type ChatApplicationEvent =
       message: string;
       recordStatus: "not_admitted" | "failed" | "unconfirmed";
       queryId?: string;
+      quota?: QuotaView;
+      canContinue?: boolean;
     };
 
-type ChatRecordStatus = "not_admitted" | "failed" | "unconfirmed";
+export type ChatRecordStatus = "not_admitted" | "failed" | "unconfirmed";
 
 export type ChatStreamResult =
+  | ChatSubmissionSnapshot
   | { status: "completed"; conversationId: string; queryId: string; ordinal: number }
   | {
       status: "failed";
@@ -34,6 +60,8 @@ export type ChatStreamResult =
       message: string;
       recordStatus: ChatRecordStatus;
       queryId?: string;
+      quota?: QuotaView;
+      canContinue?: boolean;
     };
 
 export type StreamChatOptions = {
@@ -87,6 +115,26 @@ function runtimeUrl(config: PublicConfig): string {
   );
 }
 
+function isQuotaView(value: unknown): value is QuotaView {
+  if (!isRecord(value)) return false;
+  const periodIsValid = (period: unknown) =>
+    isRecord(period) &&
+    Number.isSafeInteger(period.used) &&
+    (period.used as number) >= 0 &&
+    Number.isSafeInteger(period.limit) &&
+    (period.limit as number) >= 0 &&
+    Number.isSafeInteger(period.resetAt) &&
+    typeof period.period === "string";
+  return (
+    periodIsValid(value.daily) &&
+    periodIsValid(value.monthly) &&
+    Number.isSafeInteger(value.serverNow) &&
+    (value.blockedUntil === null || Number.isSafeInteger(value.blockedUntil)) &&
+    typeof value.policyRevision === "string" &&
+    value.policyRevision.length > 0
+  );
+}
+
 function applicationEvent(value: unknown): ChatApplicationEvent {
   if (!isRecord(value) || typeof value.type !== "string") {
     throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió un evento inválido.");
@@ -120,11 +168,47 @@ function applicationEvent(value: unknown): ChatApplicationEvent {
     value.code.length > 0 &&
     typeof value.message === "string" &&
     ["not_admitted", "failed", "unconfirmed"].includes(String(value.recordStatus)) &&
-    (value.queryId === undefined || typeof value.queryId === "string")
+    (value.queryId === undefined || typeof value.queryId === "string") &&
+    (value.quota === undefined || isQuotaView(value.quota)) &&
+    (value.canContinue === undefined || typeof value.canContinue === "boolean")
   ) {
     return value as ChatApplicationEvent;
   }
   throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió un evento inválido.");
+}
+
+function parseSnapshot(
+  value: unknown,
+  request: ChatRequest | RecoverRequest,
+): ChatSubmissionSnapshot {
+  if (
+    !isRecord(value) ||
+    value.version !== 2 ||
+    value.conversationId !== request.conversationId ||
+    value.queryId !== request.queryId ||
+    !Number.isSafeInteger(value.ordinal) ||
+    (value.ordinal as number) <= 0 ||
+    ("baseOrdinal" in request && value.ordinal !== request.baseOrdinal + 1) ||
+    (value.status !== "in_progress" && value.status !== "completed" && value.status !== "failed") ||
+    typeof value.question !== "string" ||
+    typeof value.answer !== "string" ||
+    typeof value.canContinue !== "boolean" ||
+    (value.quota !== undefined && !isQuotaView(value.quota)) ||
+    ("text" in request && value.question !== request.text)
+  ) {
+    throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió un envío inválido.");
+  }
+  return {
+    version: 2,
+    conversationId: request.conversationId,
+    queryId: request.queryId,
+    ordinal: value.ordinal as number,
+    status: value.status,
+    question: value.question,
+    answer: value.answer,
+    canContinue: value.canContinue,
+    ...(value.quota === undefined ? {} : { quota: value.quota }),
+  };
 }
 
 function parseEventFrame(
@@ -151,27 +235,46 @@ function parseRecordStatus(value: string): ChatRecordStatus {
   throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió un estado inválido.");
 }
 
-export async function streamChat(
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidChatRequest(request: ChatRequest) {
+  return (
+    request.version === 2 &&
+    (request.operation === "start" || request.operation === "message") &&
+    uuidPattern.test(request.conversationId) &&
+    uuidPattern.test(request.queryId) &&
+    Number.isSafeInteger(request.baseOrdinal) &&
+    request.baseOrdinal >= 0 &&
+    (request.operation !== "start" || request.baseOrdinal === 0) &&
+    (request.operation !== "message" || request.baseOrdinal > 0) &&
+    typeof request.text === "string" &&
+    request.text.trim().length > 0
+  );
+}
+
+function isValidRecoverRequest(request: RecoverRequest) {
+  return (
+    request.version === 2 &&
+    request.operation === "recover" &&
+    uuidPattern.test(request.conversationId) &&
+    uuidPattern.test(request.queryId)
+  );
+}
+
+async function postRuntime(
   config: PublicConfig,
   session: Session,
-  request: ChatRequest,
-  { onEvent, isActive, signal }: StreamChatOptions,
-): Promise<ChatStreamResult> {
+  request: ChatRequest | RecoverRequest,
+  options: Pick<StreamChatOptions, "isActive" | "signal">,
+  accept: string,
+): Promise<Response> {
   const url = runtimeUrl(config);
-  if (!request.conversationId || !request.text.trim()) {
-    throw chatError("INVALID_REQUEST", 400, "Escribí una consulta para continuar.");
-  }
+  const { isActive, signal } = options;
   if (!isActive()) throw chatError("INACTIVE", 0, "La vista del chat ya no está activa.");
 
   let accessToken = session.accessToken();
   if (!accessToken) throw chatError("UNAUTHORIZED", 401, "Tu sesión venció.");
-
-  const body = JSON.stringify({
-    version: 1,
-    operation: request.operation,
-    conversationId: request.conversationId,
-    text: request.text,
-  });
+  const body = JSON.stringify(request);
 
   const invoke = async (token: string) => {
     if (!isActive()) throw chatError("INACTIVE", 0, "La vista del chat ya no está activa.");
@@ -181,7 +284,7 @@ export async function streamChat(
         headers: {
           authorization: `Bearer ${token}`,
           "content-type": "application/json",
-          accept: "text/event-stream",
+          accept,
           [sessionHeader]: request.conversationId,
         },
         body,
@@ -216,7 +319,56 @@ export async function streamChat(
       response.status === 401 ? "Tu sesión venció." : "No pudimos iniciar la consulta.",
     );
   }
-  if (!response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
+  return response;
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió una respuesta inválida.");
+  }
+}
+
+function parseFailure(value: unknown, queryId: string): ChatStreamResult {
+  const event = applicationEvent(value);
+  if (event.type !== "failed" || (event.queryId !== undefined && event.queryId !== queryId)) {
+    throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió un estado inválido.");
+  }
+  return {
+    status: "failed",
+    code: event.code,
+    message: event.message,
+    recordStatus: event.recordStatus,
+    ...(event.queryId ? { queryId: event.queryId } : {}),
+    ...(event.quota ? { quota: event.quota } : {}),
+    ...(event.canContinue === undefined ? {} : { canContinue: event.canContinue }),
+  };
+}
+
+export async function streamChat(
+  config: PublicConfig,
+  session: Session,
+  request: ChatRequest,
+  { onEvent, isActive, signal }: StreamChatOptions,
+): Promise<ChatStreamResult> {
+  if (!isValidChatRequest(request)) {
+    throw chatError("INVALID_REQUEST", 400, "Escribí una consulta para continuar.");
+  }
+  const response = await postRuntime(
+    config,
+    session,
+    request,
+    { isActive, signal },
+    "text/event-stream",
+  );
+  const contentType = response.headers.get("content-type")?.toLowerCase() || "";
+  if (contentType.includes("application/json")) {
+    const payload = await readJson(response);
+    if (isRecord(payload) && payload.version === 2) return parseSnapshot(payload, request);
+    return parseFailure(payload, request.queryId);
+  }
+  if (!contentType.includes("text/event-stream")) {
     throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió una respuesta inválida.");
   }
   if (!response.body)
@@ -236,7 +388,12 @@ export async function streamChat(
     const result = parseEventFrame(eventName, data, (event) => {
       if (!isActive()) throw chatError("INACTIVE", 0, "La vista del chat ya no está activa.");
       if (event.type === "accepted") {
-        if (accepted || event.conversationId !== request.conversationId) {
+        if (
+          accepted ||
+          event.conversationId !== request.conversationId ||
+          event.queryId !== request.queryId ||
+          event.ordinal !== request.baseOrdinal + 1
+        ) {
           throw chatError("INVALID_RESPONSE", 502, "El asistente respondió a otra conversación.");
         }
         accepted = event;
@@ -252,7 +409,12 @@ export async function streamChat(
         return undefined;
       }
       if (event.type === "completed") {
-        if (!accepted || event.queryId !== accepted.queryId || nextTextIndex === 0) {
+        if (
+          !accepted ||
+          event.queryId !== accepted.queryId ||
+          event.queryId !== request.queryId ||
+          nextTextIndex === 0
+        ) {
           throw chatError("INVALID_RESPONSE", 502, "El asistente cerró una respuesta inválida.");
         }
         onEvent(event);
@@ -263,7 +425,10 @@ export async function streamChat(
           ordinal: accepted.ordinal,
         } satisfies ChatStreamResult;
       }
-      if (accepted && event.queryId !== undefined && event.queryId !== accepted.queryId) {
+      if (
+        (accepted && event.queryId !== undefined && event.queryId !== accepted.queryId) ||
+        (event.queryId !== undefined && event.queryId !== request.queryId)
+      ) {
         throw chatError("INVALID_RESPONSE", 502, "El asistente falló otro envío.");
       }
       const recordStatus = parseRecordStatus(event.recordStatus);
@@ -273,6 +438,8 @@ export async function streamChat(
         message: event.message,
         recordStatus,
         ...(event.queryId ? { queryId: event.queryId } : {}),
+        ...(event.quota ? { quota: event.quota } : {}),
+        ...(event.canContinue === undefined ? {} : { canContinue: event.canContinue }),
       } satisfies ChatStreamResult;
       onEvent(event);
       return result;
@@ -329,4 +496,22 @@ export async function streamChat(
   } finally {
     reader.releaseLock();
   }
+}
+
+export async function recoverChat(
+  config: PublicConfig,
+  session: Session,
+  request: RecoverRequest,
+  options: Pick<StreamChatOptions, "isActive" | "signal">,
+): Promise<ChatStreamResult> {
+  if (!isValidRecoverRequest(request)) {
+    throw chatError("INVALID_REQUEST", 400, "No pudimos consultar el estado de la consulta.");
+  }
+  const response = await postRuntime(config, session, request, options, "application/json");
+  if (!response.headers.get("content-type")?.toLowerCase().includes("application/json")) {
+    throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió una respuesta inválida.");
+  }
+  const payload = await readJson(response);
+  if (isRecord(payload) && payload.version === 2) return parseSnapshot(payload, request);
+  return parseFailure(payload, request.queryId);
 }

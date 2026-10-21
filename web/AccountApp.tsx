@@ -903,7 +903,7 @@ export function AccountApp({
     state.view,
   ]);
 
-  function submitChat(text: string) {
+  function submitChat(text: string): boolean {
     const identity = state.view === "ready" ? state.identity : undefined;
     const current = chatScreenStateRef.current;
     const ownerKey = identity ? chatOwnerKey(identity) : null;
@@ -915,16 +915,22 @@ export function AccountApp({
       chatOwnerKeyRef.current !== ownerKey ||
       current.profileStatus !== "complete" ||
       (current.queryStatus !== "idle" &&
-        current.queryStatus !== "completed" &&
-        current.queryStatus !== "failed") ||
+        !(
+          (current.queryStatus === "completed" || current.queryStatus === "failed") &&
+          current.canContinue !== false
+        ) &&
+        !(current.queryStatus === "rejected" && Boolean(current.quota))) ||
       chatSubmissionInFlightRef.current ||
       !text.trim()
     ) {
-      return;
+      return false;
     }
 
     const operation = chatConversationIdRef.current ? "message" : "start";
     const conversationId = chatConversationIdRef.current || window.crypto.randomUUID();
+    const queryId = window.crypto.randomUUID();
+    const baseOrdinal =
+      operation === "start" ? 0 : (current.ordinal ?? priorTurnsIncludingCurrent(current).length);
     chatConversationIdRef.current = conversationId;
     const controller = new AbortController();
     const chatEpoch = chatEpochRef.current;
@@ -941,12 +947,14 @@ export function AccountApp({
       queryStatus: "sending",
       question: text,
       answer: "",
+      quota: undefined,
+      quotaReceivedAt: undefined,
     });
 
     void streamChat(
       apiConfig,
       session,
-      { operation, conversationId, text },
+      { version: 2, operation, conversationId, queryId, baseOrdinal, text },
       {
         signal: controller.signal,
         isActive,
@@ -954,7 +962,7 @@ export function AccountApp({
           if (!isActive()) return;
           const before = chatScreenStateRef.current;
           if (event.type === "accepted") {
-            setChat({ ...before, queryStatus: "streaming" });
+            setChat({ ...before, queryStatus: "streaming", ordinal: event.ordinal });
           } else if (event.type === "text") {
             setChat({
               ...before,
@@ -965,6 +973,7 @@ export function AccountApp({
             setChat({
               ...before,
               queryStatus: "completed",
+              canContinue: true,
               queryError: undefined,
             });
           }
@@ -974,8 +983,27 @@ export function AccountApp({
       .then((result) => {
         if (!isActive()) return;
         const before = chatScreenStateRef.current;
+        if ("version" in result) {
+          setChat({
+            ...before,
+            question: result.question,
+            answer: result.answer,
+            ordinal: result.ordinal,
+            canContinue: result.canContinue,
+            quota: result.quota,
+            quotaReceivedAt: result.quota ? performance.now() : undefined,
+            queryStatus: result.status === "in_progress" ? "streaming" : result.status,
+            queryError: result.status === "failed" ? before.queryError : undefined,
+          });
+          return;
+        }
         if (result.status === "completed") {
-          setChat({ ...before, queryStatus: "completed", queryError: undefined });
+          setChat({
+            ...before,
+            queryStatus: "completed",
+            canContinue: true,
+            queryError: undefined,
+          });
           return;
         }
         const failureCode = result.code.toLowerCase();
@@ -1001,7 +1029,10 @@ export function AccountApp({
               : result.recordStatus === "not_admitted"
                 ? "rejected"
                 : "failed",
-          queryError: result.message,
+          canContinue: result.canContinue ?? result.recordStatus !== "unconfirmed",
+          quota: result.quota,
+          quotaReceivedAt: result.quota ? performance.now() : undefined,
+          queryError: result.code.toLowerCase() === "quota_exceeded" ? undefined : result.message,
         });
       })
       .catch((error: unknown) => {
@@ -1031,6 +1062,7 @@ export function AccountApp({
         chatRequestRef.current = null;
         chatSubmissionInFlightRef.current = false;
       });
+    return true;
   }
 
   function retryChatProfile() {

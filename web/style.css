@@ -594,6 +594,7 @@ h1 {
 
 .chat-knowledge-note,
 .chat-limit-note,
+.chat-quota-message,
 .chat-profile-message,
 .chat-result-error,
 .chat-progress {
@@ -611,6 +612,11 @@ h1 {
 .chat-limit-note {
   color: #49645f;
   background: #f1f2ed;
+}
+
+.chat-quota-message {
+  color: #6a261c;
+  background: #f8e8e2;
 }
 
 .chat-account-actions,

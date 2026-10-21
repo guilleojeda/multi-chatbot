@@ -1,10 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  PutCommand,
-  QueryCommand,
-  TransactWriteCommand,
-  UpdateCommand,
-} from "@aws-sdk/lib-dynamodb";
+import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
 
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
@@ -14,6 +9,32 @@ const queryIds = [
   "c6dfbc9f-3699-4e93-b120-a03c0204bc69",
   "d7efbc9f-3699-4e93-b120-a03c0204bc60",
 ];
+const now = Date.parse("2026-10-20T12:00:00.000Z");
+
+function admissionFields(queryId, timestamp = now) {
+  return {
+    ownerAttemptId: "attempt-" + queryId,
+    resultDeadlineAt: timestamp + 60 * 60 * 1000,
+    requestFingerprint: "fingerprint-" + queryId,
+    quota: {
+      daily: {
+        used: 1,
+        limit: 20,
+        resetAt: Date.parse("2026-10-21T03:00:00.000Z"),
+        period: "2026-10-20",
+      },
+      monthly: {
+        used: 1,
+        limit: 200,
+        resetAt: Date.parse("2026-11-01T03:00:00.000Z"),
+        period: "2026-10",
+      },
+      serverNow: timestamp,
+      blockedUntil: null,
+      policyRevision: "policy-r7",
+    },
+  };
+}
 
 function completedTurn(ordinal, queryId) {
   return {
@@ -34,6 +55,7 @@ function turnChunk(ordinal, queryId, role, text) {
     sk: `TURN#${String(ordinal).padStart(8, "0")}#${queryId}#${role.toUpperCase()}#00000000`,
     conversationId,
     queryId,
+    ordinal,
     role,
     index: 0,
     text,
@@ -45,7 +67,8 @@ const continuation = {
   botId: "bot-aurora",
   conversationId,
   queryId: queryIds[3],
-  now: Date.parse("2026-10-20T12:00:00.000Z"),
+  now,
+  ...admissionFields(queryIds[3]),
   text: "Seguí con una adaptación.",
   profileSnapshot: { fields: {} },
   invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "revision-123" },
@@ -58,6 +81,7 @@ describe("conversation context references", () => {
     const store = createConversationStoreAdapter({
       documentClient,
       tableName: "conversations-aurora-dev",
+      now: () => now,
     });
 
     await store.startTurn({
@@ -65,7 +89,8 @@ describe("conversation context references", () => {
       botId: "bot-aurora",
       conversationId,
       queryId: queryIds[0],
-      now: Date.parse("2026-10-20T12:00:00.000Z"),
+      now,
+      ...admissionFields(queryIds[0]),
       text: "Primera pregunta.",
       profileSnapshot: { fields: {} },
       invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "revision-123" },
@@ -76,18 +101,12 @@ describe("conversation context references", () => {
     const record = transaction.input.TransactItems.find(({ Put }) =>
       Put?.Item?.sk.startsWith("TURN#"),
     ).Put.Item;
-    const publish = commands.find((command) => command instanceof UpdateCommand);
-
-    expect(record.contextManifest).toEqual({ count: 0, complete: false });
+    expect(record.contextManifest).toEqual({ count: 0, complete: true });
     expect(
-      commands.some(
-        (command) => command instanceof PutCommand && command.input.Item.sk.includes("#CONTEXT#"),
-      ),
+      transaction.input.TransactItems.some(({ Put }) => Put?.Item?.sk.includes("#CONTEXT#")),
     ).toBe(false);
-    expect(publish.input.ExpressionAttributeValues[":contextManifest"]).toEqual({
-      count: 0,
-      complete: true,
-    });
+    expect(commands.filter((command) => command instanceof TransactWriteCommand)).toHaveLength(1);
+    expect(commands.filter((command) => command instanceof GetCommand)).toHaveLength(1);
   });
 
   it("excludes failed turns with whitespace-only prefixes from the selected context", async () => {
@@ -111,14 +130,29 @@ describe("conversation context references", () => {
       },
       turnChunk(3, queryIds[2], "user", "T1 sigue generándose."),
     ];
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub: "teacher-123",
+      botId: "bot-aurora",
+      lastOrdinal: 3,
+    };
     const documentClient = {
       send: vi.fn(async (command) =>
-        command instanceof QueryCommand ? { Items: structuredClone(items) } : {},
+        command instanceof QueryCommand
+          ? { Items: structuredClone(items) }
+          : command instanceof GetCommand
+            ? command.input.Key.sk === "META"
+              ? { Item: meta }
+              : {}
+            : {},
       ),
     };
     const store = createConversationStoreAdapter({
       documentClient,
       tableName: "conversations-aurora-dev",
+      now: () => now,
     });
 
     const selectedContext = await store.readContext({ conversationId });
@@ -135,42 +169,50 @@ describe("conversation context references", () => {
 
     const commands = documentClient.send.mock.calls.map(([command]) => command);
     const allocation = commands.find((command) => command instanceof TransactWriteCommand);
-    const turnPut = allocation.input.TransactItems.find(({ Put }) => Put).Put;
+    const turnPut = allocation.input.TransactItems.find(
+      ({ Put }) => Put?.Item?.profileSnapshot,
+    ).Put;
     expect(turnPut.Item).toMatchObject({
       ordinal: 4,
-      contextManifest: { count: 1, complete: false },
+      contextManifest: { count: 1, complete: true },
     });
     expect(Object.hasOwn(turnPut.Item, "messages")).toBe(false);
 
-    const contextPut = commands.find(
-      (command) => command instanceof PutCommand && command.input.Item.sk.includes("#CONTEXT#"),
-    );
-    expect(contextPut.input.Item.text).toBe(JSON.stringify(selectedContext.references));
-    expect(JSON.parse(contextPut.input.Item.text)).not.toContainEqual({
+    const contextPut = allocation.input.TransactItems.find(({ Put }) =>
+      Put?.Item?.sk.includes("#CONTEXT#"),
+    ).Put;
+    expect(contextPut.Item.text).toBe(JSON.stringify(selectedContext.references));
+    expect(JSON.parse(contextPut.Item.text)).not.toContainEqual({
       ordinal: 3,
       queryId: queryIds[2],
     });
-    const publish = commands.find((command) => command instanceof UpdateCommand);
-    expect(publish.input.ExpressionAttributeValues[":contextManifest"]).toEqual({
-      count: 1,
-      complete: true,
-    });
-    expect(publish.input.ExpressionAttributeValues[":manifest"]).toEqual({
-      count: 1,
-      complete: true,
-    });
-    expect(commands.indexOf(contextPut)).toBeLessThan(commands.indexOf(publish));
+    expect(turnPut.Item.questionManifest).toEqual({ count: 1, complete: true });
+    expect(turnPut.Item.contextManifest).toEqual({ count: 1, complete: true });
+    expect(commands.some((command) => command instanceof TransactWriteCommand)).toBe(true);
   });
 
-  it("splits a long reference list into bounded chunks before publishing its manifest", async () => {
+  it("splits a long reference list into bounded chunks in the admission transaction", async () => {
     const references = Array.from({ length: 7000 }, (_, index) => ({
       ordinal: index + 1,
       queryId: `a4bfbc9f-3699-4e93-b120-${String(index + 100000000000).slice(-12)}`,
     }));
-    const documentClient = { send: vi.fn(async () => ({})) };
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub: "teacher-123",
+      botId: "bot-aurora",
+      lastOrdinal: 7000,
+    };
+    const documentClient = {
+      send: vi.fn(async (command) =>
+        command instanceof GetCommand && command.input.Key.sk === "META" ? { Item: meta } : {},
+      ),
+    };
     const store = createConversationStoreAdapter({
       documentClient,
       tableName: "conversations-aurora-dev",
+      now: () => now,
     });
 
     await store.continueTurn({
@@ -182,21 +224,55 @@ describe("conversation context references", () => {
     const commands = documentClient.send.mock.calls.map(([command]) => command);
     const transaction = commands.find((command) => command instanceof TransactWriteCommand);
     const record = transaction.input.TransactItems.find(({ Put }) => Put).Put.Item;
-    const contextPuts = commands.filter(
-      (command) => command instanceof PutCommand && command.input.Item.sk.includes("#CONTEXT#"),
-    );
-    const publish = commands.find((command) => command instanceof UpdateCommand);
+    const contextPuts = transaction.input.TransactItems.filter(({ Put }) =>
+      Put?.Item?.sk.includes("#CONTEXT#"),
+    ).map(({ Put }) => Put);
 
     expect(contextPuts.length).toBeGreaterThan(1);
     expect(
-      contextPuts.every(({ input }) => Buffer.byteLength(input.Item.text, "utf8") <= 300 * 1024),
+      contextPuts.every(({ Item }) => Buffer.byteLength(Item.text, "utf8") <= 300 * 1024),
     ).toBe(true);
-    expect(record.contextManifest).toEqual({ count: contextPuts.length, complete: false });
-    expect(publish.input.ExpressionAttributeValues[":contextManifest"]).toEqual({
-      count: contextPuts.length,
-      complete: true,
+    expect(record.contextManifest).toEqual({ count: contextPuts.length, complete: true });
+    expect(commands.filter((command) => command instanceof TransactWriteCommand)).toHaveLength(1);
+  });
+
+  it("rejects a quota period that changes while admission preflight is waiting on a read", async () => {
+    let currentNow = Date.parse("2026-10-22T02:59:59.000Z");
+    const documentClient = {
+      send: vi.fn(async (command) => {
+        if (command instanceof GetCommand && command.input.Key.sk.startsWith("SEND#")) {
+          currentNow = Date.parse("2026-10-22T03:00:00.000Z");
+        }
+        return {};
+      }),
+    };
+    const store = createConversationStoreAdapter({
+      documentClient,
+      tableName: "conversations-aurora-dev",
+      now: () => currentNow,
     });
-    expect(commands.indexOf(contextPuts.at(-1))).toBeLessThan(commands.indexOf(publish));
+    const admittedAt = Date.parse("2026-10-22T02:59:59.000Z");
+    const fields = admissionFields(queryIds[0], admittedAt);
+    fields.quota.daily.period = "2026-10-21";
+    fields.quota.daily.resetAt = Date.parse("2026-10-22T03:00:00.000Z");
+
+    await expect(
+      store.startTurn({
+        sub: "teacher-123",
+        botId: "bot-aurora",
+        conversationId,
+        queryId: queryIds[0],
+        now: admittedAt,
+        ...fields,
+        text: "Primera pregunta.",
+        profileSnapshot: { fields: {} },
+        invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "revision-123" },
+      }),
+    ).rejects.toMatchObject({ code: "quota_period_changed" });
+
+    expect(
+      documentClient.send.mock.calls.filter(([command]) => command instanceof TransactWriteCommand),
+    ).toHaveLength(0);
   });
 
   it("rejects a completed turn with a missing context reference chunk", async () => {

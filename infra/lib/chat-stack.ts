@@ -112,6 +112,7 @@ export class ChatStack extends Stack {
       "dynamodb:Query",
       "dynamodb:PutItem",
       "dynamodb:UpdateItem",
+      "dynamodb:ConditionCheckItem",
     );
 
     this.runtime.role.addToPrincipalPolicy(

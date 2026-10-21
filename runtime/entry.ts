@@ -4,7 +4,7 @@ import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
 import { createAccountStoreAdapter } from "../api/aws-adapters.js";
 import { createProfileStoreAdapter } from "../api/profile-store.js";
 import { siteConfig } from "../config/site.js";
-import { createChatHandler } from "./chat.js";
+import { createChatHandler, createChatInvocationHandler } from "./chat.js";
 import { createConversationStoreAdapter } from "./conversation-store.js";
 import { createStrandsGenerator } from "./provider.js";
 
@@ -48,20 +48,10 @@ const chat = createChatHandler({
   store,
   generate,
   now: Date.now,
-  newQueryId: () => crypto.randomUUID(),
 });
 
 const app = new BedrockAgentCoreApp({
-  invocationHandler: {
-    process(payload, context) {
-      const events = chat(payload, context);
-      return (async function* () {
-        for await (const event of events) {
-          yield { event: event.type, data: event };
-        }
-      })();
-    },
-  },
+  invocationHandler: createChatInvocationHandler(chat),
   config: { logging: { enabled: false } },
 });
 
