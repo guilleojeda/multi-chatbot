@@ -24,6 +24,8 @@ El app client público permite autenticación por email/contraseña, renovación
 
 Una vez confirmado el acceso, «Mi perfil» abre el [perfil profesional y las preferencias](profile.md) e «Ir al chat» abre la [consulta docente](chat.md). Las rutas directas restauran o solicitan esa misma sesión y vuelven a comprobar membresía. El hilo y su consumidor permanecen en la frontera de cuenta al navegar entre chat y perfil con la misma identidad; las comprobaciones de ruta no reinician la conversación. Cuenta sigue siendo dueña de autenticación y salida; las vistas protegidas no implementan otro flujo de Cognito. Al iniciar logout se retiran sus datos antes de esperar la revocación remota.
 
+Iniciar otro ingreso, incluso desde una invitación para una cuenta existente, retira el consumidor y la autorización anteriores antes de autenticar. Sus resultados pendientes no pueden cerrar ni modificar la sesión nueva, aunque se ingrese con la misma identidad.
+
 La razón de estas fronteras se conserva en [Identidad común, acceso por chatbot y sesión de pestaña](../decisions/0001-identidad-y-sesion.md).
 
 ## Recuperar la contraseña
@@ -35,6 +37,8 @@ La solicitud presenta un aviso condicional: Cognito puede simular los detalles d
 Una confirmación distinta no se envía. El código incorrecto o vencido, contraseña fuera de política, límites y fallos de conexión muestran un error que permite corregir o volver a solicitar el código. No se anuncia un cambio exitoso hasta que Cognito lo confirma. El código tiene la vigencia nativa de Cognito; no se crea otra tabla ni un mecanismo propio de tokens.
 
 Al completar el cambio se vuelve al login con el email y un aviso; no hay login automático. Se limpian access/ID en memoria y únicamente `auth-refresh` de esa pestaña. También se retira el hilo local del chat y se invalida su consumidor, de modo que un ingreso posterior de la misma persona comience vacío. Un rechazo de recuperación conserva la sesión previa y su hilo. Volver al chat o al perfil mientras se confirma el cambio no deja esa pantalla bloqueada: el éxito permite ingresar de nuevo y el rechazo vuelve a comprobar el acceso de la sesión conservada. La persona ingresa con la nueva contraseña y la API vuelve a comprobar su membresía. No se promete revocación instantánea de los access tokens de otras sesiones: el JWT authorizer conserva su contrato de validación y vigencia.
+
+Si la confirmación coincide con una renovación de sesión, la renovación espera su resultado: un rechazo conserva la renovación legítima compartida; un cambio confirmado descarta sus tokens. Cerrar sesión sigue retirando los tokens inmediatamente.
 
 ## Configuración de correo de recuperación
 

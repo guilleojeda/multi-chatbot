@@ -19,10 +19,16 @@ window.fetch = (input, init) => fixture.fetch(input, init);
 function routeFromHash(hash: string): AccountRoute | null {
   const route = hash.startsWith("#") ? hash.slice(1) : hash;
   if (!route || route === "/") return null;
-  if (route === "/chat") return { kind: "chat" };
-  if (route === "/profile") return { kind: "profile" };
-  if (route === "/login") return { kind: "login" };
-  if (route === "/recover") return { kind: "recover" };
+  const questionIndex = route.indexOf("?");
+  const pathname = questionIndex < 0 ? route : route.slice(0, questionIndex);
+  const query = questionIndex < 0 ? "" : route.slice(questionIndex + 1);
+  if (pathname === "/chat") return { kind: "chat" };
+  if (pathname === "/profile") return { kind: "profile" };
+  if (pathname === "/login") return { kind: "login" };
+  if (pathname === "/recover") return { kind: "recover" };
+  if (pathname === "/invite") {
+    return { kind: "invite", token: new URLSearchParams(query).get("token") };
+  }
   return null;
 }
 
@@ -71,6 +77,10 @@ function FixtureControls() {
           <a href="#/chat">Abrir chat</a>
           <a href="#/profile">Abrir perfil</a>
           <a href="#/login">Abrir cuenta</a>
+          <a href="#/invite?token=fixture-existing-invitation">Invitación vigente · identidad A</a>
+          <a href="#/invite?token=fixture-existing-invitation-b">
+            Invitación vigente · identidad B
+          </a>
         </nav>
         <button
           className="profile-fixture-reset"
@@ -111,6 +121,13 @@ function FixtureControls() {
             onClick={() => fixture.releaseRefresh()}
           >
             Liberar refresh Cognito
+          </button>
+          <button
+            type="button"
+            disabled={!state.pendingSignIns.length}
+            onClick={() => fixture.releaseSignIn()}
+          >
+            Liberar inicio de sesión
           </button>
         </div>
         <button
@@ -176,7 +193,9 @@ function FixtureControls() {
           confirmaciones de contraseña pendientes: {state.pendingPasswordResets} · admisiones
           pendientes: {state.pendingAdmissions} · respuestas admitidas: {state.admittedStreams}· 401
           Runtime pendiente: {state.pendingRuntime401s} · refresh pendiente:{" "}
-          {state.pendingRefreshes}
+          {state.pendingRefreshes} · sign-in pendiente: {state.pendingSignIns.length} · copias
+          pendientes:{" "}
+          {state.clipboardOperations.filter(({ status }) => status === "pending").length}
         </p>
       </section>
 
@@ -214,6 +233,35 @@ function FixtureControls() {
         <details>
           <summary>Estado JSON sin credenciales</summary>
           <pre data-fixture="chat-state-json">{JSON.stringify(state, null, 2)}</pre>
+        </details>
+        <details>
+          <summary>Controlar operaciones de copia</summary>
+          {state.clipboardOperations.filter(({ status }) => status === "pending").length ? (
+            state.clipboardOperations
+              .filter(({ status }) => status === "pending")
+              .map((operation) => (
+                <article className="profile-fixture-request" key={operation.id}>
+                  <strong>Copia #{operation.id} pendiente</strong>
+                  <pre>{operation.text}</pre>
+                  <div className="profile-fixture-gates">
+                    <button
+                      type="button"
+                      onClick={() => fixture.releaseClipboardOperation(operation.id, true)}
+                    >
+                      Completar copia #{operation.id}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => fixture.releaseClipboardOperation(operation.id, false)}
+                    >
+                      Rechazar copia #{operation.id}
+                    </button>
+                  </div>
+                </article>
+              ))
+          ) : (
+            <p>No hay copias pendientes.</p>
+          )}
         </details>
       </section>
 

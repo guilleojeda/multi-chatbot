@@ -535,6 +535,12 @@ export function AccountApp({
     });
   }
 
+  function beginSignIn() {
+    invalidateChat();
+    authorizedRouteRef.current = null;
+    retryOperationRef.current = null;
+  }
+
   async function performSubmit(submission: AccountSubmission, identity: RouteIdentity) {
     const isActive = () => isCurrentRoute(identity);
     if (submission.action === "change-recovery-email") {
@@ -695,6 +701,7 @@ export function AccountApp({
         }
         replaceHash("/login");
         try {
+          beginSignIn();
           await session.signIn(submission.email, submission.password);
           if (!isActive()) return;
           await checkMembership(config, session, submission.email, isActive);
@@ -711,6 +718,7 @@ export function AccountApp({
         return;
       }
 
+      beginSignIn();
       await session.signIn(submission.email, submission.password);
       if (!isActive()) return;
 

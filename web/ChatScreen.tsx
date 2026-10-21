@@ -30,6 +30,15 @@ export type ChatScreenProps = {
   onCopy: (text: string) => void | Promise<void>;
 };
 
+type CopyTarget = {
+  latestOperation: number;
+  error: boolean;
+};
+
+function createCopyTarget(): CopyTarget {
+  return { latestOperation: 0, error: false };
+}
+
 export function ChatScreen({
   state,
   onSubmit,
@@ -39,11 +48,47 @@ export function ChatScreen({
   onCopy,
 }: ChatScreenProps) {
   const [draft, setDraft] = useState("");
-  const [copyError, setCopyError] = useState<string | null>(null);
+  const [, setCopyRevision] = useState(0);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const queryRef = useRef<HTMLTextAreaElement>(null);
   const focusQueryAfterResetRef = useRef(false);
   const previousTurns = state.previousTurns || [];
+  const previousCopyTargetsRef = useRef<(CopyTarget | null)[]>([]);
+  const currentCopyTargetRef = useRef<CopyTarget | null>(null);
+  const copyEpochRef = useRef(0);
+  const sawConversationRef = useRef(false);
+  const hasConversation =
+    previousTurns.length > 0 ||
+    Boolean(state.question || state.answer) ||
+    state.queryStatus !== "idle";
+
+  if (!hasConversation && sawConversationRef.current) {
+    copyEpochRef.current += 1;
+    previousCopyTargetsRef.current = [];
+    currentCopyTargetRef.current = null;
+  } else if (previousCopyTargetsRef.current.length > previousTurns.length) {
+    copyEpochRef.current += 1;
+    previousCopyTargetsRef.current = [];
+    currentCopyTargetRef.current = null;
+  }
+  sawConversationRef.current = hasConversation;
+  while (previousCopyTargetsRef.current.length < previousTurns.length) {
+    previousCopyTargetsRef.current.push(null);
+  }
+
+  function copyTargetForPrevious(index: number): CopyTarget {
+    const current = previousCopyTargetsRef.current[index];
+    if (current) return current;
+    const target = createCopyTarget();
+    previousCopyTargetsRef.current[index] = target;
+    return target;
+  }
+
+  function copyTargetForCurrent(): CopyTarget {
+    currentCopyTargetRef.current ??= createCopyTarget();
+    return currentCopyTargetRef.current;
+  }
+
   const sending = state.queryStatus === "sending" || state.queryStatus === "streaming";
   const canSubmit =
     state.profileStatus === "complete" &&
@@ -91,7 +136,12 @@ export function ChatScreen({
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canSubmit) return;
-    setCopyError(null);
+    while (previousCopyTargetsRef.current.length < previousTurns.length) {
+      previousCopyTargetsRef.current.push(null);
+    }
+    previousCopyTargetsRef.current[previousTurns.length] =
+      state.queryStatus === "completed" && state.answer ? currentCopyTargetRef.current : null;
+    currentCopyTargetRef.current = null;
     onSubmit(draft);
     setDraft("");
   }
@@ -99,17 +149,29 @@ export function ChatScreen({
   function restart() {
     focusQueryAfterResetRef.current = true;
     setDraft("");
-    setCopyError(null);
+    copyEpochRef.current += 1;
+    previousCopyTargetsRef.current = [];
+    currentCopyTargetRef.current = null;
+    sawConversationRef.current = false;
+    setCopyRevision((revision) => revision + 1);
     onReset();
   }
 
-  async function copyAnswer(text: string, key: string) {
+  async function copyAnswer(text: string, target: CopyTarget) {
     if (!text) return;
+    const epoch = copyEpochRef.current;
+    const operation = ++target.latestOperation;
+    function settle(error: boolean) {
+      if (copyEpochRef.current !== epoch || target.latestOperation !== operation) return;
+      target.error = error;
+      setCopyRevision((revision) => revision + 1);
+    }
+
     try {
       await onCopy(text);
-      setCopyError(null);
+      settle(false);
     } catch {
-      setCopyError(key);
+      settle(true);
     }
   }
 
@@ -180,7 +242,7 @@ export function ChatScreen({
               {previousTurns.length > 0 ? (
                 <ol className="chat-previous-turns" aria-label="Intercambios anteriores">
                   {previousTurns.map((turn, index) => {
-                    const copyKey = `previous-${index}`;
+                    const copyTarget = copyTargetForPrevious(index);
                     return (
                       <li className="chat-previous-turn" key={`${index}-${turn.status}`}>
                         <p className="chat-question">
@@ -197,7 +259,7 @@ export function ChatScreen({
                               className="account-button account-button--secondary chat-copy-button"
                               type="button"
                               aria-label={`Copiar respuesta anterior ${index + 1}`}
-                              onClick={() => void copyAnswer(turn.answer, copyKey)}
+                              onClick={() => void copyAnswer(turn.answer, copyTarget)}
                             >
                               Copiar respuesta anterior {index + 1}
                             </button>
@@ -207,7 +269,7 @@ export function ChatScreen({
                               seguimientos.
                             </p>
                           )}
-                          {copyError === copyKey ? (
+                          {copyTarget?.error ? (
                             <p className="chat-result-error" role="alert">
                               No pudimos copiar la respuesta. Podés seleccionar el texto y copiarlo.
                             </p>
@@ -234,12 +296,12 @@ export function ChatScreen({
                     <button
                       className="account-button chat-copy-button"
                       type="button"
-                      onClick={() => void copyAnswer(state.answer || "", "current")}
+                      onClick={() => void copyAnswer(state.answer || "", copyTargetForCurrent())}
                     >
                       Copiar respuesta
                     </button>
                   ) : null}
-                  {copyError === "current" ? (
+                  {currentCopyTargetRef.current?.error ? (
                     <p className="chat-result-error" role="alert">
                       No pudimos copiar la respuesta. Podés seleccionar el texto y copiarlo.
                     </p>

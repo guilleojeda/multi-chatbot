@@ -20,12 +20,14 @@ export const fixtureScenarios = [
   { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
   { id: "runtime-401", label: "Runtime: 401 y refresh correcto" },
   { id: "runtime-401-pending", label: "Runtime: 401 y refresh retenidos" },
+  { id: "sign-in-pending", label: "Cognito: retener nuevo inicio de sesión" },
   { id: "runtime-expired", label: "Runtime: 401 y sesión vencida" },
   { id: "runtime-forbidden", label: "Runtime: acceso denegado" },
   { id: "password-reset-pending", label: "Cognito: retener confirmación de contraseña" },
   { id: "password-reset-failure", label: "Cognito: rechazar el cambio de contraseña" },
   { id: "signout-pending", label: "Logout: revocación retenida" },
   { id: "clipboard-fail", label: "Portapapeles: simular error al copiar" },
+  { id: "clipboard-pending", label: "Portapapeles: retener copias" },
 ] as const;
 
 export type FixtureScenario = (typeof fixtureScenarios)[number]["id"];
@@ -65,6 +67,13 @@ type PendingSignOut = { release: () => void };
 type PendingRefresh = { release: () => void };
 type PendingRuntime401 = { request: FixtureRequest; release: () => void };
 type PendingPasswordReset = { release: (succeeds: boolean) => void };
+type PendingSignIn = { email: string; release: () => void };
+type ClipboardOperation = {
+  id: number;
+  text: string;
+  status: "pending" | "copied" | "rejected";
+  release: (succeeds: boolean) => void;
+};
 
 type ControlledStream = {
   request: FixtureRequest;
@@ -82,17 +91,30 @@ type ControlledStream = {
 type FixtureTurn = { ordinal: number; question: string; answer: string; status: string };
 type FixtureConversation = { nextOrdinal: number; turns: FixtureTurn[] };
 
-const identity = { sub: "fixture-teacher", email: "docente@example.test" };
+type FixtureIdentity = { sub: string; email: string };
+
+const identities: FixtureIdentity[] = [
+  { sub: "fixture-teacher", email: "docente@example.test" },
+  { sub: "fixture-teacher-b", email: "docente-b@example.test" },
+];
+const fixtureInvitations = new Map<string, FixtureIdentity>([
+  ["fixture-existing-invitation", identities[0]],
+  ["fixture-existing-invitation-b", identities[1]],
+]);
 const profileDraft: ProfileDraft = {
   fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
   responsePreferenceIds: ["brief-practical", "classroom-ready"],
 };
-const fixtureProfile: ProfileDocument = {
+const fixtureProfiles = identities.map<ProfileDocument>((identity) => ({
   sub: identity.sub,
   botId: "docentes",
   updatedAt: "2026-10-01T12:00:00.000Z",
-  ...profileDraft,
-};
+  ...cloneDraft(profileDraft),
+}));
+
+function identityForEmail(email: string) {
+  return identities.find((identity) => identity.email === email.trim().toLowerCase()) || null;
+}
 
 function cloneDraft(draft: ProfileDraft): ProfileDraft {
   return {
@@ -151,23 +173,24 @@ export class ChatBrowserFixture {
   private readonly pendingRefreshes: PendingRefresh[] = [];
   private readonly pendingRuntime401s: PendingRuntime401[] = [];
   private readonly pendingPasswordResets: PendingPasswordReset[] = [];
+  private readonly pendingSignIns: PendingSignIn[] = [];
+  private readonly clipboardOperations: ClipboardOperation[] = [];
   private readonly streams: ControlledStream[] = [];
   private readonly conversations = new Map<string, FixtureConversation>();
   private readonly sessionStorage = new FixtureSessionStorage();
-  private storedProfile = cloneProfile(fixtureProfile);
+  private readonly storedProfiles = new Map(
+    fixtureProfiles.map((profile) => [profile.sub, cloneProfile(profile)]),
+  );
   private selectedScenario = initialScenario();
   private nextToken = 0;
   private restoreCount = 0;
   private restorable = true;
-  private activeSub: string | null = null;
+  private refreshSub: string = identities[0].sub;
+  private nextClipboardOperation = 0;
   private runtime401Used = false;
   private holdNextRefresh = false;
   private profileRefresh401Used = false;
   private clipboardFailure = false;
-  private readonly originalClipboardDescriptor = Object.getOwnPropertyDescriptor(
-    navigator,
-    "clipboard",
-  );
 
   constructor() {
     this.session = createSession({
@@ -175,6 +198,10 @@ export class ChatBrowserFixture {
       region: this.publicConfig.region,
       storage: this.sessionStorage,
       fetch: (input, init) => this.cognitoFetch(input, init),
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: (text: string) => this.writeClipboard(text) },
     });
   }
 
@@ -194,16 +221,10 @@ export class ChatBrowserFixture {
     this.clipboardFailure = scenario === "clipboard-fail";
     this.runtime401Used = false;
     this.profileRefresh401Used = false;
-    if (this.clipboardFailure) {
-      Object.defineProperty(navigator, "clipboard", {
-        configurable: true,
-        value: { writeText: async () => Promise.reject(new Error("Fixture clipboard failure")) },
-      });
-    } else if (this.originalClipboardDescriptor) {
-      Object.defineProperty(navigator, "clipboard", this.originalClipboardDescriptor);
-    } else {
-      Reflect.deleteProperty(navigator, "clipboard");
-    }
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: (text: string) => this.writeClipboard(text) },
+    });
     this.changed();
   }
 
@@ -215,13 +236,35 @@ export class ChatBrowserFixture {
     return this.clipboardFailure;
   }
 
-  private issueTokens(): SessionTokens {
+  private issueTokens(sub: string = identities[0].sub, updateRefreshOwner = true): SessionTokens {
     const accessToken = `fixture-access-${++this.nextToken}`;
     const idToken = `fixture-id-${this.nextToken}`;
-    this.tokens.set(accessToken, identity.sub);
-    this.activeSub = identity.sub;
+    this.tokens.set(accessToken, sub);
+    if (updateRefreshOwner) this.refreshSub = sub;
     this.changed();
     return { accessToken, idToken };
+  }
+
+  private writeClipboard(text: string): Promise<void> {
+    if (this.clipboardFailure) return Promise.reject(new Error("Fixture clipboard failure"));
+    if (this.selectedScenario !== "clipboard-pending") return Promise.resolve();
+    const id = ++this.nextClipboardOperation;
+    return new Promise<void>((resolve, reject) => {
+      this.clipboardOperations.push({
+        id,
+        text,
+        status: "pending",
+        release: (succeeds) => {
+          const operation = this.clipboardOperations.find((item) => item.id === id);
+          if (!operation || operation.status !== "pending") return;
+          operation.status = succeeds ? "copied" : "rejected";
+          if (succeeds) resolve();
+          else reject(new Error("Fixture clipboard failure"));
+          this.changed();
+        },
+      });
+      this.changed();
+    });
   }
 
   private async cognitoFetch(_input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -235,7 +278,6 @@ export class ChatBrowserFixture {
 
     if (target.endsWith("RevokeToken")) {
       this.restorable = false;
-      this.activeSub = null;
       this.holdNextRefresh = false;
       this.changed();
       if (this.selectedScenario === "signout-pending") {
@@ -251,7 +293,6 @@ export class ChatBrowserFixture {
             release: (succeeds) => {
               if (succeeds) {
                 this.restorable = false;
-                this.activeSub = null;
                 this.changed();
                 resolve(new Response("", { status: 200 }));
                 return;
@@ -269,7 +310,6 @@ export class ChatBrowserFixture {
     if (target.endsWith("ForgotPassword") || target.endsWith("ConfirmForgotPassword")) {
       if (target.endsWith("ConfirmForgotPassword")) {
         this.restorable = false;
-        this.activeSub = null;
         this.changed();
       }
       return new Response("", { status: 200 });
@@ -279,26 +319,44 @@ export class ChatBrowserFixture {
     }
 
     if (body.AuthFlow === "USER_PASSWORD_AUTH") {
-      this.restorable = true;
-      return this.cognitoTokens(this.issueTokens());
+      const username = isRecord(body.AuthParameters)
+        ? String(body.AuthParameters.USERNAME || "")
+            .trim()
+            .toLowerCase()
+        : "";
+      const identity = identityForEmail(username);
+      if (!identity) return json({ __type: "NotAuthorizedException" }, 400);
+      const completeSignIn = () => {
+        this.restorable = true;
+        return this.cognitoTokens(this.issueTokens(identity.sub));
+      };
+      if (this.selectedScenario === "sign-in-pending") {
+        return new Promise<Response>((resolve) => {
+          this.pendingSignIns.push({
+            email: identity.email,
+            release: () => resolve(completeSignIn()),
+          });
+          this.changed();
+        });
+      }
+      return completeSignIn();
     }
     if (body.AuthFlow !== "REFRESH_TOKEN_AUTH") {
       return json({ __type: "NotAuthorizedException" }, 400);
     }
 
     this.restoreCount += 1;
+    const refreshSub = this.refreshSub;
     if (
       this.selectedScenario === "runtime-expired" &&
       this.runtime401Used &&
       this.restoreCount > 1
     ) {
       this.restorable = false;
-      this.activeSub = null;
       this.changed();
       return json({ __type: "NotAuthorizedException" }, 400);
     }
     if (!this.restorable) {
-      this.activeSub = null;
       this.changed();
       return json({ __type: "NotAuthorizedException" }, 400);
     }
@@ -310,12 +368,11 @@ export class ChatBrowserFixture {
         this.changed();
       });
       if (!this.restorable) {
-        this.activeSub = null;
         this.changed();
         return json({ __type: "NotAuthorizedException" }, 400);
       }
     }
-    return this.cognitoTokens(this.issueTokens());
+    return this.cognitoTokens(this.issueTokens(refreshSub, false));
   }
 
   private cognitoTokens(tokens: SessionTokens) {
@@ -354,7 +411,7 @@ export class ChatBrowserFixture {
     this.changed();
   }
 
-  private async profileResponse(request: FixtureRequest): Promise<Response> {
+  private async profileResponse(request: FixtureRequest, sub: string): Promise<Response> {
     if (this.selectedScenario === "membership-denied") {
       this.finish(request, 403, "membresía denegada al leer el perfil");
       return json(
@@ -375,9 +432,11 @@ export class ChatBrowserFixture {
       return json({ code: "TEMPORARY_FAILURE" }, 503);
     }
     const profile =
-      this.selectedScenario === "incomplete" ? null : cloneProfile(this.storedProfile);
+      this.selectedScenario === "incomplete"
+        ? null
+        : cloneProfile(this.storedProfiles.get(sub) || fixtureProfiles[0]);
     this.finish(request, 200, profile ? "perfil completo simulado" : "perfil ausente simulado");
-    return json({ sub: identity.sub, botId: "docentes", profile });
+    return json({ sub, botId: "docentes", profile });
   }
 
   private async runtimeResponse(
@@ -544,9 +603,17 @@ export class ChatBrowserFixture {
   releasePasswordReset(succeeds: boolean) {
     const pending = this.pendingPasswordResets.shift();
     if (!pending) return;
-    this.selectedScenario = "ready";
     pending.release(succeeds);
     this.changed();
+  }
+
+  releaseSignIn() {
+    this.pendingSignIns.shift()?.release();
+    this.changed();
+  }
+
+  releaseClipboardOperation(id: number, succeeds: boolean) {
+    this.clipboardOperations.find((operation) => operation.id === id)?.release(succeeds);
   }
 
   admitStream() {
@@ -629,6 +696,32 @@ export class ChatBrowserFixture {
       this.finish(item, 200, "configuración pública simulada");
       return json(this.publicConfig);
     }
+    if (url.pathname === "/api/account/invitations/inspect" && method === "POST") {
+      const invitation = isRecord(body) ? fixtureInvitations.get(String(body.token || "")) : null;
+      if (!invitation) {
+        this.finish(item, 404, "invitación de fixture inexistente o vencida");
+        return json({ code: "INVALID_INVITATION" }, 404);
+      }
+      this.finish(item, 200, "invitación vigente para una cuenta existente");
+      return json({ kind: "existing", email: invitation.email });
+    }
+    if (url.pathname === "/api/account/invitations/accept" && method === "POST") {
+      if (!sub) {
+        this.finish(item, 401, "sin sesión");
+        return json({ code: "UNAUTHORIZED" }, 401);
+      }
+      const invitation = isRecord(body) ? fixtureInvitations.get(String(body.token || "")) : null;
+      if (!invitation) {
+        this.finish(item, 404, "invitación de fixture inexistente o vencida");
+        return json({ code: "INVALID_INVITATION" }, 404);
+      }
+      if (sub !== invitation.sub) {
+        this.finish(item, 403, "la identidad no coincide con la invitación de fixture");
+        return json({ code: "INVITATION_EMAIL_MISMATCH" }, 403);
+      }
+      this.finish(item, 200, "invitación de fixture aceptada");
+      return json({ status: "accepted" });
+    }
     if (url.pathname === "/api/account/me" && method === "GET") {
       if (
         !sub ||
@@ -655,7 +748,7 @@ export class ChatBrowserFixture {
         this.finish(item, 401, "sin sesión");
         return json({ code: "UNAUTHORIZED" }, 401);
       }
-      return this.profileResponse(item);
+      return this.profileResponse(item, sub);
     }
     if (url.pathname === "/api/profile" && method === "PUT") {
       if (!sub) {
@@ -703,17 +796,18 @@ export class ChatBrowserFixture {
           503,
         );
       }
-      this.storedProfile = {
+      const profile: ProfileDocument = {
         sub,
         botId: this.publicConfig.botId,
         updatedAt: new Date().toISOString(),
         ...cloneDraft(validation.value),
       };
+      this.storedProfiles.set(sub, profile);
       this.finish(item, 200, "perfil de fixture guardado");
       return json({
         sub,
         botId: this.publicConfig.botId,
-        profile: cloneProfile(this.storedProfile),
+        profile: cloneProfile(profile),
       });
     }
     if (url.hostname === "bedrock-agentcore.us-east-1.amazonaws.com") {
@@ -737,16 +831,30 @@ export class ChatBrowserFixture {
   }
 
   snapshot(route: string) {
+    const accessToken = this.session.accessToken();
+    const sessionSub = accessToken ? (this.tokens.get(accessToken) ?? null) : null;
+    const sessionIdentity = identities.find(({ sub }) => sub === sessionSub) || null;
     return {
       fixture: "chat-browser-local",
       route,
       scenario: this.selectedScenario,
-      session: { active: Boolean(this.activeSub), credentialsIncluded: false },
+      session: {
+        active: Boolean(accessToken),
+        sub: sessionSub,
+        email: sessionIdentity?.email || null,
+        credentialsIncluded: false,
+      },
       pendingProfiles: this.pendingProfiles.length,
       pendingSignOuts: this.pendingSignOuts.length,
       pendingRefreshes: this.pendingRefreshes.length,
       pendingRuntime401s: this.pendingRuntime401s.length,
       pendingPasswordResets: this.pendingPasswordResets.length,
+      pendingSignIns: this.pendingSignIns.map(({ email }) => ({ email })),
+      clipboardOperations: this.clipboardOperations.map(({ id, text, status }) => ({
+        id,
+        text,
+        status,
+      })),
       pendingAdmissions: this.streams.filter(({ closed, admitted }) => !closed && !admitted).length,
       admittedStreams: this.streams.filter(({ closed, admitted }) => !closed && admitted).length,
       openStreams: this.streams.filter(({ closed }) => !closed).length,
@@ -754,7 +862,9 @@ export class ChatBrowserFixture {
         conversationId,
         turns: conversation.turns.map((turn) => ({ ...turn })),
       })),
-      storedProfile: cloneDraft(this.storedProfile),
+      storedProfile: cloneDraft(
+        this.storedProfiles.get(sessionSub || identities[0].sub) || fixtureProfiles[0],
+      ),
       requestCount: this.requests.length,
       requests: this.requests.map(({ ...item }) => ({ ...item })),
     };
