@@ -29,13 +29,23 @@ const refreshStorageKey = "auth-refresh";
 
 export class SessionError extends Error {
   readonly code: string;
+  readonly status: number;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, status = 0) {
     super(message);
     this.name = "SessionError";
     this.code = code;
+    this.status = status;
   }
 }
+
+const invalidRefreshTokenCodes = new Set(["NotAuthorizedException", "UserNotFoundException"]);
+const retryableCognitoCodes = new Set([
+  "InternalErrorException",
+  "LimitExceededException",
+  "ServiceUnavailableException",
+  "TooManyRequestsException",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -58,7 +68,7 @@ async function cognitoJson(
       body: JSON.stringify(body),
     });
   } catch {
-    throw new SessionError("NETWORK_ERROR", "Cognito no está disponible.");
+    throw new SessionError("NETWORK_ERROR", "Cognito no está disponible.", 0);
   }
 
   let parsed: unknown;
@@ -74,18 +84,21 @@ async function cognitoJson(
       parsed = await response.json();
     }
   } catch {
-    throw new SessionError("INVALID_RESPONSE", "Cognito devolvió una respuesta inválida.");
+    throw new SessionError("INVALID_RESPONSE", "Cognito devolvió una respuesta inválida.", 502);
   }
   if (!isRecord(parsed)) {
-    throw new SessionError("INVALID_RESPONSE", "Cognito devolvió una respuesta inválida.");
+    throw new SessionError("INVALID_RESPONSE", "Cognito devolvió una respuesta inválida.", 502);
   }
   const result: CognitoResponse = parsed;
 
   if (!response.ok) {
     const code = typeof result.__type === "string" ? result.__type.split("#").pop() || "" : "";
+    const status =
+      response.status >= 500 || retryableCognitoCodes.has(code) ? 503 : response.status;
     throw new SessionError(
       code || "COGNITO_ERROR",
       "El email o la contraseña no fueron aceptados.",
+      status,
     );
   }
 
@@ -250,16 +263,25 @@ export function createSession({
         const tokens = authenticationResult(response);
         while (passwordResetBarrier) await passwordResetBarrier;
         if (generation !== authGeneration) return null;
+        saveRefreshToken(tokens.refreshToken);
         currentAccessToken = tokens.accessToken;
         currentIdToken = tokens.idToken;
-        saveRefreshToken(tokens.refreshToken);
         return { accessToken: tokens.accessToken, idToken: tokens.idToken };
-      } catch {
+      } catch (error) {
         while (passwordResetBarrier) await passwordResetBarrier;
         if (generation !== authGeneration) return null;
-        clearMemory();
-        storage.removeItem(refreshStorageKey);
-        return null;
+        if (error instanceof SessionError && invalidRefreshTokenCodes.has(error.code)) {
+          clearMemory();
+          storage.removeItem(refreshStorageKey);
+          return null;
+        }
+        if (error instanceof SessionError) {
+          if (error.status > 0 && error.status < 500) {
+            throw new SessionError(error.code, error.message, 503);
+          }
+          throw error;
+        }
+        throw new SessionError("NETWORK_ERROR", "Cognito no está disponible.", 0);
       }
     })();
 

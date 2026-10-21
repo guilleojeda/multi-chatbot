@@ -120,8 +120,10 @@ function createSubmission(input, ordinal) {
 
 function makeHarness({
   member = true,
+  membershipFailure,
   profile = validProfile,
   profileFailure,
+  submissionFailure,
   metaByConversation = new Map(),
   quota = defaultQuota,
   generate,
@@ -169,6 +171,7 @@ function makeHarness({
     },
     async getSubmission(input) {
       state.calls.push(["getSubmission", clone(input)]);
+      if (submissionFailure) throw submissionFailure;
       return clone(findSubmission(input));
     },
     async readQuota(input) {
@@ -295,6 +298,7 @@ function makeHarness({
     accounts: {
       async hasMember(input) {
         state.calls.push(["hasMember", clone(input)]);
+        if (membershipFailure) throw membershipFailure;
         return member;
       },
     },
@@ -421,7 +425,11 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     const denied = await terminalResult(
       invoke(withoutMembership.handler, startPayload({ queryId: secondQueryId })),
     );
-    expect(denied).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
+    expect(denied).toMatchObject({
+      type: "failed",
+      code: "access_denied",
+      recordStatus: "not_admitted",
+    });
     expect(withoutMembership.store.getSubmission).not.toHaveBeenCalled();
     expect(withoutMembership.store.readQuota).not.toHaveBeenCalled();
 
@@ -436,6 +444,68 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     expect(otherOwner.store.continueTurn).not.toHaveBeenCalled();
     expect(otherOwner.store.readQuota).not.toHaveBeenCalled();
     expect(otherOwner.state.providerCalls).toBe(0);
+  });
+
+  it("keeps start, message, and recover IDs unconfirmed when membership cannot be checked", async () => {
+    const requests = [
+      startPayload(),
+      startPayload({ operation: "message", baseOrdinal: 2 }),
+      { version: 2, operation: "recover", conversationId, queryId },
+    ];
+
+    for (const payload of requests) {
+      const harness = makeHarness({
+        membershipFailure: new Error("membership lookup timed out"),
+        metaByConversation: new Map([seededMeta()]),
+      });
+
+      const result = await terminalResult(invoke(harness.handler, payload));
+
+      expect(result).toMatchObject({
+        type: "failed",
+        code: "temporarily_unavailable",
+        queryId,
+        recordStatus: "unconfirmed",
+      });
+      expect(callNames(harness.state)).toEqual(["hasMember"]);
+      expect(harness.store.getSubmission).not.toHaveBeenCalled();
+      expect(harness.store.getMeta).not.toHaveBeenCalled();
+      expect(harness.store.readQuota).not.toHaveBeenCalled();
+      expect(harness.store.startTurn).not.toHaveBeenCalled();
+      expect(harness.store.continueTurn).not.toHaveBeenCalled();
+      expect(harness.state.providerCalls).toBe(0);
+    }
+  });
+
+  it("keeps start, message, and recover IDs unconfirmed when the initial replay lookup fails", async () => {
+    const requests = [
+      startPayload(),
+      startPayload({ operation: "message", baseOrdinal: 2 }),
+      { version: 2, operation: "recover", conversationId, queryId },
+    ];
+
+    for (const payload of requests) {
+      const harness = makeHarness({
+        metaByConversation: new Map([seededMeta()]),
+        submissionFailure: new Error("submission lookup timed out"),
+      });
+
+      const result = await terminalResult(invoke(harness.handler, payload));
+
+      expect(result).toMatchObject({
+        type: "failed",
+        code: "temporarily_unavailable",
+        queryId,
+        recordStatus: "unconfirmed",
+      });
+      expect(callNames(harness.state)).toEqual(["hasMember", "getSubmission"]);
+      expect(harness.store.getSubmission).toHaveBeenCalledTimes(1);
+      expect(harness.store.getMeta).not.toHaveBeenCalled();
+      expect(harness.store.readQuota).not.toHaveBeenCalled();
+      expect(harness.store.startTurn).not.toHaveBeenCalled();
+      expect(harness.store.continueTurn).not.toHaveBeenCalled();
+      expect(harness.state.providerCalls).toBe(0);
+    }
   });
 
   it("does not reveal a recoverable snapshot after membership is revoked", async () => {

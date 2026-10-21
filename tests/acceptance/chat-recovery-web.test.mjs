@@ -3,6 +3,7 @@ import {
   createAccountAppHookHarness,
   loadAccountAppForHookTests,
 } from "../support/account-app-hook-harness.mjs";
+import { markChatJournalAdmitted, writePendingChatJournal } from "../../web/chat-journal.ts";
 
 const initialConversationId = "550e8400-e29b-41d4-a716-446655440000";
 const initialQueryId = "a4bfbc9f-3699-4a93-b120-a03c0204bc67";
@@ -23,11 +24,16 @@ const accessToken = "temporary-access-token-not-for-storage";
 const idToken = "temporary-id-token-not-for-storage";
 
 let AccountApp;
+let createSession;
 let disposeAccountAppModule;
 const apps = [];
 
 beforeAll(async () => {
-  ({ AccountApp, dispose: disposeAccountAppModule } = await loadAccountAppForHookTests());
+  ({
+    AccountApp,
+    createSession,
+    dispose: disposeAccountAppModule,
+  } = await loadAccountAppForHookTests());
 });
 
 afterAll(async () => {
@@ -208,6 +214,7 @@ function createEnvironment({
   config = baseConfig,
   profileComplete = true,
   restoreSession = true,
+  session: providedSession,
   membershipStatus = 200,
   requestPasswordReset = vi.fn(async () => undefined),
   confirmPasswordReset = vi.fn(async () => undefined),
@@ -235,7 +242,7 @@ function createEnvironment({
   const apiRequests = [];
   const events = storage.events;
   let token = accessToken;
-  const session = {
+  const session = providedSession || {
     accessToken: vi.fn(() => token),
     idToken: vi.fn(() => idToken),
     restore: vi.fn(async () => {
@@ -328,11 +335,12 @@ function createEnvironment({
   };
 }
 
-function mount(environment) {
+function mount(environment, initialRoute = { kind: "chat" }) {
   globalThis.__accountSession = environment.session;
   const app = createAccountAppHookHarness({
     AccountApp,
     getSession: () => environment.session,
+    initialRoute,
   });
   apps.push(app);
   return app;
@@ -378,6 +386,91 @@ function submissionCalls(environment) {
 }
 
 describe("the chat recovery journal and restored submission", () => {
+  it("keeps an admitted journal through real session restoration failure and recovers it after retry", async () => {
+    const storage = new MemorySessionStorage();
+    storage.setItem("auth-refresh", "refresh-before-network-error");
+    const authRequests = [];
+    let refreshAttempts = 0;
+    const session = createSession({
+      clientId: baseConfig.clientId,
+      region: baseConfig.region,
+      storage,
+      fetch: async (_url, init) => {
+        const target = new Headers(init.headers).get("x-amz-target") || "";
+        const body = JSON.parse(String(init.body));
+        authRequests.push({ target, body });
+        if (!target.endsWith("InitiateAuth") || body.AuthFlow !== "REFRESH_TOKEN_AUTH") {
+          throw new Error(`Unexpected Cognito request: ${target}`);
+        }
+        refreshAttempts += 1;
+        if (refreshAttempts === 1) throw new TypeError("network unavailable");
+        return jsonResponse({
+          AuthenticationResult: {
+            AccessToken: "restored-access-token",
+            IdToken: "restored-id-token",
+            RefreshToken: "refresh-after-retry",
+          },
+        });
+      },
+    });
+    const environment = createEnvironment({
+      storage,
+      session,
+      recoverHandler: (request) =>
+        jsonResponse(
+          snapshot(request, {
+            status: "completed",
+            question: originalQuestion,
+            answer: "Respuesta recuperada tras revalidar la sesión.",
+          }),
+        ),
+    });
+    const request = {
+      version: 2,
+      operation: "start",
+      conversationId: initialConversationId,
+      queryId: initialQueryId,
+      baseOrdinal: 0,
+      text: originalQuestion,
+    };
+    writePendingChatJournal(baseConfig, defaultIdentity, request);
+    markChatJournalAdmitted(baseConfig, defaultIdentity, request, 1);
+
+    const app = mount(environment);
+    await initialize(app);
+
+    expect(app.current().props.state).toMatchObject({ view: "denied", retryable: true });
+    expect(authRequests).toHaveLength(1);
+    expect(storage.getItem("auth-refresh")).toBe("refresh-before-network-error");
+    expect(JSON.parse(findStoredRecord(storage, initialQueryId).raw)).toMatchObject({
+      admitted: true,
+      request: { queryId: initialQueryId },
+    });
+    expect(environment.runtimeRequests).toHaveLength(0);
+
+    await app.current().props.onSubmit({ action: "retry" });
+    await app.flush();
+    await vi.waitFor(async () => {
+      expect(recoverCalls(environment)).toHaveLength(1);
+      expect(await app.html()).toContain("Respuesta recuperada tras revalidar la sesión.");
+    });
+
+    expect(authRequests).toHaveLength(2);
+    expect(session.accessToken()).toBe("restored-access-token");
+    expect(storage.getItem("auth-refresh")).toBe("refresh-after-retry");
+    expect(environment.runtimeRequests.map(({ request: actual }) => actual.operation)).toEqual([
+      "recover",
+    ]);
+    expect(recoverCalls(environment)[0].request).toEqual({
+      version: 2,
+      operation: "recover",
+      conversationId: initialConversationId,
+      queryId: initialQueryId,
+    });
+    expect(submissionCalls(environment)).toHaveLength(0);
+    expect(allStorageText(storage)).not.toContain(originalQuestion);
+  });
+
   it("writes the exact request before POST and minimizes it after accepted", async () => {
     const storage = new MemorySessionStorage();
     let pendingStream;
@@ -961,6 +1054,58 @@ describe("the chat recovery journal and restored submission", () => {
 
     expect(allStorageText(seeded.storage)).not.toContain(queryId);
     expect(seeded.environment.session.confirmPasswordReset).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a loaded journal when a password reset starts directly on the recovery route", async () => {
+    const seeded = await seedAcceptedJournal();
+    const queryId = seeded.request.queryId;
+    seeded.app.dispose();
+
+    const recovered = createEnvironment({ storage: seeded.storage });
+    const app = mount(recovered, { kind: "recover" });
+    await initialize(app);
+    await app.current().props.onSubmit({
+      action: "request-password-reset",
+      email: "teacher@example.test",
+    });
+    await vi.waitFor(async () => expect(await app.html()).toContain('id="recovery-code"'));
+    await app.current().props.onSubmit({
+      action: "confirm-password-reset",
+      email: "teacher@example.test",
+      code: "123456",
+      password: "ValidPassword1!",
+    });
+    await app.flush();
+
+    expect(allStorageText(seeded.storage)).not.toContain(queryId);
+    app.dispose();
+
+    const reentered = createEnvironment({ storage: seeded.storage });
+    const reenteredApp = mount(reentered);
+    await initialize(reenteredApp);
+    expect(recoverCalls(reentered)).toHaveLength(0);
+  });
+
+  it("clears the durable journal when signing out from a reloaded login route", async () => {
+    const seeded = await seedAcceptedJournal();
+    const queryId = seeded.request.queryId;
+    seeded.app.dispose();
+
+    const reloaded = createEnvironment({ storage: seeded.storage });
+    const loginApp = mount(reloaded, { kind: "login" });
+    await initialize(loginApp);
+    expect(reloaded.session.restore).toHaveBeenCalledTimes(1);
+    await loginApp.current().props.onSignOut();
+    await loginApp.flush();
+
+    expect(allStorageText(seeded.storage)).not.toContain(queryId);
+    loginApp.dispose();
+
+    const sameIdentity = createEnvironment({ storage: seeded.storage });
+    const chatApp = mount(sameIdentity);
+    await initialize(chatApp);
+    expect(sameIdentity.identity).toEqual(defaultIdentity);
+    expect(recoverCalls(sameIdentity)).toHaveLength(0);
   });
 
   it("clears the journal when membership is definitively revoked before recovery", async () => {

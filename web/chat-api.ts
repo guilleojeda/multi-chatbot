@@ -64,6 +64,9 @@ export type ChatStreamResult =
       canContinue?: boolean;
     };
 
+export type ChatRecoveryResult =
+  ChatSubmissionSnapshot | Extract<ChatStreamResult, { status: "failed" }>;
+
 export type StreamChatOptions = {
   onEvent: (event: ChatApplicationEvent) => void;
   isActive: () => boolean;
@@ -73,7 +76,6 @@ export type StreamChatOptions = {
 export type ChatStreamError = Error & {
   code: string;
   status: number;
-  refreshFailed?: boolean;
 };
 
 const sessionHeader = "x-amzn-bedrock-agentcore-runtime-session-id";
@@ -299,13 +301,7 @@ async function postRuntime(
 
   let response = await invoke(accessToken);
   if (response.status === 401 && isActive()) {
-    let restored;
-    try {
-      restored = await session.restore();
-    } catch (error) {
-      const refreshError = asChatError(error);
-      throw Object.assign(refreshError, { refreshFailed: true });
-    }
+    const restored = await session.restore();
     if (!isActive()) throw chatError("UNAUTHORIZED", 401, "Tu sesión venció.");
     if (!restored) throw chatError("UNAUTHORIZED", 401, "Tu sesión venció.");
     accessToken = restored.accessToken;
@@ -330,7 +326,10 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-function parseFailure(value: unknown, queryId: string): ChatStreamResult {
+function parseFailure(
+  value: unknown,
+  queryId: string,
+): Extract<ChatStreamResult, { status: "failed" }> {
   const event = applicationEvent(value);
   if (event.type !== "failed" || (event.queryId !== undefined && event.queryId !== queryId)) {
     throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió un estado inválido.");
@@ -503,7 +502,7 @@ export async function recoverChat(
   session: Session,
   request: RecoverRequest,
   options: Pick<StreamChatOptions, "isActive" | "signal">,
-): Promise<ChatStreamResult> {
+): Promise<ChatRecoveryResult> {
   if (!isValidRecoverRequest(request)) {
     throw chatError("INVALID_REQUEST", 400, "No pudimos consultar el estado de la consulta.");
   }

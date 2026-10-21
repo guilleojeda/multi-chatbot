@@ -206,6 +206,103 @@ describe("shared session refresh during a streamed chat request", () => {
     expect(session.idToken()).toBeNull();
     expect(storage.getItem("auth-refresh")).toBeNull();
   });
+
+  it.each([
+    [
+      "a network failure",
+      async () => {
+        throw new TypeError("network unavailable");
+      },
+      0,
+    ],
+    ["a Cognito service failure", async () => cognitoError("InternalErrorException", 503), 503],
+  ])(
+    "preserves the refresh token after %s and restores successfully on retry",
+    async (_label, fail, status) => {
+      const storage = new MemorySessionStorage();
+      storage.setItem("auth-refresh", "refresh-before-retry");
+      let refreshAttempts = 0;
+      const session = createSession({
+        clientId: config.clientId,
+        region: config.region,
+        storage,
+        fetch: vi.fn(async (_url, init) => {
+          const body = cognitoRequest(init);
+          if (body.AuthFlow !== "REFRESH_TOKEN_AUTH") {
+            throw new Error("Unexpected Cognito operation");
+          }
+          refreshAttempts += 1;
+          if (refreshAttempts === 1) return fail();
+          return cognitoResponse("access-restored", "id-restored", "refresh-restored");
+        }),
+      });
+
+      await expect(session.restore()).rejects.toMatchObject({
+        code: status === 0 ? "NETWORK_ERROR" : "InternalErrorException",
+        status,
+      });
+      expect(storage.getItem("auth-refresh")).toBe("refresh-before-retry");
+      expect(session.accessToken()).toBeNull();
+      expect(session.idToken()).toBeNull();
+
+      await expect(session.restore()).resolves.toEqual({
+        accessToken: "access-restored",
+        idToken: "id-restored",
+      });
+      expect(storage.getItem("auth-refresh")).toBe("refresh-restored");
+      expect(refreshAttempts).toBe(2);
+    },
+  );
+
+  it("retains the same chat request after a transient refresh error and replays its 401 once when retry succeeds", async () => {
+    const storage = new MemorySessionStorage();
+    let refreshAttempts = 0;
+    const session = createSession({
+      clientId: config.clientId,
+      region: config.region,
+      storage,
+      fetch: vi.fn(async (_url, init) => {
+        const body = cognitoRequest(init);
+        if (body.AuthFlow === "USER_PASSWORD_AUTH") {
+          return cognitoResponse("access-1", "id-1", "refresh-1");
+        }
+        if (body.AuthFlow === "REFRESH_TOKEN_AUTH") {
+          refreshAttempts += 1;
+          if (refreshAttempts === 1) throw new TypeError("network unavailable");
+          return cognitoResponse("access-2", "id-2", "refresh-2");
+        }
+        throw new Error("Unexpected Cognito operation");
+      }),
+    });
+    await session.signIn("teacher@example.test", "password");
+
+    const runtimeFetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 401 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 401 }))
+      .mockImplementationOnce(async (_url, init) => {
+        expect(new Headers(init.headers).get("authorization")).toBe("Bearer access-2");
+        return completedStream(JSON.parse(init.body));
+      });
+    vi.stubGlobal("fetch", runtimeFetch);
+
+    await expect(
+      streamChat(config, session, chatRequest, { isActive: () => true, onEvent: vi.fn() }),
+    ).rejects.toMatchObject({ code: "NETWORK_ERROR", status: 0 });
+    expect(storage.getItem("auth-refresh")).toBe("refresh-1");
+    expect(runtimeFetch).toHaveBeenCalledTimes(1);
+
+    await expect(
+      streamChat(config, session, chatRequest, { isActive: () => true, onEvent: vi.fn() }),
+    ).resolves.toMatchObject({ status: "completed", conversationId, queryId, ordinal: 2 });
+    expect(runtimeFetch).toHaveBeenCalledTimes(3);
+    expect(runtimeFetch.mock.calls.map(([, init]) => init.body)).toEqual([
+      JSON.stringify(chatRequest),
+      JSON.stringify(chatRequest),
+      JSON.stringify(chatRequest),
+    ]);
+    expect(storage.getItem("auth-refresh")).toBe("refresh-2");
+  });
 });
 
 describe("session restoration across password reset and authentication changes", () => {

@@ -270,11 +270,18 @@ export function AccountApp({
     chatRecoveryStopRef.current = null;
   }, []);
 
-  const clearCurrentChatJournal = useCallback(() => {
+  const clearCurrentChatJournal = useCallback((configToClear?: PublicConfig) => {
     const scope = chatJournalOwnerRef.current;
     if (scope) {
       try {
         clearChatJournal(scope.config, scope.identity);
+      } catch {
+        // Access revocation still clears the in-memory reference when storage is unavailable.
+      }
+    }
+    if (configToClear) {
+      try {
+        clearChatJournalForConfiguredBot(configToClear);
       } catch {
         // Access revocation still clears the in-memory reference when storage is unavailable.
       }
@@ -284,18 +291,22 @@ export function AccountApp({
     chatDisplayedQueryIdRef.current = null;
   }, []);
 
-  const invalidateChat = useCallback(() => {
-    chatEpochRef.current += 1;
-    chatProfileSequenceRef.current += 1;
-    stopChatRecovery();
-    chatRequestRef.current?.abort();
-    chatRequestRef.current = null;
-    chatSubmissionInFlightRef.current = false;
-    chatOwnerKeyRef.current = null;
-    chatConversationIdRef.current = null;
-    clearCurrentChatJournal();
-    setChat(emptyChatState());
-  }, [clearCurrentChatJournal, setChat, stopChatRecovery]);
+  // Identity activation leaves an unowned journal available to the recovery effect.
+  const invalidateChat = useCallback(
+    (configToClear?: PublicConfig) => {
+      chatEpochRef.current += 1;
+      chatProfileSequenceRef.current += 1;
+      stopChatRecovery();
+      chatRequestRef.current?.abort();
+      chatRequestRef.current = null;
+      chatSubmissionInFlightRef.current = false;
+      chatOwnerKeyRef.current = null;
+      chatConversationIdRef.current = null;
+      clearCurrentChatJournal(configToClear);
+      setChat(emptyChatState());
+    },
+    [clearCurrentChatJournal, setChat, stopChatRecovery],
+  );
 
   const activateChatIdentity = useCallback(
     (identity: { sub: string; botId: string }) => {
@@ -315,7 +326,7 @@ export function AccountApp({
     chatRequestRef.current = null;
     chatSubmissionInFlightRef.current = false;
     chatConversationIdRef.current = null;
-    clearCurrentChatJournal();
+    clearCurrentChatJournal(configRef.current ?? undefined);
     setChat({ profileStatus: "loading", queryStatus: "idle" });
     setChatProfileRetryCount((count) => count + 1);
   }, [clearCurrentChatJournal, setChat, stopChatRecovery]);
@@ -419,7 +430,7 @@ export function AccountApp({
           if (!isActive()) return;
           authorizedRouteRef.current = null;
           const apiError = asApiError(error);
-          if (apiError.status === 401 || apiError.status === 403 || apiError.refreshFailed) {
+          if (apiError.status === 401 || apiError.status === 403) {
             try {
               clearChatJournalForConfiguredBot(config);
             } catch {
@@ -547,7 +558,7 @@ export function AccountApp({
       } catch (error) {
         if (!isActive()) return;
         const apiError = asApiError(error);
-        if (apiError.status === 401 || apiError.status === 403 || apiError.refreshFailed) {
+        if (apiError.status === 401 || apiError.status === 403) {
           if (configRef.current) {
             try {
               clearChatJournalForConfiguredBot(configRef.current);
@@ -703,7 +714,7 @@ export function AccountApp({
         await session.confirmPasswordReset(submission.email, submission.code, submission.password);
         if (confirmOperationRef.current !== operation) return;
         confirmOperationRef.current = null;
-        invalidateChat();
+        invalidateChat(configRef.current ?? undefined);
         authorizedRouteRef.current = null;
         retryOperationRef.current = null;
         passwordResetLoginEmailRef.current = submission.email;
@@ -850,7 +861,7 @@ export function AccountApp({
   }
 
   const signOut = useCallback(() => {
-    invalidateChat();
+    invalidateChat(configRef.current ?? undefined);
     authorizedRouteRef.current = null;
     setState({
       view: "login",
@@ -863,7 +874,7 @@ export function AccountApp({
   }, [invalidateChat, projectName]);
 
   const profileUnauthorized = useCallback(() => {
-    invalidateChat();
+    invalidateChat(configRef.current ?? undefined);
     authorizedRouteRef.current = null;
     setState({
       view: "login",
@@ -876,7 +887,7 @@ export function AccountApp({
   }, [invalidateChat, projectName]);
 
   const profileForbidden = useCallback(() => {
-    invalidateChat();
+    invalidateChat(configRef.current ?? undefined);
     authorizedRouteRef.current = null;
     setState({
       view: "denied",
@@ -936,7 +947,7 @@ export function AccountApp({
       .catch((error: unknown) => {
         if (!isActive()) return;
         const apiError = asApiError(error);
-        if (apiError.status === 401 || apiError.refreshFailed) {
+        if (apiError.status === 401) {
           invalidateChat();
           profileUnauthorized();
           return;
@@ -1158,41 +1169,6 @@ export function AccountApp({
           return;
         }
 
-        if (result.status === "completed") {
-          failures = 0;
-          const reference = {
-            version: 2 as const,
-            operation: request.operation,
-            conversationId: request.conversationId,
-            queryId: request.queryId,
-            baseOrdinal: request.baseOrdinal,
-          };
-          try {
-            markChatJournalAdmitted(recoveryConfig, identity, reference, result.ordinal);
-          } catch {
-            // The terminal result is still displayed; plaintext removal is attempted by the helper.
-          }
-          chatJournalRef.current = {
-            request: reference,
-            admitted: true,
-            ordinal: result.ordinal,
-          };
-          chatDisplayedQueryIdRef.current = result.queryId;
-          setChat({
-            ...chatScreenStateRef.current,
-            queryStatus: "completed",
-            ordinal: result.ordinal,
-            canContinue: true,
-            recovered: true,
-            recoveryLoading: false,
-            canRetry: false,
-          });
-          stopCycle();
-          return;
-        }
-
-        if (result.status !== "failed") return;
-
         const failureCode = result.code.toLowerCase();
         if (failureCode === "access_denied") {
           invalidateChat();
@@ -1269,7 +1245,7 @@ export function AccountApp({
       } catch (error) {
         if (!isActive()) return;
         const apiError = asApiError(error);
-        if (apiError.status === 401 || apiError.refreshFailed) {
+        if (apiError.status === 401) {
           invalidateChat();
           profileUnauthorized();
           return;
@@ -1280,11 +1256,16 @@ export function AccountApp({
           return;
         }
         failures += 1;
+        const currentJournal = chatJournalRef.current;
+        const admitted =
+          currentJournal?.request.queryId === request.queryId
+            ? currentJournal.admitted
+            : journal.admitted;
         setChat({
           ...chatScreenStateRef.current,
-          queryStatus: journal.admitted ? "streaming" : "unconfirmed",
+          queryStatus: admitted ? "streaming" : "unconfirmed",
           recoveryLoading: false,
-          canRetry: !journal.admitted,
+          canRetry: !admitted,
           queryError: "No pudimos actualizar el estado. Vamos a volver a consultarlo.",
         });
         schedule(Math.min(1_000 * 2 ** Math.min(failures - 1, 5), 30_000));
@@ -1604,7 +1585,7 @@ export function AccountApp({
       .catch((error: unknown) => {
         if (!isActive()) return;
         const apiError = asApiError(error);
-        if (apiError.status === 401 || apiError.refreshFailed) {
+        if (apiError.status === 401) {
           invalidateChat();
           profileUnauthorized();
           return;

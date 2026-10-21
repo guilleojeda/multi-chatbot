@@ -19,7 +19,9 @@ export const fixtureScenarios = [
   { id: "membership-network", label: "Membresía: fallo de red" },
   { id: "config-temporary", label: "Configuración pública: fallo temporal 503" },
   { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
+  { id: "runtime-unconfirmed", label: "Runtime: lookup sin confirmar (sin admisión)" },
   { id: "runtime-temporary", label: "Runtime: fallo temporal 503" },
+  { id: "runtime-recover-network", label: "Runtime: fallo de red solo en recover" },
   { id: "runtime-quota-daily", label: "Runtime: cupo diario agotado" },
   { id: "runtime-quota-monthly", label: "Runtime: cupo mensual agotado" },
   { id: "runtime-quota-both", label: "Runtime: cupos diario y mensual agotados" },
@@ -33,6 +35,7 @@ export const fixtureScenarios = [
   { id: "runtime-stale-base", label: "Runtime: ordinal base desactualizado (sin admisión)" },
   { id: "runtime-401", label: "Runtime: 401 y refresh correcto" },
   { id: "runtime-401-pending", label: "Runtime: 401 y refresh retenidos" },
+  { id: "cognito-refresh-network", label: "Cognito: refresh token falla con TypeError de red" },
   { id: "sign-in-pending", label: "Cognito: retener nuevo inicio de sesión" },
   { id: "runtime-expired", label: "Runtime: 401 y sesión vencida" },
   { id: "runtime-forbidden", label: "Runtime: acceso denegado" },
@@ -100,6 +103,7 @@ type ControlledStream = {
   producerClosed: boolean;
   transportClosed: boolean;
   turn: FixtureTurn;
+  disconnect: () => void;
 };
 
 type FixtureTurn = {
@@ -630,6 +634,10 @@ export class ChatBrowserFixture {
         return json({ __type: "NotAuthorizedException" }, 400);
       }
     }
+    if (this.selectedScenario === "cognito-refresh-network") {
+      this.changed();
+      throw new TypeError("Failed to fetch");
+    }
     return this.cognitoTokens(this.issueTokens(refreshSub, false));
   }
 
@@ -816,7 +824,23 @@ export class ChatBrowserFixture {
       );
     }
 
+    if (operation === "recover" && this.selectedScenario === "runtime-recover-network") {
+      this.finish(request, "network-error", "fallo de red simulado solo durante recover");
+      throw new TypeError("Failed to fetch");
+    }
+
     if (operation === "recover") return this.recoverResponse(request, conversationId, queryId, sub);
+
+    if (this.selectedScenario === "runtime-unconfirmed") {
+      this.finish(request, 200, "lookup temporal sin admisión; conserva el mismo query ID");
+      return sseResponse({
+        type: "failed",
+        code: "temporarily_unavailable",
+        message: "No pudimos confirmar el estado del envío. Podés reintentar el mismo pedido.",
+        recordStatus: "unconfirmed",
+        queryId,
+      });
+    }
 
     if (this.selectedScenario === "runtime-capacity-exceeded" && operation === "message") {
       this.finish(request, 200, "contexto excedido simulado antes de admitir; sin consumo");
@@ -950,8 +974,13 @@ export class ChatBrowserFixture {
             index: firstTextIndex,
             text: firstText,
           });
-          request.status = "pending";
-          request.outcome = "respuesta progresiva abierta; esperar un cierre manual";
+          if (stream.transportClosed) {
+            request.status = "cancelled";
+            request.outcome = "admisión persistida después de cerrar SSE; no se entregó accepted";
+          } else {
+            request.status = "pending";
+            request.outcome = "respuesta progresiva abierta; esperar un cierre manual";
+          }
           this.changed();
         };
         stream = {
@@ -963,6 +992,15 @@ export class ChatBrowserFixture {
           transportClosed: false,
           turn,
           admit,
+          disconnect: () => {
+            if (stream.transportClosed) return;
+            stream.cancel();
+            try {
+              controllerRef?.error(new DOMException("Fixture SSE disconnected", "AbortError"));
+            } catch {
+              // The reader may already have canceled or errored.
+            }
+          },
           push: (value) => {
             if (stream.producerClosed || stream.transportClosed) return;
             controller.enqueue(encoder.encode(sse(value)));
@@ -1057,6 +1095,10 @@ export class ChatBrowserFixture {
 
   admitStream() {
     this.streams.find((item) => !item.producerClosed && !item.admitted)?.admit();
+  }
+
+  disconnectPendingStream() {
+    this.streams.find((item) => !item.producerClosed && !item.admitted)?.disconnect();
   }
 
   emitFragment() {

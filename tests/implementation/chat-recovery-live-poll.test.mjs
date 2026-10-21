@@ -51,6 +51,139 @@ function runtimeUrl() {
 }
 
 describe("chat recovery after an uncertain stream in the current view", () => {
+  it("keeps an admitted turn unconfirmed and continues polling after a transient error", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const values = new Map();
+    const storage = {
+      getItem: (key) => values.get(String(key)) ?? null,
+      setItem: (key, value) => values.set(String(key), String(value)),
+      removeItem: (key) => values.delete(String(key)),
+    };
+    vi.stubGlobal("window", {
+      location: { hash: "#/chat", pathname: "/", search: "" },
+      history: { replaceState() {} },
+      sessionStorage: storage,
+      addEventListener() {},
+      removeEventListener() {},
+    });
+    vi.stubGlobal("sessionStorage", storage);
+    vi.stubGlobal("navigator", { clipboard: { writeText: vi.fn(async () => undefined) } });
+
+    const request = {
+      version: 2,
+      operation: "start",
+      conversationId,
+      queryId,
+      baseOrdinal: 0,
+      text: question,
+    };
+    writePendingChatJournal(config, { sub: "teacher-a", botId: "docentes" }, request);
+    let pollCount = 0;
+    const requests = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input, init = {}) => {
+        const url = String(input);
+        if (url === "/public-config.json") return jsonResponse(config);
+        if (url === "/api/account/me") return jsonResponse({ sub: "teacher-a", botId: "docentes" });
+        if (url === "/api/profile") {
+          return jsonResponse({
+            sub: "teacher-a",
+            botId: "docentes",
+            profile: {
+              sub: "teacher-a",
+              botId: "docentes",
+              updatedAt: "2026-10-20T00:00:00.000Z",
+              fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
+              responsePreferenceIds: [],
+            },
+          });
+        }
+        if (url === runtimeUrl()) {
+          const actual = JSON.parse(String(init.body));
+          requests.push(actual);
+          pollCount += 1;
+          if (pollCount === 1) {
+            return jsonResponse({
+              version: 2,
+              conversationId,
+              queryId,
+              ordinal: 1,
+              status: "in_progress",
+              question,
+              answer: "Prefijo durable.",
+              canContinue: false,
+            });
+          }
+          if (pollCount === 2) throw new TypeError("network unavailable");
+          return jsonResponse({
+            version: 2,
+            conversationId,
+            queryId,
+            ordinal: 1,
+            status: "completed",
+            question,
+            answer: "Respuesta final durable.",
+            canContinue: true,
+          });
+        }
+        throw new Error(`Unexpected web request: ${url}`);
+      }),
+    );
+
+    const session = {
+      accessToken: () => "access-token",
+      idToken: () => "id-token",
+      restore: vi.fn(async () => ({ accessToken: "access-token", idToken: "id-token" })),
+      signOut: vi.fn(async () => undefined),
+    };
+    globalThis.__accountSession = session;
+    const app = createAccountAppHookHarness({ AccountApp, getSession: () => session });
+
+    try {
+      await app.flush();
+      expect(requests).toHaveLength(1);
+      expect(await app.html()).toContain("Prefijo durable.");
+      const storedJournal = [...values.values()]
+        .map((raw) => {
+          try {
+            return JSON.parse(raw);
+          } catch {
+            return null;
+          }
+        })
+        .find((record) => record?.request?.queryId === queryId);
+      expect(storedJournal).toMatchObject({
+        admitted: true,
+        request: { queryId },
+      });
+      expect(storedJournal.request).not.toHaveProperty("text");
+      expect([...values.values()].join("\n")).not.toContain(question);
+      expect([...values.values()].join("\n")).toContain(queryId);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await app.flush();
+      expect(requests).toHaveLength(2);
+      expect(await app.html()).toContain("No pudimos actualizar el estado.");
+      expect(await app.html()).not.toContain("Reintentar el mismo envío");
+      expect(app.current().props.onSubmit(question)).toBe(false);
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await app.flush();
+      expect(requests).toHaveLength(3);
+      expect(requests).toEqual([
+        { version: 2, operation: "recover", conversationId, queryId },
+        { version: 2, operation: "recover", conversationId, queryId },
+        { version: 2, operation: "recover", conversationId, queryId },
+      ]);
+      expect(await app.html()).toContain("Respuesta final durable.");
+      expect(requests.some(({ operation }) => operation === "start")).toBe(false);
+    } finally {
+      app.dispose();
+    }
+  });
+
   it("starts recover polling after EOF without remounting or sending another start", async () => {
     const values = new Map();
     const storage = {

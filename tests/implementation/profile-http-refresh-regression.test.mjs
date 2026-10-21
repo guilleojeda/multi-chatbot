@@ -5,7 +5,7 @@ import { SessionError } from "../../web/session.ts";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("profile request refresh failures", () => {
-  it("marks a rejected refresh and never retries the protected request", async () => {
+  it("preserves a rejected refresh error and never retries the protected request", async () => {
     const session = {
       accessToken: () => "expired-access",
       restore: vi.fn(async () => {
@@ -15,21 +15,21 @@ describe("profile request refresh failures", () => {
     const fetch = vi.fn(async () => new Response("{}", { status: 401 }));
     vi.stubGlobal("fetch", fetch);
 
-    await expect(
-      requestWithRefresh(
-        {
-          region: "test",
-          userPoolId: "pool",
-          clientId: "client",
-          apiBaseUrl: "/api",
-          botId: "bot",
-        },
-        session,
-        "/profile",
-        {},
-        () => true,
-      ),
-    ).rejects.toMatchObject({ code: "NETWORK_ERROR", status: 0, refreshFailed: true });
+    const failure = await requestWithRefresh(
+      {
+        region: "test",
+        userPoolId: "pool",
+        clientId: "client",
+        apiBaseUrl: "/api",
+        botId: "bot",
+      },
+      session,
+      "/profile",
+      {},
+      () => true,
+    ).catch((error) => error);
+    expect(failure).toMatchObject({ code: "NETWORK_ERROR", status: 0 });
+    expect(failure).not.toHaveProperty("refreshFailed");
 
     expect(session.restore).toHaveBeenCalledTimes(1);
     expect(fetch).toHaveBeenCalledTimes(1);

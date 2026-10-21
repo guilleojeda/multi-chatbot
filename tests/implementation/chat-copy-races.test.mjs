@@ -200,6 +200,66 @@ describe("copy feedback follows its answer and operation", () => {
     expect(alerts(blocks[1])).toHaveLength(0);
   });
 
+  it("keeps a pending partial answer's failure with it after submitting a follow-up", async () => {
+    const answer = "Prefijo parcial A";
+    const copy = deferred();
+    const onCopy = vi.fn(() => copy.promise);
+    const onSubmit = vi.fn();
+    const driver = createDriver(
+      props(
+        {
+          profileStatus: "complete",
+          queryStatus: "failed",
+          question: "Pregunta A",
+          answer,
+          canContinue: true,
+        },
+        onCopy,
+        onSubmit,
+      ),
+    );
+    driver.render();
+    await driver.flush();
+
+    button(driver, "Copiar texto parcial").props.onClick();
+    expect(onCopy).toHaveBeenCalledWith(answer);
+
+    const textarea = findNode(driver.output, (node) => node.type === "textarea");
+    textarea.props.onChange({ currentTarget: { value: "Pregunta B" } });
+    await driver.flush();
+    findNode(driver.output, (node) => node.type === "form").props.onSubmit({
+      preventDefault() {},
+    });
+    expect(onSubmit).toHaveBeenCalledWith("Pregunta B");
+
+    driver.setProps(
+      props(
+        {
+          profileStatus: "complete",
+          queryStatus: "streaming",
+          question: "Pregunta B",
+          answer: "Prefijo B",
+          previousTurns: [{ question: "Pregunta A", answer, status: "failed" }],
+        },
+        onCopy,
+        onSubmit,
+      ),
+    );
+    await driver.flush();
+    copy.reject(new Error("clipboard denied"));
+    await driver.flush();
+
+    const blocks = answerBlocks(driver);
+    expect(blocks).toHaveLength(2);
+    expect(textContent(blocks[0])).toContain("Respuesta incompleta");
+    expect(walk(blocks[0]).filter((node) => node.type === "button")).toHaveLength(0);
+    expect(alerts(blocks[0])).toHaveLength(1);
+    expect(textContent(alerts(blocks[0])[0])).toBe(
+      "No pudimos copiar la respuesta. Podés seleccionar el texto y copiarlo.",
+    );
+    expect(alerts(blocks[1])).toHaveLength(0);
+  });
+
   it("ignores a pending failure after reset when a new conversation has the same answer text", async () => {
     const answer = "Respuesta repetida";
     const copy = deferred();

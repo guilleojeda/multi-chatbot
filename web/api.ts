@@ -14,7 +14,6 @@ export type ApiError = Error & {
   code: string;
   status: number;
   fields?: string[];
-  refreshFailed?: boolean;
 };
 
 export type ApiRequestOptions = {
@@ -38,7 +37,6 @@ export function asApiError(error: unknown): ApiError {
       code: unknown;
       status: unknown;
       fields?: unknown;
-      refreshFailed?: unknown;
     };
     const fields = candidate.fields;
     if (
@@ -51,16 +49,13 @@ export function asApiError(error: unknown): ApiError {
         code: candidate.code,
         status: candidate.status,
         ...(Array.isArray(fields) ? { fields } : {}),
-        ...(typeof candidate.refreshFailed === "boolean"
-          ? { refreshFailed: candidate.refreshFailed }
-          : {}),
       });
     }
   }
   const message = error instanceof SessionError ? error.message : "";
   return Object.assign(new Error(message || "La solicitud no pudo completarse."), {
     code: error instanceof SessionError ? error.code : "NETWORK_ERROR",
-    status: 0,
+    status: error instanceof SessionError ? error.status : 0,
   });
 }
 
@@ -183,7 +178,7 @@ export async function requestWithRefresh(
       refreshed = await session.restore();
     } catch (refreshError) {
       if (!isActive()) throw firstError;
-      throw Object.assign(asApiError(refreshError), { refreshFailed: true });
+      throw asApiError(refreshError);
     }
     if (!isActive()) throw firstError;
     if (!refreshed) throw firstError;

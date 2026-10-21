@@ -399,18 +399,7 @@ describe("the tab-scoped Cognito session", () => {
     expect([...storage.values.values()].join(" ")).toContain("refresh-token-value");
   });
 
-  it.each([
-    [
-      "Cognito rejects the refresh token",
-      async () => jsonResponse({ __type: "NotAuthorizedException" }, 400),
-    ],
-    [
-      "the network request fails",
-      async () => {
-        throw new Error("Cognito unavailable");
-      },
-    ],
-  ])("clears tab and memory state and returns sign-in-required when %s", async (_case, fetch) => {
+  it("clears tab and memory state when Cognito definitively rejects the refresh token", async () => {
     const createSession = await loadSessionFactory();
     if (!createSession) return;
 
@@ -422,7 +411,7 @@ describe("the tab-scoped Cognito session", () => {
       clientId: "web-client-id",
       region: "us-east-1",
       storage,
-      fetch,
+      fetch: async () => jsonResponse({ __type: "NotAuthorizedException" }, 400),
     });
 
     const result = await session.restore();
@@ -430,6 +419,36 @@ describe("the tab-scoped Cognito session", () => {
     expect(result).toBeNull();
     expect(session.accessToken()).toBeNull();
     expect(storage.getItem("auth-refresh")).toBeNull();
+    expect(storage.getItem("unrelated")).toBe("keep-me");
+  });
+
+  it("preserves the session and refresh token when Cognito cannot be reached", async () => {
+    const createSession = await loadSessionFactory();
+    if (!createSession) return;
+
+    const storage = new MemorySessionStorage([["unrelated", "keep-me"]]);
+    const session = createSession({
+      clientId: "web-client-id",
+      region: "us-east-1",
+      storage,
+      fetch: async (_url, init) => {
+        if (requestBody({ init }).AuthFlow === "USER_PASSWORD_AUTH") {
+          return cognitoTokens({
+            accessToken: "access-token-value",
+            idToken: "id-token-value",
+            refreshToken: "refresh-token-value",
+          });
+        }
+        throw new Error("Cognito unavailable");
+      },
+    });
+
+    await session.signIn("teacher@example.edu", "correct-horse-battery-staple");
+    await expect(session.restore()).rejects.toMatchObject({ code: "NETWORK_ERROR", status: 0 });
+
+    expect(session.accessToken()).toBe("access-token-value");
+    expect(session.idToken()).toBe("id-token-value");
+    expect(storage.getItem("auth-refresh")).toBe("refresh-token-value");
     expect(storage.getItem("unrelated")).toBe("keep-me");
   });
 
