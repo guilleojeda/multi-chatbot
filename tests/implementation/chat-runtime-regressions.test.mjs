@@ -153,7 +153,11 @@ function makeHarness({
         return { queryId: input.queryId, ordinal };
       },
       async claimInvocation(input) {
-        const key = submissionKey({ sub: "teacher-123", botId: "bot-aurora", queryId: input.queryId });
+        const key = submissionKey({
+          sub: "teacher-123",
+          botId: "bot-aurora",
+          queryId: input.queryId,
+        });
         if (state.claims.has(key)) return false;
         state.claims.add(key);
         const submission = state.submissions.get(key);
@@ -342,10 +346,7 @@ describe("chat Runtime implementation regressions", () => {
     const textEvents = events.filter(({ type }) => type === "text");
 
     expect(textEvents.map(({ text }) => text)).toEqual(["Durable A.", " Buffered B."]);
-    expect(harness.state.appended.map(({ text }) => text)).toEqual([
-      "Durable A.",
-      " Buffered B.",
-    ]);
+    expect(harness.state.appended.map(({ text }) => text)).toEqual(["Durable A.", " Buffered B."]);
     expect(events.at(-1)).toMatchObject({ type: "failed", code: "incomplete_response" });
     expect(harness.state.failed[0]).toMatchObject({
       providerFinished: true,
@@ -364,7 +365,13 @@ describe("chat Runtime implementation regressions", () => {
       ...quotaView,
       daily: { ...quotaView.daily, period: "2026-10-22" },
     };
-    const clockValues = [beforeMidnight, beforeMidnight, beforeMidnight, afterMidnight, afterMidnight];
+    const clockValues = [
+      beforeMidnight,
+      beforeMidnight,
+      beforeMidnight,
+      afterMidnight,
+      afterMidnight,
+    ];
     let clockIndex = 0;
     const quotaReads = [];
     const admissions = [];
@@ -492,7 +499,9 @@ describe("chat Runtime implementation regressions", () => {
       answerManifest: { count: 0, complete: false },
     });
     expect(harness.state.meta.closed).not.toBe(true);
-    expect(harness.state.submissions.get(`teacher-123/bot-aurora/${queryId}`).canContinue).toBe(true);
+    expect(harness.state.submissions.get(`teacher-123/bot-aurora/${queryId}`).canContinue).toBe(
+      true,
+    );
     expect(harness.state.completed).toHaveLength(0);
   });
 
@@ -577,9 +586,7 @@ describe("chat Runtime implementation regressions", () => {
         ownerAttemptId: expect.any(String),
       });
       expect(dispatchOrder.map(([kind]) => kind)).toEqual(["log", "provider"]);
-      expect(JSON.stringify(dispatch)).not.toMatch(
-        /Armá una actividad|Matemática|text|tokens/i,
-      );
+      expect(JSON.stringify(dispatch)).not.toMatch(/Armá una actividad|Matemática|text|tokens/i);
       expect(harness.state.appended.map(({ text }) => text).join("")).toBe(
         "Prefijo durable. Último fragmento.",
       );
@@ -616,7 +623,10 @@ describe("chat Runtime implementation regressions", () => {
 
     try {
       expect((await stream.next()).value).toMatchObject({ type: "accepted", queryId });
-      expect((await stream.next()).value).toMatchObject({ type: "text", text: "Prefijo incierto." });
+      expect((await stream.next()).value).toMatchObject({
+        type: "text",
+        text: "Prefijo incierto.",
+      });
       const closing = stream.return();
       releaseProvider();
       await closing;
