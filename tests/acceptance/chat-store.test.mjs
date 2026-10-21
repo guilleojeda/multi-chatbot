@@ -41,55 +41,91 @@ function makeStore(send = vi.fn(async () => ({}))) {
 }
 
 function startInput(overrides = {}) {
+  const now = Date.parse("2026-10-19T16:00:00.000Z");
   return {
     ...owner,
     conversationId,
     queryId,
-    now: Date.parse("2026-10-19T16:00:00.000Z"),
+    now,
     text: "Armá una actividad de porcentajes.",
     profileSnapshot,
     invocation: {
       modelId: "global.anthropic.claude-sonnet-4-6",
       revision: "reviewed-revision-123",
     },
+    quota: {
+      daily: {
+        used: 4,
+        limit: 20,
+        resetAt: Date.parse("2026-10-20T03:00:00.000Z"),
+        period: "2026-10-19",
+      },
+      monthly: {
+        used: 37,
+        limit: 200,
+        resetAt: Date.parse("2026-11-01T03:00:00.000Z"),
+        period: "2026-10",
+      },
+      serverNow: now,
+      blockedUntil: null,
+      policyRevision: "policy-r7",
+    },
+    requestFingerprint: "sha256:stable-request-fingerprint",
     ...overrides,
   };
 }
 
-function putItems(command) {
-  if (command instanceof TransactWriteCommand) {
-    return command.input.TransactItems.flatMap((action) => (action.Put ? [action.Put.Item] : []));
-  }
-  if (command instanceof PutCommand) return [command.input.Item];
-  return [];
+function standaloneWrites(documentClient) {
+  return documentClient.send.mock.calls.flatMap(([command]) => {
+    if (command instanceof TransactWriteCommand) return [];
+    return [command].filter(
+      (candidate) => candidate instanceof PutCommand || candidate instanceof UpdateCommand,
+    );
+  });
 }
 
-function allPutItems(documentClient) {
-  return documentClient.send.mock.calls.flatMap(([command]) => putItems(command));
+function transactionActions(command) {
+  return command.input.TransactItems;
 }
 
-function conditionalExpression(command) {
-  if (command instanceof PutCommand || command instanceof UpdateCommand) {
-    return command.input.ConditionExpression ?? "";
-  }
-  return "";
+function transactionCommands(documentClient) {
+  return documentClient.send.mock.calls
+    .map(([command]) => command)
+    .filter((command) => command instanceof TransactWriteCommand);
 }
 
-function hasCompleteManifest(value) {
-  if (!value || typeof value !== "object") return false;
-  if (value.complete === true) return true;
-  return Object.values(value).some(hasCompleteManifest);
+function transactionUpdates(command) {
+  return transactionActions(command).flatMap((action) => (action.Update ? [action.Update] : []));
 }
 
-function conditionRequiresStatus(command, expectedStatus) {
-  const expression = command.input.ConditionExpression ?? "";
-  const names = command.input.ExpressionAttributeNames ?? {};
-  const statusAttribute =
-    Object.entries(names).find(([, attribute]) => attribute === "status")?.[0] ?? "status";
-  const escapedAttribute = statusAttribute.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = expression.match(new RegExp(`${escapedAttribute}\\s*=\\s*(:[A-Za-z0-9_]+)`));
-  if (!match) return false;
-  return command.input.ExpressionAttributeValues?.[match[1]] === expectedStatus;
+function transactionItems(command) {
+  return transactionActions(command).flatMap((action) =>
+    action.Put?.Item ? [action.Put.Item] : [],
+  );
+}
+
+function expressionValues(payload) {
+  return Object.values(payload?.ExpressionAttributeValues ?? {});
+}
+
+function conditionBoundValues(payload) {
+  const expression = payload?.ConditionExpression ?? "";
+  const tokens = expression.match(/:[A-Za-z0-9_]+/g) ?? [];
+  return [...new Set(tokens.map((token) => payload.ExpressionAttributeValues?.[token]))];
+}
+
+function conditionIncludesInstant(payload, instant) {
+  return conditionBoundValues(payload).some(
+    (value) =>
+      value === instant ||
+      (typeof value === "string" &&
+        Number.isFinite(Date.parse(value)) &&
+        Date.parse(value) === instant),
+  );
+}
+
+function namedAttributes(payload) {
+  return Object.values(payload?.ExpressionAttributeNames ?? {});
 }
 
 function equalityConditionValue(command, attribute) {
@@ -103,10 +139,6 @@ function equalityConditionValue(command, attribute) {
     new RegExp(`(?:^|\\W)${escape(attributeToken)}\\s*=\\s*(:[A-Za-z0-9_]+)(?:\\W|$)`),
   );
   return match ? values[match[1]] : undefined;
-}
-
-function conditionRequiresEquality(command, attribute, expectedValue) {
-  return equalityConditionValue(command, attribute) === expectedValue;
 }
 
 function expectScopedKey(item) {
@@ -360,84 +392,92 @@ describe("the DynamoDB conversation store adapter", () => {
     },
   );
 
-  it("creates META and the first in-progress turn atomically with conditional puts", async () => {
+  it("admits the first turn, its complete question and quota marker atomically", async () => {
     const { documentClient, store } = makeStore();
 
-    const result = await store.startTurn(startInput());
+    const input = startInput();
+    const result = await store.startTurn(input);
 
     const transaction = documentClient.send.mock.calls
       .map(([command]) => command)
       .find((command) => command instanceof TransactWriteCommand);
     expect(transaction).toBeTruthy();
-    expect(transaction.input.TransactItems).toHaveLength(2);
-    const puts = transaction.input.TransactItems.map((action) => action.Put);
-    expect(puts.every(Boolean)).toBe(true);
-    expect(puts.every(({ TableName }) => TableName === tableName)).toBe(true);
-    expect(
-      puts.every(({ ConditionExpression = "" }) =>
-        /attribute_not_exists/.test(ConditionExpression),
-      ),
-    ).toBe(true);
-
-    const [metaPut, turnPut] = puts;
-    expect(metaPut.Item).toMatchObject({
+    const items = transactionItems(transaction);
+    const meta = items.find(({ sk }) => sk === "META");
+    const turn = items.find(
+      ({ sk, queryId: turnQueryId }) => String(sk).startsWith("TURN#") && turnQueryId === queryId,
+    );
+    const marker = items.find(({ sk }) => sk === "SEND#" + queryId);
+    expect(meta).toMatchObject({
       pk: `CONV#${conversationId}`,
       sk: "META",
       conversationId,
       ...owner,
     });
-    expect(turnPut.Item).toMatchObject({
+    expect(turn).toMatchObject({
       pk: `CONV#${conversationId}`,
       queryId,
       status: "in_progress",
       profileSnapshot,
     });
-    expect(turnPut.Item.sk).toMatch(/^TURN#/);
-    expect(result).toMatchObject({ queryId, ordinal: 1 });
-    expect(documentClient.send.mock.calls.some(([command]) => command instanceof PutCommand)).toBe(
-      true,
+    expect(turn.sk).toMatch(/^TURN#/);
+    expect(turn.questionManifest).toMatchObject({ count: 1, complete: true });
+    expect(marker).toMatchObject({
+      ...owner,
+      queryId,
+      requestFingerprint: input.requestFingerprint,
+    });
+    const markerPut = transactionActions(transaction).find(
+      (action) => action.Put?.Item === marker,
+    )?.Put;
+    expect(markerPut?.ConditionExpression).toMatch(/attribute_not_exists/);
+    expect(JSON.stringify(transaction.input)).toContain(input.quota.policyRevision);
+    const questionChunks = items.filter(
+      ({ role, queryId: chunkQueryId }) => role === "user" && chunkQueryId === queryId,
     );
+    expect(questionChunks.map(({ text }) => text).join("")).toBe(input.text);
+    expect(
+      transactionActions(transaction)
+        .filter((action) => action.Put?.Item?.role === "user")
+        .every(({ Put }) => /attribute_not_exists/i.test(Put.ConditionExpression ?? "")),
+    ).toBe(true);
+    expect(result).toMatchObject({ queryId, ordinal: 1 });
+    expect(standaloneWrites(documentClient)).toEqual([]);
   });
 
-  it("writes and publishes a continuation question under its allocated ordinal before returning", async () => {
+  it("admits and publishes a complete continuation question in the allocation transaction", async () => {
     const { documentClient, store } = makeStore();
+    const input = startInput({ text: "Ahora adaptala para trabajar sin decimales." });
 
     const result = await store.continueTurn({
-      ...startInput({ text: "Ahora adaptala para trabajar sin decimales." }),
+      ...input,
       expectedLastOrdinal: 1,
       contextReferences: [],
     });
 
     expect(result).toMatchObject({ queryId, ordinal: 2 });
-    const commands = documentClient.send.mock.calls.map(([command]) => command);
-    const allocationIndex = commands.findIndex(
-      (command) => command instanceof TransactWriteCommand,
+    const transactions = documentClient.send.mock.calls
+      .map(([command]) => command)
+      .filter((command) => command instanceof TransactWriteCommand);
+    expect(transactions).toHaveLength(1);
+    const transaction = transactions[0];
+    const items = transactionItems(transaction);
+    const turn = items.find(
+      ({ sk, queryId: turnQueryId }) => String(sk).startsWith("TURN#") && turnQueryId === queryId,
     );
-    const publicationIndex = commands.findLastIndex(
-      (command) =>
-        command instanceof UpdateCommand &&
-        Object.values(command.input.ExpressionAttributeNames ?? {}).includes("questionManifest"),
+    const questionChunks = items.filter(
+      ({ role, queryId: chunkQueryId }) => role === "user" && chunkQueryId === queryId,
     );
-    const questionIndexes = commands.flatMap((command, index) =>
-      command instanceof PutCommand && command.input.Item.role === "user" ? [index] : [],
-    );
-    expect(allocationIndex).toBeGreaterThanOrEqual(0);
-    expect(questionIndexes.length).toBeGreaterThan(0);
-    expect(publicationIndex).toBeGreaterThan(allocationIndex);
-    expect(
-      questionIndexes.every((index) => index > allocationIndex && index < publicationIndex),
-    ).toBe(true);
-
-    const allocation = commands[allocationIndex];
-    const turnPut = allocation.input.TransactItems.find(({ Put }) => Put)?.Put;
-    expect(turnPut.Item).toMatchObject({
+    expect(turn).toMatchObject({
       ordinal: 2,
       queryId,
       status: "in_progress",
       profileSnapshot,
     });
-    expect(turnPut.Item.questionManifest.complete).toBe(false);
-    const questionChunks = questionIndexes.map((index) => commands[index].input.Item);
+    expect(turn.questionManifest).toMatchObject({
+      count: questionChunks.length,
+      complete: true,
+    });
     expect(questionChunks.map(({ text }) => text).join("")).toBe(
       "Ahora adaptala para trabajar sin decimales.",
     );
@@ -450,166 +490,136 @@ describe("the DynamoDB conversation store adapter", () => {
           role === "user",
       ),
     ).toBe(true);
-    expect(hasCompleteManifest(commands[publicationIndex].input.ExpressionAttributeValues)).toBe(
-      true,
-    );
-    expect(conditionRequiresStatus(commands[publicationIndex], "in_progress")).toBe(true);
+    expect(JSON.stringify(transaction.input)).toContain(input.quota.policyRevision);
+    expect(standaloneWrites(documentClient)).toEqual([]);
   });
 
   it("does not treat a start collision as permission to replace another conversation", async () => {
-    const collision = Object.assign(new Error("conditional write failed"), {
-      name: "ConditionalCheckFailedException",
+    const collision = Object.assign(new Error("transaction canceled"), {
+      name: "TransactionCanceledException",
     });
-    const send = vi.fn().mockRejectedValueOnce(collision);
+    const send = vi.fn(async (command) => {
+      if (command instanceof TransactWriteCommand) throw collision;
+      if (command instanceof GetCommand) return {};
+      return {};
+    });
     const { documentClient, store } = makeStore(send);
 
-    await expect(store.startTurn(startInput())).rejects.toBe(collision);
+    await expect(store.startTurn(startInput())).rejects.toBeInstanceOf(Error);
 
-    expect(documentClient.send).toHaveBeenCalledTimes(1);
-    const command = documentClient.send.mock.calls[0][0];
-    expect(command).toBeInstanceOf(TransactWriteCommand);
-    expect(command.input.TransactItems).toHaveLength(2);
-    expect(
-      command.input.TransactItems.every(({ Put }) =>
-        /attribute_not_exists/.test(Put.ConditionExpression),
-      ),
-    ).toBe(true);
+    const transactions = transactionCommands(documentClient);
+    expect(transactions).toHaveLength(1);
+    const marker = transactionActions(transactions[0]).find(
+      (action) => action.Put?.Item?.sk === "SEND#" + queryId,
+    )?.Put;
+    expect(marker).toBeTruthy();
+    expect(marker.ConditionExpression).toMatch(/attribute_not_exists/i);
+    expect(standaloneWrites(documentClient)).toEqual([]);
   });
 
-  it("writes question text and the server snapshot before startTurn returns", async () => {
+  it("stores the original question and server profile in the admitted turn", async () => {
     const { documentClient, store } = makeStore();
 
     await store.startTurn(startInput());
 
-    const commands = documentClient.send.mock.calls.map(([command]) => command);
-    const items = allPutItems(documentClient);
+    const transaction = transactionCommands(documentClient)[0];
+    expect(transaction).toBeTruthy();
+    const items = transactionItems(transaction);
     const turn = items.find(
-      ({ sk, status }) => typeof sk === "string" && sk.startsWith("TURN#") && status,
+      ({ sk, queryId: turnQueryId }) => String(sk).startsWith("TURN#") && turnQueryId === queryId,
     );
-    const content = items.filter(({ role }) => role === "user");
+    const content = items.filter(
+      ({ role, queryId: chunkQueryId }) => role === "user" && chunkQueryId === queryId,
+    );
     expect(turn).toBeTruthy();
     expect(turn).toMatchObject({
       status: "in_progress",
       profileSnapshot,
     });
-    expect(hasCompleteManifest(turn)).toBe(false);
+    expect(turn.questionManifest).toMatchObject({ count: content.length, complete: true });
     expect(content.map(({ text }) => text).join("")).toBe("Armá una actividad de porcentajes.");
     expect(content.every((item) => item.pk === `CONV#${conversationId}`)).toBe(true);
-    expect(commands[0]).toBeInstanceOf(TransactWriteCommand);
-    expect(commands.at(-1)).toBeInstanceOf(UpdateCommand);
-    expect(commands.slice(1, -1).every((command) => command instanceof PutCommand)).toBe(true);
-    expect(hasCompleteManifest(commands.at(-1).input.ExpressionAttributeValues)).toBe(true);
+    expect(
+      transactionActions(transaction)
+        .filter((action) => action.Put?.Item?.role === "user")
+        .every(({ Put }) => /attribute_not_exists/i.test(Put.ConditionExpression ?? "")),
+    ).toBe(true);
+    expect(standaloneWrites(documentClient)).toEqual([]);
   });
 
-  it("allocates distinct continuation ordinals with a conditional META update and turn put", async () => {
+  it("conditions continuation admission on the observed ordinal and creates its turn atomically", async () => {
     const expectedLastOrdinal = 4;
-    const competing = { lastOrdinal: expectedLastOrdinal, committedOrdinals: [] };
-    const send = vi.fn(async (command) => {
-      if (!(command instanceof TransactWriteCommand)) return {};
-      const update = command.input.TransactItems.find(({ Update }) => Update)?.Update;
-      const put = command.input.TransactItems.find(({ Put }) => Put)?.Put;
-      if (!update || !put) throw new Error("continuation allocation must be atomic");
+    const input = startInput({ queryId: "fcdd5a71-b6db-4ad9-a2c3-934cb56fe749" });
+    const { documentClient, store } = makeStore();
 
-      const expectedOrdinal = equalityConditionValue({ input: update }, "lastOrdinal");
-      if (
-        !conditionRequiresEquality({ input: update }, "lastOrdinal", competing.lastOrdinal) ||
-        !Number.isSafeInteger(expectedOrdinal) ||
-        put.Item.ordinal !== expectedOrdinal + 1
-      ) {
-        throw Object.assign(new Error("conditional allocation failed"), {
-          name: "ConditionalCheckFailedException",
-        });
-      }
-      competing.lastOrdinal = put.Item.ordinal;
-      competing.committedOrdinals.push(put.Item.ordinal);
-      return {};
+    await store.continueTurn({ ...input, expectedLastOrdinal, contextReferences: [] });
+
+    const transactions = transactionCommands(documentClient);
+    expect(transactions).toHaveLength(1);
+    const transaction = transactions[0];
+    const meta = transactionUpdates(transaction).find(({ Key }) => Key?.sk === "META");
+    const turn = transactionItems(transaction).find(
+      ({ sk, queryId: turnQueryId }) =>
+        String(sk).startsWith("TURN#") && turnQueryId === input.queryId,
+    );
+    expect(meta).toBeTruthy();
+    expect(meta.ConditionExpression).toBeTruthy();
+    expect(namedAttributes(meta).some((name) => /ordinal/i.test(name))).toBe(true);
+    expect(expressionValues(meta)).toContain(expectedLastOrdinal);
+    expect(turn).toMatchObject({
+      ordinal: expectedLastOrdinal + 1,
+      queryId: input.queryId,
+      profileSnapshot,
+      questionManifest: { complete: true },
     });
-    const { documentClient, store } = makeStore(send);
-    const nextTurn = (requestId) =>
-      store.continueTurn({
-        ...startInput({ queryId: requestId }),
-        expectedLastOrdinal,
-        contextReferences: [],
-      });
-
-    const outcomes = await Promise.allSettled([
-      nextTurn("c0a9cf23-5413-4f97-8f88-b976c9c4d6c1"),
-      nextTurn("fcdd5a71-b6db-4ad9-a2c3-934cb56fe749"),
-    ]);
-
-    const fulfilled = outcomes.filter(({ status }) => status === "fulfilled");
-    expect(fulfilled.length).toBeGreaterThan(0);
-    expect(competing.committedOrdinals).toHaveLength(fulfilled.length);
-    expect(new Set(competing.committedOrdinals).size).toBe(competing.committedOrdinals.length);
-
-    const transactions = documentClient.send.mock.calls
-      .map(([command]) => command)
-      .filter((command) => command instanceof TransactWriteCommand);
-    expect(transactions.length).toBeGreaterThanOrEqual(2);
-    const candidateItems = transactions.map((command) => {
-      const update = command.input.TransactItems.find(({ Update }) => Update)?.Update;
-      const put = command.input.TransactItems.find(({ Put }) => Put)?.Put;
-      expect(update).toBeTruthy();
-      expect(put).toBeTruthy();
-      expect(update.TableName).toBe(tableName);
-      expect(update.Key).toEqual({ pk: `CONV#${conversationId}`, sk: "META" });
-      expect(put.TableName).toBe(tableName);
-      expect(put.Item.profileSnapshot).toEqual(profileSnapshot);
-      expect(/attribute_not_exists/.test(put.ConditionExpression)).toBe(true);
-      const previousOrdinal = equalityConditionValue({ input: update }, "lastOrdinal");
-      expect(Number.isSafeInteger(previousOrdinal)).toBe(true);
-      expect(put.Item.ordinal).toBe(previousOrdinal + 1);
-      return put.Item;
-    });
-    expect(
-      candidateItems.every(({ ordinal, sk }) =>
-        sk.startsWith(`TURN#${String(ordinal).padStart(8, "0")}`),
-      ),
-    ).toBe(true);
-    expect(new Set(candidateItems.map(({ queryId: requestId }) => requestId)).size).toBe(2);
+    expect(standaloneWrites(documentClient)).toEqual([]);
   });
 
   it("uses distinct conditional chunk keys scoped to the requested turn and role", async () => {
     const { documentClient, store } = makeStore();
 
-    await store.appendChunk({ conversationId, queryId, role: "user", index: 0, text: "pregunta" });
     await store.appendChunk({
       conversationId,
+      ordinal: 2,
       queryId,
       role: "assistant",
       index: 0,
       text: "respuesta",
+      ownerAttemptId: "attempt-a",
+      now: Date.parse("2026-10-19T16:01:00.000Z"),
     });
     await store.appendChunk({
       conversationId,
+      ordinal: 2,
       queryId,
       role: "assistant",
       index: 1,
       text: " continuación",
-    });
-    await store.appendChunk({
-      conversationId,
-      queryId: "another-server-query-id",
-      role: "assistant",
-      index: 0,
-      text: "otro turno",
+      ownerAttemptId: "attempt-a",
+      now: Date.parse("2026-10-19T16:01:01.000Z"),
     });
 
-    const commands = documentClient.send.mock.calls.map(([command]) => command);
-    expect(commands.every((command) => command instanceof PutCommand)).toBe(true);
-    const items = commands.map(({ input }) => input.Item);
-    expect(items).toHaveLength(4);
+    const transactions = transactionCommands(documentClient);
+    expect(transactions).toHaveLength(2);
+    const items = transactions.map((transaction) => {
+      const actions = transactionActions(transaction);
+      const put = actions.find(({ Put }) => Put?.Item?.role === "assistant")?.Put;
+      const cursor = actions.find(({ Update }) => Update?.Key?.sk?.startsWith("TURN#"))?.Update;
+      expect(put).toBeTruthy();
+      expect(cursor).toBeTruthy();
+      expect(put.ConditionExpression).toMatch(/attribute_not_exists/i);
+      expect(cursor.ConditionExpression).toBeTruthy();
+      expect(conditionBoundValues(cursor)).toContain("attempt-a");
+      return put.Item;
+    });
+    expect(items).toHaveLength(2);
     items.forEach(expectScopedKey);
-    expect(new Set(items.map(({ sk }) => sk)).size).toBe(4);
+    expect(new Set(items.map(({ sk }) => sk)).size).toBe(2);
     expect(items.map(({ role, index, text }) => ({ role, index, text }))).toEqual([
-      { role: "user", index: 0, text: "pregunta" },
       { role: "assistant", index: 0, text: "respuesta" },
       { role: "assistant", index: 1, text: " continuación" },
-      { role: "assistant", index: 0, text: "otro turno" },
     ]);
-    expect(
-      commands.every((command) => /attribute_not_exists/.test(conditionalExpression(command))),
-    ).toBe(true);
+    expect(standaloneWrites(documentClient)).toEqual([]);
   });
 
   it("splits a large UTF-8 question below the DynamoDB item ceiling without losing text", async () => {
@@ -618,67 +628,80 @@ describe("the DynamoDB conversation store adapter", () => {
 
     await store.startTurn(startInput({ text: largeQuestion }));
 
-    const items = allPutItems(documentClient).filter(({ role }) => role === "user");
-    const questionItems = items.filter(({ role }) => role === "user");
+    const transaction = transactionCommands(documentClient)[0];
+    expect(transaction).toBeTruthy();
+    const items = transactionItems(transaction).filter(
+      ({ role, queryId: itemQueryId }) => role === "user" && itemQueryId === queryId,
+    );
+    const questionItems = items;
     expect(questionItems.length).toBeGreaterThan(1);
     for (const item of items) {
       expect(Buffer.byteLength(JSON.stringify(item), "utf8")).toBeLessThan(400 * 1024);
       expect(() => Buffer.from(item.text, "utf8").toString("utf8")).not.toThrow();
     }
     expect(questionItems.map(({ text }) => text).join("")).toBe(largeQuestion);
+    const turn = transactionItems(transaction).find(
+      ({ sk, queryId: itemQueryId }) => String(sk).startsWith("TURN#") && itemQueryId === queryId,
+    );
+    expect(turn.questionManifest).toMatchObject({
+      count: questionItems.length,
+      complete: true,
+    });
+    expect(standaloneWrites(documentClient)).toEqual([]);
   });
 
-  it("commits completed or failed only from in_progress and never downgrades a completed turn", async () => {
-    const unrelatedCondition = new UpdateCommand({
-      ConditionExpression: "attribute_exists(#status) AND #stage = :from",
-      ExpressionAttributeNames: { "#status": "status", "#stage": "stage" },
-      ExpressionAttributeValues: { ":from": "in_progress" },
-    });
-    expect(conditionRequiresStatus(unrelatedCondition, "in_progress")).toBe(false);
-
-    const turn = { status: "in_progress" };
-    const send = vi.fn(async (command) => {
-      if (!(command instanceof UpdateCommand)) return {};
-      const values = Object.values(command.input.ExpressionAttributeValues ?? {});
-      const nextStatus = values.find((value) => value === "completed" || value === "failed");
-      const onlyFromInProgress = conditionRequiresStatus(command, "in_progress");
-      if (!onlyFromInProgress || turn.status !== "in_progress") {
-        throw Object.assign(new Error("conditional update failed"), {
-          name: "ConditionalCheckFailedException",
-        });
-      }
-      turn.status = nextStatus;
-      return {};
-    });
-    const { documentClient, store } = makeStore(send);
+  it("commits terminal state with the conversation release and guards against a completed-turn downgrade", async () => {
+    const { documentClient, store } = makeStore();
 
     await store.completeTurn({
       conversationId,
+      ordinal: 2,
       queryId,
+      ownerAttemptId: "attempt-a",
+      now: Date.parse("2026-10-19T17:00:00.000Z"),
       answerManifest: { count: 1, complete: true },
       invocation: { modelId: "global.anthropic.claude-sonnet-4-6" },
     });
-    expect(turn.status).toBe("completed");
-    await expect(
-      store.failTurn({ conversationId, queryId, code: "provider_error" }),
-    ).rejects.toMatchObject({ name: "ConditionalCheckFailedException" });
-    expect(turn.status).toBe("completed");
+    await store.failTurn({
+      conversationId,
+      ordinal: 2,
+      queryId,
+      ownerAttemptId: "attempt-a",
+      code: "provider_error",
+      providerFinished: true,
+      now: Date.parse("2026-10-19T17:00:01.000Z"),
+    });
 
-    const updates = documentClient.send.mock.calls.map(([command]) => command);
-    expect(updates).toHaveLength(2);
-    expect(updates.every((command) => command instanceof UpdateCommand)).toBe(true);
-    expect(updates.every((command) => conditionRequiresStatus(command, "in_progress"))).toBe(true);
-    expect(
-      updates.every(
-        (command) => !JSON.stringify(command.input).includes(JSON.stringify(profileSnapshot)),
-      ),
-    ).toBe(true);
-    expect(
-      updates.map(({ input }) =>
-        Object.values(input.ExpressionAttributeValues).find(
-          (value) => value === "completed" || value === "failed",
+    const transactions = transactionCommands(documentClient);
+    expect(transactions).toHaveLength(2);
+    for (const [index, transaction] of transactions.entries()) {
+      const actions = transactionActions(transaction);
+      const turn = actions.find(({ Update }) => Update?.Key?.sk?.startsWith("TURN#"))?.Update;
+      const meta = actions.find(({ Update }) => Update?.Key?.sk === "META")?.Update;
+      expect(turn).toBeTruthy();
+      expect(turn.ConditionExpression).toBeTruthy();
+      expect(namedAttributes(turn).some((name) => /status|stage|phase/i.test(name))).toBe(true);
+      expect(conditionBoundValues(turn)).toContain("attempt-a");
+      expect(conditionBoundValues(turn)).toContain("invocation_claimed");
+      expect(
+        conditionIncludesInstant(
+          turn,
+          index === 0
+            ? Date.parse("2026-10-19T17:00:00.000Z")
+            : Date.parse("2026-10-19T17:00:01.000Z"),
         ),
-      ),
-    ).toEqual(["completed", "failed"]);
+      ).toBe(true);
+      expect(namedAttributes(turn).some((name) => /ownerAttemptId/i.test(name))).toBe(true);
+      expect(namedAttributes(turn).some((name) => /status/i.test(name))).toBe(true);
+      expect(namedAttributes(turn).some((name) => /deadline/i.test(name))).toBe(true);
+      expect(expressionValues(turn)).toContain(index === 0 ? "completed" : "failed");
+      const sourceStates = conditionBoundValues(turn);
+      expect(sourceStates).not.toContain("completed");
+      expect(meta).toBeTruthy();
+      expect(meta.ConditionExpression).toBeTruthy();
+      expect(conditionBoundValues(meta)).toContain(queryId);
+      expect(namedAttributes(meta).some((name) => /activeQueryId/i.test(name))).toBe(true);
+    }
+    expect(standaloneWrites(documentClient)).toEqual([]);
   });
 });

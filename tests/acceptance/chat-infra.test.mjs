@@ -350,6 +350,16 @@ describe("chat infrastructure acceptance", () => {
       const accountClient = onlyRecord(accountTemplate, "AWS::Cognito::UserPoolClient");
       const identityPool = onlyRecord(identityTemplate, "AWS::Cognito::UserPool");
 
+      // These are the existing resources: the new protocol updates their code and data.
+      expect(runtime.logicalId).toBe("ChatRuntime82B3183A");
+      expect(conversationTable.logicalId).toBe("ConversationTable75C14D21");
+      if (environment === "dev") {
+        expect(properties.AgentRuntimeName).toBe("multichatbotdevdocenteschatChatRuntimeCA8B680F");
+        expect(conversationTable.properties.TableName).toBe(
+          "multi-chatbot-dev-docentes-conversations",
+        );
+      }
+
       expect(properties.ProtocolConfiguration).toBe("HTTP");
       expect(properties.RequestHeaderConfiguration?.RequestHeaderAllowlist).toEqual([
         "Authorization",
@@ -471,6 +481,7 @@ describe("chat infrastructure acceptance", () => {
           "dynamodb:Query",
           "dynamodb:PutItem",
           "dynamodb:UpdateItem",
+          "dynamodb:ConditionCheckItem",
         ]),
       );
       expect(
@@ -480,6 +491,7 @@ describe("chat infrastructure acceptance", () => {
             "dynamodb:Query",
             "dynamodb:PutItem",
             "dynamodb:UpdateItem",
+            "dynamodb:ConditionCheckItem",
           ].includes(action),
         ),
       ).toBe(true);
