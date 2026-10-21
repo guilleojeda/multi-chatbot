@@ -13,6 +13,7 @@ const root = process.cwd();
 const conversationId = "550e8400-e29b-41d4-a716-446655440000";
 const queryId = "reset-chat-query";
 const identity = { sub: "teacher-a", botId: "docentes" };
+const secondIdentity = { sub: "teacher-b", botId: "docentes" };
 const config = {
   region: "us-east-1",
   userPoolId: "us-east-1_example",
@@ -234,8 +235,9 @@ function createHookRuntime() {
       throw new Error("AccountApp did not settle");
     },
     async setRoute(kind) {
-      route = { kind };
-      globalThis.window.location.hash = `#/${kind}`;
+      route = kind === "invite" ? { kind, token: "valid-invite" } : { kind };
+      globalThis.window.location.hash =
+        kind === "invite" ? "#/invite?token=valid-invite" : `#/${kind}`;
       dirty = true;
       await this.flush();
     },
@@ -246,10 +248,12 @@ function createHookRuntime() {
   };
 }
 
-function createEnvironment(confirmSucceeds, holdConfirmation = false) {
+function createEnvironment(confirmSucceeds, holdConfirmation = false, authOptions = {}) {
   const storage = new MemorySessionStorage();
   let tokenSequence = 0;
   let confirmationOutcome = confirmSucceeds;
+  let currentIdentity = authOptions.initialIdentity || identity;
+  let refreshCount = 0;
   let streamController;
   let streamSignal;
   let streamWasCancelled = false;
@@ -259,6 +263,10 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false) {
   const streamStarted = deferred();
   const confirmationStarted = deferred();
   const confirmationGate = deferred();
+  const refreshStarted = deferred();
+  const refreshGate = deferred();
+  const loginStarted = deferred();
+  const loginGate = deferred();
   const session = createSession({
     clientId: config.clientId,
     region: config.region,
@@ -266,6 +274,24 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false) {
     fetch: async (_input, init) => {
       const target = new Headers(init?.headers).get("x-amz-target") || "";
       if (target.endsWith("InitiateAuth")) {
+        const body = JSON.parse(init.body);
+        if (body.AuthFlow === "REFRESH_TOKEN_AUTH") {
+          refreshCount += 1;
+          if (refreshCount === 2 && authOptions.holdRefresh) {
+            refreshStarted.resolve();
+            await refreshGate.promise;
+            if (authOptions.refreshSucceeds === false) {
+              return new Response(JSON.stringify({ __type: "NotAuthorizedException" }), {
+                status: 400,
+                headers: { "content-type": "application/json" },
+              });
+            }
+          }
+        } else {
+          loginStarted.resolve();
+          currentIdentity = authOptions.loginIdentity || currentIdentity;
+          if (authOptions.holdSignIn) await loginGate.promise;
+        }
         tokenSequence += 1;
         return cognitoResponse({
           accessToken: `access-${tokenSequence}`,
@@ -300,15 +326,24 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false) {
     if (url === "/public-config.json") return Response.json(config);
     if (url === "/api/account/me") {
       membershipRequests.push(url);
-      return Response.json(identity);
+      return Response.json(currentIdentity);
+    }
+    if (url === "/api/account/invitations/inspect") {
+      return Response.json({
+        kind: "existing",
+        email: authOptions.loginEmail || "teacher@example.test",
+      });
+    }
+    if (url === "/api/account/invitations/accept") {
+      return Response.json({ status: "accepted" });
     }
     if (url === "/api/profile") {
       return Response.json({
-        sub: identity.sub,
-        botId: identity.botId,
+        sub: currentIdentity.sub,
+        botId: currentIdentity.botId,
         profile: {
-          sub: identity.sub,
-          botId: identity.botId,
+          sub: currentIdentity.sub,
+          botId: currentIdentity.botId,
           updatedAt: "2026-10-20T00:00:00.000Z",
           fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
           responsePreferenceIds: [],
@@ -321,6 +356,9 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false) {
     if (url === runtimeUrl) {
       const request = JSON.parse(String(init.body));
       runtimeRequests.push(request);
+      if (authOptions.runtimeUnauthorizedFirst && runtimeRequests.length === 1) {
+        return new Response("{}", { status: 401 });
+      }
       if (runtimeRequests.length > 1) {
         const query = "after-reset-query";
         const body = new ReadableStream({
@@ -372,10 +410,18 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false) {
     storage,
     runtimeRequests,
     streamStarted: streamStarted.promise,
+    refreshStarted: refreshStarted.promise,
+    loginStarted: loginStarted.promise,
     confirmationStarted: confirmationStarted.promise,
     releaseConfirmation(succeeds) {
       confirmationOutcome = succeeds;
       confirmationGate.resolve();
+    },
+    releaseRefresh() {
+      refreshGate.resolve();
+    },
+    releaseSignIn() {
+      loginGate.resolve();
     },
     streamSignal: () => streamSignal,
     streamWasCancelled: () => streamWasCancelled,
@@ -614,5 +660,75 @@ describe("password reset and the in-memory chat", () => {
         conversationId,
       });
     });
+  }
+});
+
+describe("chat consumers during invitation sign-in", () => {
+  for (const targetIdentity of [identity, secondIdentity]) {
+    for (const signInPhase of ["during sign-in", "after membership"]) {
+      for (const oldRefreshResult of ["success", "failure"]) {
+        it(`keeps ${targetIdentity.sub} signed in when the old chat refresh returns ${oldRefreshResult} ${signInPhase}`, async () => {
+          const holdSignIn = signInPhase === "during sign-in";
+          const invitedEmail =
+            targetIdentity.sub === secondIdentity.sub
+              ? "teacher-b@example.test"
+              : "teacher@example.test";
+          const environment = createEnvironment(false, false, {
+            holdRefresh: true,
+            holdSignIn,
+            refreshSucceeds: oldRefreshResult === "success",
+            runtimeUnauthorizedFirst: true,
+            loginIdentity: targetIdentity,
+            loginEmail: invitedEmail,
+          });
+          const app = createHookRuntime();
+          await initializeChat(app);
+          app.current().props.onSubmit("Consulta anterior durante la renovación.");
+          await environment.refreshStarted;
+          expect(environment.runtimeRequests).toHaveLength(1);
+          const oldConversationId = environment.runtimeRequests[0].conversationId;
+
+          await app.setRoute("invite");
+          await vi.waitFor(async () => expect(await app.html()).toContain("Aceptá la invitación"));
+          const signIn = app.current().props.onSubmit({
+            action: "accept-existing",
+            email: invitedEmail,
+            password: "ValidPassword1!",
+          });
+
+          if (holdSignIn) {
+            await environment.loginStarted;
+            environment.releaseRefresh();
+            await app.flush();
+            environment.releaseSignIn();
+          }
+          await signIn;
+          await app.flush();
+          expect(await app.html()).toContain("Tu acceso está activo");
+          expect(environment.session.accessToken()).not.toBeNull();
+
+          if (!holdSignIn) {
+            environment.releaseRefresh();
+            await app.flush();
+          }
+
+          expect(environment.session.accessToken()).not.toBeNull();
+          await app.setRoute("chat");
+          await initializeChat(app);
+          const emptyChat = await app.html();
+          expect(emptyChat).not.toContain("Consulta anterior durante la renovación.");
+          expect(environment.runtimeRequests).toHaveLength(1);
+
+          app.current().props.onSubmit("Consulta nueva de la sesión invitada.");
+          await vi.waitFor(() => expect(environment.runtimeRequests).toHaveLength(2));
+          expect(environment.runtimeRequests[1]).toMatchObject({
+            operation: "start",
+            text: "Consulta nueva de la sesión invitada.",
+          });
+          expect(environment.runtimeRequests[1].conversationId).not.toBe(oldConversationId);
+          await vi.waitFor(async () => expect(await app.html()).toContain("Respuesta nueva"));
+        });
+      }
+    }
   }
 });

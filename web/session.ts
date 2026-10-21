@@ -135,7 +135,8 @@ export function createSession({
   let currentAccessToken: string | null = null;
   let currentIdToken: string | null = null;
   let authGeneration = 0;
-  let passwordResetPending = false;
+  let resetGeneration = 0;
+  let passwordResetBarrier: Promise<void> | null = null;
   let refreshPromise: Promise<SessionTokens | null> | null = null;
 
   function clearMemory() {
@@ -148,13 +149,14 @@ export function createSession({
   }
 
   async function signIn(email: string, password: string): Promise<SessionTokens> {
-    if (passwordResetPending) {
+    if (passwordResetBarrier) {
       throw new SessionError(
         "PASSWORD_RESET_IN_PROGRESS",
         "El cambio de contraseña sigue en curso.",
       );
     }
     const generation = ++authGeneration;
+    const resetGenerationAtStart = resetGeneration;
     refreshPromise = null;
     clearMemory();
     storage.removeItem(refreshStorageKey);
@@ -167,7 +169,7 @@ export function createSession({
       },
     });
     const tokens = authenticationResult(response);
-    if (passwordResetPending || generation !== authGeneration) {
+    if (generation !== authGeneration || resetGenerationAtStart !== resetGeneration) {
       throw new SessionError(
         "PASSWORD_RESET_IN_PROGRESS",
         "El cambio de contraseña sigue en curso.",
@@ -197,15 +199,18 @@ export function createSession({
     code: string,
     password: string,
   ): Promise<void> {
-    if (passwordResetPending) {
+    if (passwordResetBarrier) {
       throw new SessionError(
         "PASSWORD_RESET_IN_PROGRESS",
         "El cambio de contraseña sigue en curso.",
       );
     }
-    passwordResetPending = true;
-    authGeneration += 1;
-    refreshPromise = null;
+    resetGeneration += 1;
+    let releaseBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    passwordResetBarrier = barrier;
     try {
       await cognitoJson(fetcher, region, "ConfirmForgotPassword", {
         ClientId: clientId,
@@ -213,18 +218,22 @@ export function createSession({
         ConfirmationCode: code,
         Password: password,
       });
+      authGeneration += 1;
+      refreshPromise = null;
       clearMemory();
       storage.removeItem(refreshStorageKey);
     } finally {
-      passwordResetPending = false;
+      if (passwordResetBarrier === barrier) passwordResetBarrier = null;
+      releaseBarrier();
     }
   }
 
   async function restore(): Promise<SessionTokens | null> {
-    if (passwordResetPending) return null;
+    const generation = authGeneration;
+    while (passwordResetBarrier) await passwordResetBarrier;
+    if (generation !== authGeneration) return null;
     if (refreshPromise) return refreshPromise;
 
-    const generation = authGeneration;
     const refreshToken = storage.getItem(refreshStorageKey);
     if (!refreshToken) {
       clearMemory();
@@ -239,13 +248,15 @@ export function createSession({
           AuthParameters: { REFRESH_TOKEN: refreshToken },
         });
         const tokens = authenticationResult(response);
-        if (passwordResetPending || generation !== authGeneration) return null;
+        while (passwordResetBarrier) await passwordResetBarrier;
+        if (generation !== authGeneration) return null;
         currentAccessToken = tokens.accessToken;
         currentIdToken = tokens.idToken;
         saveRefreshToken(tokens.refreshToken);
         return { accessToken: tokens.accessToken, idToken: tokens.idToken };
       } catch {
-        if (passwordResetPending || generation !== authGeneration) return null;
+        while (passwordResetBarrier) await passwordResetBarrier;
+        if (generation !== authGeneration) return null;
         clearMemory();
         storage.removeItem(refreshStorageKey);
         return null;

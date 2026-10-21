@@ -96,10 +96,47 @@ use “Emitir fragmento” to confirm the answer continues; from profile, return
 existing `password-reset-failure` scenario still returns an immediate code mismatch on the recovery
 screen for checking its error message.
 
+The reset and refresh gates are independent: changing the scenario does not discard an already
+pending HTTP 401, refresh, password-reset confirmation, sign-in, or clipboard Promise. To exercise
+a rejected reset while refresh is pending, start a chat send with `runtime-401-pending`, release
+“Responder 401 de Runtime”, and wait for “refresh pendiente: 1”. Open `/#/recover`, request a code
+for the fake identity, select `password-reset-pending`, and confirm with any fixture-only code and
+password. Select `ready` after the confirmation is held. Reject the reset, return to chat, and
+release “Liberar refresh Cognito”; the existing request should retry once, preserve its conversation
+ID and partial answer, and leave the same fixture session active. For the success control, repeat
+the setup and confirm the reset before releasing refresh; the session and chat must stay cleared,
+and the late refresh must not restore them.
+
+The fixture exposes two in-memory valid invitations for existing accounts:
+`/#/invite?token=fixture-existing-invitation` for identity A and
+`/#/invite?token=fixture-existing-invitation-b` for identity B. The invitation's email field is
+read-only, as in the product, and the simulated accept endpoint checks that the signed-in `sub`
+matches the selected invitation. Start a chat send with `runtime-401-pending`, release its 401, and
+wait for a pending refresh. Open either invitation and select `sign-in-pending`; its email is
+pre-filled for A (`docente@example.test`) or B (`docente-b@example.test`). Submit with a fake
+password. For the during-sign-in case, release the old refresh before “Liberar inicio de sesión”; for
+the after-membership case, release sign-in, wait for access to become active, then release the old
+refresh. Neither order should log out the new session or retry the old Runtime request. The two
+synthetic users have distinct `sub` claims and matching saved profile records; the invitations are
+fixture-only and do not alter a real membership.
+
+To test delayed clipboard completion, complete an answer, select `clipboard-pending`, and click its
+“Copiar respuesta” action. The fixture retains the exact string passed to `navigator.clipboard` and
+shows a per-operation completion/rejection button and sanitized state JSON. For the first variant,
+start a follow-up while the earlier answer copy is pending, then reject that earlier copy; its error
+must not appear by the new answer. For the second, restart the chat and submit a new question before
+rejecting the old copy; the new conversation must stay free of that error. For overlapping copies,
+complete a first answer and a follow-up, start copies of the previous and current answers, reject
+the current copy, then complete the previous copy; the current answer's error must remain attached
+to that answer. Compare each queued text with its visible completed answer to check exact copying;
+the fixture never writes to the operating-system clipboard.
+
 Append `?scenario=<name>` before the hash to select an initial scenario, for example
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-401`, `runtime-401-pending`, `runtime-expired`, `runtime-forbidden`,
-`password-reset-pending`, `password-reset-failure`, `signout-pending`, and `clipboard-fail`. The selector also changes the
-scenario for the next matching operation without reloading.
+`password-reset-pending`, `password-reset-failure`, `signout-pending`, `sign-in-pending`,
+`clipboard-fail`, and `clipboard-pending`. The selector also changes the scenario for the next
+matching operation without reloading; pending operations keep their own controls when the selection
+changes.
