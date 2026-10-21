@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createChatHandler } from "../../runtime/chat.ts";
+import { createChatHandler, createChatInvocationHandler } from "../../runtime/chat.ts";
 import { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
 
@@ -268,6 +268,48 @@ async function collect(stream) {
 }
 
 describe("chat Runtime implementation regressions", () => {
+  it("async disposal detaches only the observer while the registered producer finishes", async () => {
+    const releaseProducer = deferred();
+    const producerPaused = deferred();
+    const producerFinished = deferred();
+    let activeTasks = 0;
+    let completedEventProduced = false;
+    const chat = async () =>
+      (async function* () {
+        yield { type: "accepted", queryId };
+        producerPaused.resolve();
+        await releaseProducer.promise;
+        completedEventProduced = true;
+        producerFinished.resolve();
+        yield { type: "completed", queryId };
+      })();
+    const invocation = createChatInvocationHandler(chat, {
+      addAsyncTask() {
+        activeTasks += 1;
+        return 1;
+      },
+      completeAsyncTask() {
+        activeTasks -= 1;
+        return true;
+      },
+    });
+    const response = await invocation.process({}, {});
+
+    try {
+      await producerPaused.promise;
+      expect(activeTasks).toBe(1);
+      await response[Symbol.asyncDispose]();
+      releaseProducer.resolve();
+      await producerFinished.promise;
+      await vi.waitFor(() => expect(activeTasks).toBe(0));
+      expect(completedEventProduced).toBe(true);
+      expect(await response.next()).toMatchObject({ done: true });
+    } finally {
+      releaseProducer.resolve();
+      await response.return();
+    }
+  });
+
   it("persists the exact selected context and waits for that write before accepted", async () => {
     const contextReferences = [
       { ordinal: 1, queryId: "5faca543-38a3-4e57-a1a3-3045c96968f2" },

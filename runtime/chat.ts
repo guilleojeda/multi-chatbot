@@ -753,6 +753,9 @@ function observeChatEvents(
       channel.detach();
       throw error;
     },
+    async [Symbol.asyncDispose]() {
+      channel.detach();
+    },
     [Symbol.asyncIterator]() {
       return iterator;
     },
