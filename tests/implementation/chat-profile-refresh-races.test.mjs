@@ -16,7 +16,15 @@ const config = {
   runtimeQualifier: "DEFAULT",
 };
 const conversationId = "550e8400-e29b-41d4-a716-446655440000";
-const queryId = "query-profile-race";
+const queryId = "550e8400-e29b-41d4-a716-446655440001";
+const request = {
+  version: 2,
+  operation: "start",
+  conversationId,
+  queryId,
+  baseOrdinal: 0,
+  text: "Prepará una actividad.",
+};
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -68,16 +76,24 @@ function frame(type, fields) {
   return `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
 }
 
-function completedStream() {
+function completedStream(chatRequest = request) {
   const encoder = new TextEncoder();
   const body = new ReadableStream({
     start(controller) {
       controller.enqueue(
         encoder.encode(
           [
-            frame("accepted", { conversationId, queryId, ordinal: 1 }),
-            frame("text", { queryId, index: 0, text: "Respuesta progresiva" }),
-            frame("completed", { queryId }),
+            frame("accepted", {
+              conversationId: chatRequest.conversationId,
+              queryId: chatRequest.queryId,
+              ordinal: chatRequest.baseOrdinal + 1,
+            }),
+            frame("text", {
+              queryId: chatRequest.queryId,
+              index: 0,
+              text: "Respuesta progresiva",
+            }),
+            frame("completed", { queryId: chatRequest.queryId }),
           ].join(""),
         ),
       );
@@ -188,7 +204,7 @@ describe("a real session refresh shared by Runtime and profile API", () => {
           runtimeStarted.resolve();
           return runtime401.promise;
         }
-        return completedStream();
+        return completedStream(JSON.parse(init.body));
       }
       if (url === "/api/profile") {
         profileCalls.push({ token, body: JSON.parse(init.body) });
@@ -202,12 +218,7 @@ describe("a real session refresh shared by Runtime and profile API", () => {
     });
     vi.stubGlobal("fetch", fetch);
 
-    const chat = streamChat(
-      config,
-      session,
-      { operation: "start", conversationId, text: "Prepará una actividad." },
-      { isActive: () => true, onEvent: vi.fn() },
-    );
+    const chat = streamChat(config, session, request, { isActive: () => true, onEvent: vi.fn() });
     await runtimeStarted.promise;
     runtime401.resolve(new Response("{}", { status: 401 }));
     await refreshStarted.promise;
@@ -274,12 +285,7 @@ describe("a real session refresh shared by Runtime and profile API", () => {
     );
     vi.stubGlobal("fetch", fetch);
 
-    const chat = streamChat(
-      config,
-      session,
-      { operation: "start", conversationId, text: "Prepará una actividad." },
-      { isActive: () => true, onEvent: vi.fn() },
-    );
+    const chat = streamChat(config, session, request, { isActive: () => true, onEvent: vi.fn() });
     await refreshStarted.promise;
     const profileSave = requestWithRefresh(
       config,
@@ -339,12 +345,7 @@ describe("a real session refresh shared by Runtime and profile API", () => {
 
     let active = true;
     const isActive = () => active;
-    const chat = streamChat(
-      config,
-      session,
-      { operation: "start", conversationId, text: "Prepará una actividad." },
-      { isActive, onEvent: vi.fn() },
-    );
+    const chat = streamChat(config, session, request, { isActive, onEvent: vi.fn() });
     await refreshStarted.promise;
     const profileSave = requestWithRefresh(
       config,
@@ -385,12 +386,7 @@ describe("a real session refresh shared by Runtime and profile API", () => {
       requestWithRefresh(config, session, "/profile", {}, () => true),
     ).rejects.toMatchObject({ code: "UNAUTHORIZED", status: 401 });
     await expect(
-      streamChat(
-        config,
-        session,
-        { operation: "start", conversationId, text: "Prepará una actividad." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, session, request, { isActive: () => true, onEvent: vi.fn() }),
     ).rejects.toMatchObject({ code: "UNAUTHORIZED", status: 401 });
 
     expect(cognitoFetch).not.toHaveBeenCalled();

@@ -251,6 +251,7 @@ function makeHarness({
         status: "in_progress",
         question: input.text,
         answer: "",
+        answerManifest: { count: 0, complete: false },
         canContinue: false,
         cursor: 0,
       });
@@ -281,6 +282,7 @@ function makeHarness({
         status: "in_progress",
         question: input.text,
         answer: "",
+        answerManifest: { count: 0, complete: false },
         canContinue: false,
         cursor: 0,
       });
@@ -307,6 +309,7 @@ function makeHarness({
       if (submission) {
         submission.answer += input.text;
         submission.cursor += 1;
+        submission.answerManifest = { count: submission.cursor, complete: false };
       }
     },
     async completeTurn(input) {
@@ -322,6 +325,7 @@ function makeHarness({
         if (submission) {
           submission.status = "completed";
           submission.canContinue = true;
+          submission.answerManifest = clone(input.answerManifest);
         }
         if (state.meta?.activeQueryId === input.queryId) delete state.meta.activeQueryId;
       };
@@ -341,9 +345,13 @@ function makeHarness({
       );
       if (submission) {
         submission.status = "failed";
-        submission.canContinue = input.canContinue ?? true;
+        submission.canContinue = !(input.invocationClaimed && !input.providerFinished);
       }
-      if (input.canContinue === false && state.meta?.conversationId === input.conversationId) {
+      if (
+        input.invocationClaimed &&
+        !input.providerFinished &&
+        state.meta?.conversationId === input.conversationId
+      ) {
         state.meta.closed = true;
       }
       if (state.meta?.activeQueryId === input.queryId) delete state.meta.activeQueryId;
@@ -617,7 +625,7 @@ describe("the conversation Runtime handler", () => {
     async (_label, meta) => {
       const harness = makeHarness({ meta });
 
-      const events = await request(harness, makePayload({ operation: "message" }));
+      const events = await request(harness, makePayload({ operation: "message", baseOrdinal: 1 }));
 
       expect(terminal(events)).toMatchObject({ type: "failed" });
       const names = harness.state.calls.map(([name]) => name);
@@ -734,8 +742,8 @@ describe("the conversation Runtime handler", () => {
     expect(events[0]).toMatchObject({ type: "accepted", conversationId, ordinal: 3 });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
       "hasMember",
-      "getMeta",
       "getSubmission",
+      "getMeta",
       "getProfile",
       "readContext",
       "readQuota",
@@ -822,8 +830,8 @@ describe("the conversation Runtime handler", () => {
     expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
       "hasMember",
-      "getMeta",
       "getSubmission",
+      "getMeta",
       "getProfile",
     ]);
     expect(harness.state.providerCalls).toBe(0);
@@ -840,8 +848,8 @@ describe("the conversation Runtime handler", () => {
     expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
       "hasMember",
-      "getMeta",
       "getSubmission",
+      "getMeta",
       "getProfile",
       "readContext",
     ]);
@@ -942,28 +950,33 @@ describe("the conversation Runtime handler", () => {
     const gate = deferred();
     const started = deferred();
     const harness = makeHarness({ startGate: gate.promise, onStart: started.resolve });
-    const stream = await openStream(harness, makePayload(), makeContext());
-    let settled = false;
-    const pendingEvent = stream.next().then((value) => {
-      settled = true;
-      return value;
+    const responsePromise = harness.handler(makePayload(), makeContext());
+    let responseSettled = false;
+    void responsePromise.then(() => {
+      responseSettled = true;
     });
 
     try {
       expect(await waitFor(started.promise)).toBe(true);
       await Promise.resolve();
-      expect(settled).toBe(false);
+      expect(responseSettled).toBe(false);
       expect(harness.state.providerCalls).toBe(0);
       expect(harness.state.admitted).toBeNull();
 
       gate.resolve();
-      const first = await pendingEvent;
+      const response = await responsePromise;
+      expect(isAsyncIterable(response)).toBe(true);
+      const stream = response[Symbol.asyncIterator]();
+      const first = await stream.next();
       expect(first.value).toMatchObject({ type: "accepted", conversationId, queryId, ordinal: 1 });
       expect(harness.state.admitted).toMatchObject({ text: makePayload().text, queryId });
       expect(harness.state.providerCalls).toBe(0);
+      const remainingEvents = [];
+      for await (const event of stream) remainingEvents.push(event);
+      expect(terminal(remainingEvents)).toMatchObject({ type: "completed", queryId });
+      expect(harness.state.providerCalls).toBe(1);
     } finally {
       gate.resolve();
-      await stream.return();
     }
   });
 
@@ -1132,7 +1145,8 @@ describe("the conversation Runtime handler", () => {
       expect(harness.state.failed).toBe(true);
       expect(harness.state.failureInput).toMatchObject({
         queryId,
-        canContinue: false,
+        invocationClaimed: true,
+        providerFinished: false,
       });
       expect(harness.state.submissions.get(`${caller.sub}/${botId}/${queryId}`)).toMatchObject({
         status: "failed",

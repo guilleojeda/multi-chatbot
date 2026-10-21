@@ -108,6 +108,7 @@ function createSubmission(input, ordinal) {
     ordinal,
     status: "in_progress",
     question: input.text,
+    answerManifest: { count: 0, complete: false },
     answer: "",
     canContinue: false,
     profileSnapshot: clone(input.profileSnapshot),
@@ -214,6 +215,7 @@ function makeHarness({
       if (submission) {
         submission.answer += input.text;
         submission.cursor += 1;
+        submission.answerManifest = { count: submission.cursor, complete: false };
       }
     },
     async completeTurn(input) {
@@ -222,6 +224,7 @@ function makeHarness({
       if (submission) {
         submission.status = "completed";
         submission.canContinue = true;
+        submission.answerManifest = clone(input.answerManifest);
         submission.cursor = input.cursor ?? submission.cursor;
       }
       const meta = state.metaByConversation.get(input.conversationId);
@@ -232,11 +235,12 @@ function makeHarness({
       const submission = findSubmission(input);
       if (submission) {
         submission.status = "failed";
-        submission.canContinue = input.canContinue ?? true;
+        submission.canContinue = !(input.invocationClaimed && !input.providerFinished);
         submission.failure = { code: input.code };
         submission.cursor = input.cursor ?? submission.cursor;
       }
       const meta = state.metaByConversation.get(input.conversationId);
+      if (input.invocationClaimed && !input.providerFinished && meta) meta.closed = true;
       if (meta?.activeQueryId === input.queryId) delete meta.activeQueryId;
     },
     async reconcileTurn(input) {
@@ -740,6 +744,8 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     expect((await firstStream.next()).value).toMatchObject({ type: "accepted", queryId });
     const pendingText = firstStream.next();
     expect(await waitFor(entered.promise)).toBe(true);
+    const callsBeforeSecondRequest = harness.state.calls.length;
+    const quotaReadsBeforeSecondRequest = harness.store.readQuota.mock.calls.length;
     harness.store.continueTurn = vi.fn(async () => {
       throw Object.assign(new Error("conversation is busy"), { code: "conversation_busy" });
     });
@@ -759,7 +765,12 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     expect(failure).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
     expect(String(failure.code)).toMatch(/busy|conversation/i);
     expect(harness.state.providerCalls).toBe(1);
-    expect(harness.store.continueTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.continueTurn).not.toHaveBeenCalled();
+    const secondRequestCalls = harness.state.calls
+      .slice(callsBeforeSecondRequest)
+      .map(([name]) => name);
+    expect(secondRequestCalls).not.toContain("getProfile");
+    expect(harness.store.readQuota).toHaveBeenCalledTimes(quotaReadsBeforeSecondRequest);
     release.resolve();
     await pendingText;
     await firstStream.return();
@@ -1035,11 +1046,14 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     const harness = makeHarness({
       storeOverrides: {
         async completeTurn(input) {
-          const submission = this._harnessState.submissions.get(keyOf(input));
+          const submission = [...this._harnessState.submissions.values()].find(
+            (item) =>
+              item.queryId === input.queryId && item.conversationId === input.conversationId,
+          );
           expect(submission).toBeDefined();
           submission.status = "completed";
           submission.canContinue = true;
-          submission.answer = "Commit confirmado en DynamoDB.";
+          submission.answerManifest = clone(input.answerManifest);
           throw new Error("completion response timed out");
         },
       },
