@@ -106,6 +106,18 @@ async function loadStreamChat() {
   return typeof module.streamChat === "function" ? module.streamChat : null;
 }
 
+async function loadRecoverChat() {
+  const moduleExists = existsSync(clientPath);
+  expect(moduleExists, "Expected the chat client at web/chat-api.ts").toBe(true);
+  if (!moduleExists) return null;
+
+  const module = await import(pathToFileURL(clientPath).href);
+  expect(typeof module.recoverChat, "Expected recoverChat to be the public recovery client").toBe(
+    "function",
+  );
+  return typeof module.recoverChat === "function" ? module.recoverChat : null;
+}
+
 async function loadPublicConfigReader() {
   const moduleExists = existsSync(publicApiPath);
   expect(moduleExists, "Expected the public configuration client at web/api.ts").toBe(true);
@@ -930,5 +942,87 @@ describe("the direct Runtime chat client", () => {
     );
     expect(received.map(({ type }) => type)).toEqual(["accepted"]);
     expect(outcome.result?.status).not.toBe("completed");
+  });
+});
+
+describe("the authenticated recovery request", () => {
+  const request = {
+    version: 2,
+    operation: "recover",
+    conversationId,
+    queryId: secondQueryId,
+  };
+  const snapshot = {
+    version: 2,
+    conversationId,
+    queryId: secondQueryId,
+    ordinal: 1,
+    status: "in_progress",
+    question: "Prepará una actividad de porcentajes.",
+    answer: "Primer tramo durable.",
+    canContinue: false,
+  };
+
+  it("replays one 401 with the identical recover body and returns its JSON snapshot", async () => {
+    const recoverChat = await loadRecoverChat();
+    if (!recoverChat) return;
+
+    let currentToken = "expired-access";
+    const session = makeSession({
+      token: currentToken,
+      restore: vi.fn(async () => {
+        currentToken = "renewed-access";
+        return { accessToken: currentToken, idToken: "renewed-id" };
+      }),
+    });
+    session.accessToken.mockImplementation(() => currentToken);
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("", { status: 401 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(snapshot), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(recoverChat(config, session, request, { isActive: () => true })).resolves.toEqual(
+      snapshot,
+    );
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(session.restore).toHaveBeenCalledTimes(1);
+    const firstInit = fetch.mock.calls[0][1];
+    const replayInit = fetch.mock.calls[1][1];
+    expect(new Headers(firstInit.headers).get("authorization")).toBe("Bearer expired-access");
+    expect(new Headers(replayInit.headers).get("authorization")).toBe("Bearer renewed-access");
+    expect(new Headers(firstInit.headers).get("accept")).toBe("application/json");
+    expect(new Headers(firstInit.headers).get("x-amzn-bedrock-agentcore-runtime-session-id")).toBe(
+      conversationId,
+    );
+    expect(replayInit.body).toBe(firstInit.body);
+    expect(JSON.parse(firstInit.body)).toEqual(request);
+    expect(session.idToken).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["queryId", { queryId }],
+    ["conversationId", { conversationId: "650e8400-e29b-41d4-a716-446655440000" }],
+  ])("rejects a recovery snapshot for a different %s", async (_identityField, identity) => {
+    const recoverChat = await loadRecoverChat();
+    if (!recoverChat) return;
+
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ ...snapshot, ...identity }), {
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(
+      recoverChat(config, makeSession(), request, { isActive: () => true }),
+    ).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

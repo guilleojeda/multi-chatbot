@@ -26,7 +26,7 @@ async function freePort() {
   return address.port;
 }
 
-async function makeServer() {
+async function makeServer({ detached = false } = {}) {
   const port = await freePort();
   const chatPath = fileURLToPath(new URL("../../runtime/chat.ts", import.meta.url));
   const bundle = await build({
@@ -52,6 +52,7 @@ async function makeServer() {
     const savedQueryId = ${JSON.stringify(savedQueryId)};
     const quotaConversationId = ${JSON.stringify(quotaConversationId)};
     const quotaQueryId = ${JSON.stringify(quotaQueryId)};
+    const detached = ${JSON.stringify(detached)};
     const now = Date.parse("2026-10-21T15:00:00.000Z");
     const quota = {
       daily: { used: 19, limit: 20, resetAt: now + 3600000, period: "2026-10-21" },
@@ -73,10 +74,26 @@ async function makeServer() {
     };
     const submissions = new Map();
     const metas = new Map();
+    let admissionCount = 0;
+    let quotaReadCount = 0;
+    let providerDispatchCount = 0;
     let releaseAdmission;
     const admissionGate = new Promise((resolve) => { releaseAdmission = resolve; });
+    let releaseProvider;
+    const providerGate = new Promise((resolve) => { releaseProvider = resolve; });
     parentPort.on("message", (message) => {
       if (message === "release-admission") releaseAdmission();
+      if (message === "release-provider") releaseProvider();
+      if (message?.type === "inspect-state") {
+        parentPort.postMessage({
+          type: "state",
+          requestId: message.requestId,
+          admissionCount,
+          quotaReadCount,
+          providerDispatchCount,
+          taskInfo: app.getAsyncTaskInfo(),
+        });
+      }
     });
     const fingerprint = (request) => createHash("sha256")
       .update(JSON.stringify([request.operation, request.conversationId, request.baseOrdinal, request.text]))
@@ -115,10 +132,11 @@ async function makeServer() {
     const store = {
       async getSubmission({ queryId }) { return submissions.get(queryId) ?? null; },
       async getMeta({ conversationId }) { return metas.get(conversationId) ?? null; },
-      async readQuota() { return quota; },
+      async readQuota() { quotaReadCount += 1; return quota; },
       async readContext() { return { messages: [], references: [] }; },
       async reconcileTurn({ queryId }) { return submissions.get(queryId) ?? null; },
       async startTurn(input) {
+        admissionCount += 1;
         if (input.conversationId === quotaConversationId) {
           const error = new Error("quota exceeded");
           error.code = "quota_exceeded";
@@ -146,7 +164,7 @@ async function makeServer() {
           answer: "",
           answerManifest: { count: 0, complete: false },
           cursor: 0,
-          canContinue: true,
+          canContinue: false,
           resultDeadlineAt: input.resultDeadlineAt,
           profileSnapshot: input.profileSnapshot,
           invocation: input.invocation,
@@ -173,6 +191,7 @@ async function makeServer() {
         const submission = submissions.get(input.queryId);
         submission.answer += input.text;
         submission.cursor = input.index + 1;
+        parentPort.postMessage({ type: "chunk-persisted", queryId: input.queryId, text: input.text });
       },
       async completeTurn(input) {
         const submission = submissions.get(input.queryId);
@@ -185,6 +204,7 @@ async function makeServer() {
           delete meta.activeQueryId;
           meta.lastQueryId = input.queryId;
         }
+        parentPort.postMessage({ type: "terminal-persisted", queryId: input.queryId });
       },
       async failTurn(input) {
         const submission = submissions.get(input.queryId);
@@ -208,15 +228,28 @@ async function makeServer() {
       profiles: { async getProfile() { return profile; } },
       store,
       async *generate() {
-        parentPort.postMessage({ type: "provider-dispatch" });
+        providerDispatchCount += 1;
+        parentPort.postMessage({
+          type: "provider-dispatch",
+          taskInfo: app.getAsyncTaskInfo(),
+        });
         yield { type: "text", text: "Respuesta de prueba." };
+        if (detached) {
+          await providerGate;
+          yield { type: "text", text: " Continuación durable." };
+        }
         yield { type: "result", stopReason: "end_turn" };
       },
       now: () => now,
     });
 
-    const app = new BedrockAgentCoreApp({
-      invocationHandler: createChatInvocationHandler(chat),
+    let app;
+    const tasks = {
+      addAsyncTask(...args) { return app.addAsyncTask(...args); },
+      completeAsyncTask(...args) { return app.completeAsyncTask(...args); },
+    };
+    app = new BedrockAgentCoreApp({
+      invocationHandler: createChatInvocationHandler(chat, tasks),
       config: { logging: { enabled: false } },
     });
     app.run({ port: workerData.port, host: "127.0.0.1" });
@@ -224,7 +257,7 @@ async function makeServer() {
   const workerUrl = `data:text/javascript;base64,${Buffer.from(workerCode).toString("base64")}`;
   const worker = new Worker(new URL(workerUrl), {
     type: "module",
-    workerData: { port, chatModule },
+    workerData: { port, chatModule, detached },
   });
   workers.add(worker);
 
@@ -252,8 +285,8 @@ async function makeServer() {
   return { worker, origin, messages };
 }
 
-async function waitForWorkerMessage(worker, messages, type) {
-  const existing = messages.find((message) => message?.type === type);
+async function waitForWorkerMessage(worker, messages, type, predicate = () => true) {
+  const existing = messages.find((message) => message?.type === type && predicate(message));
   if (existing) return existing;
   return new Promise((resolve, reject) => {
     const onError = (error) => {
@@ -261,7 +294,7 @@ async function waitForWorkerMessage(worker, messages, type) {
       reject(error);
     };
     const onMessage = (message) => {
-      if (message?.type !== type) return;
+      if (message?.type !== type || !predicate(message)) return;
       worker.off("message", onMessage);
       worker.off("error", onError);
       resolve(message);
@@ -271,7 +304,20 @@ async function waitForWorkerMessage(worker, messages, type) {
   });
 }
 
-async function post(origin, payload, accept) {
+let nextInspectionId = 0;
+
+async function inspectState(worker, messages) {
+  const requestId = ++nextInspectionId;
+  worker.postMessage({ type: "inspect-state", requestId });
+  return waitForWorkerMessage(
+    worker,
+    messages,
+    "state",
+    (message) => message.requestId === requestId,
+  );
+}
+
+async function post(origin, payload, accept, signal) {
   return fetch(`${origin}/invocations`, {
     method: "POST",
     headers: {
@@ -281,7 +327,20 @@ async function post(origin, payload, accept) {
       authorization: `Bearer e30.${Buffer.from(JSON.stringify({ sub: "teacher-123", token_use: "access" })).toString("base64url")}.runtime-validated`,
     },
     body: JSON.stringify(payload),
+    signal,
   });
+}
+
+async function readSseUntil(reader, predicate) {
+  const decoder = new TextDecoder();
+  let text = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error("SSE ended before the expected events arrived.");
+    text += decoder.decode(value, { stream: true });
+    const events = parseSse(text);
+    if (predicate(events)) return events;
+  }
 }
 
 function parseSse(text) {
@@ -400,5 +459,127 @@ describe("the real AgentCore HTTP response boundary", () => {
       quota: { daily: { used: 19, limit: 20 }, monthly: { used: 199, limit: 200 } },
     });
     expect(messages.filter((message) => message?.type === "provider-dispatch")).toHaveLength(1);
+  });
+
+  it("keeps the producer active after an HTTP SSE abort and recovers its durable state", async () => {
+    const { worker, origin, messages } = await makeServer({ detached: true });
+    const request = {
+      version: 2,
+      operation: "start",
+      conversationId: streamConversationId,
+      queryId: streamQueryId,
+      baseOrdinal: 0,
+      text: "Nuevo pedido que continúa después del corte",
+    };
+    const controller = new AbortController();
+    const pendingAdmission = waitForWorkerMessage(worker, messages, "admission-pending");
+    const streamResponsePromise = post(origin, request, "text/event-stream", controller.signal);
+    await pendingAdmission;
+    worker.postMessage("release-admission");
+
+    const streamResponse = await streamResponsePromise;
+    expect(streamResponse.status).toBe(200);
+    expect(streamResponse.headers.get("content-type")).toContain("text/event-stream");
+    expect(streamResponse.body).toBeTruthy();
+    const reader = streamResponse.body.getReader();
+    const eventsBeforeAbort = await readSseUntil(reader, (events) =>
+      events.some(({ event }) => event === "text"),
+    );
+    expect(eventsBeforeAbort.map(({ event }) => event)).toEqual(["accepted", "text"]);
+    expect(eventsBeforeAbort[0].data).toMatchObject({
+      type: "accepted",
+      queryId: streamQueryId,
+    });
+    expect(eventsBeforeAbort[1].data).toMatchObject({
+      type: "text",
+      queryId: streamQueryId,
+      text: "Respuesta de prueba.",
+    });
+    await waitForWorkerMessage(worker, messages, "chunk-persisted");
+
+    controller.abort();
+    await reader.cancel().catch(() => {});
+
+    const activeState = await inspectState(worker, messages);
+    expect(activeState).toMatchObject({
+      admissionCount: 1,
+      quotaReadCount: 1,
+      providerDispatchCount: 1,
+      taskInfo: { activeCount: 1 },
+    });
+    expect(activeState.taskInfo.runningJobs).toHaveLength(1);
+    expect(messages.find((message) => message?.type === "provider-dispatch")).toMatchObject({
+      taskInfo: { activeCount: 1 },
+    });
+
+    const activeRecoveryResponse = await post(
+      origin,
+      {
+        version: 2,
+        operation: "recover",
+        conversationId: streamConversationId,
+        queryId: streamQueryId,
+      },
+      "application/json",
+    );
+    expect(activeRecoveryResponse.status).toBe(200);
+    expect(activeRecoveryResponse.headers.get("content-type")).toContain("application/json");
+    expect(await activeRecoveryResponse.json()).toMatchObject({
+      version: 2,
+      conversationId: streamConversationId,
+      queryId: streamQueryId,
+      status: "in_progress",
+      question: request.text,
+      answer: "Respuesta de prueba.",
+      canContinue: false,
+    });
+    expect(await inspectState(worker, messages)).toMatchObject({
+      admissionCount: 1,
+      quotaReadCount: 1,
+      providerDispatchCount: 1,
+      taskInfo: { activeCount: 1 },
+    });
+
+    worker.postMessage("release-provider");
+    await waitForWorkerMessage(worker, messages, "terminal-persisted");
+    let terminalState;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      terminalState = await inspectState(worker, messages);
+      if (terminalState.taskInfo.activeCount === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(terminalState).toMatchObject({
+      admissionCount: 1,
+      quotaReadCount: 1,
+      providerDispatchCount: 1,
+      taskInfo: { activeCount: 0, runningJobs: [] },
+    });
+
+    const completedRecoveryResponse = await post(
+      origin,
+      {
+        version: 2,
+        operation: "recover",
+        conversationId: streamConversationId,
+        queryId: streamQueryId,
+      },
+      "application/json",
+    );
+    expect(completedRecoveryResponse.status).toBe(200);
+    expect(await completedRecoveryResponse.json()).toMatchObject({
+      version: 2,
+      conversationId: streamConversationId,
+      queryId: streamQueryId,
+      status: "completed",
+      question: request.text,
+      answer: "Respuesta de prueba. Continuación durable.",
+      canContinue: true,
+    });
+    expect(await inspectState(worker, messages)).toMatchObject({
+      admissionCount: 1,
+      quotaReadCount: 1,
+      providerDispatchCount: 1,
+      taskInfo: { activeCount: 0 },
+    });
   });
 });

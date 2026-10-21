@@ -19,6 +19,7 @@ export const fixtureScenarios = [
   { id: "membership-network", label: "Membresía: fallo de red" },
   { id: "config-temporary", label: "Configuración pública: fallo temporal 503" },
   { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
+  { id: "runtime-temporary", label: "Runtime: fallo temporal 503" },
   { id: "runtime-quota-daily", label: "Runtime: cupo diario agotado" },
   { id: "runtime-quota-monthly", label: "Runtime: cupo mensual agotado" },
   { id: "runtime-quota-both", label: "Runtime: cupos diario y mensual agotados" },
@@ -90,12 +91,34 @@ type ControlledStream = {
   queryId: string;
   nextIndex: number;
   admitted: boolean;
-  closed: boolean;
+  producerClosed: boolean;
+  transportClosed: boolean;
   turn: FixtureTurn;
 };
 
-type FixtureTurn = { ordinal: number; question: string; answer: string; status: string };
-type FixtureConversation = { nextOrdinal: number; turns: FixtureTurn[] };
+type FixtureTurn = {
+  ordinal: number;
+  queryId: string;
+  question: string;
+  answer: string;
+  status: string;
+  canContinue: boolean;
+};
+type FixtureConversation = {
+  conversationId: string;
+  ownerSub: string;
+  botId: string;
+  nextOrdinal: number;
+  turns: FixtureTurn[];
+};
+
+type StoredFixtureState = {
+  version: 1;
+  conversations: FixtureConversation[];
+};
+
+const fixtureTabStateKey = "multi-chatbot:fixture-chat-tab-state:v1";
+const productJournalPrefix = "chat-journal:v2";
 
 type FixtureIdentity = { sub: string; email: string };
 
@@ -137,6 +160,160 @@ function cloneProfile(profile: ProfileDocument): ProfileDocument {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFixtureTurn(value: unknown): value is FixtureTurn {
+  return (
+    isRecord(value) &&
+    typeof value.ordinal === "number" &&
+    Number.isSafeInteger(value.ordinal) &&
+    value.ordinal > 0 &&
+    typeof value.queryId === "string" &&
+    value.queryId.length > 0 &&
+    typeof value.question === "string" &&
+    typeof value.answer === "string" &&
+    typeof value.status === "string" &&
+    typeof value.canContinue === "boolean"
+  );
+}
+
+function isFixtureConversation(value: unknown): value is FixtureConversation {
+  return (
+    isRecord(value) &&
+    typeof value.conversationId === "string" &&
+    value.conversationId.length > 0 &&
+    typeof value.ownerSub === "string" &&
+    typeof value.botId === "string" &&
+    typeof value.nextOrdinal === "number" &&
+    Number.isSafeInteger(value.nextOrdinal) &&
+    value.nextOrdinal > 0 &&
+    Array.isArray(value.turns) &&
+    value.turns.every(isFixtureTurn)
+  );
+}
+
+function readFixtureTabState(): Map<string, FixtureConversation> {
+  try {
+    const raw = window.sessionStorage.getItem(fixtureTabStateKey);
+    if (!raw) return new Map();
+    const parsed: unknown = JSON.parse(raw);
+    if (!isRecord(parsed) || parsed.version !== 1 || !Array.isArray(parsed.conversations)) {
+      return new Map();
+    }
+    const conversations = parsed.conversations.filter(isFixtureConversation);
+    return new Map(
+      conversations.map((conversation) => [
+        conversation.conversationId,
+        cloneConversation(conversation),
+      ]),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+function cloneConversation(conversation: FixtureConversation): FixtureConversation {
+  return {
+    conversationId: conversation.conversationId,
+    ownerSub: conversation.ownerSub,
+    botId: conversation.botId,
+    nextOrdinal: conversation.nextOrdinal,
+    turns: conversation.turns.map((turn) => ({ ...turn })),
+  };
+}
+
+function productJournalScope(config: ChatBrowserFixture["publicConfig"]) {
+  return [
+    config.region,
+    config.clientId,
+    config.apiBaseUrl,
+    config.runtimeArn,
+    config.runtimeQualifier,
+    config.botId,
+  ];
+}
+
+function sanitizedJournalRequest(value: unknown) {
+  if (!isRecord(value)) return null;
+  const { version, operation, conversationId, queryId, baseOrdinal, text } = value;
+  if (
+    version !== 2 ||
+    (operation !== "start" && operation !== "message") ||
+    typeof conversationId !== "string" ||
+    typeof queryId !== "string" ||
+    typeof baseOrdinal !== "number" ||
+    !Number.isSafeInteger(baseOrdinal)
+  ) {
+    return null;
+  }
+  return {
+    version,
+    operation,
+    conversationId,
+    queryId,
+    baseOrdinal,
+    ...(typeof text === "string" ? { text } : {}),
+  };
+}
+
+function readProductJournal(config: ChatBrowserFixture["publicConfig"]) {
+  const entries: Array<{
+    sub: string;
+    botId: string;
+    admitted: boolean;
+    ordinal?: number;
+    request: ReturnType<typeof sanitizedJournalRequest>;
+  }> = [];
+  const ownerPointers: string[] = [];
+  const scope = productJournalScope(config);
+  try {
+    const store = window.sessionStorage;
+    for (let index = 0; index < store.length; index += 1) {
+      const key = store.key(index);
+      if (!key || !key.startsWith(productJournalPrefix)) continue;
+      const raw = store.getItem(key);
+      if (!raw) continue;
+      if (key.startsWith(`${productJournalPrefix}:owner:`)) {
+        if (identities.some(({ sub }) => sub === raw)) ownerPointers.push(raw);
+        continue;
+      }
+      if (!key.startsWith(`${productJournalPrefix}:entry:`)) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch {
+        continue;
+      }
+      if (
+        !isRecord(parsed) ||
+        parsed.version !== 2 ||
+        JSON.stringify(parsed.scope) !== JSON.stringify(scope) ||
+        typeof parsed.sub !== "string" ||
+        typeof parsed.botId !== "string" ||
+        parsed.botId !== config.botId ||
+        !identities.some(({ sub }) => sub === parsed.sub) ||
+        typeof parsed.admitted !== "boolean"
+      ) {
+        continue;
+      }
+      const request = sanitizedJournalRequest(parsed.request);
+      if (!request) continue;
+      const ordinal =
+        typeof parsed.ordinal === "number" && Number.isSafeInteger(parsed.ordinal)
+          ? parsed.ordinal
+          : undefined;
+      entries.push({
+        sub: parsed.sub,
+        botId: parsed.botId,
+        admitted: parsed.admitted,
+        ...(ordinal === undefined ? {} : { ordinal }),
+        request,
+      });
+    }
+  } catch {
+    return { entries: [], ownerPointers: [] };
+  }
+  return { entries, ownerPointers };
 }
 
 function json(value: unknown, status = 200) {
@@ -217,7 +394,7 @@ export class ChatBrowserFixture {
   private readonly pendingSignIns: PendingSignIn[] = [];
   private readonly clipboardOperations: ClipboardOperation[] = [];
   private readonly streams: ControlledStream[] = [];
-  private readonly conversations = new Map<string, FixtureConversation>();
+  private readonly conversations = readFixtureTabState();
   private readonly sessionStorage = new FixtureSessionStorage();
   private readonly storedProfiles = new Map(
     fixtureProfiles.map((profile) => [profile.sub, cloneProfile(profile)]),
@@ -255,6 +432,40 @@ export class ChatBrowserFixture {
 
   private changed() {
     for (const listener of this.listeners) listener();
+  }
+
+  private persistConversations() {
+    const state: StoredFixtureState = {
+      version: 1,
+      conversations: [...this.conversations.values()].map(cloneConversation),
+    };
+    try {
+      window.sessionStorage.setItem(fixtureTabStateKey, JSON.stringify(state));
+    } catch {
+      // The fixture remains usable when a browser blocks sessionStorage. Its state is then volatile.
+    }
+  }
+
+  private activeSessionSub() {
+    const accessToken = this.session.accessToken();
+    return accessToken ? (this.tokens.get(accessToken) ?? null) : null;
+  }
+
+  private restoredActiveTurns() {
+    const sub = this.activeSessionSub();
+    if (!sub) return [];
+    const liveQueryIds = new Set(
+      this.streams
+        .filter(({ producerClosed, admitted }) => !producerClosed && admitted)
+        .map(({ queryId }) => queryId),
+    );
+    return [...this.conversations.values()]
+      .filter(({ ownerSub, botId }) => ownerSub === sub && botId === this.publicConfig.botId)
+      .flatMap(({ turns }) => turns)
+      .filter(
+        ({ queryId, status }) =>
+          !liveQueryIds.has(queryId) && status !== "completed" && status !== "failed",
+      );
   }
 
   selectScenario(scenario: FixtureScenario) {
@@ -480,9 +691,62 @@ export class ChatBrowserFixture {
     return json({ sub, botId: "docentes", profile });
   }
 
+  private recoverResponse(
+    request: FixtureRequest,
+    conversationId: string,
+    queryId: string,
+    sub: string,
+  ): Response {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation) {
+      this.finish(request, 200, "no hay una conversación recuperable para ese ID");
+      return json({
+        type: "failed",
+        code: "conversation_unavailable",
+        message: "No pudimos completar la consulta. Podés volver a intentarlo desde un hilo nuevo.",
+        recordStatus: "not_admitted",
+        queryId,
+      });
+    }
+    if (conversation.ownerSub !== sub || conversation.botId !== this.publicConfig.botId) {
+      this.finish(request, 403, "el envío no pertenece a la identidad de fixture");
+      return json({ code: "FORBIDDEN" }, 403);
+    }
+    const turn = conversation.turns.find((candidate) => candidate.queryId === queryId);
+    if (!turn) {
+      this.finish(request, 200, "no hay un envío recuperable para ese ID");
+      return json({
+        type: "failed",
+        code: "conversation_unavailable",
+        message: "No pudimos completar la consulta. Podés volver a intentarlo desde un hilo nuevo.",
+        recordStatus: "not_admitted",
+        queryId,
+      });
+    }
+
+    const status =
+      turn.status === "completed"
+        ? "completed"
+        : turn.status === "failed"
+          ? "failed"
+          : "in_progress";
+    this.finish(request, 200, `snapshot ${status} recuperado sin nueva admisión`);
+    return json({
+      version: 2,
+      conversationId,
+      queryId,
+      ordinal: turn.ordinal,
+      status,
+      question: turn.question,
+      answer: turn.answer,
+      canContinue: status === "in_progress" ? false : turn.canContinue,
+    });
+  }
+
   private async runtimeResponse(
     request: FixtureRequest,
     requestBody: unknown,
+    sub: string,
     signal?: AbortSignal | null,
   ): Promise<Response> {
     const body = isRecord(requestBody) ? requestBody : {};
@@ -490,17 +754,19 @@ export class ChatBrowserFixture {
     const queryId = typeof body.queryId === "string" ? body.queryId : "";
     const operation = body.operation;
 
+    const uuidPattern =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     if (
       body.version !== 2 ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        conversationId,
-      ) ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(queryId) ||
-      typeof body.baseOrdinal !== "number" ||
-      !Number.isSafeInteger(body.baseOrdinal) ||
-      body.baseOrdinal < 0 ||
-      typeof body.text !== "string" ||
-      !body.text.trim()
+      !uuidPattern.test(conversationId) ||
+      !uuidPattern.test(queryId) ||
+      (operation !== "recover" &&
+        (typeof body.baseOrdinal !== "number" ||
+          !Number.isSafeInteger(body.baseOrdinal) ||
+          body.baseOrdinal < 0 ||
+          typeof body.text !== "string" ||
+          !body.text.trim())) ||
+      (operation !== "recover" && operation !== "start" && operation !== "message")
     ) {
       this.finish(request, 400, "la solicitud no cumple el contrato v2");
       return json({ code: "INVALID_REQUEST" }, 400);
@@ -532,6 +798,19 @@ export class ChatBrowserFixture {
       this.finish(request, 403, "acceso denegado simulado");
       return json({ code: "FORBIDDEN" }, 403);
     }
+
+    if (this.selectedScenario === "runtime-temporary") {
+      this.finish(request, 503, "fallo temporal de Runtime simulado");
+      return json(
+        {
+          code: "TRY_AGAIN",
+          message: "No pudimos actualizar el estado del envío. Intentá de nuevo.",
+        },
+        503,
+      );
+    }
+
+    if (operation === "recover") return this.recoverResponse(request, conversationId, queryId, sub);
 
     if (
       this.selectedScenario === "runtime-quota-daily" ||
@@ -571,11 +850,19 @@ export class ChatBrowserFixture {
         this.finish(request, 409, "el ID ya pertenece a una conversación");
         return json({ code: "CONVERSATION_EXISTS" }, 409);
       }
-      conversation = { nextOrdinal: 1, turns: [] };
+      conversation = {
+        conversationId,
+        ownerSub: sub,
+        botId: this.publicConfig.botId,
+        nextOrdinal: 1,
+        turns: [],
+      };
       this.conversations.set(conversationId, conversation);
     } else if (
       operation !== "message" ||
       !conversation ||
+      conversation.ownerSub !== sub ||
+      conversation.botId !== this.publicConfig.botId ||
       conversation.turns.length === 0 ||
       body.baseOrdinal !== conversation.nextOrdinal - 1
     ) {
@@ -591,27 +878,31 @@ export class ChatBrowserFixture {
         controllerRef = controller;
         const turn: FixtureTurn = {
           ordinal: body.baseOrdinal as number,
+          queryId,
           question: typeof body.text === "string" ? body.text : "",
           answer: "",
           status: "pending",
+          canContinue: true,
         };
         const admit = () => {
-          if (stream.closed || stream.admitted) return;
+          if (stream.producerClosed || stream.admitted) return;
           stream.admitted = true;
           turn.ordinal += 1;
           conversation!.nextOrdinal = turn.ordinal + 1;
           turn.status = "streaming";
           conversation!.turns.push(turn);
-          stream.push({ type: "accepted", conversationId, queryId, ordinal: turn.ordinal });
           const firstText =
             "Propuesta: abrí la clase con una situación cotidiana y pedí que expliquen sus ideas. ";
+          const firstTextIndex = stream.nextIndex++;
+          turn.answer += firstText;
+          this.persistConversations();
+          stream.push({ type: "accepted", conversationId, queryId, ordinal: turn.ordinal });
           stream.push({
             type: "text",
             queryId,
-            index: stream.nextIndex++,
+            index: firstTextIndex,
             text: firstText,
           });
-          turn.answer += firstText;
           request.status = "pending";
           request.outcome = "respuesta progresiva abierta; esperar un cierre manual";
           this.changed();
@@ -621,23 +912,29 @@ export class ChatBrowserFixture {
           queryId,
           nextIndex: 0,
           admitted: false,
-          closed: false,
+          producerClosed: false,
+          transportClosed: false,
           turn,
           admit,
           push: (value) => {
-            if (!stream.closed) controller.enqueue(encoder.encode(sse(value)));
+            if (stream.producerClosed || stream.transportClosed) return;
+            controller.enqueue(encoder.encode(sse(value)));
           },
           close: () => {
-            if (stream.closed) return;
-            stream.closed = true;
-            controller.close();
+            if (stream.producerClosed) return;
+            stream.producerClosed = true;
+            if (!stream.transportClosed) {
+              stream.transportClosed = true;
+              controller.close();
+            }
             this.finish(request, 200, "stream completado manualmente");
             this.changed();
           },
           cancel: () => {
-            if (stream.closed) return;
-            stream.closed = true;
-            this.finish(request, "cancelled", "lector cancelado al invalidar la vista");
+            if (stream.transportClosed) return;
+            stream.transportClosed = true;
+            request.outcome = "SSE desconectado; productor simulado continúa en la pestaña";
+            this.changed();
           },
         };
         this.streams.push(stream);
@@ -652,7 +949,7 @@ export class ChatBrowserFixture {
       cancel: () => stream?.cancel(),
     });
     const abortStream = () => {
-      if (stream!.closed) return;
+      if (stream!.producerClosed) return;
       if (this.selectedScenario === "signout-pending") {
         request.outcome = "aborto recibido; se retiene el fragmento para probar callback obsoleto";
         this.changed();
@@ -712,29 +1009,71 @@ export class ChatBrowserFixture {
   }
 
   admitStream() {
-    this.streams.find((item) => !item.closed && !item.admitted)?.admit();
+    this.streams.find((item) => !item.producerClosed && !item.admitted)?.admit();
   }
 
   emitFragment() {
-    const stream = this.streams.find((item) => !item.closed && item.admitted);
-    if (!stream) return;
+    const stream = this.streams.find((item) => !item.producerClosed && item.admitted);
     const text =
       "Después, resolvé una consigna breve.\n\nLuego comparen estrategias en parejas: ¿cuál es más clara para el grupo? ¡Buen trabajo!";
+    if (!stream) {
+      const turn = this.restoredActiveTurns()[0];
+      if (!turn) return;
+      turn.answer += text;
+      this.persistConversations();
+      this.changed();
+      return;
+    }
+    const index = stream.nextIndex++;
+    stream.turn.answer += text;
+    this.persistConversations();
     stream.push({
       type: "text",
       queryId: stream.queryId,
-      index: stream.nextIndex++,
+      index,
       text,
     });
-    stream.turn.answer += text;
+    this.changed();
   }
 
   finishStream(mode: "complete" | "failed" | "profile-required" | "unconfirmed") {
-    const stream = this.streams.find((item) => !item.closed && item.admitted);
-    if (!stream) return;
+    const stream = this.streams.find((item) => !item.producerClosed && item.admitted);
+    if (!stream) {
+      const turn = this.restoredActiveTurns()[0];
+      if (!turn) return;
+      if (mode === "complete") {
+        turn.status = "completed";
+        turn.canContinue = true;
+      } else if (mode === "failed") {
+        turn.status = "failed";
+        turn.canContinue = true;
+      } else if (mode === "profile-required") {
+        turn.status = "failed";
+        turn.canContinue = false;
+      } else {
+        turn.status = "unconfirmed";
+        turn.canContinue = false;
+      }
+      this.persistConversations();
+      this.changed();
+      return;
+    }
+    if (mode === "complete") {
+      stream.turn.status = "completed";
+      stream.turn.canContinue = true;
+    } else if (mode === "failed") {
+      stream.turn.status = "failed";
+      stream.turn.canContinue = true;
+    } else if (mode === "profile-required") {
+      stream.turn.status = "failed";
+      stream.turn.canContinue = false;
+    } else {
+      stream.turn.status = "unconfirmed";
+      stream.turn.canContinue = false;
+    }
+    this.persistConversations();
     if (mode === "complete") {
       stream.push({ type: "completed", queryId: stream.queryId });
-      stream.turn.status = "completed";
     } else if (mode === "failed") {
       stream.push({
         type: "failed",
@@ -742,8 +1081,8 @@ export class ChatBrowserFixture {
         message: "La generación terminó con un error simulado.",
         recordStatus: "failed",
         queryId: stream.queryId,
+        canContinue: true,
       });
-      stream.turn.status = "failed";
     } else if (mode === "profile-required") {
       stream.push({
         type: "failed",
@@ -751,10 +1090,8 @@ export class ChatBrowserFixture {
         message: "Completá tu perfil para iniciar esta consulta.",
         recordStatus: "not_admitted",
         queryId: stream.queryId,
+        canContinue: false,
       });
-      stream.turn.status = "failed";
-    } else {
-      stream.turn.status = "unconfirmed";
     }
     stream.close();
   }
@@ -912,14 +1249,16 @@ export class ChatBrowserFixture {
       }
       if (
         !isRecord(body) ||
-        (body.operation !== "start" && body.operation !== "message") ||
+        (body.operation !== "start" &&
+          body.operation !== "message" &&
+          body.operation !== "recover") ||
         typeof body.conversationId !== "string" ||
-        typeof body.text !== "string"
+        (body.operation !== "recover" && typeof body.text !== "string")
       ) {
         this.finish(item, 400, "payload de inicio inválido");
         return json({ code: "INVALID_REQUEST" }, 400);
       }
-      return this.runtimeResponse(item, body, init?.signal);
+      return this.runtimeResponse(item, body, sub, init?.signal);
     }
     this.finish(item, 404, "ruta no simulada");
     return json({ code: "NOT_FOUND" }, 404);
@@ -929,6 +1268,7 @@ export class ChatBrowserFixture {
     const accessToken = this.session.accessToken();
     const sessionSub = accessToken ? (this.tokens.get(accessToken) ?? null) : null;
     const sessionIdentity = identities.find(({ sub }) => sub === sessionSub) || null;
+    const restoredActiveCount = this.restoredActiveTurns().length;
     return {
       fixture: "chat-browser-local",
       route,
@@ -950,13 +1290,20 @@ export class ChatBrowserFixture {
         text,
         status,
       })),
-      pendingAdmissions: this.streams.filter(({ closed, admitted }) => !closed && !admitted).length,
-      admittedStreams: this.streams.filter(({ closed, admitted }) => !closed && admitted).length,
-      openStreams: this.streams.filter(({ closed }) => !closed).length,
+      pendingAdmissions: this.streams.filter(
+        ({ producerClosed, admitted }) => !producerClosed && !admitted,
+      ).length,
+      admittedStreams:
+        this.streams.filter(({ producerClosed, admitted }) => !producerClosed && admitted).length +
+        restoredActiveCount,
+      openStreams:
+        this.streams.filter(({ producerClosed }) => !producerClosed).length + restoredActiveCount,
       conversations: [...this.conversations.entries()].map(([conversationId, conversation]) => ({
         conversationId,
+        ownerSub: conversation.ownerSub,
         turns: conversation.turns.map((turn) => ({ ...turn })),
       })),
+      productJournal: readProductJournal(this.publicConfig),
       storedProfile: cloneDraft(
         this.storedProfiles.get(sessionSub || identities[0].sub) || fixtureProfiles[0],
       ),

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createChatHandler } from "../../runtime/chat.ts";
+import { createChatHandler, createChatInvocationHandler } from "../../runtime/chat.ts";
 import { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
 
@@ -41,6 +41,14 @@ const profileConfig = {
     },
   ],
 };
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 function bearer(claims = { sub: "teacher-123", token_use: "access" }) {
   const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
@@ -224,7 +232,7 @@ function makeHarness({
     generate(input) {
       state.providerCalls += 1;
       state.providerInput = input;
-      return generate();
+      return generate(input, state);
     },
     now: clock,
   });
@@ -260,6 +268,48 @@ async function collect(stream) {
 }
 
 describe("chat Runtime implementation regressions", () => {
+  it("async disposal detaches only the observer while the registered producer finishes", async () => {
+    const releaseProducer = deferred();
+    const producerPaused = deferred();
+    const producerFinished = deferred();
+    let activeTasks = 0;
+    let completedEventProduced = false;
+    const chat = async () =>
+      (async function* () {
+        yield { type: "accepted", queryId };
+        producerPaused.resolve();
+        await releaseProducer.promise;
+        completedEventProduced = true;
+        producerFinished.resolve();
+        yield { type: "completed", queryId };
+      })();
+    const invocation = createChatInvocationHandler(chat, {
+      addAsyncTask() {
+        activeTasks += 1;
+        return 1;
+      },
+      completeAsyncTask() {
+        activeTasks -= 1;
+        return true;
+      },
+    });
+    const response = await invocation.process({}, {});
+
+    try {
+      await producerPaused.promise;
+      expect(activeTasks).toBe(1);
+      await response[Symbol.asyncDispose]();
+      releaseProducer.resolve();
+      await producerFinished.promise;
+      await vi.waitFor(() => expect(activeTasks).toBe(0));
+      expect(completedEventProduced).toBe(true);
+      expect(await response.next()).toMatchObject({ done: true });
+    } finally {
+      releaseProducer.resolve();
+      await response.return();
+    }
+  });
+
   it("persists the exact selected context and waits for that write before accepted", async () => {
     const contextReferences = [
       { ordinal: 1, queryId: "5faca543-38a3-4e57-a1a3-3045c96968f2" },
@@ -545,6 +595,64 @@ describe("chat Runtime implementation regressions", () => {
       await stream.return();
     } finally {
       dispatch.mockRestore();
+    }
+  });
+
+  it("signals local provider cancellation at the deadline and closes without remote terminal evidence", async () => {
+    const admittedAt = Date.parse("2026-10-19T16:00:00.000Z");
+    const deadlineMs = 60 * 60 * 1000;
+    const providerStarted = deferred();
+    const signalObserved = deferred();
+    const harness = makeHarness({
+      clock: () => admittedAt,
+      generate: (input) => {
+        providerStarted.resolve(input);
+        return (async function* () {
+          await new Promise((resolve) => {
+            if (input.cancelSignal.aborted) {
+              resolve();
+              return;
+            }
+            input.cancelSignal.addEventListener("abort", resolve, { once: true });
+          });
+          signalObserved.resolve();
+          yield { type: "error", providerCode: "local_cancellation" };
+        })();
+      },
+    });
+    vi.useFakeTimers();
+
+    try {
+      const response = await request(harness);
+      const stream = response[Symbol.asyncIterator]();
+      expect((await stream.next()).value).toMatchObject({ type: "accepted", queryId });
+      const terminal = stream.next();
+      const generation = await providerStarted.promise;
+      expect(generation.cancelSignal).toBeInstanceOf(AbortSignal);
+      expect(generation.cancelSignal.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(deadlineMs);
+      await signalObserved.promise;
+      expect((await terminal).value).toMatchObject({
+        type: "failed",
+        code: "result_timeout",
+        canContinue: false,
+      });
+      expect(harness.state.failed).toHaveLength(1);
+      expect(harness.state.failed[0]).toMatchObject({
+        code: "result_timeout",
+        invocationClaimed: true,
+        providerFinished: false,
+      });
+      expect(harness.state.meta.closed).toBe(true);
+      expect(harness.state.submissions.get("teacher-123/bot-aurora/" + queryId)).toMatchObject({
+        status: "failed",
+        canContinue: false,
+      });
+      await stream.return();
+    } finally {
+      await vi.advanceTimersByTimeAsync(deadlineMs);
+      vi.useRealTimers();
     }
   });
 

@@ -1,13 +1,13 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
 
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const handlerPath = path.join(projectRoot, "runtime/chat.ts");
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
-const secondQueryId = "b5cfbc9f-3699-4e93-b120-a03c0204bc68";
 const fixedNow = Date.parse("2026-10-19T16:00:00.000Z");
 const caller = { sub: "teacher-123", token_use: "access" };
 const botId = "bot-aurora";
@@ -52,6 +52,7 @@ const profileWithoutPreferences = { ...validProfile };
 delete profileWithoutPreferences.responsePreferenceIds;
 
 let createChatHandler;
+let createChatInvocationHandler;
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
@@ -454,12 +455,17 @@ describe("the conversation Runtime handler", () => {
     if (!existsSync(handlerPath)) return;
     const module = await import(pathToFileURL(handlerPath).href);
     createChatHandler = module.createChatHandler;
+    createChatInvocationHandler = module.createChatInvocationHandler;
   });
 
   beforeEach(() => {
     expect(
       typeof createChatHandler,
       "producto ausente: expected runtime/chat.ts#createChatHandler",
+    ).toBe("function");
+    expect(
+      typeof createChatInvocationHandler,
+      "producto ausente: expected runtime/chat.ts#createChatInvocationHandler",
     ).toBe("function");
   });
 
@@ -970,7 +976,6 @@ describe("the conversation Runtime handler", () => {
       const first = await stream.next();
       expect(first.value).toMatchObject({ type: "accepted", conversationId, queryId, ordinal: 1 });
       expect(harness.state.admitted).toMatchObject({ text: makePayload().text, queryId });
-      expect(harness.state.providerCalls).toBe(0);
       const remainingEvents = [];
       for await (const event of stream) remainingEvents.push(event);
       expect(terminal(remainingEvents)).toMatchObject({ type: "completed", queryId });
@@ -1113,66 +1118,74 @@ describe("the conversation Runtime handler", () => {
     }
   });
 
-  it("fails uncertain generation and closes the thread when the SSE consumer returns", async () => {
+  it("keeps the registered producer active and durable after the SSE consumer returns", async () => {
     const nextChunk = deferred();
     const completeStarted = deferred();
+    const app = new BedrockAgentCoreApp({
+      config: { logging: { enabled: false } },
+      invocationHandler: {
+        async process() {
+          return null;
+        },
+      },
+    });
+    let activeTasksAtProviderStart;
     const harness = makeHarness({
-      generationFactory: () =>
-        (async function* () {
+      generationFactory: () => {
+        activeTasksAtProviderStart = app.getAsyncTaskInfo().activeCount;
+        return (async function* () {
           yield { type: "text", text: "Prefijo que ya se mostró." };
           await nextChunk.promise;
           yield { type: "text", text: "Parte que no llegó a mostrarse." };
           yield { type: "result", stopReason: "end_turn" };
-        })(),
+        })();
+      },
       onComplete: completeStarted.resolve,
     });
-    const stream = await openStream(harness, makePayload(), makeContext());
+    const invocationHandler = createChatInvocationHandler(harness.handler, app);
+    const response = await invocationHandler.process(makePayload(), makeContext());
+    expect(isAsyncIterable(response)).toBe(true);
+    const stream = response[Symbol.asyncIterator]();
 
     try {
-      expect((await stream.next()).value.type).toBe("accepted");
+      expect((await stream.next()).value).toMatchObject({
+        event: "accepted",
+        data: { type: "accepted", queryId },
+      });
       const firstTextPromise = stream.next();
       expect(await waitFor(firstTextPromise)).toBe(true);
       expect((await firstTextPromise).value).toMatchObject({
-        type: "text",
-        text: "Prefijo que ya se mostró.",
+        event: "text",
+        data: { type: "text", text: "Prefijo que ya se mostró." },
       });
+      expect(activeTasksAtProviderStart).toBe(1);
+      expect(app.getAsyncTaskInfo().activeCount).toBe(1);
       await stream.return();
 
+      expect(app.getAsyncTaskInfo().activeCount).toBe(1);
       expect(harness.state.answerChunks.map(({ text }) => text)).toEqual([
         "Prefijo que ya se mostró.",
       ]);
       expect(harness.state.completed).toBe(false);
-      expect(harness.state.failed).toBe(true);
-      expect(harness.state.failureInput).toMatchObject({
-        queryId,
-        invocationClaimed: true,
-        providerFinished: false,
-      });
-      expect(harness.state.submissions.get(`${caller.sub}/${botId}/${queryId}`)).toMatchObject({
-        status: "failed",
-        canContinue: false,
-      });
-      expect(harness.state.meta.closed).toBe(true);
+      expect(harness.state.failed).toBe(false);
+      expect(harness.state.failureInput).toBeNull();
 
       nextChunk.resolve();
-      expect(await waitFor(completeStarted.promise)).toBe(false);
-
-      const callsBeforeFollowup = harness.state.providerCalls;
-      const followup = await request(
-        harness,
-        makePayload({
-          operation: "message",
-          queryId: secondQueryId,
-          baseOrdinal: 1,
-          text: "No reutilizar un hilo de fin incierto.",
-        }),
-      );
-      const followupResult = Array.isArray(followup) ? terminal(followup) : followup;
-      expect(followupResult).toMatchObject({ type: "failed" });
-      expect(followup.some?.(({ type }) => type === "accepted" || type === "completed")).not.toBe(
-        true,
-      );
-      expect(harness.state.providerCalls).toBe(callsBeforeFollowup);
+      expect(await waitFor(completeStarted.promise)).toBe(true);
+      expect(harness.state.answerChunks.map(({ text }) => text)).toEqual([
+        "Prefijo que ya se mostró.",
+        "Parte que no llegó a mostrarse.",
+      ]);
+      expect(harness.state.completed).toBe(true);
+      expect(harness.state.failed).toBe(false);
+      expect(harness.state.failureInput).toBeNull();
+      expect(harness.state.providerCalls).toBe(1);
+      expect(harness.state.calls.filter(([name]) => name === "claimInvocation")).toHaveLength(1);
+      await vi.waitFor(() => expect(app.getAsyncTaskInfo().activeCount).toBe(0));
+      expect(harness.state.submissions.get(`${caller.sub}/${botId}/${queryId}`)).toMatchObject({
+        status: "completed",
+        canContinue: true,
+      });
     } finally {
       nextChunk.resolve();
       await stream.return();

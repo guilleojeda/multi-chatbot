@@ -50,9 +50,22 @@ const chat = createChatHandler({
   now: Date.now,
 });
 
+const runtimeApp: { instance?: BedrockAgentCoreApp } = {};
+const taskRegistry = {
+  addAsyncTask(name: string, metadata?: Record<string, unknown>): number {
+    if (!runtimeApp.instance) throw new Error("Runtime task registry is not initialized.");
+    return runtimeApp.instance.addAsyncTask(name, metadata);
+  },
+  completeAsyncTask(taskId: number): boolean {
+    if (!runtimeApp.instance) throw new Error("Runtime task registry is not initialized.");
+    return runtimeApp.instance.completeAsyncTask(taskId);
+  },
+};
+
 const app = new BedrockAgentCoreApp({
-  invocationHandler: createChatInvocationHandler(chat),
+  invocationHandler: createChatInvocationHandler(chat, taskRegistry),
   config: { logging: { enabled: false } },
 });
 
+runtimeApp.instance = app;
 app.run();

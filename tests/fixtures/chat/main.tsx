@@ -55,7 +55,9 @@ function FixtureControls() {
         <h2>Fixture de navegador del chat</h2>
         <p>
           Esta página monta AccountApp, ChatScreen y createSession reales. Cognito, perfil y Runtime
-          se simulan en memoria; no se usan servicios AWS ni almacenamiento persistente.
+          se simulan localmente; las conversaciones del Runtime se conservan en una clave propia de
+          sessionStorage de esta pestaña para probar recover. No se usan servicios AWS; el Runtime
+          simulado no escribe el journal productivo.
         </p>
       </header>
 
@@ -87,7 +89,7 @@ function FixtureControls() {
           type="button"
           onClick={() => window.location.reload()}
         >
-          Reiniciar fixture
+          Recargar pestaña y probar recuperación
         </button>
       </section>
 
@@ -196,6 +198,11 @@ function FixtureControls() {
           {state.pendingRefreshes} · sign-in pendiente: {state.pendingSignIns.length} · copias
           pendientes:{" "}
           {state.clipboardOperations.filter(({ status }) => status === "pending").length}
+        </p>
+        <p className="profile-fixture-readout">
+          El productor simulado conserva el registro aunque se cierre el consumidor SSE; tras
+          recargar, estos controles actualizan el registro restaurado y AccountApp lo observa
+          mediante <code>recover</code> con el mismo conversation ID y query ID.
         </p>
       </section>
 

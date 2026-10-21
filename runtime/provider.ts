@@ -8,6 +8,7 @@ type GenerationInput = {
   messages: MessageData[];
   modelId: string;
   revision: string;
+  cancelSignal?: AbortSignal;
 };
 
 type ProviderEvent =
@@ -83,6 +84,21 @@ function safeProviderError(
   };
 }
 
+function localCancellationEvent(
+  observedStopReason?: string,
+  metrics?: Record<string, number>,
+): Extract<ProviderEvent, { type: "error" }> {
+  const confirmedStopReason = observedStopReason ? stopReason(observedStopReason) : undefined;
+  return {
+    type: "error",
+    providerCode: "local_cancellation",
+    ...(confirmedStopReason && confirmedStopReason !== "cancelled"
+      ? { stopReason: confirmedStopReason }
+      : {}),
+    ...(metrics ? { metrics } : {}),
+  };
+}
+
 function stopReason(reason: string): string {
   switch (reason) {
     case "endTurn":
@@ -141,7 +157,10 @@ export function createStrandsGenerator(input: { region: string }) {
     let observedStopReason: string | undefined;
     let observedMetrics: Record<string, number> | undefined;
     try {
-      for await (const event of agent.stream(request.text)) {
+      for await (const event of agent.stream(
+        request.text,
+        request.cancelSignal ? { cancelSignal: request.cancelSignal } : undefined,
+      )) {
         switch (event.type) {
           case "modelStreamUpdateEvent": {
             const modelEvent = event.event;
@@ -186,6 +205,10 @@ export function createStrandsGenerator(input: { region: string }) {
             break;
           case "afterModelCallEvent":
             if (event.error) {
+              if (request.cancelSignal?.aborted) {
+                yield localCancellationEvent(observedStopReason, observedMetrics);
+                return;
+              }
               yield safeProviderError(event.error, {
                 ...(observedStopReason ? { stopReason: observedStopReason } : {}),
                 ...(observedMetrics ? { metrics: observedMetrics } : {}),
@@ -196,6 +219,10 @@ export function createStrandsGenerator(input: { region: string }) {
           case "agentResultEvent": {
             if (event.result.lastMessage.content.some((block) => block.type !== "textBlock")) {
               throw new Error("Strands returned non-text result content.");
+            }
+            if (request.cancelSignal?.aborted || event.result.stopReason === "cancelled") {
+              yield localCancellationEvent(observedStopReason, observedMetrics);
+              return;
             }
             if (event.result.stopReason === "toolUse") {
               throw new Error("Strands requested a tool.");
@@ -225,6 +252,10 @@ export function createStrandsGenerator(input: { region: string }) {
         }
       }
     } catch (error) {
+      if (request.cancelSignal?.aborted) {
+        yield localCancellationEvent(observedStopReason, observedMetrics);
+        return;
+      }
       yield safeProviderError(error, {
         ...(observedStopReason ? { stopReason: observedStopReason } : {}),
         ...(observedMetrics ? { metrics: observedMetrics } : {}),
