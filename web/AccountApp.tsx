@@ -50,6 +50,17 @@ function chatOwnerKey(identity: { sub: string; botId: string }) {
   return JSON.stringify([identity.sub, identity.botId]);
 }
 
+function sameChatJournalScope(left: PublicConfig, right: PublicConfig) {
+  return (
+    left.region === right.region &&
+    left.clientId === right.clientId &&
+    left.apiBaseUrl === right.apiBaseUrl &&
+    (left.runtimeArn ?? "") === (right.runtimeArn ?? "") &&
+    (left.runtimeQualifier ?? "") === (right.runtimeQualifier ?? "") &&
+    left.botId === right.botId
+  );
+}
+
 function emptyChatState(): ChatScreenState {
   return { profileStatus: "loading", queryStatus: "idle" };
 }
@@ -1057,6 +1068,16 @@ export function AccountApp({
       };
     }
 
+    const liveJournal = chatJournalRef.current;
+    const liveJournalOwner = chatJournalOwnerRef.current;
+    const liveJournalHasCurrentOwner =
+      liveJournal !== null &&
+      liveJournalOwner !== null &&
+      chatOwnerKey(liveJournalOwner.identity) === identityKey &&
+      chatOwnerKeyRef.current === identityKey &&
+      sameChatJournalScope(liveJournalOwner.config, recoveryConfig);
+    if (!loadedJournal && liveJournalHasCurrentOwner) loadedJournal = liveJournal;
+
     chatJournalOwnerRef.current = { config: recoveryConfig, identity };
     chatJournalRef.current = loadedJournal;
     if (!loadedJournal) {
@@ -1072,10 +1093,21 @@ export function AccountApp({
     const pendingText = journal.admitted ? undefined : journal.request.text;
     chatConversationIdRef.current = request.conversationId;
     const current = chatScreenStateRef.current;
+    const newerRejectedQueryAlreadyVisible =
+      liveJournalHasCurrentOwner &&
+      liveJournal?.admitted === true &&
+      liveJournal.request.queryId === request.queryId &&
+      liveJournal.request.conversationId === request.conversationId &&
+      journal.admitted &&
+      current.queryStatus === "rejected" &&
+      current.ordinal === journal.ordinal &&
+      Boolean(current.previousTurns?.length) &&
+      Boolean(chatDisplayedQueryIdRef.current) &&
+      chatDisplayedQueryIdRef.current !== request.queryId;
     const terminalAlreadyVisible =
       chatDisplayedQueryIdRef.current === request.queryId &&
       (current.queryStatus === "completed" || current.queryStatus === "failed");
-    if (terminalAlreadyVisible) {
+    if (terminalAlreadyVisible || newerRejectedQueryAlreadyVisible) {
       return () => {
         active = false;
         clearTimer();

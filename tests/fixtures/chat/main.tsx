@@ -78,7 +78,8 @@ function FixtureControls() {
         <p className="profile-fixture-readout">
           Para C, el conteo y el preflight de almacenamiento se simulan antes de admitir. El error
           de contexto afecta solo seguimientos; el historial de peticiones conserva cuerpo e IDs
-          para comprobar el reintento y el inicio nuevo.
+          para comprobar el reintento y el inicio nuevo. `journal-admission-write-failure` rechaza
+          la escritura del journal después de la admisión.
         </p>
         <nav className="profile-fixture-links" aria-label="Rutas locales">
           <a href="#/chat">Abrir chat</a>
