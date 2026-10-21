@@ -181,6 +181,16 @@ counter:
   submitting. The mock returns `storage_capacity_exceeded` without a quota view or admitted turn;
   the original text remains editable so it can be corrected. This local response exercises the web
   state only; the acceptance tests exercise the actual storage preflight.
+- To check profile navigation after an admitted journal write fails, select
+  `journal-admission-write-failure`, submit a query, admit it, and complete it. The Runtime turn
+  remains available while the product journal entry is removed. Open “Mi perfil,” return to chat,
+  and submit a follow-up. The request list should show `message` with the original conversation ID
+  and ordinal one. The same scenario can be selected after a query is sent so the admitted write
+  fails for that query.
+- To check a rejected follow-up across navigation, complete a turn under `ready`, select
+  `runtime-storage-capacity-exceeded`, and send a follow-up. Open “Mi perfil,” then return to chat.
+  The rejected follow-up should remain current and the completed turn should appear once in history;
+  the fixture should not issue another `recover` request for that older turn.
 
 `signout-pending` clears the session immediately while holding the simulated sign-out promise.
 After clicking “Cerrar sesión”, use “Emitir fragmento (o tardío tras logout)” to release an old
@@ -260,7 +270,7 @@ Append `?scenario=<name>` before the hash to select an initial scenario, for exa
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-unconfirmed`, `runtime-temporary`, `runtime-recover-network`, `runtime-quota-daily`,
 `runtime-quota-monthly`, `runtime-quota-both`,
-`runtime-capacity-exceeded`, `runtime-token-count-unavailable`,
+`runtime-capacity-exceeded`, `journal-admission-write-failure`, `runtime-token-count-unavailable`,
 `runtime-storage-capacity-exceeded`, `runtime-conversation-busy`, `runtime-stale-base`,
 `runtime-401`, `runtime-401-pending`, `cognito-refresh-network`,
 `runtime-expired`, `runtime-forbidden`,

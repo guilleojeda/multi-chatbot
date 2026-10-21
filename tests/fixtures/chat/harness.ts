@@ -26,6 +26,10 @@ export const fixtureScenarios = [
   { id: "runtime-quota-monthly", label: "Runtime: cupo mensual agotado" },
   { id: "runtime-quota-both", label: "Runtime: cupos diario y mensual agotados" },
   { id: "runtime-capacity-exceeded", label: "Runtime: contexto supera la ventana del modelo" },
+  {
+    id: "journal-admission-write-failure",
+    label: "Storage: falla al guardar la referencia admitida",
+  },
   { id: "runtime-token-count-unavailable", label: "Runtime: conteo nativo no disponible" },
   {
     id: "runtime-storage-capacity-exceeded",
@@ -129,6 +133,53 @@ type StoredFixtureState = {
 
 const fixtureTabStateKey = "multi-chatbot:fixture-chat-tab-state:v1";
 const productJournalPrefix = "chat-journal:v2";
+
+class FixtureProductStorage {
+  private rejectAdmittedJournalWrites = false;
+
+  constructor(private readonly storage: Storage) {}
+
+  get length() {
+    return this.storage.length;
+  }
+
+  key(index: number) {
+    return this.storage.key(index);
+  }
+
+  getItem(key: string) {
+    return this.storage.getItem(key);
+  }
+
+  setItem(key: string, value: string) {
+    if (this.rejectAdmittedJournalWrites && key.startsWith(`${productJournalPrefix}:entry:`)) {
+      try {
+        const parsed: unknown = JSON.parse(value);
+        if (isRecord(parsed) && parsed.admitted === true) {
+          throw new DOMException(
+            "The fixture rejected an admitted journal write",
+            "QuotaExceededError",
+          );
+        }
+      } catch (error) {
+        if (error instanceof DOMException) throw error;
+      }
+    }
+    this.storage.setItem(key, value);
+  }
+
+  removeItem(key: string) {
+    this.storage.removeItem(key);
+  }
+
+  clear() {
+    this.storage.clear();
+  }
+
+  setAdmissionWriteFailure(enabled: boolean) {
+    this.rejectAdmittedJournalWrites = enabled;
+  }
+}
 
 type FixtureIdentity = { sub: string; email: string };
 
@@ -404,7 +455,8 @@ export class ChatBrowserFixture {
   private readonly pendingSignIns: PendingSignIn[] = [];
   private readonly clipboardOperations: ClipboardOperation[] = [];
   private readonly streams: ControlledStream[] = [];
-  private readonly conversations = readFixtureTabState();
+  private readonly productStorage: FixtureProductStorage;
+  private readonly conversations: Map<string, FixtureConversation>;
   private readonly sessionStorage = new FixtureSessionStorage();
   private readonly storedProfiles = new Map(
     fixtureProfiles.map((profile) => [profile.sub, cloneProfile(profile)]),
@@ -421,6 +473,15 @@ export class ChatBrowserFixture {
   private clipboardFailure = false;
 
   constructor() {
+    this.productStorage = new FixtureProductStorage(window.sessionStorage);
+    Object.defineProperty(window, "sessionStorage", {
+      configurable: true,
+      value: this.productStorage,
+    });
+    this.productStorage.setAdmissionWriteFailure(
+      this.selectedScenario === "journal-admission-write-failure",
+    );
+    this.conversations = readFixtureTabState();
     this.session = createSession({
       clientId: this.publicConfig.clientId,
       region: this.publicConfig.region,
@@ -481,6 +542,7 @@ export class ChatBrowserFixture {
   selectScenario(scenario: FixtureScenario) {
     this.selectedScenario = scenario;
     this.clipboardFailure = scenario === "clipboard-fail";
+    this.productStorage.setAdmissionWriteFailure(scenario === "journal-admission-write-failure");
     this.runtime401Used = false;
     this.profileRefresh401Used = false;
     Object.defineProperty(navigator, "clipboard", {
