@@ -31,11 +31,14 @@ const profileSnapshot = {
 
 let createConversationStoreAdapter;
 
-function makeStore(send = vi.fn(async () => ({}))) {
+function makeStore(
+  send = vi.fn(async () => ({})),
+  now = () => Date.parse("2026-10-22T02:30:00.000Z"),
+) {
   const documentClient = { send };
   const store =
     typeof createConversationStoreAdapter === "function"
-      ? createConversationStoreAdapter({ documentClient, tableName })
+      ? createConversationStoreAdapter({ documentClient, tableName, now })
       : null;
   return { documentClient, store };
 }
@@ -125,6 +128,8 @@ function admissionInput(overrides = {}) {
     conversationId,
     queryId,
     now,
+    ownerAttemptId: "attempt-admitted",
+    resultDeadlineAt: now + 60 * 60 * 1000,
     text: "Armá una actividad de porcentajes.",
     profileSnapshot,
     invocation: {
@@ -295,8 +300,18 @@ function turnRecord(overrides = {}) {
     queryId,
     ordinal: 2,
     status: "in_progress",
-    stage: "admitted",
+    phase: "admitted",
+    ownerAttemptId: "attempt-a",
     resultDeadlineAt: Date.parse("2026-10-22T03:00:00.000Z"),
+    cursor: 0,
+    questionManifest: { count: 1, complete: true },
+    answerManifest: { count: 0, complete: false },
+    contextManifest: { count: 0, complete: true },
+    profileSnapshot,
+    invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "profile-r7" },
+    operation: "message",
+    baseOrdinal: 1,
+    requestFingerprint: "sha256:stable-request-fingerprint",
     ...overrides,
   };
 }
@@ -309,6 +324,7 @@ function metaRecord(overrides = {}) {
     ...owner,
     lastOrdinal: 2,
     activeQueryId: queryId,
+    activeOwnerAttemptId: "attempt-a",
     ...overrides,
   };
 }
@@ -320,6 +336,8 @@ function submissionRecord(overrides = {}) {
     ...owner,
     queryId,
     requestFingerprint: "sha256:stable-request-fingerprint",
+    operation: "message",
+    baseOrdinal: 1,
     conversationId,
     ordinal: 2,
     admittedAt: Date.parse("2026-10-22T02:30:00.000Z"),
@@ -361,10 +379,12 @@ function lifecycleRecords(turnOverrides = {}, metaOverrides = {}) {
     ...turnOverrides,
   });
   const meta = metaRecord(metaOverrides);
+  const question = submissionChunk(turn.ordinal, turn.queryId, "user", 0, "Pregunta fixture.");
   return new Map([
     [keyId({ pk: submission.pk, sk: submission.sk }), submission],
     [keyId({ pk: turn.pk, sk: turn.sk }), turn],
     [keyId({ pk: meta.pk, sk: meta.sk }), meta],
+    [keyId({ pk: question.pk, sk: question.sk }), question],
   ]);
 }
 
@@ -809,7 +829,8 @@ describe("the DynamoDB usage and submission store adapter", () => {
     const record = submissionRecord({ ordinal: 2 });
     const turn = turnRecord({
       status: "completed",
-      stage: "complete",
+      phase: "complete",
+      resultDeadlineAt: record.resultDeadlineAt,
       questionManifest: { count: 1, complete: true },
       answerManifest: { count: 2, complete: true },
       cursor: 2,
@@ -1004,7 +1025,7 @@ describe("the DynamoDB usage and submission store adapter", () => {
     const now = admittedAt + 60 * 60 * 1000;
     expect(now).toBe(Date.parse("2026-10-22T03:30:00.000Z"));
     const records = lifecycleRecords(
-      { stage: "admitted", status: "in_progress", resultDeadlineAt: now },
+      { phase: "admitted", status: "in_progress", resultDeadlineAt: now },
       { activeQueryId: queryId },
     );
     const { documentClient, store } = makeStore(mapReadRecords(records));
@@ -1042,7 +1063,7 @@ describe("the DynamoDB usage and submission store adapter", () => {
     expect(now).toBe(Date.parse("2026-10-22T03:30:00.000Z"));
     const records = lifecycleRecords(
       {
-        stage: "invocation_claimed",
+        phase: "invocation_claimed",
         status: "in_progress",
         ownerAttemptId: "attempt-a",
         resultDeadlineAt: now,

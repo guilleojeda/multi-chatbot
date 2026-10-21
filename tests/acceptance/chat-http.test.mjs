@@ -859,7 +859,7 @@ describe("the direct Runtime chat client", () => {
     const streamChat = await loadStreamChat();
     if (!streamChat) return;
 
-    const fetch = vi.fn(async () => streamResponse(successFrames()));
+    const fetch = vi.fn(async () => streamResponse(successFrames(conversationId, secondQueryId)));
     vi.stubGlobal("fetch", fetch);
     const noSession = makeSession();
     noSession.accessToken.mockReturnValue(null);

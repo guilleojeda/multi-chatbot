@@ -867,24 +867,55 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
       },
     });
     harness.store._harnessState = harness.state;
-    const response = await invoke(harness.handler, startPayload());
-    expect(isAsyncIterable(response)).toBe(true);
-    const stream = response[Symbol.asyncIterator]();
+    const responsePromise = invoke(harness.handler, startPayload());
+    let response;
+    let stream;
     let eventSettled = false;
-    const pendingEvent = stream.next().then((value) => {
-      eventSettled = true;
-      return value;
-    });
-    expect(await waitFor(admissionStarted.promise)).toBe(true);
-    await Promise.resolve();
-    expect(eventSettled).toBe(false);
-    expect(harness.state.providerCalls).toBe(0);
-
-    releaseAdmission.resolve();
-    expect((await pendingEvent).value).toMatchObject({ type: "accepted", queryId, ordinal: 1 });
+    const first = await Promise.race([
+      responsePromise.then((value) => ({ kind: "response", value })),
+      admissionStarted.promise.then(() => ({ kind: "admission" })),
+    ]);
+    if (first.kind === "response") {
+      response = first.value;
+      expect(isAsyncIterable(response)).toBe(true);
+      stream = response[Symbol.asyncIterator]();
+      const pendingEvent = stream.next().then((value) => {
+        eventSettled = true;
+        return value;
+      });
+      expect(await waitFor(admissionStarted.promise)).toBe(true);
+      await Promise.resolve();
+      expect(eventSettled).toBe(false);
+      expect(harness.state.providerCalls).toBe(0);
+      releaseAdmission.resolve();
+      expect((await pendingEvent).value).toMatchObject({
+        type: "accepted",
+        queryId,
+        ordinal: 1,
+      });
+    } else {
+      let responseSettled = false;
+      void responsePromise.then(() => {
+        responseSettled = true;
+      });
+      await Promise.resolve();
+      expect(responseSettled).toBe(false);
+      expect(harness.state.providerCalls).toBe(0);
+      releaseAdmission.resolve();
+      response = await responsePromise;
+      expect(isAsyncIterable(response)).toBe(true);
+      stream = response[Symbol.asyncIterator]();
+      expect((await stream.next()).value).toMatchObject({
+        type: "accepted",
+        queryId,
+        ordinal: 1,
+      });
+    }
     expect(harness.store.startTurn.mock.calls[0][0].text).toBe(startPayload().text);
+    const remainingEvents = [];
+    for await (const event of stream) remainingEvents.push(event);
+    expect(terminal(remainingEvents)).toMatchObject({ type: "completed", queryId });
     expect(harness.state.providerCalls).toBe(1);
-    await stream.return();
   });
 
   it("recovers an admission whose commit acknowledgement was lost under the same query ID", async () => {

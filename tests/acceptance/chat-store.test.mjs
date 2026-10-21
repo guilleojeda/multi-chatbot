@@ -31,11 +31,14 @@ const profileSnapshot = {
 
 let createConversationStoreAdapter;
 
-function makeStore(send = vi.fn(async () => ({}))) {
+function makeStore(
+  send = vi.fn(async () => ({})),
+  now = () => Date.parse("2026-10-19T16:00:00.000Z"),
+) {
   const documentClient = { send };
   const store =
     typeof createConversationStoreAdapter === "function"
-      ? createConversationStoreAdapter({ documentClient, tableName })
+      ? createConversationStoreAdapter({ documentClient, tableName, now })
       : null;
   return { documentClient, store };
 }
@@ -47,6 +50,8 @@ function startInput(overrides = {}) {
     conversationId,
     queryId,
     now,
+    ownerAttemptId: "attempt-admitted",
+    resultDeadlineAt: now + 60 * 60 * 1000,
     text: "Armá una actividad de porcentajes.",
     profileSnapshot,
     invocation: {
@@ -167,6 +172,7 @@ function textChunk(ordinal, requestId, role, index, text) {
     conversationId,
     queryId: requestId,
     role,
+    ordinal,
     index,
     text,
   };
@@ -668,6 +674,7 @@ describe("the DynamoDB conversation store adapter", () => {
       queryId,
       ownerAttemptId: "attempt-a",
       code: "provider_error",
+      invocationClaimed: true,
       providerFinished: true,
       now: Date.parse("2026-10-19T17:00:01.000Z"),
     });
