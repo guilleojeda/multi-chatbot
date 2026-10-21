@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
 import path from "node:path";
@@ -25,9 +25,9 @@ async function runtimeEntryBundleUrl() {
   if (!runtimeEntryModulePromise) {
     runtimeEntryModulePromise = (async () => {
       const entryPath = path.join(projectRoot, "runtime/entry.ts");
-      const outputDirectory = mkdtempSync(
-        path.join(projectRoot, ".work/fase-5/http-entry-config-"),
-      );
+      const outputParentDirectory = path.join(projectRoot, ".work/test-artifacts");
+      mkdirSync(outputParentDirectory, { recursive: true });
+      const outputDirectory = mkdtempSync(path.join(outputParentDirectory, "http-entry-config-"));
       runtimeEntryBundleDirectories.add(outputDirectory);
       const result = await build({
         entryPoints: [entryPath],
