@@ -400,7 +400,10 @@ export function createChatHandler(dependencies: ChatDependencies) {
         return failureResponse(request, safeFailure("access_denied", "not_admitted"));
       }
     } catch {
-      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+      return failureResponse(
+        request,
+        safeFailure("temporarily_unavailable", "unconfirmed", request.queryId),
+      );
     }
 
     const profileKey = { sub, botId: config.botId };
@@ -408,7 +411,10 @@ export function createChatHandler(dependencies: ChatDependencies) {
     try {
       existing = await store.getSubmission({ ...profileKey, queryId: request.queryId });
     } catch {
-      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+      return failureResponse(
+        request,
+        safeFailure("temporarily_unavailable", "unconfirmed", request.queryId),
+      );
     }
     if (existing !== null) {
       if (!belongsToSubmittingIdentity(existing, { ...profileKey, queryId: request.queryId })) {

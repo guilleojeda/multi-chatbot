@@ -255,6 +255,16 @@ describe("continuation store ownership guard", () => {
     const turnUpdates = terminalActions.map(
       (actions) => actions.find(({ Update }) => Update?.Key?.sk === "TURN#00000004").Update,
     );
+    expect(
+      turnUpdates.map((update) => update.ConditionExpression.includes("#cursor = :cursor")),
+    ).toEqual([true, true]);
+    expect(turnUpdates.map((update) => update.ExpressionAttributeNames["#cursor"])).toEqual([
+      "cursor",
+      "cursor",
+    ]);
+    expect(turnUpdates.map((update) => update.ExpressionAttributeValues[":cursor"])).toEqual([
+      0, 1,
+    ]);
     expect(turnUpdates[0].ExpressionAttributeValues[":cursor"]).toBe(0);
     expect(turnUpdates[0].ExpressionAttributeValues[":manifest"]).toEqual({
       count: 0,
@@ -266,4 +276,113 @@ describe("continuation store ownership guard", () => {
       complete: false,
     });
   });
+
+  it.each([
+    { providerFinished: true, closesConversation: false },
+    { providerFinished: false, closesConversation: true },
+  ])(
+    "binds the cursor fence and keeps the terminal transaction atomic when providerFinished=$providerFinished",
+    async ({ providerFinished, closesConversation }) => {
+      const now = Date.parse("2026-10-20T12:10:00.000Z");
+      const turnRecord = {
+        pk: `CONV#${turn.conversationId}`,
+        sk: "TURN#00000004",
+        conversationId: turn.conversationId,
+        queryId: turn.queryId,
+        ordinal: 4,
+        status: "in_progress",
+        phase: "invocation_claimed",
+        ownerAttemptId: turn.ownerAttemptId,
+        resultDeadlineAt: turn.resultDeadlineAt,
+        cursor: 2,
+        answerManifest: { count: 2, complete: false },
+      };
+      const metaRecord = {
+        pk: `CONV#${turn.conversationId}`,
+        sk: "META",
+        conversationId: turn.conversationId,
+        sub: turn.sub,
+        botId: turn.botId,
+        lastOrdinal: 4,
+        activeQueryId: turn.queryId,
+        activeOwnerAttemptId: turn.ownerAttemptId,
+      };
+      const records = new Map(
+        [turnRecord, metaRecord].map((item) => [item.pk + "\u0000" + item.sk, item]),
+      );
+      const documentClient = {
+        send: vi.fn(async (command) => {
+          if (command instanceof GetCommand) {
+            const key = command.input.Key;
+            return { Item: records.get(key.pk + "\u0000" + key.sk) };
+          }
+          return {};
+        }),
+      };
+      const store = createConversationStoreAdapter({
+        documentClient,
+        tableName: "conversations-aurora-dev",
+      });
+
+      await store.failTurn({
+        conversationId: turn.conversationId,
+        ordinal: 4,
+        queryId: turn.queryId,
+        ownerAttemptId: turn.ownerAttemptId,
+        now,
+        code: "provider_error",
+        invocationClaimed: true,
+        providerFinished,
+      });
+
+      const command = documentClient.send.mock.calls
+        .map(([sent]) => sent)
+        .find((sent) => sent instanceof TransactWriteCommand);
+      expect(command).toBeInstanceOf(TransactWriteCommand);
+      expect(command.input.TransactItems).toHaveLength(2);
+      const turnUpdate = command.input.TransactItems.find(
+        ({ Update }) => Update?.Key?.sk === "TURN#00000004",
+      ).Update;
+      const metaUpdate = command.input.TransactItems.find(
+        ({ Update }) => Update?.Key?.sk === "META",
+      ).Update;
+
+      expect(turnUpdate.ConditionExpression).toContain("#cursor = :cursor");
+      expect(turnUpdate.ExpressionAttributeNames).toMatchObject({
+        "#status": "status",
+        "#phase": "phase",
+        "#queryId": "queryId",
+        "#ownerAttemptId": "ownerAttemptId",
+        "#cursor": "cursor",
+        "#resultDeadlineAt": "resultDeadlineAt",
+      });
+      expect(turnUpdate.ExpressionAttributeValues).toMatchObject({
+        ":inProgress": "in_progress",
+        ":expectedPhase": "invocation_claimed",
+        ":claimed": "invocation_claimed",
+        ":queryId": turn.queryId,
+        ":ownerAttemptId": turn.ownerAttemptId,
+        ":cursor": 2,
+        ":nowMs": now,
+        ":manifest": { count: 2, complete: false },
+      });
+      expect(turnUpdate.ConditionExpression).toContain("#status = :inProgress");
+      expect(turnUpdate.ConditionExpression).toContain("#phase = :expectedPhase");
+      expect(turnUpdate.ConditionExpression).toContain("#queryId = :queryId");
+      expect(turnUpdate.ConditionExpression).toContain("#resultDeadlineAt >= :nowMs");
+      expect(turnUpdate.ConditionExpression).toContain("#ownerAttemptId = :ownerAttemptId");
+      expect(metaUpdate.ConditionExpression).toContain("#activeOwnerAttemptId = :ownerAttemptId");
+      expect(metaUpdate.ExpressionAttributeValues[":queryId"]).toBe(turn.queryId);
+      expect(metaUpdate.ExpressionAttributeValues[":ownerAttemptId"]).toBe(turn.ownerAttemptId);
+      expect(metaUpdate.UpdateExpression).toContain("REMOVE #activeQueryId, #activeOwnerAttemptId");
+      expect(metaUpdate.UpdateExpression.includes("#closed = :true")).toBe(closesConversation);
+      if (closesConversation) {
+        expect(metaUpdate.ExpressionAttributeNames["#closed"]).toBe("closed");
+        expect(metaUpdate.ExpressionAttributeValues[":true"]).toBe(true);
+      } else {
+        expect(metaUpdate.ExpressionAttributeNames["#closed"]).toBeUndefined();
+        expect(metaUpdate.ExpressionAttributeValues[":true"]).toBeUndefined();
+      }
+    },
+  );
 });

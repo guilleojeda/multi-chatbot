@@ -1400,6 +1400,7 @@ export function createConversationStoreAdapter(input: {
           "#phase": "phase",
           "#queryId": "queryId",
           "#ownerAttemptId": "ownerAttemptId",
+          "#cursor": "cursor",
           "#resultDeadlineAt": "resultDeadlineAt",
           "#failure": "failure",
           "#failedAt": "failedAt",

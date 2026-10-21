@@ -205,7 +205,9 @@ export function ChatScreen({
       previousCopyTargetsRef.current.push(null);
     }
     previousCopyTargetsRef.current[previousTurns.length] =
-      state.queryStatus === "completed" && state.answer ? currentCopyTargetRef.current : null;
+      (state.queryStatus === "completed" || state.queryStatus === "failed") && state.answer
+        ? currentCopyTargetRef.current
+        : null;
     currentCopyTargetRef.current = null;
     setDraft("");
   }

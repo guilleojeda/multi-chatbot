@@ -109,7 +109,7 @@ export function ProfileApp({
       .catch((error: unknown) => {
         if (!isActive()) return;
         const apiError = asApiError(error);
-        if (apiError.status === 401 || apiError.refreshFailed) {
+        if (apiError.status === 401) {
           requestKindRef.current = null;
           invalidate();
           setState({ view: "loading", draft: emptyDraft(config), hasProfile: false });
@@ -247,7 +247,7 @@ export function ProfileApp({
     } catch (error) {
       if (!context.isActive()) return;
       const apiError = asApiError(error);
-      if (apiError.status === 401 || apiError.refreshFailed) {
+      if (apiError.status === 401) {
         requestKindRef.current = null;
         context.invalidate();
         setState({ view: "loading", draft: emptyDraft(config), hasProfile: false });

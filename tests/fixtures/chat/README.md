@@ -2,10 +2,12 @@
 
 This local fixture mounts the production `AccountApp`, profile screen, chat screen, and
 `createSession()` with deterministic in-memory Cognito, profile, and Runtime boundaries. It does not
-contact AWS. Cognito and profile state remain in the fixture instance; the fake Runtime stores its
-conversation records in a fixture-only `sessionStorage` key for the lifetime of the browser tab.
-That key is separate from the product recovery journal and contains only the simulated conversation,
-question, answer prefix, and status.
+contact AWS. Cognito and profile state remain in the fixture instance. `createSession()` uses a
+fixture-owned in-memory `Storage` map for its synthetic refresh token; that map is recreated on page
+reload. The product journal and the fake Runtime's conversation records use the browser's real
+`window.sessionStorage` for this tab and survive reloads. The Runtime records use a fixture-only key
+separate from the product recovery journal and contain only the simulated conversation, question,
+answer prefix, and status.
 The mock Runtime accepts `start` once per new conversation ID and `message` for later turns with
 that same ID. The sanitized request list and state JSON show the operation, ID, ordinal, and mock
 turns. The profile route saves edits in fixture memory so navigation can exercise the real profile
@@ -23,15 +25,18 @@ npx vite --config tests/fixtures/chat/vite.config.ts --host 127.0.0.1
 ```
 
 Open the local server URL printed by Vite. For navigation sequences, use a plain URL without a
-query string and select the scenario in the fixture controls. The fixture opens `/#/chat` with a
-restored test identity and complete profile. Choose a scenario before retrying an operation. The
-Runtime stream emits an accepted event and a text fragment immediately; use the fixture controls to emit more
-text, complete, fail, or close without a terminal event. `runtime-admission-pending` waits before
-accepted so “Enviando consulta…” and the submit lock can be inspected; click “Admitir consulta” to
-continue. The emitted answer includes accented text and blank lines for an exact copy check.
+query string and select the scenario in the fixture controls. For a scenario that must run during
+initialization or recovery, load it directly as `/?scenario=<name>#/chat` on the same origin and tab.
+The fixture opens `/#/chat` with a restored test identity and complete profile. Choose a scenario
+before retrying an operation. The Runtime stream emits an accepted event and a text fragment
+immediately; use the fixture controls to emit more text, complete, fail, or close without a terminal
+event. `runtime-admission-pending` waits before accepted so “Enviando consulta…” and the submit lock
+can be inspected; click “Admitir consulta” to continue. The emitted answer includes accented text and
+blank lines for an exact copy check.
 The fake producer records the question, answer prefix, and status before emitting each controlled
-event. Closing the route or aborting its SSE consumer leaves that producer and record available in
-the current fixture instance; a transport cancellation does not turn the record into a failure.
+event. Aborting its SSE consumer leaves the producer available in the current fixture instance; a
+transport cancellation does not turn the record into a failure. “Cerrar SSE antes de admitir” can
+close a held consumer while leaving the pending producer available for “Admitir consulta.”
 To exercise recovery, submit a query, click “Recargar pestaña y probar recuperación,” and inspect the
 request history after the page returns. The product journal should issue `recover` with the same
 conversation ID and query ID, receive JSON with the stored question/prefix/status, and avoid a new
@@ -50,16 +55,51 @@ reload the tab. Select `runtime-temporary`; the `recover` request returns HTTP 5
 the same `streaming` state and shows the retryable status error while retaining its reference. Select
 `ready` again; the next poll recovers the same prefix or terminal snapshot without a new `start`.
 This scenario applies the one 503 control to Runtime requests, including `recover`; it does not
-simulate a lost AWS process.
-After a completed exchange, send a follow-up and confirm the request list shows `message` with the
-same conversation ID and the next ordinal. While a stream is open, open “Mi perfil,” wait for the
-profile form, then return to chat and confirm the same partial answer and pending request remain;
-the fixture keeps the stream active while the product route changes. Save a profile edit and return
-to chat to exercise a fresh profile read. Alternatively, make a draft and discard it; the fixture's
-stored profile should retain the saved value. The mock cannot validate the server's context snapshot.
-To check a failed save, open the profile, edit a value, select `profile-save-error`, then save. The
-mock returns the profile API's 503 error without applying the update; its stored-profile value in the
-state JSON should still show the last saved profile.
+simulate a lost AWS process. `runtime-recover-network` instead rejects only a `recover` request with
+a network `TypeError`, leaving start/message requests unaffected.
+
+### Recovery and retry checks
+
+- **R2, uncertain result and exact retry:** select `runtime-unconfirmed` and submit a question. The
+  first Runtime POST returns the contract's `failed` result with code `temporarily_unavailable`,
+  `recordStatus: "unconfirmed"`, and its `queryId`; the fixture creates no conversation turn. Wait
+  for the automatic `recover` lookup to report `conversation_unavailable/not_admitted`. The composer
+  should retain the question and show “Reintentar el mismo envío.” In the product-journal JSON, the
+  entry remains unadmitted and includes the exact body. Select `ready`, then click the retry button.
+  Compare the two POST bodies: operation, conversation ID, query ID, base ordinal, and text must
+  match. There is no second admission request (`start` or `message`) or admitted turn before the
+  explicit click, apart from the automatic `recover` lookup; the retry admits one turn under the
+  original IDs.
+- **R2, lost acceptance event:** select `runtime-admission-pending` and submit a question. While
+  “Admisiones pendientes” is nonzero, click “Cerrar SSE antes de admitir,” then “Admitir consulta.”
+  The fake producer persists the turn but cannot deliver `accepted` to the disconnected consumer.
+  The product journal remains pending with its question. Reload the same origin at
+  `/?scenario=ready#/chat`. Recovery should show the stored question and prefix for the same IDs,
+  with no new `start`. The request history resets with the fixture instance, so after reload compare
+  its `recover` body with the IDs in `productJournal` and confirm there is no `start` in the new
+  history.
+- **R3, Cognito refresh network failure:** begin with an admitted query, then load the same origin
+  and tab at `/?scenario=cognito-refresh-network#/chat`. The real `createSession().restore()` makes
+  `REFRESH_TOKEN_AUTH`; the fixture rejects that Cognito call with `TypeError("Failed to fetch")`.
+  Initialization should show its retryable access error before sending `recover`, while the
+  admitted product-journal reference remains. Select `ready` in the fixture controls and click the
+  account screen's “Reintentar.” The new initialization should restore the synthetic identity and
+  recover the same query ID and snapshot, with no new `start`.
+- **R5, admitted journal and recover network failure:** begin with an accepted query and reload the
+  same origin and tab at `/?scenario=runtime-recover-network#/chat`. The first `recover` alone fails
+  with a network `TypeError`; the chat must retain its admitted streaming snapshot and show a
+  status message. It must not offer “Reintentar el mismo envío.” Select `ready` before the scheduled
+  poll (one second after the first failure). The next `recover` should return the same in-progress
+  snapshot and prefix. The request history should contain no new `start` or `message`.
+  After a completed exchange, send a follow-up and confirm the request list shows `message` with the
+  same conversation ID and the next ordinal. While a stream is open, open “Mi perfil,” wait for the
+  profile form, then return to chat and confirm the same partial answer and pending request remain;
+  the fixture keeps the stream active while the product route changes. Save a profile edit and return
+  to chat to exercise a fresh profile read. Alternatively, make a draft and discard it; the fixture's
+  stored profile should retain the saved value. The mock cannot validate the server's context snapshot.
+  To check a failed save, open the profile, edit a value, select `profile-save-error`, then save. The
+  mock returns the profile API's 503 error without applying the update; its stored-profile value in the
+  state JSON should still show the last saved profile.
 
 To exercise access loss while a stream is open, start a query and select `membership-denied` in the
 fixture controls before opening “Mi perfil.” The profile GET returns 403, so `AccountApp` should
@@ -159,6 +199,19 @@ use “Emitir fragmento” to confirm the answer continues; from profile, return
 existing `password-reset-failure` scenario still returns an immediate code mismatch on the recovery
 screen for checking its error message.
 
+**R4, reset and same-person re-entry:** with an admitted query visible, load the same origin
+and tab directly at `/?scenario=ready#/recover` so AccountApp mounts without first opening chat.
+Request a code and confirm a fixture-only password reset. Sign in again as identity A
+(`docente@example.test`) and open chat. The product journal must be empty and no request should
+recover or display the old query. The fixture's simulated Runtime record may still exist in its
+separate storage key; without the product reference it is not restored.
+
+**R4, logout and same-person re-entry:** with another admitted query present, load the same origin
+and tab directly at `/?scenario=ready#/login`. After session restoration, click “Cerrar sesión” on
+that same login route, sign in again as the same identity, and open chat. The old query should
+remain absent and the request history should contain no `recover` for it. This tests cleanup
+without a local chat owner and without relying on a subsequent hash change to clear storage.
+
 The reset and refresh gates are independent: changing the scenario does not discard an already
 pending HTTP 401, refresh, password-reset confirmation, sign-in, or clipboard Promise. To exercise
 a rejected reset while refresh is pending, start a chat send with `runtime-401-pending`, release
@@ -194,14 +247,22 @@ the current copy, then complete the previous copy; the current answer's error mu
 to that answer. Compare each queued text with its visible completed answer to check exact copying;
 the fixture never writes to the operating-system clipboard.
 
+**R6, failed copy of a partial while a follow-up starts:** submit question A with `ready`, let the
+first prefix appear, and click “Fallar generación.” Once A is visibly failed but continuable, select
+`clipboard-pending` and click “Copiar texto parcial.” Enter and submit question B. In the fixture
+controls, reject A's pending copy operation. The alert should appear under A after it moves into
+previous turns; B must have no copy alert. A remains labeled “Respuesta incompleta” and its
+historical block has no copy button.
+
 Append `?scenario=<name>` before the hash to select an initial scenario, for example
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
-`runtime-temporary`, `runtime-quota-daily`, `runtime-quota-monthly`, `runtime-quota-both`,
+`runtime-unconfirmed`, `runtime-temporary`, `runtime-recover-network`, `runtime-quota-daily`,
+`runtime-quota-monthly`, `runtime-quota-both`,
 `runtime-capacity-exceeded`, `runtime-token-count-unavailable`,
 `runtime-storage-capacity-exceeded`, `runtime-conversation-busy`, `runtime-stale-base`,
-`runtime-401`, `runtime-401-pending`,
+`runtime-401`, `runtime-401-pending`, `cognito-refresh-network`,
 `runtime-expired`, `runtime-forbidden`,
 `password-reset-pending`, `password-reset-failure`, `signout-pending`, `sign-in-pending`,
 `clipboard-fail`, and `clipboard-pending`. The selector also changes the scenario for the next

@@ -146,6 +146,13 @@ function FixtureControls() {
         </button>
         <button
           type="button"
+          disabled={!state.pendingAdmissions}
+          onClick={() => fixture.disconnectPendingStream()}
+        >
+          Cerrar SSE antes de admitir
+        </button>
+        <button
+          type="button"
           disabled={!state.admittedStreams}
           onClick={() => fixture.emitFragment()}
         >
