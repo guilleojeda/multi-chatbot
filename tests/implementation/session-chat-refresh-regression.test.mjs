@@ -12,7 +12,15 @@ const config = {
   runtimeQualifier: "DEFAULT",
 };
 const conversationId = "550e8400-e29b-41d4-a716-446655440000";
-const queryId = "query-001";
+const queryId = "550e8400-e29b-41d4-a716-446655440001";
+const chatRequest = {
+  version: 2,
+  operation: "message",
+  conversationId,
+  queryId,
+  baseOrdinal: 1,
+  text: "Seguimiento.",
+};
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -57,12 +65,16 @@ function frame(type, fields) {
   return `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
 }
 
-function completedStream() {
+function completedStream(request = chatRequest) {
   const encoder = new TextEncoder();
   const content = [
-    frame("accepted", { conversationId, queryId, ordinal: 1 }),
-    frame("text", { queryId, index: 0, text: "Respuesta" }),
-    frame("completed", { queryId }),
+    frame("accepted", {
+      conversationId: request.conversationId,
+      queryId: request.queryId,
+      ordinal: request.baseOrdinal + 1,
+    }),
+    frame("text", { queryId: request.queryId, index: 0, text: "Respuesta" }),
+    frame("completed", { queryId: request.queryId }),
   ].join("");
   const body = new ReadableStream({
     start(controller) {
@@ -121,17 +133,12 @@ describe("shared session refresh during a streamed chat request", () => {
       .mockResolvedValueOnce(new Response("{}", { status: 401 }))
       .mockImplementationOnce(async (_url, init) => {
         expect(new Headers(init.headers).get("authorization")).toBe("Bearer access-2");
-        return completedStream();
+        return completedStream(JSON.parse(init.body));
       });
     vi.stubGlobal("fetch", runtimeFetch);
 
     const onEvent = vi.fn();
-    const chat = streamChat(
-      config,
-      session,
-      { operation: "message", conversationId, text: "Seguimiento." },
-      { isActive: () => true, onEvent },
-    );
+    const chat = streamChat(config, session, chatRequest, { isActive: () => true, onEvent });
     await refreshStarted.promise;
 
     const routeInitialization = session.restore();
@@ -142,7 +149,7 @@ describe("shared session refresh during a streamed chat request", () => {
     refreshGate.resolve(cognitoResponse("access-2", "id-2", "refresh-2"));
     const [chatResult, routeTokens] = await Promise.all([chat, routeInitialization]);
 
-    expect(chatResult).toMatchObject({ status: "completed", conversationId, queryId, ordinal: 1 });
+    expect(chatResult).toMatchObject({ status: "completed", conversationId, queryId, ordinal: 2 });
     expect(routeTokens).toEqual({ accessToken: "access-2", idToken: "id-2" });
     expect(session.accessToken()).toBe("access-2");
     expect(session.idToken()).toBe("id-2");
@@ -184,12 +191,10 @@ describe("shared session refresh during a streamed chat request", () => {
 
     const runtimeFetch = vi.fn(async () => new Response("{}", { status: 401 }));
     vi.stubGlobal("fetch", runtimeFetch);
-    const chat = streamChat(
-      config,
-      session,
-      { operation: "message", conversationId, text: "Seguimiento." },
-      { isActive: () => session.accessToken() !== null, onEvent: vi.fn() },
-    );
+    const chat = streamChat(config, session, chatRequest, {
+      isActive: () => session.accessToken() !== null,
+      onEvent: vi.fn(),
+    });
     await refreshStarted.promise;
 
     await session.signOut();

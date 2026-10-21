@@ -1,7 +1,19 @@
 import { accessTokenSubject } from "../api/auth.js";
+import { createHash, randomUUID } from "node:crypto";
 import { isStoredProfile, type ProfileConfig, type StoredProfile } from "../config/profile.js";
 import type { MessageData } from "@strands-agents/sdk";
-import type { ContextReference, ConversationContext } from "./contracts.js";
+import type {
+  AppendChunkInput,
+  CompleteTurnInput,
+  ConversationMeta,
+  ConversationStore,
+  ContextReference,
+  FailTurnInput,
+  QuotaView,
+  StartTurnInput,
+  ContinueTurnInput,
+  SubmissionSnapshot,
+} from "./contracts.js";
 import { splitUtf8Text } from "./text.js";
 
 type ChatConfig = {
@@ -19,65 +31,6 @@ type ChatContext = {
 
 type ProfileStore = {
   getProfile(input: { sub: string; botId: string }): Promise<unknown>;
-};
-
-type ConversationStore = {
-  getMeta(input: { conversationId: string }): Promise<unknown | null>;
-  readContext(input: { conversationId: string }): Promise<ConversationContext>;
-  startTurn(input: {
-    sub: string;
-    botId: string;
-    conversationId: string;
-    queryId: string;
-    now: number;
-    text: string;
-    profileSnapshot: Record<string, unknown>;
-    invocation: { modelId: string; revision: string };
-  }): Promise<{ queryId: string; ordinal: number }>;
-  continueTurn(input: {
-    sub: string;
-    botId: string;
-    conversationId: string;
-    queryId: string;
-    now: number;
-    text: string;
-    profileSnapshot: Record<string, unknown>;
-    invocation: { modelId: string; revision: string };
-    expectedLastOrdinal: number;
-    contextReferences: ContextReference[];
-  }): Promise<{ queryId: string; ordinal: number }>;
-  appendChunk(input: {
-    conversationId: string;
-    ordinal: number;
-    queryId: string;
-    role: "assistant";
-    index: number;
-    text: string;
-    now: number;
-  }): Promise<void>;
-  completeTurn(input: {
-    conversationId: string;
-    ordinal: number;
-    queryId: string;
-    now: number;
-    answerManifest: { count: number; complete: true };
-    invocation: { modelId: string; revision: string };
-    stopReason: string;
-    requestId?: string;
-    metrics?: Record<string, number>;
-  }): Promise<void>;
-  failTurn(input: {
-    conversationId: string;
-    ordinal: number;
-    queryId: string;
-    now: number;
-    code: string;
-    answerManifest: { count: number; complete: false };
-    stopReason?: string;
-    requestId?: string;
-    metrics?: Record<string, number>;
-    providerError?: Record<string, unknown>;
-  }): Promise<void>;
 };
 
 type ProviderEvent =
@@ -114,31 +67,72 @@ type ChatDependencies = {
   store: ConversationStore;
   generate(input: ProviderInput): AsyncIterable<ProviderEvent>;
   now(): number;
-  newQueryId(): string;
 };
 
+type NewChatRequest = {
+  version: 2;
+  operation: "start" | "message";
+  conversationId: string;
+  queryId: string;
+  baseOrdinal: number;
+  text: string;
+};
+
+type RecoverRequest = {
+  version: 2;
+  operation: "recover";
+  conversationId: string;
+  queryId: string;
+};
+
+type ChatRequest = NewChatRequest | RecoverRequest;
+
+type ChatEvent =
+  | { type: "accepted"; conversationId: string; queryId: string; ordinal: number }
+  | { type: "text"; queryId: string; index: number; text: string }
+  | ReturnType<typeof safeFailure>
+  | { type: "completed"; queryId: string };
+
+type ChatResponse = Record<string, unknown> | AsyncIterable<ChatEvent>;
+
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const allowedPayloadKeys = new Set(["version", "operation", "conversationId", "text"]);
+const chatPayloadKeys = new Set([
+  "version",
+  "operation",
+  "conversationId",
+  "queryId",
+  "baseOrdinal",
+  "text",
+]);
+const recoverPayloadKeys = new Set(["version", "operation", "conversationId", "queryId"]);
 const responseBatchBytes = 8 * 1024;
 const responseBatchIntervalMs = 250;
+const resultDeadlineMs = 60 * 60 * 1000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isPayload(value: unknown): value is {
-  version: 1;
-  operation: "start" | "message";
-  conversationId: string;
-  text: string;
-} {
-  if (!isRecord(value) || Object.keys(value).some((key) => !allowedPayloadKeys.has(key)))
+function isChatRequest(value: unknown): value is ChatRequest {
+  if (!isRecord(value) || value.version !== 2) return false;
+  if (
+    typeof value.conversationId !== "string" ||
+    !uuidPattern.test(value.conversationId) ||
+    typeof value.queryId !== "string" ||
+    !uuidPattern.test(value.queryId)
+  ) {
     return false;
+  }
+  if (value.operation === "recover") {
+    return Object.keys(value).every((key) => recoverPayloadKeys.has(key));
+  }
   return (
-    value.version === 1 &&
     (value.operation === "start" || value.operation === "message") &&
-    typeof value.conversationId === "string" &&
-    uuidPattern.test(value.conversationId) &&
+    Object.keys(value).every((key) => chatPayloadKeys.has(key)) &&
+    typeof value.baseOrdinal === "number" &&
+    Number.isSafeInteger(value.baseOrdinal) &&
+    value.baseOrdinal >= 0 &&
+    (value.operation !== "start" || value.baseOrdinal === 0) &&
     typeof value.text === "string" &&
     value.text.trim().length > 0
   );
@@ -147,7 +141,7 @@ function isPayload(value: unknown): value is {
 function isOwnedConversationMeta(
   value: unknown,
   input: { conversationId: string; sub: string; botId: string },
-): value is Record<string, unknown> & { lastOrdinal: number } {
+): value is ConversationMeta {
   return (
     isRecord(value) &&
     value.conversationId === input.conversationId &&
@@ -234,6 +228,7 @@ function safeFailure(
   code: string,
   recordStatus: "not_admitted" | "failed" | "unconfirmed",
   queryId?: string,
+  details: { canContinue?: boolean; quota?: QuotaView } = {},
 ) {
   return {
     type: "failed" as const,
@@ -241,6 +236,8 @@ function safeFailure(
     message: "No pudimos completar la consulta. Podés volver a intentarlo desde un hilo nuevo.",
     recordStatus,
     ...(queryId ? { queryId } : {}),
+    ...(details.canContinue === undefined ? {} : { canContinue: details.canContinue }),
+    ...(details.quota ? { quota: details.quota } : {}),
   };
 }
 
@@ -273,13 +270,97 @@ function providerStopReason(value: unknown): string | undefined {
   return typeof value === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : undefined;
 }
 
-export function createChatHandler(dependencies: ChatDependencies) {
-  const { config, accounts, profiles, store, generate, now, newQueryId } = dependencies;
+function fingerprint(request: NewChatRequest): string {
+  const canonicalRequest = JSON.stringify([
+    request.operation,
+    request.conversationId,
+    request.baseOrdinal,
+    request.text,
+  ]);
+  return createHash("sha256").update(canonicalRequest).digest("hex");
+}
 
-  return async function* handler(payload: unknown, context: ChatContext) {
-    if (!isPayload(payload)) {
-      yield safeFailure("invalid_request", "not_admitted");
-      return;
+function publicSnapshot(
+  submission: SubmissionSnapshot,
+  quota?: QuotaView,
+): Record<string, unknown> {
+  return {
+    version: 2,
+    conversationId: submission.conversationId,
+    queryId: submission.queryId,
+    ordinal: submission.ordinal,
+    status: submission.status,
+    question: submission.question,
+    answer: submission.answer,
+    canContinue: submission.canContinue,
+    ...(quota ? { quota } : {}),
+  };
+}
+
+function matchesRequest(submission: SubmissionSnapshot, request: NewChatRequest): boolean {
+  return (
+    submission.operation === request.operation &&
+    submission.conversationId === request.conversationId &&
+    submission.queryId === request.queryId &&
+    submission.baseOrdinal === request.baseOrdinal &&
+    submission.question === request.text &&
+    submission.requestFingerprint === fingerprint(request)
+  );
+}
+
+function belongsToCaller(
+  submission: SubmissionSnapshot,
+  input: { sub: string; botId: string; conversationId: string; queryId: string },
+): boolean {
+  return (
+    submission.sub === input.sub &&
+    submission.botId === input.botId &&
+    submission.conversationId === input.conversationId &&
+    submission.queryId === input.queryId
+  );
+}
+
+function belongsToSubmittingIdentity(
+  submission: SubmissionSnapshot,
+  input: { sub: string; botId: string; queryId: string },
+): boolean {
+  return (
+    submission.sub === input.sub &&
+    submission.botId === input.botId &&
+    submission.queryId === input.queryId
+  );
+}
+
+function failureResponse(payload: unknown, failure: ReturnType<typeof safeFailure>): ChatResponse {
+  if (isRecord(payload) && payload.version === 2 && payload.operation === "recover") {
+    return failure;
+  }
+  return (async function* () {
+    yield failure;
+  })();
+}
+
+function errorCode(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+}
+
+function providerDispatch(input: {
+  revision: string;
+  botId: string;
+  sub: string;
+  conversationId: string;
+  queryId: string;
+  ownerAttemptId: string;
+}): void {
+  console.info(JSON.stringify({ event: "chat_provider_dispatch", ...input }));
+}
+
+export function createChatHandler(dependencies: ChatDependencies) {
+  const { config, accounts, profiles, store, generate, now } = dependencies;
+
+  return async function handler(payload: unknown, context: ChatContext): Promise<ChatResponse> {
+    if (!isChatRequest(payload)) {
+      return failureResponse(payload, safeFailure("invalid_request", "not_admitted"));
     }
     const request = payload;
     const sessionId = context.sessionId;
@@ -289,38 +370,58 @@ export function createChatHandler(dependencies: ChatDependencies) {
       sessionId !== request.conversationId ||
       (sessionHeader !== undefined && sessionHeader !== request.conversationId)
     ) {
-      yield safeFailure("invalid_request", "not_admitted");
-      return;
+      return failureResponse(request, safeFailure("invalid_request", "not_admitted"));
     }
 
     const sub = bearerSubject(context.headers?.authorization);
     if (!sub) {
-      yield safeFailure("unauthorized", "not_admitted");
-      return;
+      return failureResponse(request, safeFailure("unauthorized", "not_admitted"));
     }
 
     try {
       if (!(await accounts.hasMember({ sub, botId: config.botId }))) {
-        yield safeFailure("access_denied", "not_admitted");
-        return;
+        return failureResponse(request, safeFailure("access_denied", "not_admitted"));
       }
     } catch {
-      yield safeFailure("temporarily_unavailable", "not_admitted");
-      return;
+      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
     }
 
-    let meta: unknown | null;
+    const profileKey = { sub, botId: config.botId };
+    let existing: SubmissionSnapshot | null;
+    try {
+      existing = await store.getSubmission({ ...profileKey, queryId: request.queryId });
+    } catch {
+      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+    }
+    if (existing !== null) {
+      if (!belongsToSubmittingIdentity(existing, { ...profileKey, queryId: request.queryId })) {
+        return failureResponse(request, safeFailure("conversation_unavailable", "not_admitted"));
+      }
+      if (request.operation === "recover") {
+        return recoverSnapshot(existing, request, profileKey, store, now);
+      }
+      if (!matchesRequest(existing, request)) {
+        return failureResponse(request, safeFailure("conflict", "not_admitted", request.queryId));
+      }
+      return publicSnapshot(existing);
+    }
+    if (request.operation === "recover") {
+      return safeFailure("conversation_unavailable", "not_admitted", request.queryId);
+    }
+
+    let meta: ConversationMeta | null;
     try {
       meta = await store.getMeta({ conversationId: request.conversationId });
     } catch {
-      yield safeFailure("temporarily_unavailable", "not_admitted");
-      return;
+      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
     }
-    let ownerMeta: (Record<string, unknown> & { lastOrdinal: number }) | null = null;
+
     if (request.operation === "start") {
       if (meta !== null) {
-        yield safeFailure("conversation_unavailable", "not_admitted");
-        return;
+        return failureResponse(
+          request,
+          safeFailure("conversation_unavailable", "not_admitted", request.queryId),
+        );
       }
     } else {
       if (
@@ -330,27 +431,89 @@ export function createChatHandler(dependencies: ChatDependencies) {
           botId: config.botId,
         })
       ) {
-        yield safeFailure("conversation_unavailable", "not_admitted");
-        return;
+        return failureResponse(
+          request,
+          safeFailure("conversation_unavailable", "not_admitted", request.queryId),
+        );
       }
-      ownerMeta = meta;
+      if (meta.closed) {
+        return failureResponse(
+          request,
+          safeFailure("conversation_closed", "not_admitted", request.queryId, {
+            canContinue: false,
+          }),
+        );
+      }
+      if (meta.activeQueryId) {
+        let active: SubmissionSnapshot | null;
+        try {
+          active = await store.getSubmission({
+            ...profileKey,
+            queryId: meta.activeQueryId,
+          });
+        } catch {
+          return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+        }
+        if (
+          active &&
+          belongsToCaller(active, {
+            ...profileKey,
+            conversationId: request.conversationId,
+            queryId: meta.activeQueryId,
+          }) &&
+          active.status === "in_progress" &&
+          now() >= active.resultDeadlineAt
+        ) {
+          try {
+            await store.reconcileTurn({
+              ...profileKey,
+              conversationId: request.conversationId,
+              queryId: active.queryId,
+              now: now(),
+            });
+            meta = await store.getMeta({ conversationId: request.conversationId });
+          } catch {
+            return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+          }
+          if (
+            !isOwnedConversationMeta(meta, {
+              conversationId: request.conversationId,
+              sub,
+              botId: config.botId,
+            })
+          ) {
+            return failureResponse(
+              request,
+              safeFailure("conversation_unavailable", "not_admitted", request.queryId),
+            );
+          }
+        }
+        if (meta.activeQueryId) {
+          return failureResponse(
+            request,
+            safeFailure("conversation_busy", "not_admitted", request.queryId),
+          );
+        }
+      }
+      if (request.baseOrdinal !== meta.lastOrdinal) {
+        return failureResponse(request, safeFailure("stale_base", "not_admitted", request.queryId));
+      }
     }
 
-    const profileKey = { sub, botId: config.botId };
     let storedProfile: unknown;
     try {
       storedProfile = await profiles.getProfile(profileKey);
     } catch {
-      yield safeFailure("temporarily_unavailable", "not_admitted");
-      return;
+      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
     }
     if (storedProfile === null) {
-      yield safeFailure("profile_required", "not_admitted");
-      return;
+      return failureResponse(
+        request,
+        safeFailure("profile_required", "not_admitted", request.queryId),
+      );
     }
     if (!isStoredProfile(storedProfile, profileKey, config.profile)) {
-      yield safeFailure("temporarily_unavailable", "not_admitted");
-      return;
+      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
     }
 
     let messages: MessageData[] = [];
@@ -361,8 +524,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
         messages = context.messages;
         contextReferences = context.references;
       } catch {
-        yield safeFailure("temporarily_unavailable", "not_admitted");
-        return;
+        return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
       }
     }
 
@@ -373,47 +535,274 @@ export function createChatHandler(dependencies: ChatDependencies) {
       config.revision,
     );
     const invocation = { modelId: config.modelId, revision: config.revision };
-    let queryId: string;
+    const requestFingerprint = fingerprint(request);
+    const ownerAttemptId = randomUUID();
+    let admittedAt = now();
+    let quota: QuotaView;
     try {
-      queryId = newQueryId();
-      if (!uuidPattern.test(queryId)) throw new Error("Invalid query identifier.");
+      quota = await store.readQuota({ ...profileKey, now: admittedAt });
     } catch {
-      yield safeFailure("temporarily_unavailable", "not_admitted");
-      return;
+      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
     }
-
-    const turnInput = {
-      ...profileKey,
-      conversationId: request.conversationId,
-      queryId,
-      now: now(),
-      text: request.text,
-      profileSnapshot,
-      invocation,
+    const beforeAdmissionAt = now();
+    if (!quotaPeriodsMatch(quota, beforeAdmissionAt)) {
+      admittedAt = beforeAdmissionAt;
+      try {
+        quota = await store.readQuota({ ...profileKey, now: admittedAt });
+      } catch {
+        return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+      }
+    }
+    admittedAt = now();
+    if (!quotaPeriodsMatch(quota, admittedAt)) {
+      return failureResponse(
+        request,
+        safeFailure("temporarily_unavailable", "not_admitted", request.queryId),
+      );
+    }
+    let resultDeadlineAt = admittedAt + resultDeadlineMs;
+    const performAdmission = async (): Promise<{ queryId: string; ordinal: number }> => {
+      const admission = {
+        ...profileKey,
+        conversationId: request.conversationId,
+        queryId: request.queryId,
+        now: admittedAt,
+        resultDeadlineAt,
+        ownerAttemptId,
+        text: request.text,
+        profileSnapshot,
+        invocation,
+        quota,
+        requestFingerprint,
+      };
+      if (request.operation === "start") {
+        const startInput: StartTurnInput = {
+          ...admission,
+          operation: "start",
+          baseOrdinal: 0,
+        };
+        return store.startTurn(startInput);
+      }
+      const continueInput: ContinueTurnInput = {
+        ...admission,
+        operation: "message",
+        baseOrdinal: request.baseOrdinal,
+        expectedLastOrdinal: request.baseOrdinal,
+        contextReferences,
+      };
+      return store.continueTurn(continueInput);
     };
     let admitted: { queryId: string; ordinal: number };
     try {
-      if (request.operation === "start") {
-        admitted = await store.startTurn(turnInput);
-      } else if (ownerMeta !== null) {
-        admitted = await store.continueTurn({
-          ...turnInput,
-          expectedLastOrdinal: ownerMeta.lastOrdinal,
-          contextReferences,
-        });
-      } else {
-        yield safeFailure("conversation_unavailable", "not_admitted");
-        return;
+      try {
+        admitted = await performAdmission();
+      } catch (error) {
+        if (errorCode(error) !== "quota_period_changed") throw error;
+        admittedAt = now();
+        try {
+          quota = await store.readQuota({ ...profileKey, now: admittedAt });
+        } catch {
+          return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+        }
+        admittedAt = now();
+        if (!quotaPeriodsMatch(quota, admittedAt)) {
+          return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+        }
+        resultDeadlineAt = admittedAt + resultDeadlineMs;
+        admitted = await performAdmission();
       }
-    } catch {
-      yield safeFailure("temporarily_unavailable", "unconfirmed", queryId);
-      return;
+      if (
+        admitted.queryId !== request.queryId ||
+        !Number.isSafeInteger(admitted.ordinal) ||
+        admitted.ordinal <= 0
+      ) {
+        throw new Error("Admission returned an invalid turn identity.");
+      }
+    } catch (error) {
+      let persisted: SubmissionSnapshot | null = null;
+      try {
+        persisted = await store.getSubmission({ ...profileKey, queryId: request.queryId });
+      } catch {
+        // A failed read cannot establish whether the transaction committed.
+      }
+      if (
+        persisted &&
+        belongsToSubmittingIdentity(persisted, { ...profileKey, queryId: request.queryId })
+      ) {
+        if (matchesRequest(persisted, request)) return publicSnapshot(persisted);
+        return failureResponse(request, safeFailure("conflict", "not_admitted", request.queryId));
+      }
+      const code = errorCode(error);
+      if (code === "quota_period_changed") {
+        return failureResponse(
+          request,
+          safeFailure("temporarily_unavailable", "not_admitted", request.queryId),
+        );
+      }
+      if (code === "quota_exceeded") {
+        const suppliedQuota = isRecord(error) && isQuotaView(error.quota) ? error.quota : quota;
+        return failureResponse(
+          request,
+          safeFailure(code, "not_admitted", request.queryId, { quota: suppliedQuota }),
+        );
+      }
+      if (code === "conversation_busy" || code === "stale_base" || code === "conflict") {
+        return failureResponse(request, safeFailure(code, "not_admitted", request.queryId));
+      }
+      return failureResponse(
+        request,
+        safeFailure("temporarily_unavailable", "unconfirmed", request.queryId),
+      );
     }
 
-    const admittedQueryId = admitted.queryId;
+    return admittedStream({
+      config,
+      store,
+      generate,
+      now,
+      request,
+      sub,
+      ownerAttemptId,
+      admitted,
+      profileSnapshot,
+      invocation,
+      messages,
+      resultDeadlineAt,
+    });
+  };
+}
+
+export function createChatInvocationHandler(chat: ReturnType<typeof createChatHandler>) {
+  return {
+    async process(payload: unknown, context: ChatContext) {
+      const result = await chat(payload, context);
+      if (
+        typeof result !== "object" ||
+        result === null ||
+        !(Symbol.asyncIterator in result) ||
+        typeof result[Symbol.asyncIterator] !== "function"
+      ) {
+        return result;
+      }
+      return (async function* () {
+        for await (const event of result) {
+          yield { event: event.type, data: event };
+        }
+      })();
+    },
+  };
+}
+
+function isQuotaView(value: unknown): value is QuotaView {
+  if (!isRecord(value) || !isRecord(value.daily) || !isRecord(value.monthly)) return false;
+  return (
+    typeof value.daily.used === "number" &&
+    typeof value.daily.limit === "number" &&
+    typeof value.daily.resetAt === "number" &&
+    typeof value.daily.period === "string" &&
+    typeof value.monthly.used === "number" &&
+    typeof value.monthly.limit === "number" &&
+    typeof value.monthly.resetAt === "number" &&
+    typeof value.monthly.period === "string" &&
+    typeof value.serverNow === "number" &&
+    (value.blockedUntil === null || typeof value.blockedUntil === "number") &&
+    typeof value.policyRevision === "string"
+  );
+}
+
+function quotaPeriodsMatch(quota: QuotaView, timestamp: number): boolean {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Argentina/Cordoba",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(timestamp));
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return (
+    quota.daily.period === `${values.year}-${values.month}-${values.day}` &&
+    quota.monthly.period === `${values.year}-${values.month}`
+  );
+}
+
+async function recoverSnapshot(
+  initial: SubmissionSnapshot,
+  request: RecoverRequest,
+  owner: { sub: string; botId: string },
+  store: ConversationStore,
+  now: () => number,
+): Promise<Record<string, unknown>> {
+  let submission = initial;
+  if (
+    !belongsToCaller(submission, {
+      ...owner,
+      conversationId: request.conversationId,
+      queryId: request.queryId,
+    })
+  ) {
+    return safeFailure("conversation_unavailable", "not_admitted", request.queryId);
+  }
+  if (submission.status === "in_progress" && now() >= submission.resultDeadlineAt) {
+    try {
+      await store.reconcileTurn({
+        ...owner,
+        conversationId: request.conversationId,
+        queryId: request.queryId,
+        now: now(),
+      });
+      const latest = await store.getSubmission({ ...owner, queryId: request.queryId });
+      if (
+        !latest ||
+        !belongsToCaller(latest, {
+          ...owner,
+          conversationId: request.conversationId,
+          queryId: request.queryId,
+        })
+      ) {
+        return safeFailure("conversation_unavailable", "not_admitted", request.queryId);
+      }
+      submission = latest;
+    } catch {
+      return safeFailure("temporarily_unavailable", "not_admitted", request.queryId);
+    }
+  }
+  return publicSnapshot(submission);
+}
+
+function admittedStream(input: {
+  config: ChatConfig;
+  store: ConversationStore;
+  generate(input: ProviderInput): AsyncIterable<ProviderEvent>;
+  now(): number;
+  request: NewChatRequest;
+  sub: string;
+  ownerAttemptId: string;
+  admitted: { queryId: string; ordinal: number };
+  profileSnapshot: Record<string, unknown>;
+  invocation: { modelId: string; revision: string };
+  messages: MessageData[];
+  resultDeadlineAt: number;
+}): AsyncGenerator<ChatEvent, void, unknown> {
+  const {
+    config,
+    store,
+    generate,
+    now,
+    request,
+    sub,
+    ownerAttemptId,
+    admitted,
+    profileSnapshot,
+    invocation,
+    messages,
+    resultDeadlineAt,
+  } = input;
+
+  return (async function* () {
     let nextChunkIndex = 0;
     let completed = false;
     let failureRecorded = false;
+    let providerFinished = false;
+    let invocationClaimed = false;
     let failureCode = "provider_error";
     let finalResult: Extract<ProviderEvent, { type: "result" }> | undefined;
     let providerOutcome:
@@ -423,45 +812,162 @@ export function createChatHandler(dependencies: ChatDependencies) {
     let bufferedTextBytes = 0;
     let hasNonWhitespaceOutput = false;
     let lastFlushAt = performance.now();
+    let durableAnswer = "";
 
-    async function* flushText(): AsyncGenerator<{
-      type: "text";
-      queryId: string;
-      index: number;
-      text: string;
-    }> {
+    async function* flushText(): AsyncGenerator<Extract<ChatEvent, { type: "text" }>> {
       const batch = bufferedText;
       bufferedText = "";
       bufferedTextBytes = 0;
       lastFlushAt = performance.now();
       for (const text of splitUtf8Text(batch)) {
         const index = nextChunkIndex;
+        const appendInput: AppendChunkInput = {
+          conversationId: request.conversationId,
+          ordinal: admitted.ordinal,
+          queryId: admitted.queryId,
+          role: "assistant",
+          index,
+          text,
+          ownerAttemptId,
+          now: now(),
+        };
         try {
-          await store.appendChunk({
-            conversationId: request.conversationId,
-            ordinal: admitted.ordinal,
-            queryId: admittedQueryId,
-            role: "assistant",
-            index,
-            text,
-            now: now(),
-          });
-        } catch (error) {
+          await store.appendChunk(appendInput);
+        } catch {
           failureCode = "temporarily_unavailable";
-          throw error;
+          throw new Error("Could not confirm durable answer text.");
         }
         nextChunkIndex += 1;
-        yield { type: "text", queryId: admittedQueryId, index, text };
+        durableAnswer += text;
+        yield { type: "text", queryId: admitted.queryId, index, text };
       }
+    }
+
+    async function readOwnSubmission(): Promise<SubmissionSnapshot | null> {
+      return store.getSubmission({ sub, botId: config.botId, queryId: admitted.queryId });
+    }
+
+    async function persistFailure(
+      code: string,
+    ): Promise<
+      | { kind: "completed" }
+      | { kind: "failed"; recordStatus: "failed" | "unconfirmed"; canContinue: boolean }
+    > {
+      let recordStatus: "failed" | "unconfirmed" = "failed";
+      const failureInput: FailTurnInput = {
+        conversationId: request.conversationId,
+        ordinal: admitted.ordinal,
+        queryId: admitted.queryId,
+        ownerAttemptId,
+        now: now(),
+        code,
+        providerFinished,
+        invocationClaimed,
+        answerManifest: { count: nextChunkIndex, complete: false },
+        ...(providerOutcome?.stopReason ? { stopReason: providerOutcome.stopReason } : {}),
+        ...(providerOutcome?.requestId ? { requestId: providerOutcome.requestId } : {}),
+        ...(providerOutcome?.metrics ? { metrics: providerOutcome.metrics } : {}),
+        ...(providerFailure ? { providerError: providerFailure } : {}),
+      };
+      try {
+        await store.failTurn(failureInput);
+      } catch {
+        recordStatus = "unconfirmed";
+      }
+      try {
+        const latest = await readOwnSubmission();
+        if (
+          latest &&
+          belongsToCaller(latest, {
+            sub,
+            botId: config.botId,
+            conversationId: request.conversationId,
+            queryId: admitted.queryId,
+          })
+        ) {
+          if (
+            latest.status === "completed" &&
+            latest.answerManifest.complete &&
+            latest.cursor === latest.answerManifest.count
+          ) {
+            return { kind: "completed" };
+          }
+          if (latest.status === "failed") {
+            return {
+              kind: "failed",
+              recordStatus: "failed",
+              canContinue: latest.canContinue,
+            };
+          }
+        }
+      } catch {
+        recordStatus = "unconfirmed";
+      }
+      return {
+        kind: "failed",
+        recordStatus,
+        canContinue: providerFinished,
+      };
     }
 
     try {
       yield {
-        type: "accepted" as const,
+        type: "accepted",
         conversationId: request.conversationId,
-        queryId: admittedQueryId,
+        queryId: admitted.queryId,
         ordinal: admitted.ordinal,
       };
+
+      let claimed = false;
+      try {
+        claimed = await store.claimInvocation({
+          conversationId: request.conversationId,
+          ordinal: admitted.ordinal,
+          queryId: admitted.queryId,
+          ownerAttemptId,
+          now: now(),
+        });
+      } catch {
+        try {
+          const latest = await readOwnSubmission();
+          claimed =
+            latest?.status === "in_progress" &&
+            latest.stage === "invocation_claimed" &&
+            latest.ownerAttemptId === ownerAttemptId;
+        } catch {
+          // Do not invoke unless this attempt's persisted permission is confirmed.
+        }
+      }
+      if (!claimed) {
+        failureRecorded = true;
+        yield safeFailure("invocation_unconfirmed", "unconfirmed", admitted.queryId, {
+          canContinue: false,
+        });
+        return;
+      }
+      invocationClaimed = true;
+      if (now() >= resultDeadlineAt) {
+        const outcome = await persistFailure("result_timeout");
+        failureRecorded = true;
+        if (outcome.kind === "completed") {
+          completed = true;
+          yield { type: "completed", queryId: admitted.queryId };
+        } else {
+          yield safeFailure("result_timeout", outcome.recordStatus, admitted.queryId, {
+            canContinue: outcome.canContinue,
+          });
+        }
+        return;
+      }
+
+      providerDispatch({
+        revision: config.revision,
+        botId: config.botId,
+        sub,
+        conversationId: request.conversationId,
+        queryId: admitted.queryId,
+        ownerAttemptId,
+      });
       for await (const event of generate({
         systemPrompt: profilePrompt(profileSnapshot, config),
         profileSnapshot,
@@ -476,6 +982,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
         if (providerResult(event)) {
           if (finalResult) throw new Error("Provider returned more than one result.");
           finalResult = event;
+          providerFinished = true;
           if (typeof event.stopReason !== "string") throw new Error("Invalid provider result.");
           const metrics = providerMetrics(event.metrics);
           providerOutcome = {
@@ -490,6 +997,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
         }
         if (event.type === "error") {
           const stopReason = providerStopReason(event.stopReason);
+          if (stopReason) providerFinished = true;
           const metrics = providerMetrics(event.metrics);
           providerOutcome = {
             ...(stopReason ? { stopReason } : {}),
@@ -529,7 +1037,6 @@ export function createChatHandler(dependencies: ChatDependencies) {
         if (event.text.trim().length > 0) hasNonWhitespaceOutput = true;
         bufferedText += event.text;
         bufferedTextBytes += Buffer.byteLength(event.text, "utf8");
-        // Show the first text immediately, then batch by size or elapsed time.
         if (
           nextChunkIndex === 0 ||
           bufferedTextBytes >= responseBatchBytes ||
@@ -540,70 +1047,61 @@ export function createChatHandler(dependencies: ChatDependencies) {
       }
 
       yield* flushText();
-
       if (!finalResult || finalResult.stopReason !== "end_turn" || !hasNonWhitespaceOutput) {
         failureCode = "incomplete_response";
         throw new Error("Provider did not complete a non-empty answer.");
       }
+
       failureCode = "temporarily_unavailable";
-      await store.completeTurn({
+      const completionInput: CompleteTurnInput = {
         conversationId: request.conversationId,
         ordinal: admitted.ordinal,
-        queryId: admittedQueryId,
+        queryId: admitted.queryId,
+        ownerAttemptId,
         now: now(),
         answerManifest: { count: nextChunkIndex, complete: true },
         invocation,
         stopReason: providerOutcome?.stopReason ?? finalResult.stopReason,
         ...(providerOutcome?.requestId ? { requestId: providerOutcome.requestId } : {}),
         ...(providerOutcome?.metrics ? { metrics: providerOutcome.metrics } : {}),
-      });
-      completed = true;
-      yield { type: "completed" as const, queryId: admittedQueryId };
+      };
+      try {
+        await store.completeTurn(completionInput);
+        completed = true;
+      } catch {
+        const latest = await readOwnSubmission().catch(() => null);
+        completed = Boolean(
+          latest &&
+          latest.status === "completed" &&
+          latest.answer === durableAnswer &&
+          latest.answerManifest.complete &&
+          latest.answerManifest.count === nextChunkIndex &&
+          latest.cursor === nextChunkIndex,
+        );
+        if (!completed) throw new Error("Could not confirm the completed turn.");
+      }
+      yield { type: "completed", queryId: admitted.queryId };
     } catch {
       try {
         yield* flushText();
       } catch {
-        // The failed batch is neither durable nor emitted; the stored prefix remains authoritative.
+        failureCode = "temporarily_unavailable";
       }
       const code = failureCode;
-      let recordStatus: "failed" | "unconfirmed" = "failed";
-      try {
-        await store.failTurn({
-          conversationId: request.conversationId,
-          ordinal: admitted.ordinal,
-          queryId: admittedQueryId,
-          now: now(),
-          code,
-          answerManifest: { count: nextChunkIndex, complete: false },
-          ...(providerOutcome?.stopReason ? { stopReason: providerOutcome.stopReason } : {}),
-          ...(providerOutcome?.requestId ? { requestId: providerOutcome.requestId } : {}),
-          ...(providerOutcome?.metrics ? { metrics: providerOutcome.metrics } : {}),
-          ...(providerFailure ? { providerError: providerFailure } : {}),
-        });
-      } catch {
-        recordStatus = "unconfirmed";
-      }
+      const outcome = await persistFailure(code);
       failureRecorded = true;
-      yield safeFailure(code, recordStatus, admittedQueryId);
+      if (outcome.kind === "completed") {
+        completed = true;
+        yield { type: "completed", queryId: admitted.queryId };
+      } else {
+        yield safeFailure(code, outcome.recordStatus, admitted.queryId, {
+          canContinue: outcome.canContinue,
+        });
+      }
     } finally {
       if (!completed && !failureRecorded) {
-        try {
-          await store.failTurn({
-            conversationId: request.conversationId,
-            ordinal: admitted.ordinal,
-            queryId: admittedQueryId,
-            now: now(),
-            code: "stream_interrupted",
-            answerManifest: { count: nextChunkIndex, complete: false },
-            ...(providerOutcome?.stopReason ? { stopReason: providerOutcome.stopReason } : {}),
-            ...(providerOutcome?.requestId ? { requestId: providerOutcome.requestId } : {}),
-            ...(providerOutcome?.metrics ? { metrics: providerOutcome.metrics } : {}),
-            ...(providerFailure ? { providerError: providerFailure } : {}),
-          });
-        } catch {
-          // A closed consumer cannot receive an uncertainty event; the durable state remains authoritative.
-        }
+        await persistFailure("stream_interrupted");
       }
     }
-  };
+  })();
 }

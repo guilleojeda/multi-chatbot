@@ -7,7 +7,9 @@ const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const clientPath = path.join(projectRoot, "web/chat-api.ts");
 const publicApiPath = path.join(projectRoot, "web/api.ts");
 const conversationId = "550e8400-e29b-41d4-a716-446655440000";
-const queryId = "query-001";
+const queryId = "a4bfbc9f-3699-4a93-b120-a03c0204bc67";
+const secondQueryId = "b0d7cf70-ae36-49f4-a1b9-2837633a54ca";
+const thirdQueryId = "c166b6c3-5c0d-4b45-a9da-77b675bed25b";
 const config = {
   region: "us-east-1",
   userPoolId: "us-east-1_example",
@@ -51,13 +53,37 @@ function chunksOf(value, size = 1) {
   return chunks;
 }
 
-function successFrames(id = conversationId, requestId = queryId, answer = "¡Listo, maestra!") {
+function successFrames(
+  id = conversationId,
+  requestId = queryId,
+  answer = "¡Listo, maestra!",
+  ordinal = 1,
+) {
   return [
     ": keep-alive\n\n",
-    frame(event("accepted", { conversationId: id, queryId: requestId, ordinal: 1 })),
+    frame(event("accepted", { conversationId: id, queryId: requestId, ordinal })),
     frame(event("text", { queryId: requestId, index: 0, text: answer })),
     frame(event("completed", { queryId: requestId })),
   ];
+}
+
+function chatRequest(
+  text = "Una consulta.",
+  {
+    operation = "start",
+    conversationId: requestConversationId = conversationId,
+    queryId: requestQueryId = queryId,
+    baseOrdinal = operation === "message" ? 1 : 0,
+  } = {},
+) {
+  return {
+    version: 2,
+    operation,
+    conversationId: requestConversationId,
+    queryId: requestQueryId,
+    baseOrdinal,
+    text,
+  };
 }
 
 function makeSession({ token = "access-token", restore } = {}) {
@@ -111,9 +137,11 @@ function assertRuntimeRequest(call, token = "access-token", operation = "start")
 
   const body = JSON.parse(init.body);
   expect(body).toEqual({
-    version: 1,
+    version: 2,
     operation,
     conversationId,
+    queryId,
+    baseOrdinal: 0,
     text: "Armá una actividad de porcentajes.",
   });
   expect(JSON.stringify(body)).not.toMatch(/profile|historial|history|model|prompt/i);
@@ -149,7 +177,7 @@ describe("the direct Runtime chat client", () => {
     const result = await streamChat(
       config,
       session,
-      { operation: "start", conversationId, text: "Armá una actividad de porcentajes." },
+      chatRequest("Armá una actividad de porcentajes."),
       { isActive: () => true, onEvent },
     );
 
@@ -178,12 +206,10 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
     const received = [];
 
-    const result = await streamChat(
-      config,
-      makeSession(),
-      { operation: "start", conversationId, text: "Prepará un ejemplo." },
-      { isActive: () => true, onEvent: (item) => received.push(item) },
-    );
+    const result = await streamChat(config, makeSession(), chatRequest("Prepará un ejemplo."), {
+      isActive: () => true,
+      onEvent: (item) => received.push(item),
+    });
 
     expect(result).toMatchObject({ status: "completed" });
     expect(received.map(({ type }) => type)).toEqual(["accepted", "text", "completed"]);
@@ -210,12 +236,10 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
 
     await expect(
-      streamChat(
-        config,
-        makeSession(),
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, makeSession(), chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).resolves.toMatchObject({ status: "completed" });
   });
 
@@ -245,17 +269,12 @@ describe("the direct Runtime chat client", () => {
     const sawText = new Promise((resolve) => {
       resolveText = resolve;
     });
-    const request = streamChat(
-      config,
-      makeSession(),
-      { operation: "start", conversationId, text: "Escribí una consigna." },
-      {
-        isActive: () => true,
-        onEvent: (item) => {
-          if (item.type === "text") resolveText();
-        },
+    const request = streamChat(config, makeSession(), chatRequest("Escribí una consigna."), {
+      isActive: () => true,
+      onEvent: (item) => {
+        if (item.type === "text") resolveText();
       },
-    ).finally(() => {
+    }).finally(() => {
       finished = true;
     });
     const requestOutcome = request.then(
@@ -306,12 +325,10 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
     const received = [];
 
-    const result = await streamChat(
-      config,
-      makeSession(),
-      { operation: "start", conversationId, text: "Prepará una actividad." },
-      { isActive: () => true, onEvent: (item) => received.push(item) },
-    );
+    const result = await streamChat(config, makeSession(), chatRequest("Prepará una actividad."), {
+      isActive: () => true,
+      onEvent: (item) => received.push(item),
+    });
 
     expect(result).toMatchObject({
       status: "failed",
@@ -326,8 +343,6 @@ describe("the direct Runtime chat client", () => {
     const streamChat = await loadStreamChat();
     if (!streamChat) return;
 
-    const secondQueryId = "query-002";
-    const thirdQueryId = "query-003";
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(
@@ -361,18 +376,18 @@ describe("the direct Runtime chat client", () => {
       streamChat(
         config,
         makeSession(),
-        {
-          operation: "start",
-          conversationId,
-          text: "Prepará una actividad de porcentajes.",
-        },
+        chatRequest("Prepará una actividad de porcentajes."),
         options,
       ),
     ).resolves.toMatchObject({ status: "completed" });
     const failed = await streamChat(
       config,
       makeSession(),
-      { operation: "message", conversationId, text: "¿Podés aclarar el primer paso?" },
+      chatRequest("¿Podés aclarar el primer paso?", {
+        operation: "message",
+        queryId: secondQueryId,
+        baseOrdinal: 1,
+      }),
       options,
     );
     expect(failed).toMatchObject({ status: "failed", recordStatus: "failed" });
@@ -382,11 +397,11 @@ describe("the direct Runtime chat client", () => {
       streamChat(
         config,
         makeSession(),
-        {
+        chatRequest("Continuá con una consigna breve.", {
           operation: "message",
-          conversationId,
-          text: "Continuá con una consigna breve.",
-        },
+          queryId: thirdQueryId,
+          baseOrdinal: 2,
+        }),
         options,
       ),
     ).resolves.toMatchObject({ status: "completed" });
@@ -394,21 +409,27 @@ describe("the direct Runtime chat client", () => {
     expect(fetch).toHaveBeenCalledTimes(3);
     expect(fetch.mock.calls.map(([, init]) => JSON.parse(init.body))).toEqual([
       {
-        version: 1,
+        version: 2,
         operation: "start",
         conversationId,
+        queryId,
+        baseOrdinal: 0,
         text: "Prepará una actividad de porcentajes.",
       },
       {
-        version: 1,
+        version: 2,
         operation: "message",
         conversationId,
+        queryId: secondQueryId,
+        baseOrdinal: 1,
         text: "¿Podés aclarar el primer paso?",
       },
       {
-        version: 1,
+        version: 2,
         operation: "message",
         conversationId,
+        queryId: thirdQueryId,
+        baseOrdinal: 2,
         text: "Continuá con una consigna breve.",
       },
     ]);
@@ -435,11 +456,15 @@ describe("the direct Runtime chat client", () => {
       .mockResolvedValueOnce(
         streamResponse([
           frame(
-            event("accepted", { conversationId: restartedConversationId, queryId, ordinal: 1 }),
+            event("accepted", {
+              conversationId: restartedConversationId,
+              queryId: secondQueryId,
+              ordinal: 1,
+            }),
           ),
           frame(
             event("failed", {
-              queryId,
+              queryId: secondQueryId,
               code: "PERSISTENCE_UNCONFIRMED",
               message: "No pudimos confirmar el resultado.",
               recordStatus: "unconfirmed",
@@ -452,17 +477,16 @@ describe("the direct Runtime chat client", () => {
     const rejectedBeforeAdmission = await streamChat(
       config,
       makeSession(),
-      { operation: "start", conversationId, text: "Una consulta." },
+      chatRequest("Una consulta."),
       { isActive: () => true, onEvent: vi.fn() },
     );
     const uncertainAfterAdmission = await streamChat(
       config,
       makeSession(),
-      {
-        operation: "start",
+      chatRequest("Una consulta.", {
         conversationId: restartedConversationId,
-        text: "Una consulta.",
-      },
+        queryId: secondQueryId,
+      }),
       { isActive: () => true, onEvent: vi.fn() },
     );
 
@@ -479,6 +503,8 @@ describe("the direct Runtime chat client", () => {
     expect(requests[0].conversationId).toBe(conversationId);
     expect(requests[1].conversationId).toBe(restartedConversationId);
     expect(requests[1].conversationId).not.toBe(requests[0].conversationId);
+    expect(requests.map(({ queryId }) => queryId)).toEqual([queryId, secondQueryId]);
+    expect(requests.map(({ baseOrdinal }) => baseOrdinal)).toEqual([0, 0]);
   });
 
   it.each([
@@ -494,7 +520,7 @@ describe("the direct Runtime chat client", () => {
       "a different query id",
       [
         event("accepted", { conversationId, queryId, ordinal: 1 }),
-        event("text", { queryId: "another-query", index: 0, text: "wrong turn" }),
+        event("text", { queryId: secondQueryId, index: 0, text: "wrong turn" }),
         event("completed", { queryId }),
       ],
     ],
@@ -521,7 +547,7 @@ describe("the direct Runtime chat client", () => {
       "completion for another query",
       [
         event("accepted", { conversationId, queryId, ordinal: 1 }),
-        event("completed", { queryId: "another-query" }),
+        event("completed", { queryId: secondQueryId }),
       ],
     ],
   ])("rejects %s", async (_caseName, events) => {
@@ -532,12 +558,10 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
 
     await expect(
-      streamChat(
-        config,
-        makeSession(),
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, makeSession(), chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
   });
 
@@ -565,12 +589,10 @@ describe("the direct Runtime chat client", () => {
       restore: vi.fn(async () => ({ accessToken: "renewed", idToken: "id" })),
     });
     await expect(
-      streamChat(
-        config,
-        session,
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, session, chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(session.restore).not.toHaveBeenCalled();
@@ -595,12 +617,10 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
 
     await expect(
-      streamChat(
-        config,
-        makeSession(),
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, makeSession(), chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
   });
 
@@ -618,12 +638,10 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
 
     await expect(
-      streamChat(
-        config,
-        session,
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, session, chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(session.restore).not.toHaveBeenCalled();
@@ -645,13 +663,19 @@ describe("the direct Runtime chat client", () => {
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(new Response("", { status: 401 }))
-      .mockResolvedValueOnce(streamResponse(successFrames()));
+      .mockResolvedValueOnce(
+        streamResponse(successFrames(conversationId, secondQueryId, "¡Listo, maestra!", 2)),
+      );
     vi.stubGlobal("fetch", fetch);
 
     const result = await streamChat(
       config,
       session,
-      { operation: "message", conversationId, text: "Armá una actividad de porcentajes." },
+      chatRequest("Armá una actividad de porcentajes.", {
+        operation: "message",
+        queryId: secondQueryId,
+        baseOrdinal: 1,
+      }),
       { isActive: () => true, onEvent: vi.fn() },
     );
 
@@ -665,7 +689,17 @@ describe("the direct Runtime chat client", () => {
       "Bearer renewed-access",
     );
     expect(fetch.mock.calls[1][1].body).toBe(fetch.mock.calls[0][1].body);
-    expect(JSON.parse(fetch.mock.calls[1][1].body)).toMatchObject({ operation: "message" });
+    expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({
+      version: 2,
+      operation: "message",
+      conversationId,
+      queryId: secondQueryId,
+      baseOrdinal: 1,
+      text: "Armá una actividad de porcentajes.",
+    });
+    expect(JSON.parse(fetch.mock.calls[1][1].body)).toEqual(
+      JSON.parse(fetch.mock.calls[0][1].body),
+    );
   });
 
   it("does not send a request when the view is already inactive", async () => {
@@ -678,12 +712,10 @@ describe("the direct Runtime chat client", () => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     await expect(
-      streamChat(
-        config,
-        session,
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => false, onEvent: vi.fn() },
-      ),
+      streamChat(config, session, chatRequest("Una consulta."), {
+        isActive: () => false,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
     expect(session.restore).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
@@ -704,12 +736,10 @@ describe("the direct Runtime chat client", () => {
     const fetch = vi.fn(() => responsePending);
     vi.stubGlobal("fetch", fetch);
 
-    const request = streamChat(
-      config,
-      session,
-      { operation: "start", conversationId, text: "Una consulta." },
-      { isActive: () => active, onEvent: vi.fn() },
-    );
+    const request = streamChat(config, session, chatRequest("Una consulta."), {
+      isActive: () => active,
+      onEvent: vi.fn(),
+    });
     expect(fetch).toHaveBeenCalledTimes(1);
     active = false;
     resolveResponse(new Response("", { status: 401 }));
@@ -729,12 +759,10 @@ describe("the direct Runtime chat client", () => {
     const secondFetch = vi.fn(async () => new Response("", { status: 401 }));
     vi.stubGlobal("fetch", secondFetch);
     await expect(
-      streamChat(
-        config,
-        secondSession,
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, secondSession, chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
     expect(secondSession.restore).toHaveBeenCalledTimes(1);
     expect(secondFetch).toHaveBeenCalledTimes(2);
@@ -757,12 +785,10 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
 
     await expect(
-      streamChat(
-        config,
-        session,
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, session, chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
     expect(session.restore).toHaveBeenCalledTimes(1);
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -779,12 +805,10 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
 
     await expect(
-      streamChat(
-        config,
-        session,
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, session, chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(session.restore).not.toHaveBeenCalled();
@@ -802,12 +826,10 @@ describe("the direct Runtime chat client", () => {
     });
     vi.stubGlobal("fetch", fetch);
     await expect(
-      streamChat(
-        config,
-        session,
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, session, chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(session.restore).not.toHaveBeenCalled();
@@ -824,12 +846,10 @@ describe("the direct Runtime chat client", () => {
       ]),
     );
     await expect(
-      streamChat(
-        config,
-        session,
-        { operation: "start", conversationId, text: "Otra consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, session, chatRequest("Otra consulta.", { queryId: secondQueryId }), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).resolves.toMatchObject({ status: "failed", recordStatus: "not_admitted" });
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(session.restore).not.toHaveBeenCalled();
@@ -839,17 +859,15 @@ describe("the direct Runtime chat client", () => {
     const streamChat = await loadStreamChat();
     if (!streamChat) return;
 
-    const fetch = vi.fn(async () => streamResponse(successFrames()));
+    const fetch = vi.fn(async () => streamResponse(successFrames(conversationId, secondQueryId)));
     vi.stubGlobal("fetch", fetch);
     const noSession = makeSession();
     noSession.accessToken.mockReturnValue(null);
     await expect(
-      streamChat(
-        config,
-        noSession,
-        { operation: "start", conversationId, text: "Una consulta." },
-        { isActive: () => true, onEvent: vi.fn() },
-      ),
+      streamChat(config, noSession, chatRequest("Una consulta."), {
+        isActive: () => true,
+        onEvent: vi.fn(),
+      }),
     ).rejects.toBeInstanceOf(Error);
     expect(fetch).not.toHaveBeenCalled();
 
@@ -857,7 +875,7 @@ describe("the direct Runtime chat client", () => {
     await streamChat(
       config,
       makeSession(),
-      { operation: "start", conversationId, text: "Otra consulta." },
+      chatRequest("Otra consulta.", { queryId: secondQueryId }),
       { isActive: () => true, onEvent: vi.fn(), signal: abort.signal },
     );
     expect(fetch.mock.calls[0][1].signal).toBe(abort.signal);
@@ -877,7 +895,7 @@ describe("the direct Runtime chat client", () => {
     const pending = streamChat(
       config,
       makeSession(),
-      { operation: "start", conversationId, text: "Una consulta cancelada." },
+      chatRequest("Una consulta cancelada.", { queryId: secondQueryId }),
       { isActive: () => true, onEvent: vi.fn(), signal: cancelled.signal },
     );
     cancelled.abort();
@@ -900,18 +918,13 @@ describe("the direct Runtime chat client", () => {
     vi.stubGlobal("fetch", fetch);
     const received = [];
 
-    const outcome = await streamChat(
-      config,
-      makeSession(),
-      { operation: "start", conversationId, text: "Una consulta." },
-      {
-        isActive: () => active,
-        onEvent: (item) => {
-          received.push(item);
-          if (item.type === "accepted") active = false;
-        },
+    const outcome = await streamChat(config, makeSession(), chatRequest("Una consulta."), {
+      isActive: () => active,
+      onEvent: (item) => {
+        received.push(item);
+        if (item.type === "accepted") active = false;
       },
-    ).then(
+    }).then(
       (result) => ({ result }),
       (error) => ({ error }),
     );

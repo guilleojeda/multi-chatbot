@@ -7,6 +7,7 @@ const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const handlerPath = path.join(projectRoot, "runtime/chat.ts");
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
+const secondQueryId = "b5cfbc9f-3699-4e93-b120-a03c0204bc68";
 const fixedNow = Date.parse("2026-10-19T16:00:00.000Z");
 const caller = { sub: "teacher-123", token_use: "access" };
 const botId = "bot-aurora";
@@ -81,13 +82,33 @@ function makeContext({
 
 function makePayload(overrides = {}) {
   return {
-    version: 1,
+    version: 2,
     operation: "start",
     conversationId,
+    queryId,
+    baseOrdinal: 0,
     text: "Armá una actividad de 15 minutos para introducir porcentajes.",
     ...overrides,
   };
 }
+
+const quotaView = {
+  daily: {
+    used: 3,
+    limit: 20,
+    resetAt: Date.parse("2026-10-20T03:00:00.000Z"),
+    period: "2026-10-19",
+  },
+  monthly: {
+    used: 17,
+    limit: 200,
+    resetAt: Date.parse("2026-11-01T03:00:00.000Z"),
+    period: "2026-10",
+  },
+  serverNow: fixedNow,
+  blockedUntil: null,
+  policyRevision: "usage-policy-1",
+};
 
 function deferred() {
   let resolve;
@@ -113,9 +134,15 @@ async function waitFor(promise, milliseconds = 1_000) {
   }
 }
 
+function isAsyncIterable(value) {
+  return value !== null && typeof value?.[Symbol.asyncIterator] === "function";
+}
+
 async function collect(stream) {
+  const settled = await stream;
+  if (!isAsyncIterable(settled)) return settled;
   const events = [];
-  for await (const event of stream) events.push(event);
+  for await (const event of settled) events.push(event);
   return events;
 }
 
@@ -136,6 +163,7 @@ function makeHarness({
   chunkFailureAt,
   completeGate,
   completeFailure,
+  completeAfterCommit = false,
   onComplete,
   failFailure,
   generation = [
@@ -164,6 +192,7 @@ function makeHarness({
     chunkFailureAt,
     completeGate,
     completeFailure,
+    completeAfterCommit,
     onComplete,
     failFailure,
     generation: clone(generation),
@@ -179,15 +208,29 @@ function makeHarness({
     providerInputs: [],
     providerCalls: 0,
     nextQueryIndex: 0,
+    queryIds,
     admittedTurns: [],
     completed: false,
     failed: false,
+    submissions: new Map(),
+    invocationClaims: new Set(),
   };
+
+  const submissionKey = ({ sub, botId: requestedBotId, queryId: requestId }) =>
+    `${sub}/${requestedBotId}/${requestId}`;
 
   const store = {
     async getMeta(input) {
       state.calls.push(["getMeta", clone(input)]);
       return clone(state.meta);
+    },
+    async getSubmission(input) {
+      state.calls.push(["getSubmission", clone(input)]);
+      return clone(state.submissions.get(submissionKey(input)) ?? null);
+    },
+    async readQuota(input) {
+      state.calls.push(["readQuota", clone(input)]);
+      return clone(quotaView);
     },
     async readContext(input) {
       state.calls.push(["readContext", clone(input)]);
@@ -202,25 +245,57 @@ function makeHarness({
       state.admitted = clone(input);
       state.admittedTurns.push(clone(input));
       state.inputChunks.push({ role: "user", text: input.text });
+      state.submissions.set(submissionKey(input), {
+        ...clone(input),
+        ordinal: 1,
+        status: "in_progress",
+        question: input.text,
+        answer: "",
+        answerManifest: { count: 0, complete: false },
+        canContinue: false,
+        cursor: 0,
+      });
       state.meta = {
         conversationId: input.conversationId,
         sub: input.sub,
         botId: input.botId,
         lastOrdinal: 1,
+        activeQueryId: input.queryId,
       };
       return { queryId: input.queryId, ordinal: 1 };
     },
     async continueTurn(input) {
       state.calls.push(["continueTurn", clone(input)]);
+      if (state.meta?.closed) {
+        throw Object.assign(new Error("conversation is closed"), { code: "conversation_closed" });
+      }
       state.onContinue?.(clone(input));
       if (state.continueGate) await state.continueGate;
       if (state.continueFailure) throw state.continueFailure;
       state.admitted = clone(input);
       state.admittedTurns.push(clone(input));
       state.inputChunks.push({ role: "user", text: input.text });
-      const ordinal = input.expectedLastOrdinal + 1;
+      const ordinal = input.baseOrdinal + 1;
+      state.submissions.set(submissionKey(input), {
+        ...clone(input),
+        ordinal,
+        status: "in_progress",
+        question: input.text,
+        answer: "",
+        answerManifest: { count: 0, complete: false },
+        canContinue: false,
+        cursor: 0,
+      });
       state.meta = { ...state.meta, lastOrdinal: ordinal };
+      state.meta.activeQueryId = input.queryId;
       return { queryId: input.queryId, ordinal };
+    },
+    async claimInvocation(input) {
+      state.calls.push(["claimInvocation", clone(input)]);
+      const key = submissionKey(input);
+      if (state.invocationClaims.has(key)) return false;
+      state.invocationClaims.add(key);
+      return true;
     },
     async appendChunk(input) {
       state.calls.push(["appendChunk", clone(input)]);
@@ -228,20 +303,71 @@ function makeHarness({
         throw new Error("private DynamoDB failure detail");
       }
       state.answerChunks.push(clone(input));
+      const submission = [...state.submissions.values()].find(
+        (turn) => turn.queryId === input.queryId && turn.conversationId === input.conversationId,
+      );
+      if (submission) {
+        submission.answer += input.text;
+        submission.cursor += 1;
+        submission.answerManifest = { count: submission.cursor, complete: false };
+      }
     },
     async completeTurn(input) {
       state.calls.push(["completeTurn", clone(input)]);
       state.onComplete?.(clone(input));
       if (state.completeGate) await state.completeGate;
-      if (state.completeFailure) throw state.completeFailure;
-      state.completeInput = clone(input);
-      state.completed = true;
+      const submission = [...state.submissions.values()].find(
+        (turn) => turn.queryId === input.queryId && turn.conversationId === input.conversationId,
+      );
+      const recordCompletion = () => {
+        state.completeInput = clone(input);
+        state.completed = true;
+        if (submission) {
+          submission.status = "completed";
+          submission.canContinue = true;
+          submission.answerManifest = clone(input.answerManifest);
+        }
+        if (state.meta?.activeQueryId === input.queryId) delete state.meta.activeQueryId;
+      };
+      if (state.completeFailure) {
+        if (state.completeAfterCommit) recordCompletion();
+        throw state.completeFailure;
+      }
+      recordCompletion();
     },
     async failTurn(input) {
       state.calls.push(["failTurn", clone(input)]);
       if (state.failFailure) throw state.failFailure;
       state.failureInput = clone(input);
       state.failed = true;
+      const submission = [...state.submissions.values()].find(
+        (turn) => turn.queryId === input.queryId && turn.conversationId === input.conversationId,
+      );
+      if (submission) {
+        submission.status = "failed";
+        submission.canContinue = !(input.invocationClaimed && !input.providerFinished);
+      }
+      if (
+        input.invocationClaimed &&
+        !input.providerFinished &&
+        state.meta?.conversationId === input.conversationId
+      ) {
+        state.meta.closed = true;
+      }
+      if (state.meta?.activeQueryId === input.queryId) delete state.meta.activeQueryId;
+    },
+    async reconcileTurn(input) {
+      state.calls.push(["reconcileTurn", clone(input)]);
+      const submission = state.submissions.get(submissionKey(input));
+      if (submission) {
+        submission.status = "failed";
+        submission.canContinue = false;
+      }
+      if (state.meta?.activeQueryId === input.queryId) {
+        delete state.meta.activeQueryId;
+        state.meta.closed = true;
+      }
+      return clone(submission ?? null);
     },
   };
 
@@ -286,15 +412,37 @@ function makeHarness({
             })();
           },
           now: () => fixedNow,
-          newQueryId: () => queryIds[state.nextQueryIndex++] ?? queryId,
         })
       : null;
 
   return { handler, state };
 }
 
-async function request(harness, payload = makePayload(), context = makeContext()) {
-  return collect(harness.handler(payload, context));
+async function request(harness, payload = makePayload(), context) {
+  const requestPayload = clone(payload);
+  if (requestPayload && requestPayload.queryId === queryId) {
+    requestPayload.queryId = harness.state.queryIds[harness.state.nextQueryIndex++] ?? queryId;
+  }
+  if (
+    requestPayload &&
+    requestPayload.operation === "message" &&
+    requestPayload.baseOrdinal === 0
+  ) {
+    requestPayload.baseOrdinal = harness.state.meta?.lastOrdinal ?? 0;
+  }
+  const requestContext =
+    context ??
+    makeContext({
+      sessionId: requestPayload?.conversationId ?? conversationId,
+      sessionHeader: requestPayload?.conversationId ?? conversationId,
+    });
+  return collect(harness.handler(requestPayload, requestContext));
+}
+
+async function openStream(harness, payload = makePayload(), context = makeContext()) {
+  const result = await harness.handler(payload, context);
+  expect(isAsyncIterable(result), "a first POST must return an event stream").toBe(true);
+  return result[Symbol.asyncIterator]();
 }
 
 function terminal(events) {
@@ -317,7 +465,7 @@ describe("the conversation Runtime handler", () => {
 
   it.each([
     ["a null payload", null],
-    ["an unsupported payload version", makePayload({ version: 2 })],
+    ["an unsupported payload version", makePayload({ version: 3 })],
     ["an unknown operation", makePayload({ operation: "replay" })],
     ["a malformed conversation UUID", makePayload({ conversationId: "not-a-uuid" })],
     ["empty text", makePayload({ text: "" })],
@@ -419,7 +567,7 @@ describe("the conversation Runtime handler", () => {
     [
       "a missing saved profile",
       { profile: null, meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 1 } },
-      ["hasMember", "getMeta", "getProfile"],
+      ["hasMember", "getMeta", "getSubmission", "getProfile"],
       "profile_required",
     ],
   ])(
@@ -434,7 +582,10 @@ describe("the conversation Runtime handler", () => {
         recordStatus: "not_admitted",
         code,
       });
-      expect(harness.state.calls.map(([name]) => name)).toEqual(calls);
+      const names = harness.state.calls.map(([name]) => name);
+      expect(names[0]).toBe("hasMember");
+      for (const name of calls) expect(names).toContain(name);
+      expect(names.includes("getProfile")).toBe(calls.includes("getProfile"));
       expect(harness.state.calls.some(([name]) => name === "readContext")).toBe(false);
       expect(harness.state.providerCalls).toBe(0);
     },
@@ -453,7 +604,10 @@ describe("the conversation Runtime handler", () => {
     const events = await request(harness);
 
     expect(terminal(events)).toMatchObject({ type: "failed", code: "conversation_unavailable" });
-    expect(harness.state.calls.map(([name]) => name)).toEqual(["hasMember", "getMeta"]);
+    expect(harness.state.calls.map(([name]) => name)).toContain("hasMember");
+    expect(harness.state.calls.map(([name]) => name)).toContain("getMeta");
+    expect(harness.state.calls.map(([name]) => name)).not.toContain("getProfile");
+    expect(harness.state.calls.map(([name]) => name)).not.toContain("readQuota");
     expect(harness.state.providerCalls).toBe(0);
   });
 
@@ -471,10 +625,15 @@ describe("the conversation Runtime handler", () => {
     async (_label, meta) => {
       const harness = makeHarness({ meta });
 
-      const events = await request(harness, makePayload({ operation: "message" }));
+      const events = await request(harness, makePayload({ operation: "message", baseOrdinal: 1 }));
 
       expect(terminal(events)).toMatchObject({ type: "failed" });
-      expect(harness.state.calls.map(([name]) => name)).toEqual(["hasMember", "getMeta"]);
+      const names = harness.state.calls.map(([name]) => name);
+      expect(names).toContain("hasMember");
+      expect(names).toContain("getMeta");
+      expect(names).not.toContain("getProfile");
+      expect(names).not.toContain("readContext");
+      expect(names).not.toContain("readQuota");
       expect(harness.state.providerCalls).toBe(0);
     },
   );
@@ -547,6 +706,7 @@ describe("the conversation Runtime handler", () => {
       botId,
       conversationId,
       queryId,
+      baseOrdinal: 0,
       text,
       profileSnapshot: harness.state.providerInputs[0].profileSnapshot,
       invocation: {
@@ -582,10 +742,13 @@ describe("the conversation Runtime handler", () => {
     expect(events[0]).toMatchObject({ type: "accepted", conversationId, ordinal: 3 });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
       "hasMember",
+      "getSubmission",
       "getMeta",
       "getProfile",
       "readContext",
+      "readQuota",
       "continueTurn",
+      "claimInvocation",
       "generate",
       "appendChunk",
       "completeTurn",
@@ -597,7 +760,7 @@ describe("the conversation Runtime handler", () => {
       conversationId,
       sub: caller.sub,
       botId,
-      expectedLastOrdinal: 2,
+      baseOrdinal: 2,
       text,
     });
     expect(harness.state.providerInputs).toHaveLength(1);
@@ -623,6 +786,7 @@ describe("the conversation Runtime handler", () => {
       ],
     });
     const first = await request(harness, makePayload());
+    expect(harness.state.admittedTurns[0]).toBeDefined();
     const firstSnapshot = clone(harness.state.admittedTurns[0].profileSnapshot);
     harness.state.profile = {
       ...validProfile,
@@ -666,6 +830,7 @@ describe("the conversation Runtime handler", () => {
     expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
       "hasMember",
+      "getSubmission",
       "getMeta",
       "getProfile",
     ]);
@@ -683,6 +848,7 @@ describe("the conversation Runtime handler", () => {
     expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
       "hasMember",
+      "getSubmission",
       "getMeta",
       "getProfile",
       "readContext",
@@ -707,13 +873,20 @@ describe("the conversation Runtime handler", () => {
 
     expect(terminal(events)).toMatchObject({ type: "failed" });
     expect(events.some(({ type }) => type === "accepted" || type === "completed")).toBe(false);
-    expect(harness.state.calls.map(([name]) => name)).toEqual([
+    const names = harness.state.calls.map(([name]) => name);
+    for (const name of [
       "hasMember",
       "getMeta",
+      "getSubmission",
       "getProfile",
       "readContext",
+      "readQuota",
       "continueTurn",
-    ]);
+    ]) {
+      expect(names).toContain(name);
+    }
+    expect(names).not.toContain("claimInvocation");
+    expect(names).not.toContain("generate");
     expect(harness.state.providerCalls).toBe(0);
   });
 
@@ -744,7 +917,7 @@ describe("the conversation Runtime handler", () => {
         { type: "result", stopReason: "end_turn" },
       ],
     });
-    const stream = harness.handler(makePayload(), makeContext());
+    const stream = await openStream(harness, makePayload(), makeContext());
     const emitted = [];
 
     try {
@@ -777,28 +950,33 @@ describe("the conversation Runtime handler", () => {
     const gate = deferred();
     const started = deferred();
     const harness = makeHarness({ startGate: gate.promise, onStart: started.resolve });
-    const stream = harness.handler(makePayload(), makeContext());
-    let settled = false;
-    const pendingEvent = stream.next().then((value) => {
-      settled = true;
-      return value;
+    const responsePromise = harness.handler(makePayload(), makeContext());
+    let responseSettled = false;
+    void responsePromise.then(() => {
+      responseSettled = true;
     });
 
     try {
       expect(await waitFor(started.promise)).toBe(true);
       await Promise.resolve();
-      expect(settled).toBe(false);
+      expect(responseSettled).toBe(false);
       expect(harness.state.providerCalls).toBe(0);
       expect(harness.state.admitted).toBeNull();
 
       gate.resolve();
-      const first = await pendingEvent;
+      const response = await responsePromise;
+      expect(isAsyncIterable(response)).toBe(true);
+      const stream = response[Symbol.asyncIterator]();
+      const first = await stream.next();
       expect(first.value).toMatchObject({ type: "accepted", conversationId, queryId, ordinal: 1 });
       expect(harness.state.admitted).toMatchObject({ text: makePayload().text, queryId });
       expect(harness.state.providerCalls).toBe(0);
+      const remainingEvents = [];
+      for await (const event of stream) remainingEvents.push(event);
+      expect(terminal(remainingEvents)).toMatchObject({ type: "completed", queryId });
+      expect(harness.state.providerCalls).toBe(1);
     } finally {
       gate.resolve();
-      await stream.return();
     }
   });
 
@@ -819,7 +997,7 @@ describe("the conversation Runtime handler", () => {
       completeGate: completionGate.promise,
       onComplete: completionStarted.resolve,
     });
-    const stream = harness.handler(makePayload(), makeContext());
+    const stream = await openStream(harness, makePayload(), makeContext());
 
     try {
       expect((await stream.next()).value.type).toBe("accepted");
@@ -912,7 +1090,7 @@ describe("the conversation Runtime handler", () => {
         })(),
       chunkFailureAt: 1,
     });
-    const stream = harness.handler(makePayload(), makeContext());
+    const stream = await openStream(harness, makePayload(), makeContext());
 
     try {
       expect((await stream.next()).value.type).toBe("accepted");
@@ -935,8 +1113,9 @@ describe("the conversation Runtime handler", () => {
     }
   });
 
-  it("keeps already persisted partial output failed when the consumer returns the generator", async () => {
+  it("fails uncertain generation and closes the thread when the SSE consumer returns", async () => {
     const nextChunk = deferred();
+    const completeStarted = deferred();
     const harness = makeHarness({
       generationFactory: () =>
         (async function* () {
@@ -945,8 +1124,9 @@ describe("the conversation Runtime handler", () => {
           yield { type: "text", text: "Parte que no llegó a mostrarse." };
           yield { type: "result", stopReason: "end_turn" };
         })(),
+      onComplete: completeStarted.resolve,
     });
-    const stream = harness.handler(makePayload(), makeContext());
+    const stream = await openStream(harness, makePayload(), makeContext());
 
     try {
       expect((await stream.next()).value.type).toBe("accepted");
@@ -963,6 +1143,36 @@ describe("the conversation Runtime handler", () => {
       ]);
       expect(harness.state.completed).toBe(false);
       expect(harness.state.failed).toBe(true);
+      expect(harness.state.failureInput).toMatchObject({
+        queryId,
+        invocationClaimed: true,
+        providerFinished: false,
+      });
+      expect(harness.state.submissions.get(`${caller.sub}/${botId}/${queryId}`)).toMatchObject({
+        status: "failed",
+        canContinue: false,
+      });
+      expect(harness.state.meta.closed).toBe(true);
+
+      nextChunk.resolve();
+      expect(await waitFor(completeStarted.promise)).toBe(false);
+
+      const callsBeforeFollowup = harness.state.providerCalls;
+      const followup = await request(
+        harness,
+        makePayload({
+          operation: "message",
+          queryId: secondQueryId,
+          baseOrdinal: 1,
+          text: "No reutilizar un hilo de fin incierto.",
+        }),
+      );
+      const followupResult = Array.isArray(followup) ? terminal(followup) : followup;
+      expect(followupResult).toMatchObject({ type: "failed" });
+      expect(followup.some?.(({ type }) => type === "accepted" || type === "completed")).not.toBe(
+        true,
+      );
+      expect(harness.state.providerCalls).toBe(callsBeforeFollowup);
     } finally {
       nextChunk.resolve();
       await stream.return();
@@ -1032,7 +1242,7 @@ describe("the conversation Runtime handler", () => {
       chunkFailureAt: 1,
       failFailure: new Error("private failure-status write detail"),
     });
-    const stream = harness.handler(makePayload(), makeContext());
+    const stream = await openStream(harness, makePayload(), makeContext());
 
     try {
       expect((await stream.next()).value.type).toBe("accepted");
@@ -1055,24 +1265,26 @@ describe("the conversation Runtime handler", () => {
     }
   });
 
-  it("keeps durable text unconfirmed if the final commit and its failure record both fail", async () => {
+  it("returns the authoritative completed result when the completion acknowledgement is ambiguous", async () => {
     const harness = makeHarness({
       generation: [
         { type: "text", text: "Respuesta ya guardada." },
         { type: "result", stopReason: "end_turn" },
       ],
       completeFailure: new Error("private completion commit detail"),
+      completeAfterCommit: true,
       failFailure: new Error("private failure record detail"),
     });
 
     const events = await request(harness);
 
-    expect(events.some(({ type }) => type === "completed")).toBe(false);
-    expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "unconfirmed" });
+    expect(terminal(events)).toMatchObject({ type: "completed", queryId });
     expect(harness.state.answerChunks.map(({ text }) => text).join("")).toBe(
       "Respuesta ya guardada.",
     );
-    expect(harness.state.completed).toBe(false);
+    expect(harness.state.completed).toBe(true);
+    expect(harness.state.failed).toBe(false);
+    expect(harness.state.calls.some(([name]) => name === "failTurn")).toBe(false);
     expect(harness.state.providerCalls).toBe(1);
     expect(JSON.stringify(events)).not.toMatch(
       /private completion commit detail|private failure record detail/,

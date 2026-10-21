@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { PutCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
 
 const turn = {
@@ -8,6 +8,26 @@ const turn = {
   conversationId: "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9",
   queryId: "e54bd567-c9a1-49af-b204-8b69ef988a31",
   now: Date.parse("2026-10-20T12:00:00.000Z"),
+  ownerAttemptId: "attempt-followup",
+  resultDeadlineAt: Date.parse("2026-10-20T13:00:00.000Z"),
+  requestFingerprint: "fingerprint-followup",
+  quota: {
+    daily: {
+      used: 1,
+      limit: 20,
+      resetAt: Date.parse("2026-10-21T03:00:00.000Z"),
+      period: "2026-10-20",
+    },
+    monthly: {
+      used: 1,
+      limit: 200,
+      resetAt: Date.parse("2026-11-01T03:00:00.000Z"),
+      period: "2026-10",
+    },
+    serverNow: Date.parse("2026-10-20T12:00:00.000Z"),
+    blockedUntil: null,
+    policyRevision: "policy-r7",
+  },
   text: "Adaptá la actividad para un grupo que todavía no trabajó decimales.",
   profileSnapshot: {
     sub: "teacher-123",
@@ -34,11 +54,47 @@ function conditionValue(command, attribute) {
 }
 
 describe("continuation store ownership guard", () => {
-  it("compares the same owner, chatbot, conversation, and observed ordinal in its allocation transaction", async () => {
-    const documentClient = { send: vi.fn(async () => ({})) };
+  it("rejects a stored META record without its required owner fields", async () => {
+    const malformedMeta = {
+      pk: `CONV#${turn.conversationId}`,
+      sk: "META",
+      conversationId: turn.conversationId,
+      sub: turn.sub,
+      lastOrdinal: 3,
+    };
+    const documentClient = {
+      send: vi.fn(async (command) =>
+        command instanceof GetCommand ? { Item: malformedMeta } : {},
+      ),
+    };
     const store = createConversationStoreAdapter({
       documentClient,
       tableName: "conversations-aurora-dev",
+    });
+
+    await expect(store.getMeta({ conversationId: turn.conversationId })).rejects.toThrow(
+      "Conversation META record is malformed",
+    );
+  });
+
+  it("compares the same owner, chatbot, conversation, and observed ordinal in its allocation transaction", async () => {
+    const meta = {
+      pk: `CONV#${turn.conversationId}`,
+      sk: "META",
+      conversationId: turn.conversationId,
+      sub: turn.sub,
+      botId: turn.botId,
+      lastOrdinal: turn.expectedLastOrdinal,
+    };
+    const documentClient = {
+      send: vi.fn(async (command) =>
+        command instanceof GetCommand && command.input.Key.sk === "META" ? { Item: meta } : {},
+      ),
+    };
+    const store = createConversationStoreAdapter({
+      documentClient,
+      tableName: "conversations-aurora-dev",
+      now: () => turn.now,
     });
 
     await store.continueTurn({ ...turn, contextReferences: [] });
@@ -46,7 +102,9 @@ describe("continuation store ownership guard", () => {
     const commands = documentClient.send.mock.calls.map(([command]) => command);
     const transaction = commands.find((command) => command instanceof TransactWriteCommand);
     expect(transaction).toBeTruthy();
-    const update = transaction.input.TransactItems.find(({ Update }) => Update)?.Update;
+    const update = transaction.input.TransactItems.find(
+      ({ Update }) => Update?.Key?.sk === "META",
+    )?.Update;
     const put = transaction.input.TransactItems.find(({ Put }) => Put)?.Put;
     expect(update).toBeTruthy();
     expect(put).toBeTruthy();
@@ -65,7 +123,147 @@ describe("continuation store ownership guard", () => {
       profileSnapshot: turn.profileSnapshot,
     });
     expect(put.ConditionExpression).toMatch(/attribute_not_exists/);
-    expect(commands[0]).toBe(transaction);
-    expect(commands.some((command) => command instanceof PutCommand)).toBe(true);
+    expect(commands.indexOf(transaction)).toBeGreaterThan(0);
+    expect(commands.some((command) => command instanceof GetCommand)).toBe(true);
+    expect(
+      commands.every(
+        (command) => command instanceof GetCommand || command instanceof TransactWriteCommand,
+      ),
+    ).toBe(true);
+  });
+
+  it("re-reads and fences the failure prefix when an append wins after the first cursor read", async () => {
+    const now = Date.parse("2026-10-20T12:10:00.000Z");
+    const marker = {
+      pk: "USER#teacher-123#BOT#bot-aurora",
+      sk: "SEND#" + turn.queryId,
+      sub: turn.sub,
+      botId: turn.botId,
+      queryId: turn.queryId,
+      requestFingerprint: turn.requestFingerprint,
+      operation: "message",
+      baseOrdinal: 3,
+      conversationId: turn.conversationId,
+      ordinal: 4,
+      resultDeadlineAt: turn.resultDeadlineAt,
+    };
+    const turnRecord = {
+      pk: `CONV#${turn.conversationId}`,
+      sk: "TURN#00000004",
+      conversationId: turn.conversationId,
+      queryId: turn.queryId,
+      ordinal: 4,
+      requestFingerprint: turn.requestFingerprint,
+      operation: "message",
+      baseOrdinal: 3,
+      status: "in_progress",
+      phase: "invocation_claimed",
+      ownerAttemptId: "attempt-followup",
+      resultDeadlineAt: turn.resultDeadlineAt,
+      cursor: 0,
+      questionManifest: { count: 1, complete: true },
+      answerManifest: { count: 0, complete: false },
+      contextManifest: { count: 0, complete: true },
+      profileSnapshot: turn.profileSnapshot,
+      invocation: turn.invocation,
+    };
+    const meta = {
+      pk: `CONV#${turn.conversationId}`,
+      sk: "META",
+      conversationId: turn.conversationId,
+      sub: turn.sub,
+      botId: turn.botId,
+      lastOrdinal: 4,
+      activeQueryId: turn.queryId,
+      activeOwnerAttemptId: "attempt-followup",
+    };
+    const question = {
+      pk: `CONV#${turn.conversationId}`,
+      sk: `TURN#00000004#${turn.queryId}#USER#00000000`,
+      conversationId: turn.conversationId,
+      queryId: turn.queryId,
+      ordinal: 4,
+      role: "user",
+      index: 0,
+      text: turn.text,
+    };
+    const records = new Map(
+      [marker, turnRecord, meta, question].map((item) => [item.pk + "\u0000" + item.sk, item]),
+    );
+    const keyOf = (key) => key.pk + "\u0000" + key.sk;
+    let transactions = 0;
+    const documentClient = {
+      send: vi.fn(async (command) => {
+        if (command instanceof GetCommand) return { Item: records.get(keyOf(command.input.Key)) };
+        if (command instanceof QueryCommand) {
+          const values = command.input.ExpressionAttributeValues;
+          const prefix = values[":prefix"];
+          return {
+            Items: [...records.values()].filter(
+              (item) => item.pk === values[":pk"] && item.sk.startsWith(prefix),
+            ),
+          };
+        }
+        if (command instanceof TransactWriteCommand && transactions++ === 0) {
+          turnRecord.cursor = 1;
+          turnRecord.answerManifest = { count: 1, complete: false };
+          const answer = {
+            pk: `CONV#${turn.conversationId}`,
+            sk: `TURN#00000004#${turn.queryId}#ASSISTANT#00000000`,
+            conversationId: turn.conversationId,
+            queryId: turn.queryId,
+            ordinal: 4,
+            role: "assistant",
+            index: 0,
+            text: "Prefijo durable.",
+          };
+          records.set(keyOf({ pk: turnRecord.pk, sk: turnRecord.sk }), turnRecord);
+          records.set(keyOf({ pk: answer.pk, sk: answer.sk }), answer);
+          throw Object.assign(new Error("cursor changed during failure write"), {
+            name: "ConditionalCheckFailedException",
+          });
+        }
+        return {};
+      }),
+    };
+    const store = createConversationStoreAdapter({
+      documentClient,
+      tableName: "conversations-aurora-dev",
+      now: () => turn.now,
+    });
+
+    await store.failTurn({
+      conversationId: turn.conversationId,
+      ordinal: 4,
+      queryId: turn.queryId,
+      ownerAttemptId: "attempt-followup",
+      now,
+      code: "provider_error",
+      invocationClaimed: true,
+      providerFinished: false,
+    });
+
+    const writes = documentClient.send.mock.calls
+      .map(([command]) => command)
+      .filter((command) => command instanceof TransactWriteCommand);
+    expect(writes).toHaveLength(2);
+    const terminalActions = writes.map((command) => command.input.TransactItems);
+    for (const actions of terminalActions) {
+      expect(actions).toHaveLength(2);
+      expect(actions.some(({ Update }) => Update?.Key?.sk === "META")).toBe(true);
+    }
+    const turnUpdates = terminalActions.map(
+      (actions) => actions.find(({ Update }) => Update?.Key?.sk === "TURN#00000004").Update,
+    );
+    expect(turnUpdates[0].ExpressionAttributeValues[":cursor"]).toBe(0);
+    expect(turnUpdates[0].ExpressionAttributeValues[":manifest"]).toEqual({
+      count: 0,
+      complete: false,
+    });
+    expect(turnUpdates[1].ExpressionAttributeValues[":cursor"]).toBe(1);
+    expect(turnUpdates[1].ExpressionAttributeValues[":manifest"]).toEqual({
+      count: 1,
+      complete: false,
+    });
   });
 });

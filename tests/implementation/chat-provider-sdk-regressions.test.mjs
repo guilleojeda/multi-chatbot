@@ -13,6 +13,24 @@ const request = {
 };
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
+const fixedNow = Date.parse("2026-10-20T12:00:00.000Z");
+const quota = {
+  daily: {
+    used: 0,
+    limit: 20,
+    resetAt: Date.parse("2026-10-21T03:00:00.000Z"),
+    period: "2026-10-20",
+  },
+  monthly: {
+    used: 0,
+    limit: 200,
+    resetAt: Date.parse("2026-11-01T03:00:00.000Z"),
+    period: "2026-10",
+  },
+  serverNow: fixedNow,
+  blockedUntil: null,
+  policyRevision: "usage-policy-1",
+};
 
 const profileConfig = {
   fields: [
@@ -30,7 +48,8 @@ const profileConfig = {
 
 async function collect(source) {
   const events = [];
-  for await (const event of source) events.push(event);
+  const settled = await source;
+  for await (const event of settled) events.push(event);
   return events;
 }
 
@@ -76,7 +95,14 @@ function modelMessageEvents(stopReason, includeMetadata) {
 }
 
 function makeHandler() {
-  const state = { appended: [], failed: [], completed: [] };
+  const state = {
+    appended: [],
+    failed: [],
+    completed: [],
+    submission: null,
+    meta: null,
+    admitted: null,
+  };
   const profile = {
     sub: "teacher-123",
     botId: "bot-aurora",
@@ -104,24 +130,111 @@ function makeHandler() {
     },
     store: {
       async getMeta() {
-        return null;
+        return structuredClone(state.meta);
       },
-      async startTurn() {
+      async getSubmission(input) {
+        if (
+          !state.submission ||
+          state.submission.sub !== input.sub ||
+          state.submission.botId !== input.botId ||
+          state.submission.queryId !== input.queryId
+        ) {
+          return null;
+        }
+        return structuredClone(state.submission);
+      },
+      async readQuota() {
+        return structuredClone(quota);
+      },
+      async startTurn(input) {
+        state.admitted = structuredClone(input);
+        state.submission = {
+          sub: input.sub,
+          botId: input.botId,
+          conversationId: input.conversationId,
+          queryId: input.queryId,
+          requestFingerprint: input.requestFingerprint,
+          operation: "start",
+          baseOrdinal: 0,
+          ordinal: 1,
+          status: "in_progress",
+          stage: "admitted",
+          question: input.text,
+          questionManifest: { count: 1, complete: true },
+          contextReferences: [],
+          answer: "",
+          answerManifest: { count: 0, complete: false },
+          cursor: 0,
+          canContinue: false,
+          resultDeadlineAt: input.resultDeadlineAt,
+          profileSnapshot: structuredClone(input.profileSnapshot),
+          invocation: structuredClone(input.invocation),
+          ownerAttemptId: input.ownerAttemptId,
+        };
+        state.meta = {
+          conversationId: input.conversationId,
+          sub: input.sub,
+          botId: input.botId,
+          lastOrdinal: 1,
+          lastQueryId: input.queryId,
+          activeQueryId: input.queryId,
+          closed: false,
+        };
         return { queryId, ordinal: 1 };
+      },
+      async claimInvocation(input) {
+        if (
+          !state.submission ||
+          state.submission.status !== "in_progress" ||
+          state.submission.stage !== "admitted" ||
+          state.submission.ownerAttemptId !== input.ownerAttemptId ||
+          state.submission.queryId !== input.queryId
+        ) {
+          return false;
+        }
+        state.submission.stage = "invocation_claimed";
+        return true;
       },
       async appendChunk(input) {
         state.appended.push(input);
+        state.submission.answer += input.text;
+        state.submission.cursor = input.index + 1;
+        state.submission.answerManifest = { count: input.index + 1, complete: false };
       },
       async completeTurn(input) {
         state.completed.push(input);
+        state.submission.status = "completed";
+        state.submission.stage = "complete";
+        state.submission.canContinue = true;
+        state.submission.answerManifest = structuredClone(input.answerManifest);
+        if (state.meta?.activeQueryId === input.queryId) delete state.meta.activeQueryId;
       },
       async failTurn(input) {
         state.failed.push(input);
+        state.submission.status = "failed";
+        state.submission.stage = "failed";
+        state.submission.failure = { code: input.code };
+        state.submission.canContinue = !(input.invocationClaimed && !input.providerFinished);
+        state.submission.answerManifest = structuredClone(input.answerManifest);
+        if (input.invocationClaimed && !input.providerFinished && state.meta) {
+          state.meta.closed = true;
+        }
+        if (state.meta?.activeQueryId === input.queryId) delete state.meta.activeQueryId;
+      },
+      async reconcileTurn(input) {
+        if (state.submission?.queryId === input.queryId) {
+          const wasClaimed = state.submission.stage === "invocation_claimed";
+          state.submission.status = "failed";
+          state.submission.stage = "failed";
+          state.submission.failure = { code: "result_timeout" };
+          state.submission.canContinue = !wasClaimed;
+          if (wasClaimed && state.meta) state.meta.closed = true;
+          if (state.meta?.activeQueryId === input.queryId) delete state.meta.activeQueryId;
+        }
       },
     },
     generate: createStrandsGenerator({ region: "us-east-1" }),
-    now: () => Date.parse("2026-10-20T12:00:00.000Z"),
-    newQueryId: () => queryId,
+    now: () => fixedNow,
   });
   return { handler, state };
 }
@@ -171,7 +284,14 @@ describe("the real Strands/Bedrock provider stream contract", () => {
     await withModelStream(modelMessageEvents("maxTokens", true), async (streamCalls) => {
       const events = await collect(
         handler(
-          { version: 1, operation: "start", conversationId, text: request.text },
+          {
+            version: 2,
+            operation: "start",
+            conversationId,
+            queryId,
+            baseOrdinal: 0,
+            text: request.text,
+          },
           {
             sessionId: conversationId,
             headers: {
@@ -225,7 +345,14 @@ describe("the real Strands/Bedrock provider stream contract", () => {
       async (streamCalls) => {
         const events = await collect(
           handler(
-            { version: 1, operation: "start", conversationId, text: request.text },
+            {
+              version: 2,
+              operation: "start",
+              conversationId,
+              queryId,
+              baseOrdinal: 0,
+              text: request.text,
+            },
             {
               sessionId: conversationId,
               headers: {

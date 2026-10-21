@@ -33,7 +33,7 @@ Las pruebas con errores intencionales trabajan en copias y repositorios Git temp
 
 `tsconfig.web.json` comprueba TSX y tipos DOM; Vite transforma y empaqueta con el plugin React. Vitest utiliza esa transformación y mantiene su raíz en el repositorio. La infraestructura usa otra configuración TypeScript, NodeNext, y se ejecuta compilada a JavaScript.
 
-La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes` y define sus campos y opciones de perfil. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo. Una persona autorizada guarda su perfil y hace una consulta docente o pide un material como texto copiable. Puede continuar el mismo hilo y navegar a su perfil sin perder una respuesta en curso. El siguiente envío usa los cambios de perfil ya guardados. Recargar inicia un chat vacío; todavía no hay historial recuperable. Ver [cuenta e invitaciones](docs/intent/account.md), [perfil y preferencias](docs/intent/profile.md) y [chat, datos y fallos](docs/intent/chat.md).
+La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes` y define sus campos y opciones de perfil. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo. Una persona autorizada guarda su perfil y hace una consulta docente o pide un material como texto copiable. Puede continuar el mismo hilo y navegar a su perfil sin perder una respuesta en curso. El siguiente envío usa los cambios de perfil ya guardados. Cada persona dispone inicialmente de 20 consultas diarias y 200 mensuales por chatbot, con períodos de Argentina. Un envío admitido consume aunque falle; repetir el mismo ID no vuelve a consumir ni generar. Recargar inicia un chat vacío; todavía no hay historial recuperable. Ver [cuenta e invitaciones](docs/intent/account.md), [perfil y preferencias](docs/intent/profile.md) y [chat, datos y fallos](docs/intent/chat.md).
 
 Para usar el sitio localmente:
 
@@ -84,6 +84,22 @@ La identidad debe devolver **118903272638**. Para una sesión proporcionada como
 Usar una [AWS CLI v2 actual](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) o SDK vigente para las operaciones de control. La consulta `bedrock get-foundation-model-availability --model-id anthropic.claude-sonnet-4-6 --region us-east-1` informa autorización, acuerdo, entitlement y región por separado; estos estados no prueban una inferencia. Los permisos de Runtime se comprueban con el recorrido real del chat y sus registros.
 
 Los archivos `.env` locales, credenciales, dependencias, `.work/` y salidas generadas quedan fuera de Git. Los ejemplos explícitos `.env.example` pueden versionarse sin secretos. La configuración pública y el lockfile sí se versionan. No hay secretos AWS estáticos en Actions: el pipeline utiliza OIDC.
+
+## Inicializar cupos de desarrollo
+
+Con la cuenta `118903272638` y región `us-east-1` verificadas, crear la política una sola vez en la tabla conversacional existente:
+
+```sh
+aws dynamodb put-item --region us-east-1 \
+  --table-name multi-chatbot-dev-docentes-conversations \
+  --item '{"pk":{"S":"BOT#docentes"},"sk":{"S":"QUOTA#POLICY"},"dailyLimit":{"N":"20"},"monthlyLimit":{"N":"200"},"revision":{"S":"initial-20-200-v1"}}' \
+  --condition-expression 'attribute_not_exists(pk)'
+aws dynamodb get-item --region us-east-1 \
+  --table-name multi-chatbot-dev-docentes-conversations --consistent-read \
+  --key '{"pk":{"S":"BOT#docentes"},"sk":{"S":"QUOTA#POLICY"}}'
+```
+
+Si ya existe, el primer comando devuelve `ConditionalCheckFailedException`; leer y validar el registro existente sin sobrescribirlo. Los límites deben ser enteros no negativos y la revisión una cadena no vacía. Repetir esta preparación conserva política y consumos. Para cambiar límites, actualizar explícitamente la política con una nueva revisión, conservando los contadores; los pedidos nuevos usan el cambio. Una política ausente o inválida impide admitir sin consumir. No hay interfaz administrativa ni tarea de reinicio de cupos. Ver [contrato del chat](docs/intent/chat.md).
 
 ## CDK y entrega
 

@@ -1,17 +1,26 @@
 import {
   GetCommand,
-  PutCommand,
   QueryCommand,
   TransactWriteCommand,
   UpdateCommand,
   type DynamoDBDocumentClient,
 } from "@aws-sdk/lib-dynamodb";
 import type { MessageData } from "@strands-agents/sdk";
-import type { ContextReference, ConversationContext } from "./contracts.js";
+import type {
+  AppendChunkInput,
+  CompleteTurnInput,
+  ContextReference,
+  ConversationContext,
+  ConversationMeta,
+  ContinueTurnInput,
+  FailTurnInput,
+  QuotaView,
+  StartTurnInput,
+  SubmissionSnapshot,
+  TurnManifest,
+} from "./contracts.js";
 import { maxDynamoTextChunkBytes, splitUtf8Text } from "./text.js";
 
-type ProfileSnapshot = Record<string, unknown>;
-type Invocation = { modelId: string; revision?: string };
 type ChunkRole = "user" | "assistant";
 type TextChunk = { index: number; text: string };
 
@@ -21,23 +30,31 @@ const chunkPrefixPattern = /^TURN#(\d+)#/;
 const chunkRecordPattern = /^TURN#(\d+)#([0-9a-f-]{36})#(USER|ASSISTANT)#(\d+)$/i;
 const contextChunkRecordPattern = /^TURN#(\d+)#CONTEXT#(\d+)$/;
 
-type StartTurnInput = {
-  sub: string;
-  botId: string;
-  conversationId: string;
-  queryId: string;
-  now: number;
-  text: string;
-  profileSnapshot: ProfileSnapshot;
-  invocation: Invocation;
-};
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isPositiveSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isConversationMeta(value: unknown, conversationId: string): value is ConversationMeta {
+  return (
+    isRecord(value) &&
+    value.pk === `CONV#${conversationId}` &&
+    value.sk === "META" &&
+    value.conversationId === conversationId &&
+    typeof value.sub === "string" &&
+    value.sub.length > 0 &&
+    typeof value.botId === "string" &&
+    value.botId.length > 0 &&
+    isPositiveSafeInteger(value.lastOrdinal) &&
+    (value.lastQueryId === undefined ||
+      (typeof value.lastQueryId === "string" && value.lastQueryId.length > 0)) &&
+    (value.activeQueryId === undefined ||
+      (typeof value.activeQueryId === "string" && value.activeQueryId.length > 0)) &&
+    (value.closed === undefined || typeof value.closed === "boolean")
+  );
 }
 
 function manifestCount(value: unknown): number | null {
@@ -58,6 +75,32 @@ function contextManifestCount(value: unknown): number | null {
     return null;
   }
   return value.count;
+}
+
+function partialManifestCount(value: unknown): number | null {
+  if (
+    !isRecord(value) ||
+    typeof value.complete !== "boolean" ||
+    typeof value.count !== "number" ||
+    !Number.isSafeInteger(value.count) ||
+    value.count < 0
+  ) {
+    return null;
+  }
+  return value.count;
+}
+
+function assemblePrefix(fragments: TextChunk[], count: number, queryId: string): string {
+  if (fragments.length !== count) {
+    throw new Error(`Conversation query ${queryId} has an incomplete answer prefix.`);
+  }
+  const ordered = [...fragments].sort((left, right) => left.index - right.index);
+  for (let index = 0; index < count; index += 1) {
+    if (ordered[index].index !== index) {
+      throw new Error(`Conversation query ${queryId} has an invalid answer cursor.`);
+    }
+  }
+  return ordered.map(({ text }) => text).join("");
 }
 
 function assembleText(
@@ -362,10 +405,235 @@ function encodeContextReferences(references: ContextReference[], targetOrdinal: 
 export function createConversationStoreAdapter(input: {
   documentClient: DynamoDBDocumentClient;
   tableName: string;
+  now?: () => number;
 }) {
   const { documentClient, tableName } = input;
+  const currentTime = input.now ?? Date.now;
+  const zone = "America/Argentina/Cordoba";
+  const itemLimit = 400 * 1024;
+  const transactionLimit = 4 * 1024 * 1024;
+  const actionLimit = 100;
+  const resultDeadlineMs = 60 * 60 * 1000;
+  const timeFormatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: zone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
 
-  async function putChunk(chunk: {
+  function storeError(
+    code:
+      | "quota_exceeded"
+      | "conversation_busy"
+      | "stale_base"
+      | "conflict"
+      | "quota_period_changed"
+      | "submission_exists",
+    message: string,
+    quota?: QuotaView,
+  ): Error & { code: string; quota?: QuotaView } {
+    const error = new Error(message) as Error & { code: string; quota?: QuotaView };
+    error.code = code;
+    if (quota) error.quota = quota;
+    return error;
+  }
+
+  function partsAt(instant: number): Record<string, number> {
+    if (!Number.isFinite(instant)) throw new TypeError("Quota time must be a finite timestamp.");
+    const parts = Object.fromEntries(
+      timeFormatter
+        .formatToParts(new Date(instant))
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, Number(part.value)]),
+    );
+    return {
+      year: parts.year,
+      month: parts.month,
+      day: parts.day,
+      hour: parts.hour,
+      minute: parts.minute,
+      second: parts.second,
+    };
+  }
+
+  function calendarDate(instant: number): { year: number; month: number; day: number } {
+    const parts = partsAt(instant);
+    return { year: parts.year, month: parts.month, day: parts.day };
+  }
+
+  function localDateString(date: { year: number; month: number; day: number }): string {
+    return (
+      String(date.year).padStart(4, "0") +
+      "-" +
+      String(date.month).padStart(2, "0") +
+      "-" +
+      String(date.day).padStart(2, "0")
+    );
+  }
+
+  function localDateToInstant(date: { year: number; month: number; day: number }): number {
+    const wanted = Date.UTC(date.year, date.month - 1, date.day, 0, 0, 0, 0);
+    let candidate = wanted;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const local = partsAt(candidate);
+      const observed = Date.UTC(
+        local.year,
+        local.month - 1,
+        local.day,
+        local.hour,
+        local.minute,
+        local.second,
+        0,
+      );
+      const correction = wanted - observed;
+      candidate += correction;
+      if (correction === 0) break;
+    }
+    return candidate;
+  }
+
+  function localPeriods(instant: number) {
+    const current = calendarDate(instant);
+    const nextDay = new Date(Date.UTC(current.year, current.month - 1, current.day + 1));
+    const nextMonth = new Date(Date.UTC(current.year, current.month, 1));
+    const dayPeriod = localDateString(current);
+    const monthPeriod =
+      String(current.year).padStart(4, "0") + "-" + String(current.month).padStart(2, "0");
+    return {
+      day: {
+        period: dayPeriod,
+        resetAt: localDateToInstant({
+          year: nextDay.getUTCFullYear(),
+          month: nextDay.getUTCMonth() + 1,
+          day: nextDay.getUTCDate(),
+        }),
+      },
+      month: {
+        period: monthPeriod,
+        resetAt: localDateToInstant({
+          year: nextMonth.getUTCFullYear(),
+          month: nextMonth.getUTCMonth() + 1,
+          day: 1,
+        }),
+      },
+    };
+  }
+
+  function numberSize(value: number): number {
+    if (!Number.isFinite(value))
+      throw new TypeError("DynamoDB items cannot contain non-finite numbers.");
+    const digits = String(Math.abs(value))
+      .split(/[eE]/)[0]
+      .replace(/[^0-9]/g, "")
+      .replace(/^0+|0+$/g, "");
+    return Math.max(1, Math.ceil((digits.length || 1) / 2) + 1);
+  }
+
+  function valueSize(value: unknown): number {
+    if (typeof value === "string") return Buffer.byteLength(value, "utf8");
+    if (typeof value === "number") return numberSize(value);
+    if (typeof value === "boolean" || value === null) return 1;
+    if (value instanceof Uint8Array) return value.byteLength;
+    if (Array.isArray(value)) {
+      return (
+        3 +
+        value.reduce((total, entry) => {
+          if (entry === undefined) return total;
+          return total + 1 + valueSize(entry);
+        }, 0)
+      );
+    }
+    if (isRecord(value)) {
+      return (
+        3 +
+        Object.entries(value).reduce((total, [name, entry]) => {
+          if (entry === undefined) return total;
+          return total + 1 + Buffer.byteLength(name, "utf8") + valueSize(entry);
+        }, 0)
+      );
+    }
+    throw new TypeError("DynamoDB item contains an unsupported value.");
+  }
+
+  function itemSize(item: Record<string, unknown>): number {
+    return Object.entries(item).reduce((total, [name, value]) => {
+      if (value === undefined) return total;
+      return total + Buffer.byteLength(name, "utf8") + valueSize(value);
+    }, 0);
+  }
+
+  function itemKey(item: Record<string, unknown>): string {
+    if (typeof item.pk !== "string" || typeof item.sk !== "string") {
+      throw new TypeError("DynamoDB transaction item has no valid key.");
+    }
+    return item.pk + "\u0000" + item.sk;
+  }
+
+  function preflight(
+    actions: Record<string, unknown>[],
+    affectedItems: Record<string, unknown>[],
+  ): void {
+    if (actions.length > actionLimit)
+      throw new RangeError("DynamoDB transaction exceeds 100 actions.");
+    const keys = new Set<string>();
+    for (const item of affectedItems) {
+      const key = itemKey(item);
+      if (keys.has(key))
+        throw new TypeError("DynamoDB transactions cannot target an item more than once.");
+      keys.add(key);
+      if (itemSize(item) > itemLimit)
+        throw new RangeError("DynamoDB transaction item exceeds 400 KiB.");
+    }
+    if (affectedItems.reduce((total, item) => total + itemSize(item), 0) > transactionLimit) {
+      throw new RangeError("DynamoDB transaction exceeds 4 MiB.");
+    }
+  }
+
+  async function getItem(
+    key: Record<string, unknown>,
+  ): Promise<Record<string, unknown> | undefined> {
+    const result = await documentClient.send(
+      new GetCommand({ TableName: tableName, Key: key, ConsistentRead: true }),
+    );
+    return result.Item;
+  }
+
+  function validCounter(item: Record<string, unknown> | undefined): number {
+    if (!item) return 0;
+    if (!Number.isSafeInteger(item.used) || Number(item.used) < 0) {
+      throw new Error("Quota usage record is invalid; refusing admission.");
+    }
+    return Number(item.used);
+  }
+
+  function validPolicy(item: Record<string, unknown> | undefined): {
+    dailyLimit: number;
+    monthlyLimit: number;
+    revision: string;
+  } {
+    if (
+      !item ||
+      !Number.isSafeInteger(item.dailyLimit) ||
+      Number(item.dailyLimit) < 0 ||
+      !Number.isSafeInteger(item.monthlyLimit) ||
+      Number(item.monthlyLimit) < 0 ||
+      typeof item.revision !== "string" ||
+      item.revision.trim().length === 0
+    ) {
+      throw new Error("Quota policy is missing or invalid; refusing new submissions.");
+    }
+    return {
+      dailyLimit: Number(item.dailyLimit),
+      monthlyLimit: Number(item.monthlyLimit),
+      revision: item.revision,
+    };
+  }
+
+  function chunkItem(chunk: {
     conversationId: string;
     ordinal: number;
     queryId: string;
@@ -373,70 +641,414 @@ export function createConversationStoreAdapter(input: {
     index: number;
     text: string;
     now: number;
-  }): Promise<void> {
-    if (Buffer.byteLength(chunk.text, "utf8") > maxDynamoTextChunkBytes) {
-      throw new RangeError("Conversation text chunk exceeds the storage item limit.");
-    }
-    await documentClient.send(
-      new PutCommand({
-        TableName: tableName,
-        Item: {
-          ...chunkKey(chunk.conversationId, chunk.ordinal, chunk.queryId, chunk.role, chunk.index),
-          conversationId: chunk.conversationId,
-          queryId: chunk.queryId,
-          role: chunk.role,
-          index: chunk.index,
-          text: chunk.text,
-          createdAt: isoDate(chunk.now),
-        },
-        ConditionExpression: "attribute_not_exists(pk)",
-      }),
-    );
+  }): Record<string, unknown> {
+    return {
+      ...chunkKey(chunk.conversationId, chunk.ordinal, chunk.queryId, chunk.role, chunk.index),
+      conversationId: chunk.conversationId,
+      queryId: chunk.queryId,
+      ordinal: chunk.ordinal,
+      role: chunk.role,
+      index: chunk.index,
+      text: chunk.text,
+      createdAt: isoDate(chunk.now),
+    };
   }
 
-  async function putContextChunk(chunk: {
+  function contextItem(input: {
     conversationId: string;
     ordinal: number;
     index: number;
     text: string;
     now: number;
-  }): Promise<void> {
-    if (Buffer.byteLength(chunk.text, "utf8") > maxDynamoTextChunkBytes) {
-      throw new RangeError("Conversation context reference chunk exceeds the storage item limit.");
-    }
-    await documentClient.send(
-      new PutCommand({
-        TableName: tableName,
-        Item: {
-          ...contextChunkKey(chunk.conversationId, chunk.ordinal, chunk.index),
-          conversationId: chunk.conversationId,
-          ordinal: chunk.ordinal,
-          index: chunk.index,
-          text: chunk.text,
-          createdAt: isoDate(chunk.now),
-        },
-        ConditionExpression: "attribute_not_exists(pk)",
-      }),
+  }): Record<string, unknown> {
+    return {
+      ...contextChunkKey(input.conversationId, input.ordinal, input.index),
+      conversationId: input.conversationId,
+      ordinal: input.ordinal,
+      index: input.index,
+      text: input.text,
+      createdAt: isoDate(input.now),
+    };
+  }
+
+  function isConditionalFailure(error: unknown): boolean {
+    if (!isRecord(error)) return false;
+    if (error.name === "ConditionalCheckFailedException") return true;
+    return (
+      error.name === "TransactionCanceledException" &&
+      Array.isArray(error.CancellationReasons) &&
+      error.CancellationReasons.some(
+        (reason) => isRecord(reason) && reason.Code === "ConditionalCheckFailed",
+      )
     );
   }
 
-  async function writeQuestionAndPublish(
-    turn: StartTurnInput,
-    ordinal: number,
-    questionChunks: string[],
-    contextChunks: string[],
-  ): Promise<void> {
-    for (const [index, text] of contextChunks.entries()) {
-      await putContextChunk({
-        conversationId: turn.conversationId,
-        ordinal,
-        index,
-        text,
-        now: turn.now,
-      });
+  function inputBaseOrdinal(turn: ContinueTurnInput): number {
+    const value = turn.baseOrdinal ?? turn.expectedLastOrdinal;
+    if (
+      !isPositiveSafeInteger(value) ||
+      (turn.baseOrdinal !== undefined &&
+        turn.expectedLastOrdinal !== undefined &&
+        turn.baseOrdinal !== turn.expectedLastOrdinal) ||
+      !Number.isSafeInteger(value + 1)
+    ) {
+      throw new RangeError("Conversation base ordinal is invalid.");
     }
-    for (const [index, text] of questionChunks.entries()) {
-      await putChunk({
+    return value;
+  }
+
+  function validateAdmission(
+    turn: StartTurnInput | ContinueTurnInput,
+    operation: "start" | "message",
+    baseOrdinal: number,
+  ): void {
+    if (
+      typeof turn.sub !== "string" ||
+      turn.sub.length === 0 ||
+      typeof turn.botId !== "string" ||
+      turn.botId.length === 0 ||
+      typeof turn.conversationId !== "string" ||
+      turn.conversationId.length === 0 ||
+      typeof turn.queryId !== "string" ||
+      !uuidPattern.test(turn.queryId) ||
+      typeof turn.ownerAttemptId !== "string" ||
+      turn.ownerAttemptId.length === 0 ||
+      typeof turn.requestFingerprint !== "string" ||
+      turn.requestFingerprint.length === 0 ||
+      typeof turn.text !== "string" ||
+      turn.text.trim().length === 0 ||
+      !isRecord(turn.profileSnapshot) ||
+      !isRecord(turn.invocation) ||
+      !Number.isFinite(turn.now) ||
+      turn.resultDeadlineAt !== turn.now + resultDeadlineMs ||
+      (operation === "start" && baseOrdinal !== 0)
+    ) {
+      throw new TypeError("Submission admission input is invalid.");
+    }
+    const periods = localPeriods(turn.now);
+    if (
+      turn.quota.daily.period !== periods.day.period ||
+      turn.quota.monthly.period !== periods.month.period
+    ) {
+      throw storeError("quota_period_changed", "Quota period changed before admission.");
+    }
+    if (
+      turn.quota.daily.used >= turn.quota.daily.limit ||
+      turn.quota.monthly.used >= turn.quota.monthly.limit
+    ) {
+      throw storeError("quota_exceeded", "A submission quota is exhausted.", turn.quota);
+    }
+  }
+
+  function assertCurrentQuotaPeriod(quota: QuotaView): void {
+    const periods = localPeriods(currentTime());
+    if (
+      periods.day.period !== quota.daily.period ||
+      periods.month.period !== quota.monthly.period
+    ) {
+      throw storeError(
+        "quota_period_changed",
+        "Quota period changed before transaction submission.",
+      );
+    }
+  }
+
+  async function readExistingSubmission(
+    sub: string,
+    botId: string,
+    queryId: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    return getItem({ pk: "USER#" + sub + "#BOT#" + botId, sk: "SEND#" + queryId });
+  }
+
+  function markerMatches(
+    marker: Record<string, unknown>,
+    turn: StartTurnInput | ContinueTurnInput,
+    operation: "start" | "message",
+    baseOrdinal: number,
+  ): boolean {
+    return (
+      marker.sub === turn.sub &&
+      marker.botId === turn.botId &&
+      marker.queryId === turn.queryId &&
+      marker.conversationId === turn.conversationId &&
+      marker.requestFingerprint === turn.requestFingerprint &&
+      marker.operation === operation &&
+      marker.baseOrdinal === baseOrdinal
+    );
+  }
+
+  async function existingAdmission(
+    turn: StartTurnInput | ContinueTurnInput,
+    operation: "start" | "message",
+    baseOrdinal: number,
+  ): Promise<{ queryId: string; ordinal: number } | null> {
+    const marker = await readExistingSubmission(turn.sub, turn.botId, turn.queryId);
+    if (!marker) return null;
+    if (
+      !markerMatches(marker, turn, operation, baseOrdinal) ||
+      !isPositiveSafeInteger(marker.ordinal)
+    ) {
+      throw storeError(
+        "conflict",
+        "Stable submission ID was already used for a different request.",
+      );
+    }
+    throw storeError(
+      "submission_exists",
+      "Stable submission already exists; load its durable snapshot.",
+    );
+  }
+
+  async function buildAdmission(
+    turn: StartTurnInput | ContinueTurnInput,
+    operation: "start" | "message",
+    baseOrdinal: number,
+  ) {
+    const ordinal = baseOrdinal + 1;
+    if (!Number.isSafeInteger(ordinal) || ordinal <= 0)
+      throw new RangeError("Conversation ordinal cannot be safely incremented.");
+    const questionChunks = splitUtf8Text(turn.text);
+    if (questionChunks.length === 0) throw new TypeError("Submission question is empty.");
+    const contextChunks =
+      operation === "message"
+        ? encodeContextReferences((turn as ContinueTurnInput).contextReferences, ordinal)
+        : [];
+    const createdAt = isoDate(turn.now);
+    const partition = conversationKey(turn.conversationId);
+    const marker = {
+      pk: "USER#" + turn.sub + "#BOT#" + turn.botId,
+      sk: "SEND#" + turn.queryId,
+      sub: turn.sub,
+      botId: turn.botId,
+      queryId: turn.queryId,
+      requestFingerprint: turn.requestFingerprint,
+      operation,
+      baseOrdinal,
+      conversationId: turn.conversationId,
+      ordinal,
+      admittedAt: turn.now,
+      resultDeadlineAt: turn.resultDeadlineAt,
+      quotaSnapshot: turn.quota,
+    };
+    const record = {
+      ...turnKey(turn.conversationId, ordinal),
+      conversationId: turn.conversationId,
+      sub: turn.sub,
+      botId: turn.botId,
+      queryId: turn.queryId,
+      requestFingerprint: turn.requestFingerprint,
+      operation,
+      baseOrdinal,
+      ordinal,
+      status: "in_progress",
+      phase: "admitted",
+      ownerAttemptId: turn.ownerAttemptId,
+      resultDeadlineAt: turn.resultDeadlineAt,
+      cursor: 0,
+      createdAt,
+      updatedAt: createdAt,
+      questionManifest: { count: questionChunks.length, complete: true },
+      answerManifest: { count: 0, complete: false },
+      contextManifest: { count: contextChunks.length, complete: true },
+      profileSnapshot: turn.profileSnapshot,
+      invocation: turn.invocation,
+    };
+    const metaKey = { ...partition, sk: "META" };
+    const meta = {
+      ...metaKey,
+      conversationId: turn.conversationId,
+      sub: turn.sub,
+      botId: turn.botId,
+      createdAt,
+      updatedAt: createdAt,
+      lastOrdinal: ordinal,
+      lastQueryId: turn.queryId,
+      activeQueryId: turn.queryId,
+      activeOwnerAttemptId: turn.ownerAttemptId,
+      closed: false,
+    };
+    const day = localPeriods(turn.now).day.period;
+    const month = localPeriods(turn.now).month.period;
+    const usagePk = { pk: "USER#" + turn.sub + "#BOT#" + turn.botId };
+    const dailyKey = { ...usagePk, sk: "USAGE#DAY#" + day };
+    const monthlyKey = { ...usagePk, sk: "USAGE#MONTH#" + month };
+    const dailyCounter = {
+      ...dailyKey,
+      used: turn.quota.daily.used + 1,
+      period: day,
+      updatedAt: createdAt,
+    };
+    const monthlyCounter = {
+      ...monthlyKey,
+      used: turn.quota.monthly.used + 1,
+      period: month,
+      updatedAt: createdAt,
+    };
+    const policyKey = { pk: "BOT#" + turn.botId, sk: "QUOTA#POLICY" };
+    const transactionItems: Record<string, unknown>[] = [
+      {
+        ConditionCheck: {
+          TableName: tableName,
+          Key: policyKey,
+          ConditionExpression:
+            "#revision = :revision AND #dailyLimit = :dailyLimit AND #monthlyLimit = :monthlyLimit",
+          ExpressionAttributeNames: {
+            "#revision": "revision",
+            "#dailyLimit": "dailyLimit",
+            "#monthlyLimit": "monthlyLimit",
+          },
+          ExpressionAttributeValues: {
+            ":revision": turn.quota.policyRevision,
+            ":dailyLimit": turn.quota.daily.limit,
+            ":monthlyLimit": turn.quota.monthly.limit,
+          },
+        },
+      },
+      {
+        Update: {
+          TableName: tableName,
+          Key: dailyKey,
+          UpdateExpression: "SET #period = :period, #updatedAt = :updatedAt ADD #used :one",
+          ConditionExpression:
+            ":limit > :zero AND (attribute_not_exists(#used) OR (#used >= :zero AND #used < :limit))",
+          ExpressionAttributeNames: {
+            "#period": "period",
+            "#updatedAt": "updatedAt",
+            "#used": "used",
+          },
+          ExpressionAttributeValues: {
+            ":period": day,
+            ":updatedAt": createdAt,
+            ":one": 1,
+            ":zero": 0,
+            ":limit": turn.quota.daily.limit,
+          },
+        },
+      },
+      {
+        Update: {
+          TableName: tableName,
+          Key: monthlyKey,
+          UpdateExpression: "SET #period = :period, #updatedAt = :updatedAt ADD #used :one",
+          ConditionExpression:
+            ":limit > :zero AND (attribute_not_exists(#used) OR (#used >= :zero AND #used < :limit))",
+          ExpressionAttributeNames: {
+            "#period": "period",
+            "#updatedAt": "updatedAt",
+            "#used": "used",
+          },
+          ExpressionAttributeValues: {
+            ":period": month,
+            ":updatedAt": createdAt,
+            ":one": 1,
+            ":zero": 0,
+            ":limit": turn.quota.monthly.limit,
+          },
+        },
+      },
+    ];
+    const affectedItems: Record<string, unknown>[] = [
+      {
+        pk: policyKey.pk,
+        sk: policyKey.sk,
+        dailyLimit: turn.quota.daily.limit,
+        monthlyLimit: turn.quota.monthly.limit,
+        revision: turn.quota.policyRevision,
+      },
+      dailyCounter,
+      monthlyCounter,
+    ];
+    if (operation === "start") {
+      transactionItems.push(
+        {
+          Put: {
+            TableName: tableName,
+            Item: meta,
+            ConditionExpression: "attribute_not_exists(pk)",
+          },
+        },
+        {
+          Put: {
+            TableName: tableName,
+            Item: record,
+            ConditionExpression: "attribute_not_exists(pk)",
+          },
+        },
+      );
+      affectedItems.push(meta, record);
+    } else {
+      transactionItems.push({
+        Update: {
+          TableName: tableName,
+          Key: metaKey,
+          UpdateExpression:
+            "SET #lastOrdinal = :nextOrdinal, #lastQueryId = :queryId, #activeQueryId = :queryId, #activeOwnerAttemptId = :ownerAttemptId, #updatedAt = :updatedAt",
+          ConditionExpression:
+            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND (attribute_not_exists(#closed) OR #closed = :false)",
+          ExpressionAttributeNames: {
+            "#sub": "sub",
+            "#botId": "botId",
+            "#conversationId": "conversationId",
+            "#lastOrdinal": "lastOrdinal",
+            "#lastQueryId": "lastQueryId",
+            "#activeQueryId": "activeQueryId",
+            "#activeOwnerAttemptId": "activeOwnerAttemptId",
+            "#updatedAt": "updatedAt",
+            "#closed": "closed",
+          },
+          ExpressionAttributeValues: {
+            ":sub": turn.sub,
+            ":botId": turn.botId,
+            ":conversationId": turn.conversationId,
+            ":expectedLastOrdinal": baseOrdinal,
+            ":nextOrdinal": ordinal,
+            ":queryId": turn.queryId,
+            ":ownerAttemptId": turn.ownerAttemptId,
+            ":updatedAt": createdAt,
+            ":false": false,
+          },
+        },
+      });
+      const previousMeta = await getItem(metaKey);
+      if (
+        previousMeta &&
+        (previousMeta.sub !== turn.sub ||
+          previousMeta.botId !== turn.botId ||
+          previousMeta.conversationId !== turn.conversationId)
+      ) {
+        throw storeError("conflict", "Conversation does not belong to this user and chatbot.");
+      }
+      if (previousMeta?.activeQueryId || previousMeta?.closed === true) {
+        throw storeError("conversation_busy", "Conversation already has an active or closed turn.");
+      }
+      if (previousMeta && previousMeta.lastOrdinal !== baseOrdinal)
+        throw storeError("stale_base", "Conversation base ordinal is stale.");
+      affectedItems.push({
+        ...(previousMeta ?? {
+          ...metaKey,
+          conversationId: turn.conversationId,
+          sub: turn.sub,
+          botId: turn.botId,
+          lastOrdinal: baseOrdinal,
+        }),
+        lastOrdinal: ordinal,
+        lastQueryId: turn.queryId,
+        activeQueryId: turn.queryId,
+        activeOwnerAttemptId: turn.ownerAttemptId,
+        updatedAt: createdAt,
+      });
+      transactionItems.push({
+        Put: {
+          TableName: tableName,
+          Item: record,
+          ConditionExpression: "attribute_not_exists(pk)",
+        },
+      });
+      affectedItems.push(record);
+    }
+    const questionItems = questionChunks.map((text, index) =>
+      chunkItem({
         conversationId: turn.conversationId,
         ordinal,
         queryId: turn.queryId,
@@ -444,45 +1056,430 @@ export function createConversationStoreAdapter(input: {
         index,
         text,
         now: turn.now,
-      });
-    }
-
-    const updatedAt = isoDate(turn.now);
-    await documentClient.send(
-      new UpdateCommand({
-        TableName: tableName,
-        Key: turnKey(turn.conversationId, ordinal),
-        UpdateExpression:
-          "SET #questionManifest = :manifest, #contextManifest = :contextManifest, #phase = :phase, #updatedAt = :updatedAt",
-        ConditionExpression: "#status = :inProgress",
-        ExpressionAttributeNames: {
-          "#questionManifest": "questionManifest",
-          "#contextManifest": "contextManifest",
-          "#phase": "phase",
-          "#status": "status",
-          "#updatedAt": "updatedAt",
-        },
-        ExpressionAttributeValues: {
-          ":manifest": { count: questionChunks.length, complete: true },
-          ":contextManifest": { count: contextChunks.length, complete: true },
-          ":phase": "generating",
-          ":inProgress": "in_progress",
-          ":updatedAt": updatedAt,
-        },
       }),
     );
+    const contextRecords = contextChunks.map((text, index) =>
+      contextItem({
+        conversationId: turn.conversationId,
+        ordinal,
+        index,
+        text,
+        now: turn.now,
+      }),
+    );
+    for (const item of [...questionItems, ...contextRecords]) {
+      transactionItems.push({
+        Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(pk)" },
+      });
+      affectedItems.push(item);
+    }
+    transactionItems.push({
+      Put: {
+        TableName: tableName,
+        Item: marker,
+        ConditionExpression: "attribute_not_exists(pk)",
+      },
+    });
+    affectedItems.push(marker);
+    preflight(transactionItems, affectedItems);
+    return { ordinal, transactionItems, affectedItems, marker };
   }
 
-  return {
-    async getMeta({ conversationId }: { conversationId: string }) {
-      const result = await documentClient.send(
-        new GetCommand({
+  async function classifyAdmissionFailure(
+    turn: StartTurnInput | ContinueTurnInput,
+    original: unknown,
+    operation: "start" | "message",
+    baseOrdinal: number,
+  ): Promise<never> {
+    const marker = await readExistingSubmission(turn.sub, turn.botId, turn.queryId);
+    if (marker) {
+      if (
+        !markerMatches(marker, turn, operation, baseOrdinal) ||
+        !isPositiveSafeInteger(marker.ordinal)
+      ) {
+        throw storeError(
+          "conflict",
+          "Stable submission ID was already used for a different request.",
+        );
+      }
+      throw storeError("submission_exists", "Admission is already durable; load its snapshot.");
+    }
+    if (!isConditionalFailure(original)) throw original;
+    const quota = await adapter.readQuota({ sub: turn.sub, botId: turn.botId, now: turn.now });
+    if (quota.daily.used >= quota.daily.limit || quota.monthly.used >= quota.monthly.limit) {
+      throw storeError("quota_exceeded", "A submission quota is exhausted.", quota);
+    }
+    if (operation === "message") {
+      const meta = await adapter.getMeta({ conversationId: turn.conversationId });
+      if (!meta) throw storeError("stale_base", "Conversation does not exist.");
+      if (meta?.activeQueryId || meta?.closed === true)
+        throw storeError("conversation_busy", "Conversation is busy or closed.");
+      if (meta && meta.lastOrdinal !== baseOrdinal)
+        throw storeError("stale_base", "Conversation base ordinal is stale.");
+    } else {
+      const meta = await adapter.getMeta({ conversationId: turn.conversationId });
+      if (meta) throw storeError("conversation_busy", "Conversation already exists.");
+    }
+    throw storeError("conflict", "Admission was conditionally rejected.");
+  }
+
+  async function queryItems(
+    key: Record<string, unknown>,
+    sortPrefix?: string,
+  ): Promise<Record<string, unknown>[]> {
+    const items: Record<string, unknown>[] = [];
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const page = await documentClient.send(
+        new QueryCommand({
           TableName: tableName,
-          Key: { ...conversationKey(conversationId), sk: "META" },
+          KeyConditionExpression: sortPrefix
+            ? "#pk = :pk AND begins_with(#sk, :prefix)"
+            : "#pk = :pk",
+          ExpressionAttributeNames: sortPrefix ? { "#pk": "pk", "#sk": "sk" } : { "#pk": "pk" },
+          ExpressionAttributeValues: sortPrefix
+            ? { ":pk": key.pk, ":prefix": sortPrefix }
+            : { ":pk": key.pk },
           ConsistentRead: true,
+          ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
         }),
       );
-      return result.Item ?? null;
+      items.push(...(page.Items ?? []));
+      exclusiveStartKey = page.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    return items;
+  }
+
+  async function getSubmission(input: {
+    sub: string;
+    botId: string;
+    queryId: string;
+  }): Promise<SubmissionSnapshot | null> {
+    const marker = await readExistingSubmission(input.sub, input.botId, input.queryId);
+    if (!marker) return null;
+    if (
+      marker.sub !== input.sub ||
+      marker.botId !== input.botId ||
+      marker.queryId !== input.queryId ||
+      typeof marker.conversationId !== "string" ||
+      !isPositiveSafeInteger(marker.ordinal)
+    )
+      throw new Error("Submission marker is malformed or outside the requested scope.");
+    const turn = await getItem(turnKey(marker.conversationId, marker.ordinal));
+    if (!turn) throw new Error("Submission marker points to a missing turn.");
+    if (
+      turn.conversationId !== marker.conversationId ||
+      turn.ordinal !== marker.ordinal ||
+      turn.queryId !== input.queryId ||
+      turn.pk !== conversationKey(marker.conversationId).pk ||
+      (turn.requestFingerprint !== undefined &&
+        turn.requestFingerprint !== marker.requestFingerprint)
+    )
+      throw new Error("Submission marker does not match its turn.");
+    const ordinal = Number(marker.ordinal);
+    const chunks = await queryItems(
+      conversationKey(marker.conversationId),
+      turnKey(marker.conversationId, ordinal).sk + "#",
+    );
+    const questionCount = contextManifestCount(turn.questionManifest);
+    const answerCount = partialManifestCount(turn.answerManifest);
+    const cursor = turn.cursor;
+    if (
+      questionCount === null ||
+      !isRecord(turn.questionManifest) ||
+      turn.questionManifest.complete !== true ||
+      answerCount === null ||
+      typeof cursor !== "number" ||
+      !Number.isSafeInteger(cursor) ||
+      Number(cursor) < 0 ||
+      Number(cursor) > answerCount ||
+      !["in_progress", "completed", "failed"].includes(String(turn.status)) ||
+      !["admitted", "invocation_claimed", "complete", "failed"].includes(String(turn.phase))
+    )
+      throw new Error("Submission turn is malformed.");
+    if (
+      turn.status === "completed" &&
+      (!isRecord(turn.answerManifest) ||
+        turn.answerManifest.complete !== true ||
+        Number(cursor) !== answerCount)
+    ) {
+      throw new Error("Completed submission has an inconsistent answer cursor.");
+    }
+    if (
+      turn.status !== "completed" &&
+      isRecord(turn.answerManifest) &&
+      turn.answerManifest.complete === true
+    ) {
+      throw new Error("Non-completed submission has a completed answer manifest.");
+    }
+    const questionPieces: TextChunk[] = [];
+    const answerPieces: TextChunk[] = [];
+    for (const item of chunks) {
+      const match = chunkRecordPattern.exec(String(item.sk));
+      if (!match) continue;
+      const chunkOrdinal = Number(match[1]);
+      const chunkIndex = Number(match[4]);
+      const role = match[3].toLowerCase();
+      if (
+        chunkOrdinal !== ordinal ||
+        String(chunkOrdinal).padStart(8, "0") !== match[1] ||
+        !Number.isSafeInteger(chunkIndex) ||
+        chunkIndex < 0 ||
+        item.pk !== turn.pk ||
+        item.conversationId !== marker.conversationId ||
+        item.ordinal !== ordinal ||
+        item.index !== chunkIndex ||
+        typeof item.text !== "string" ||
+        item.queryId !== input.queryId ||
+        (role !== "user" && role !== "assistant") ||
+        item.role !== role
+      )
+        throw new Error("Submission contains a malformed text chunk.");
+      if (role === "user") questionPieces.push({ index: chunkIndex, text: item.text });
+      else if (chunkIndex < cursor) answerPieces.push({ index: chunkIndex, text: item.text });
+    }
+    const question = assembleText(questionPieces, questionCount, "user", input.queryId);
+    const answer = assemblePrefix(answerPieces, Number(cursor), input.queryId);
+
+    let contextReferences: ContextReference[] = [];
+    const rawContextCount =
+      turn.contextManifest === undefined ? 0 : contextManifestCount(turn.contextManifest);
+    if (
+      rawContextCount === null ||
+      (turn.contextManifest !== undefined &&
+        (!isRecord(turn.contextManifest) || turn.contextManifest.complete !== true))
+    ) {
+      throw new Error("Submission context manifest is malformed.");
+    }
+    if (rawContextCount > 0) {
+      const contextParts = chunks.filter((item) => String(item.sk).includes("#CONTEXT#"));
+      const serialized = assembleText(
+        contextParts.flatMap((item) => {
+          const match = contextChunkRecordPattern.exec(String(item.sk));
+          if (!match) throw new Error("Submission context record is malformed.");
+          const index = Number(match[2]);
+          if (
+            Number(match[1]) !== ordinal ||
+            item.pk !== turn.pk ||
+            item.conversationId !== marker.conversationId ||
+            item.ordinal !== ordinal ||
+            item.index !== index ||
+            typeof item.text !== "string"
+          )
+            throw new Error("Submission context record is malformed.");
+          return [{ index, text: item.text }];
+        }),
+        rawContextCount,
+        "context",
+        input.queryId,
+      );
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(serialized);
+      } catch {
+        throw new Error("Submission context references are malformed.");
+      }
+      if (!Array.isArray(parsed)) throw new Error("Submission context references are malformed.");
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        throw new Error("Submission context references are malformed.");
+      }
+      encodeContextReferences(parsed as ContextReference[], ordinal);
+      contextReferences = parsed as ContextReference[];
+    } else {
+      parseContextReferences({
+        ordinal,
+        queryId: input.queryId,
+        count: 0,
+        chunks,
+        partition: String(turn.pk),
+        conversationId: marker.conversationId,
+        turns: new Map(),
+      });
+    }
+    const meta = await getItem({ ...conversationKey(marker.conversationId), sk: "META" });
+    const status = turn.status as SubmissionSnapshot["status"];
+    const stage = turn.phase as SubmissionSnapshot["stage"];
+    const snapshot: SubmissionSnapshot = {
+      sub: input.sub,
+      botId: input.botId,
+      conversationId: marker.conversationId,
+      queryId: input.queryId,
+      requestFingerprint: String(marker.requestFingerprint ?? turn.requestFingerprint ?? ""),
+      operation: (marker.operation ??
+        turn.operation ??
+        (ordinal === 1 ? "start" : "message")) as SubmissionSnapshot["operation"],
+      baseOrdinal: Number(marker.baseOrdinal ?? turn.baseOrdinal ?? ordinal - 1),
+      ordinal,
+      status,
+      stage,
+      question,
+      questionManifest: turn.questionManifest as TurnManifest,
+      contextReferences,
+      answer,
+      answerManifest: turn.answerManifest as TurnManifest,
+      cursor: Number(cursor),
+      canContinue:
+        status !== "in_progress" &&
+        meta?.closed !== true &&
+        !meta?.activeQueryId &&
+        meta?.lastOrdinal === ordinal,
+      resultDeadlineAt: Number(turn.resultDeadlineAt ?? marker.resultDeadlineAt),
+      profileSnapshot: isRecord(turn.profileSnapshot) ? turn.profileSnapshot : {},
+      invocation: isRecord(turn.invocation)
+        ? (turn.invocation as SubmissionSnapshot["invocation"])
+        : { modelId: "" },
+      ...(isRecord(turn.failure) && typeof turn.failure.code === "string"
+        ? { failure: { code: turn.failure.code } }
+        : {}),
+      ...(typeof turn.ownerAttemptId === "string" ? { ownerAttemptId: turn.ownerAttemptId } : {}),
+    };
+    return snapshot;
+  }
+
+  async function failTurnInternal(turn: FailTurnInput, remainingRetries: number): Promise<void> {
+    if (
+      !isPositiveSafeInteger(turn.ordinal) ||
+      typeof turn.invocationClaimed !== "boolean" ||
+      typeof turn.providerFinished !== "boolean"
+    ) {
+      throw new TypeError("Turn failure input is invalid.");
+    }
+    const key = turnKey(turn.conversationId, turn.ordinal);
+    const metaKey = { ...conversationKey(turn.conversationId), sk: "META" };
+    const [previousTurn, previousMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
+    const now = isoDate(turn.now);
+    const cursor = previousTurn?.cursor ?? turn.answerManifest?.count ?? 0;
+    const phase = turn.invocationClaimed ? "invocation_claimed" : "admitted";
+    const retire = turn.invocationClaimed && !turn.providerFinished;
+    const answerManifest = { count: cursor, complete: false };
+    const projectedTurn = {
+      ...(previousTurn ?? {
+        ...key,
+        conversationId: turn.conversationId,
+        queryId: turn.queryId,
+        ordinal: turn.ordinal,
+      }),
+      status: "failed",
+      phase: "failed",
+      failure: { code: turn.code },
+      failedAt: now,
+      updatedAt: now,
+      answerManifest,
+      ...(turn.stopReason ? { stopReason: turn.stopReason } : {}),
+      ...(turn.requestId ? { requestId: turn.requestId } : {}),
+      ...(turn.metrics ? { metrics: turn.metrics } : {}),
+      ...(turn.providerError ? { providerError: turn.providerError } : {}),
+    };
+    const projectedMeta: Record<string, unknown> = {
+      ...(previousMeta ?? metaKey),
+      updatedAt: now,
+      ...(retire ? { closed: true } : {}),
+    };
+    delete projectedMeta.activeQueryId;
+    delete projectedMeta.activeOwnerAttemptId;
+    const turnUpdate = {
+      Update: {
+        TableName: tableName,
+        Key: key,
+        UpdateExpression:
+          "SET #status = :failed, #phase = :failed, #failure = :failure, #failedAt = :now, #updatedAt = :now, #answerManifest = :manifest" +
+          (turn.stopReason ? ", #stopReason = :stopReason" : "") +
+          (turn.requestId ? ", #requestId = :requestId" : "") +
+          (turn.metrics ? ", #metrics = :metrics" : "") +
+          (turn.providerError ? ", #providerError = :providerError" : ""),
+        ConditionExpression:
+          "#status = :inProgress AND #phase = :expectedPhase AND #queryId = :queryId AND #ownerAttemptId = :ownerAttemptId AND #cursor = :cursor AND (#resultDeadlineAt >= :nowMs OR #phase = :claimed)",
+        ExpressionAttributeNames: {
+          "#status": "status",
+          "#phase": "phase",
+          "#queryId": "queryId",
+          "#ownerAttemptId": "ownerAttemptId",
+          "#resultDeadlineAt": "resultDeadlineAt",
+          "#failure": "failure",
+          "#failedAt": "failedAt",
+          "#updatedAt": "updatedAt",
+          "#answerManifest": "answerManifest",
+          ...(turn.stopReason ? { "#stopReason": "stopReason" } : {}),
+          ...(turn.requestId ? { "#requestId": "requestId" } : {}),
+          ...(turn.metrics ? { "#metrics": "metrics" } : {}),
+          ...(turn.providerError ? { "#providerError": "providerError" } : {}),
+        },
+        ExpressionAttributeValues: {
+          ":failed": "failed",
+          ":failure": { code: turn.code },
+          ":now": now,
+          ":nowMs": turn.now,
+          ":inProgress": "in_progress",
+          ":expectedPhase": phase,
+          ":claimed": "invocation_claimed",
+          ":queryId": turn.queryId,
+          ":ownerAttemptId": turn.ownerAttemptId,
+          ":cursor": cursor,
+          ":manifest": answerManifest,
+          ...(turn.stopReason ? { ":stopReason": turn.stopReason } : {}),
+          ...(turn.requestId ? { ":requestId": turn.requestId } : {}),
+          ...(turn.metrics ? { ":metrics": turn.metrics } : {}),
+          ...(turn.providerError ? { ":providerError": turn.providerError } : {}),
+        },
+      },
+    };
+    const metaUpdate = {
+      Update: {
+        TableName: tableName,
+        Key: metaKey,
+        UpdateExpression:
+          "SET #updatedAt = :now" +
+          (retire ? ", #closed = :true" : "") +
+          " REMOVE #activeQueryId, #activeOwnerAttemptId",
+        ConditionExpression:
+          "#activeQueryId = :queryId AND #activeOwnerAttemptId = :ownerAttemptId",
+        ExpressionAttributeNames: {
+          "#updatedAt": "updatedAt",
+          "#activeQueryId": "activeQueryId",
+          "#activeOwnerAttemptId": "activeOwnerAttemptId",
+          ...(retire ? { "#closed": "closed" } : {}),
+        },
+        ExpressionAttributeValues: {
+          ":now": now,
+          ":queryId": turn.queryId,
+          ":ownerAttemptId": turn.ownerAttemptId,
+          ...(retire ? { ":true": true } : {}),
+        },
+      },
+    };
+    const actions = [turnUpdate, metaUpdate];
+    preflight(actions, [projectedTurn, projectedMeta]);
+    try {
+      await documentClient.send(new TransactWriteCommand({ TransactItems: actions }));
+    } catch (error) {
+      const latest = await getSubmissionByTurn(turn).catch(() => null);
+      if (latest?.status === "failed" && latest.ownerAttemptId === turn.ownerAttemptId) return;
+      if (
+        remainingRetries > 0 &&
+        isConditionalFailure(error) &&
+        latest?.status === "in_progress" &&
+        latest.ownerAttemptId === turn.ownerAttemptId &&
+        latest.queryId === turn.queryId &&
+        latest.cursor !== cursor
+      ) {
+        return failTurnInternal(turn, remainingRetries - 1);
+      }
+      throw error;
+    }
+  }
+
+  const adapter = {
+    async getMeta({
+      conversationId,
+    }: {
+      conversationId: string;
+    }): Promise<ConversationMeta | null> {
+      const item = await getItem({ ...conversationKey(conversationId), sk: "META" });
+      if (!item) return null;
+      if (!isConversationMeta(item, conversationId)) {
+        throw new Error("Conversation META record is malformed; refusing to use it.");
+      }
+      return item;
     },
 
     async readContext({
@@ -490,200 +1487,344 @@ export function createConversationStoreAdapter(input: {
     }: {
       conversationId: string;
     }): Promise<ConversationContext> {
-      const items: unknown[] = [];
-      let exclusiveStartKey: Record<string, unknown> | undefined;
-      do {
-        const page = await documentClient.send(
-          new QueryCommand({
-            TableName: tableName,
-            KeyConditionExpression: "#pk = :pk",
-            ExpressionAttributeNames: { "#pk": "pk" },
-            ExpressionAttributeValues: { ":pk": `CONV#${conversationId}` },
-            ConsistentRead: true,
-            ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
-          }),
-        );
-        items.push(...(page.Items ?? []));
-        exclusiveStartKey = page.LastEvaluatedKey;
-      } while (exclusiveStartKey);
-      return reconstructMessages(conversationId, items);
+      return reconstructMessages(conversationId, await queryItems(conversationKey(conversationId)));
     },
+
+    async readQuota({
+      sub,
+      botId,
+      now,
+    }: {
+      sub: string;
+      botId: string;
+      now: number;
+    }): Promise<QuotaView> {
+      if (
+        typeof sub !== "string" ||
+        !sub ||
+        typeof botId !== "string" ||
+        !botId ||
+        !Number.isFinite(now)
+      ) {
+        throw new TypeError("Quota read input is invalid.");
+      }
+      const periods = localPeriods(now);
+      const usagePk = { pk: "USER#" + sub + "#BOT#" + botId };
+      const policyKey = { pk: "BOT#" + botId, sk: "QUOTA#POLICY" };
+      const dailyKey = { ...usagePk, sk: "USAGE#DAY#" + periods.day.period };
+      const monthlyKey = { ...usagePk, sk: "USAGE#MONTH#" + periods.month.period };
+      const [policyItem, dailyItem, monthlyItem] = await Promise.all([
+        getItem(policyKey),
+        getItem(dailyKey),
+        getItem(monthlyKey),
+      ]);
+      const policy = validPolicy(policyItem);
+      const dailyUsed = validCounter(dailyItem);
+      const monthlyUsed = validCounter(monthlyItem);
+      const daily: QuotaView["daily"] = {
+        used: dailyUsed,
+        limit: policy.dailyLimit,
+        resetAt: periods.day.resetAt,
+        period: periods.day.period,
+      };
+      const monthly: QuotaView["monthly"] = {
+        used: monthlyUsed,
+        limit: policy.monthlyLimit,
+        resetAt: periods.month.resetAt,
+        period: periods.month.period,
+      };
+      const exhausted = [
+        ...(daily.used >= daily.limit ? [daily.resetAt] : []),
+        ...(monthly.used >= monthly.limit ? [monthly.resetAt] : []),
+      ];
+      return {
+        daily,
+        monthly,
+        serverNow: now,
+        blockedUntil: exhausted.length > 0 ? Math.max(...exhausted) : null,
+        policyRevision: policy.revision,
+      };
+    },
+
+    getSubmission,
 
     async startTurn(turn: StartTurnInput): Promise<{ queryId: string; ordinal: number }> {
-      const createdAt = isoDate(turn.now);
-      const questionChunks = splitUtf8Text(turn.text);
-      const ordinal = 1;
-      const meta = {
-        ...conversationKey(turn.conversationId),
-        sk: "META",
-        conversationId: turn.conversationId,
-        sub: turn.sub,
-        botId: turn.botId,
-        createdAt,
-        updatedAt: createdAt,
-        lastOrdinal: ordinal,
-        lastQueryId: turn.queryId,
-      };
-      const record = {
-        ...turnKey(turn.conversationId, ordinal),
-        conversationId: turn.conversationId,
-        sub: turn.sub,
-        botId: turn.botId,
-        queryId: turn.queryId,
-        ordinal,
-        status: "in_progress",
-        phase: "recording_question",
-        createdAt,
-        updatedAt: createdAt,
-        questionManifest: { count: questionChunks.length, complete: false },
-        answerManifest: { count: 0, complete: false },
-        contextManifest: { count: 0, complete: false },
-        profileSnapshot: turn.profileSnapshot,
-        invocation: turn.invocation,
-      };
-
-      await documentClient.send(
-        new TransactWriteCommand({
-          TransactItems: [
-            {
-              Put: {
-                TableName: tableName,
-                Item: meta,
-                ConditionExpression: "attribute_not_exists(pk)",
-              },
-            },
-            {
-              Put: {
-                TableName: tableName,
-                Item: record,
-                ConditionExpression: "attribute_not_exists(pk)",
-              },
-            },
-          ],
-        }),
-      );
-
-      await writeQuestionAndPublish(turn, ordinal, questionChunks, []);
-      return { queryId: turn.queryId, ordinal };
-    },
-
-    async continueTurn(
-      turn: StartTurnInput & { expectedLastOrdinal: number; contextReferences: ContextReference[] },
-    ): Promise<{ queryId: string; ordinal: number }> {
-      if (
-        !isPositiveSafeInteger(turn.expectedLastOrdinal) ||
-        !Number.isSafeInteger(turn.expectedLastOrdinal + 1)
-      ) {
-        throw new RangeError("Conversation ordinal cannot be safely incremented.");
+      const operation = turn.operation ?? "start";
+      const baseOrdinal = turn.baseOrdinal ?? 0;
+      if (operation !== "start") throw new TypeError("Start admission operation is invalid.");
+      validateAdmission(turn, operation, baseOrdinal);
+      const prior = await existingAdmission(turn, operation, baseOrdinal);
+      if (prior) return prior;
+      const plan = await buildAdmission(turn, operation, baseOrdinal);
+      assertCurrentQuotaPeriod(turn.quota);
+      try {
+        await documentClient.send(
+          new TransactWriteCommand({
+            TransactItems: plan.transactionItems,
+            ReturnConsumedCapacity: "NONE",
+          }),
+        );
+      } catch (error) {
+        return classifyAdmissionFailure(turn, error, operation, baseOrdinal);
       }
-      const ordinal = turn.expectedLastOrdinal + 1;
-      const createdAt = isoDate(turn.now);
-      const questionChunks = splitUtf8Text(turn.text);
-      const contextChunks = encodeContextReferences(turn.contextReferences, ordinal);
-      const record = {
-        ...turnKey(turn.conversationId, ordinal),
-        conversationId: turn.conversationId,
-        sub: turn.sub,
-        botId: turn.botId,
-        queryId: turn.queryId,
-        ordinal,
-        status: "in_progress",
-        phase: "recording_question",
-        createdAt,
-        updatedAt: createdAt,
-        questionManifest: { count: questionChunks.length, complete: false },
-        answerManifest: { count: 0, complete: false },
-        contextManifest: { count: contextChunks.length, complete: false },
-        profileSnapshot: turn.profileSnapshot,
-        invocation: turn.invocation,
-      };
+      return { queryId: turn.queryId, ordinal: plan.ordinal };
+    },
 
-      await documentClient.send(
-        new TransactWriteCommand({
-          TransactItems: [
-            {
-              Update: {
-                TableName: tableName,
-                Key: { ...conversationKey(turn.conversationId), sk: "META" },
-                UpdateExpression:
-                  "SET #lastOrdinal = :nextOrdinal, #lastQueryId = :queryId, #updatedAt = :updatedAt",
-                ConditionExpression:
-                  "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal",
-                ExpressionAttributeNames: {
-                  "#sub": "sub",
-                  "#botId": "botId",
-                  "#conversationId": "conversationId",
-                  "#lastOrdinal": "lastOrdinal",
-                  "#lastQueryId": "lastQueryId",
-                  "#updatedAt": "updatedAt",
-                },
-                ExpressionAttributeValues: {
-                  ":sub": turn.sub,
-                  ":botId": turn.botId,
-                  ":conversationId": turn.conversationId,
-                  ":expectedLastOrdinal": turn.expectedLastOrdinal,
-                  ":nextOrdinal": ordinal,
-                  ":queryId": turn.queryId,
-                  ":updatedAt": createdAt,
-                },
-              },
-            },
-            {
-              Put: {
-                TableName: tableName,
-                Item: record,
-                ConditionExpression: "attribute_not_exists(pk)",
-              },
-            },
-          ],
+    async continueTurn(turn: ContinueTurnInput): Promise<{ queryId: string; ordinal: number }> {
+      const operation = turn.operation ?? "message";
+      const baseOrdinal = inputBaseOrdinal(turn);
+      if (operation !== "message") throw new TypeError("Continue admission operation is invalid.");
+      validateAdmission(turn, operation, baseOrdinal);
+      const prior = await existingAdmission(turn, operation, baseOrdinal);
+      if (prior) return prior;
+      const plan = await buildAdmission(turn, operation, baseOrdinal);
+      assertCurrentQuotaPeriod(turn.quota);
+      try {
+        await documentClient.send(
+          new TransactWriteCommand({
+            TransactItems: plan.transactionItems,
+            ReturnConsumedCapacity: "NONE",
+          }),
+        );
+      } catch (error) {
+        return classifyAdmissionFailure(turn, error, operation, baseOrdinal);
+      }
+      return { queryId: turn.queryId, ordinal: plan.ordinal };
+    },
+
+    async claimInvocation(claim: {
+      conversationId: string;
+      ordinal: number;
+      queryId: string;
+      ownerAttemptId: string;
+      now: number;
+    }): Promise<boolean> {
+      const key = turnKey(claim.conversationId, claim.ordinal);
+      const now = isoDate(claim.now);
+      const current = await getItem(key);
+      const projectedTurn = {
+        ...(current ?? {
+          ...key,
+          conversationId: claim.conversationId,
+          queryId: claim.queryId,
+          ordinal: claim.ordinal,
+          status: "in_progress",
+          ownerAttemptId: claim.ownerAttemptId,
+          resultDeadlineAt: claim.now + 1,
         }),
-      );
-
-      await writeQuestionAndPublish(turn, ordinal, questionChunks, contextChunks);
-      return { queryId: turn.queryId, ordinal };
-    },
-
-    async appendChunk(chunk: {
-      conversationId: string;
-      ordinal?: number;
-      queryId: string;
-      role: ChunkRole;
-      index: number;
-      text: string;
-      now?: number;
-    }): Promise<void> {
-      await putChunk({ ...chunk, ordinal: chunk.ordinal ?? 1, now: chunk.now ?? Date.now() });
-    },
-
-    async completeTurn(turn: {
-      conversationId: string;
-      ordinal?: number;
-      queryId: string;
-      now?: number;
-      answerManifest: { count: number; complete: true };
-      invocation: Invocation;
-      stopReason?: string;
-      requestId?: string;
-      metrics?: Record<string, unknown>;
-    }): Promise<void> {
-      const now = turn.now ?? Date.now();
-      await documentClient.send(
-        new UpdateCommand({
+        phase: "invocation_claimed",
+        invocationClaimedAt: now,
+        updatedAt: now,
+      };
+      const claimUpdate = {
+        Update: {
           TableName: tableName,
-          Key: turnKey(turn.conversationId, turn.ordinal ?? 1),
-          UpdateExpression:
-            "SET #status = :completed, #phase = :complete, #answerManifest = :manifest, #invocation = :invocation, #completedAt = :completedAt, #updatedAt = :completedAt, #stopReason = :stopReason" +
-            (turn.requestId ? ", #requestId = :requestId" : "") +
-            (turn.metrics ? ", #metrics = :metrics" : ""),
-          ConditionExpression: "#status = :inProgress",
+          Key: key,
+          UpdateExpression: "SET #phase = :claimed, #invocationClaimedAt = :now, #updatedAt = :now",
+          ConditionExpression:
+            "#status = :inProgress AND #phase = :admitted AND #queryId = :queryId AND #ownerAttemptId = :ownerAttemptId AND #resultDeadlineAt > :nowMs",
           ExpressionAttributeNames: {
             "#status": "status",
             "#phase": "phase",
+            "#queryId": "queryId",
+            "#ownerAttemptId": "ownerAttemptId",
+            "#resultDeadlineAt": "resultDeadlineAt",
+            "#invocationClaimedAt": "invocationClaimedAt",
+            "#updatedAt": "updatedAt",
+          },
+          ExpressionAttributeValues: {
+            ":inProgress": "in_progress",
+            ":admitted": "admitted",
+            ":claimed": "invocation_claimed",
+            ":queryId": claim.queryId,
+            ":ownerAttemptId": claim.ownerAttemptId,
+            ":now": now,
+            ":nowMs": claim.now,
+          },
+        },
+      };
+      preflight([claimUpdate], [projectedTurn]);
+      try {
+        await documentClient.send(new UpdateCommand(claimUpdate.Update));
+        return true;
+      } catch (error) {
+        if (isConditionalFailure(error)) return false;
+        try {
+          const current = await getItem(key);
+          return (
+            current?.queryId === claim.queryId &&
+            current?.ownerAttemptId === claim.ownerAttemptId &&
+            current?.status === "in_progress" &&
+            current?.phase === "invocation_claimed"
+          );
+        } catch {
+          throw error;
+        }
+      }
+    },
+
+    async appendChunk(chunk: AppendChunkInput): Promise<void> {
+      if (
+        chunk.role !== "assistant" ||
+        !isPositiveSafeInteger(chunk.ordinal) ||
+        !Number.isSafeInteger(chunk.index) ||
+        chunk.index < 0 ||
+        typeof chunk.text !== "string" ||
+        !Number.isFinite(chunk.now)
+      ) {
+        throw new TypeError("Assistant chunk input is invalid.");
+      }
+      if (Buffer.byteLength(chunk.text, "utf8") > maxDynamoTextChunkBytes) {
+        throw new RangeError("Conversation text chunk exceeds the storage item limit.");
+      }
+      const key = turnKey(chunk.conversationId, chunk.ordinal);
+      const previous = await getItem(key);
+      const projectedTurn = {
+        ...(previous ?? {
+          ...key,
+          conversationId: chunk.conversationId,
+          queryId: chunk.queryId,
+          ordinal: chunk.ordinal,
+          status: "in_progress",
+          phase: "invocation_claimed",
+          ownerAttemptId: chunk.ownerAttemptId,
+          resultDeadlineAt: chunk.now + 1,
+        }),
+        cursor: chunk.index + 1,
+        answerManifest: { count: chunk.index + 1, complete: false },
+        updatedAt: isoDate(chunk.now),
+      };
+      const output = chunkItem(chunk);
+      const update = {
+        Update: {
+          TableName: tableName,
+          Key: key,
+          UpdateExpression:
+            "SET #cursor = :nextCursor, #answerManifest = :manifest, #updatedAt = :updatedAt",
+          ConditionExpression:
+            "#status = :inProgress AND #phase = :claimed AND #queryId = :queryId AND #ownerAttemptId = :ownerAttemptId AND #cursor = :index AND #resultDeadlineAt > :now",
+          ExpressionAttributeNames: {
+            "#cursor": "cursor",
             "#answerManifest": "answerManifest",
-            "#invocation": "invocation",
+            "#updatedAt": "updatedAt",
+            "#status": "status",
+            "#phase": "phase",
+            "#queryId": "queryId",
+            "#ownerAttemptId": "ownerAttemptId",
+            "#resultDeadlineAt": "resultDeadlineAt",
+          },
+          ExpressionAttributeValues: {
+            ":nextCursor": chunk.index + 1,
+            ":manifest": { count: chunk.index + 1, complete: false },
+            ":updatedAt": isoDate(chunk.now),
+            ":inProgress": "in_progress",
+            ":claimed": "invocation_claimed",
+            ":queryId": chunk.queryId,
+            ":ownerAttemptId": chunk.ownerAttemptId,
+            ":index": chunk.index,
+            ":now": chunk.now,
+          },
+        },
+      };
+      const actions = [
+        {
+          Put: {
+            TableName: tableName,
+            Item: output,
+            ConditionExpression: "attribute_not_exists(pk)",
+          },
+        },
+        update,
+      ];
+      preflight(actions, [output, projectedTurn]);
+      try {
+        await documentClient.send(new TransactWriteCommand({ TransactItems: actions }));
+      } catch (error) {
+        try {
+          const [current, savedChunk] = await Promise.all([
+            getItem(key),
+            getItem(
+              chunkKey(chunk.conversationId, chunk.ordinal, chunk.queryId, chunk.role, chunk.index),
+            ),
+          ]);
+          if (
+            savedChunk?.queryId === chunk.queryId &&
+            savedChunk?.role === chunk.role &&
+            savedChunk?.index === chunk.index &&
+            savedChunk?.text === chunk.text &&
+            current?.queryId === chunk.queryId &&
+            current?.ownerAttemptId === chunk.ownerAttemptId &&
+            Number(current.cursor) >= chunk.index + 1
+          )
+            return;
+        } catch {
+          /* Preserve the original write error when confirmation is unavailable. */
+        }
+        throw error;
+      }
+    },
+
+    async completeTurn(turn: CompleteTurnInput): Promise<void> {
+      if (
+        !isPositiveSafeInteger(turn.ordinal) ||
+        turn.answerManifest.complete !== true ||
+        !Number.isSafeInteger(turn.answerManifest.count) ||
+        turn.answerManifest.count < 0
+      ) {
+        throw new TypeError("Turn completion input is invalid.");
+      }
+      const key = turnKey(turn.conversationId, turn.ordinal);
+      const metaKey = { ...conversationKey(turn.conversationId), sk: "META" };
+      const [previousTurn, previousMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
+      const cursor = previousTurn?.cursor ?? turn.answerManifest.count;
+      const completedAt = isoDate(turn.now);
+      const projectedTurn = {
+        ...(previousTurn ?? {
+          ...key,
+          conversationId: turn.conversationId,
+          queryId: turn.queryId,
+          ordinal: turn.ordinal,
+        }),
+        status: "completed",
+        phase: "complete",
+        answerManifest: turn.answerManifest,
+        cursor,
+        invocation: turn.invocation ?? previousTurn?.invocation,
+        completedAt,
+        updatedAt: completedAt,
+        stopReason: turn.stopReason ?? "endTurn",
+        ...(turn.requestId ? { requestId: turn.requestId } : {}),
+        ...(turn.metrics ? { metrics: turn.metrics } : {}),
+      };
+      const projectedMeta: Record<string, unknown> = {
+        ...(previousMeta ?? metaKey),
+        updatedAt: completedAt,
+      };
+      delete projectedMeta.activeQueryId;
+      delete projectedMeta.activeOwnerAttemptId;
+      const turnUpdate = {
+        Update: {
+          TableName: tableName,
+          Key: key,
+          UpdateExpression:
+            "SET #status = :completed, #phase = :complete, #answerManifest = :manifest, #completedAt = :now, #updatedAt = :now, #stopReason = :stopReason" +
+            (turn.invocation ? ", #invocation = :invocation" : "") +
+            (turn.requestId ? ", #requestId = :requestId" : "") +
+            (turn.metrics ? ", #metrics = :metrics" : ""),
+          ConditionExpression:
+            "#status = :inProgress AND #phase = :claimed AND #queryId = :queryId AND #ownerAttemptId = :ownerAttemptId AND #resultDeadlineAt > :nowMs AND #cursor = :count",
+          ExpressionAttributeNames: {
+            "#status": "status",
+            "#phase": "phase",
+            "#queryId": "queryId",
+            "#ownerAttemptId": "ownerAttemptId",
+            "#resultDeadlineAt": "resultDeadlineAt",
+            "#cursor": "cursor",
+            "#answerManifest": "answerManifest",
             "#completedAt": "completedAt",
             "#updatedAt": "updatedAt",
             "#stopReason": "stopReason",
+            ...(turn.invocation ? { "#invocation": "invocation" } : {}),
             ...(turn.requestId ? { "#requestId": "requestId" } : {}),
             ...(turn.metrics ? { "#metrics": "metrics" } : {}),
           },
@@ -691,68 +1832,191 @@ export function createConversationStoreAdapter(input: {
             ":completed": "completed",
             ":complete": "complete",
             ":manifest": turn.answerManifest,
-            ":invocation": turn.invocation,
-            ":completedAt": isoDate(now),
+            ":now": completedAt,
+            ":nowMs": turn.now,
             ":stopReason": turn.stopReason ?? "endTurn",
             ":inProgress": "in_progress",
+            ":claimed": "invocation_claimed",
+            ":queryId": turn.queryId,
+            ":ownerAttemptId": turn.ownerAttemptId,
+            ":count": turn.answerManifest.count,
+            ...(turn.invocation ? { ":invocation": turn.invocation } : {}),
             ...(turn.requestId ? { ":requestId": turn.requestId } : {}),
             ...(turn.metrics ? { ":metrics": turn.metrics } : {}),
           },
-        }),
-      );
+        },
+      };
+      const metaUpdate = {
+        Update: {
+          TableName: tableName,
+          Key: metaKey,
+          UpdateExpression: "SET #updatedAt = :now REMOVE #activeQueryId, #activeOwnerAttemptId",
+          ConditionExpression:
+            "#activeQueryId = :queryId AND #activeOwnerAttemptId = :ownerAttemptId",
+          ExpressionAttributeNames: {
+            "#updatedAt": "updatedAt",
+            "#activeQueryId": "activeQueryId",
+            "#activeOwnerAttemptId": "activeOwnerAttemptId",
+          },
+          ExpressionAttributeValues: {
+            ":now": completedAt,
+            ":queryId": turn.queryId,
+            ":ownerAttemptId": turn.ownerAttemptId,
+          },
+        },
+      };
+      const actions = [turnUpdate, metaUpdate];
+      preflight(actions, [projectedTurn, projectedMeta]);
+      try {
+        await documentClient.send(new TransactWriteCommand({ TransactItems: actions }));
+      } catch (error) {
+        const latest = await getSubmissionByTurn(turn).catch(() => null);
+        if (
+          latest?.status === "completed" &&
+          latest.ownerAttemptId === turn.ownerAttemptId &&
+          latest.cursor === turn.answerManifest.count
+        )
+          return;
+        throw error;
+      }
     },
 
-    async failTurn(turn: {
+    async failTurn(turn: FailTurnInput): Promise<void> {
+      return failTurnInternal(turn, 1);
+    },
+    async reconcileTurn(input: {
+      sub: string;
+      botId: string;
       conversationId: string;
-      ordinal?: number;
       queryId: string;
-      now?: number;
-      code: string;
-      answerManifest?: { count: number; complete: false };
-      stopReason?: string;
-      requestId?: string;
-      metrics?: Record<string, unknown>;
-      providerError?: Record<string, unknown>;
-    }): Promise<void> {
-      const now = turn.now ?? Date.now();
-      await documentClient.send(
-        new UpdateCommand({
+      now: number;
+    }): Promise<SubmissionSnapshot | null> {
+      const snapshot = await getSubmission({
+        sub: input.sub,
+        botId: input.botId,
+        queryId: input.queryId,
+      });
+      if (
+        !snapshot ||
+        snapshot.conversationId !== input.conversationId ||
+        snapshot.status !== "in_progress"
+      )
+        return snapshot;
+      if (input.now < snapshot.resultDeadlineAt) return snapshot;
+      if (!snapshot.ownerAttemptId) throw new Error("Expired turn has no owner attempt.");
+      const key = turnKey(input.conversationId, snapshot.ordinal);
+      const metaKey = { ...conversationKey(input.conversationId), sk: "META" };
+      const [previousTurn, previousMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
+      if (!previousTurn || !previousMeta)
+        throw new Error("Expired submission is missing its turn or conversation record.");
+      const now = isoDate(input.now);
+      const claimed = snapshot.stage === "invocation_claimed";
+      const retired = claimed;
+      const answerManifest = { count: snapshot.cursor, complete: false };
+      const projectedTurn = {
+        ...previousTurn,
+        status: "failed",
+        phase: "failed",
+        failure: { code: "result_timeout" },
+        failedAt: now,
+        updatedAt: now,
+        answerManifest,
+      };
+      const projectedMeta: Record<string, unknown> = {
+        ...previousMeta,
+        updatedAt: now,
+        ...(retired ? { closed: true } : {}),
+      };
+      delete projectedMeta.activeQueryId;
+      delete projectedMeta.activeOwnerAttemptId;
+      const turnUpdate = {
+        Update: {
           TableName: tableName,
-          Key: turnKey(turn.conversationId, turn.ordinal ?? 1),
+          Key: key,
           UpdateExpression:
-            "SET #status = :failed, #phase = :failedPhase, #failure = :failure, #failedAt = :failedAt, #updatedAt = :failedAt" +
-            (turn.answerManifest ? ", #answerManifest = :manifest" : "") +
-            (turn.stopReason ? ", #stopReason = :stopReason" : "") +
-            (turn.requestId ? ", #requestId = :requestId" : "") +
-            (turn.metrics ? ", #metrics = :metrics" : "") +
-            (turn.providerError ? ", #providerError = :providerError" : ""),
-          ConditionExpression: "#status = :inProgress",
+            "SET #status = :failed, #phase = :failed, #failure = :failure, #failedAt = :now, #updatedAt = :now, #answerManifest = :manifest",
+          ConditionExpression:
+            "#status = :inProgress AND #phase = :phase AND #ownerAttemptId = :ownerAttemptId AND #resultDeadlineAt <= :nowMs AND #cursor = :cursor AND #queryId = :queryId",
           ExpressionAttributeNames: {
             "#status": "status",
             "#phase": "phase",
+            "#ownerAttemptId": "ownerAttemptId",
+            "#resultDeadlineAt": "resultDeadlineAt",
+            "#cursor": "cursor",
+            "#queryId": "queryId",
             "#failure": "failure",
             "#failedAt": "failedAt",
             "#updatedAt": "updatedAt",
-            ...(turn.answerManifest ? { "#answerManifest": "answerManifest" } : {}),
-            ...(turn.stopReason ? { "#stopReason": "stopReason" } : {}),
-            ...(turn.requestId ? { "#requestId": "requestId" } : {}),
-            ...(turn.metrics ? { "#metrics": "metrics" } : {}),
-            ...(turn.providerError ? { "#providerError": "providerError" } : {}),
+            "#answerManifest": "answerManifest",
           },
           ExpressionAttributeValues: {
             ":failed": "failed",
-            ":failedPhase": "failed",
-            ":failure": { code: turn.code },
-            ":failedAt": isoDate(now),
+            ":phase": snapshot.stage,
+            ":ownerAttemptId": snapshot.ownerAttemptId,
+            ":nowMs": input.now,
+            ":cursor": snapshot.cursor,
+            ":queryId": input.queryId,
             ":inProgress": "in_progress",
-            ...(turn.answerManifest ? { ":manifest": turn.answerManifest } : {}),
-            ...(turn.stopReason ? { ":stopReason": turn.stopReason } : {}),
-            ...(turn.requestId ? { ":requestId": turn.requestId } : {}),
-            ...(turn.metrics ? { ":metrics": turn.metrics } : {}),
-            ...(turn.providerError ? { ":providerError": turn.providerError } : {}),
+            ":failure": { code: "result_timeout" },
+            ":now": now,
+            ":manifest": answerManifest,
           },
-        }),
-      );
+        },
+      };
+      const metaUpdate = {
+        Update: {
+          TableName: tableName,
+          Key: metaKey,
+          UpdateExpression:
+            "SET #updatedAt = :now" +
+            (retired ? ", #closed = :true" : "") +
+            " REMOVE #activeQueryId, #activeOwnerAttemptId",
+          ConditionExpression:
+            "#activeQueryId = :queryId AND #activeOwnerAttemptId = :ownerAttemptId",
+          ExpressionAttributeNames: {
+            "#updatedAt": "updatedAt",
+            "#activeQueryId": "activeQueryId",
+            "#activeOwnerAttemptId": "activeOwnerAttemptId",
+            ...(retired ? { "#closed": "closed" } : {}),
+          },
+          ExpressionAttributeValues: {
+            ":now": now,
+            ":queryId": input.queryId,
+            ":ownerAttemptId": snapshot.ownerAttemptId,
+            ...(retired ? { ":true": true } : {}),
+          },
+        },
+      };
+      const actions = [turnUpdate, metaUpdate];
+      preflight(actions, [projectedTurn, projectedMeta]);
+      try {
+        await documentClient.send(new TransactWriteCommand({ TransactItems: actions }));
+      } catch (error) {
+        const latest = await getSubmission({
+          sub: input.sub,
+          botId: input.botId,
+          queryId: input.queryId,
+        }).catch(() => null);
+        if (latest && latest.status !== "in_progress") return latest;
+        if (isConditionalFailure(error)) return latest;
+        throw error;
+      }
+      return getSubmission({ sub: input.sub, botId: input.botId, queryId: input.queryId });
     },
   };
+
+  async function getSubmissionByTurn(turn: {
+    conversationId: string;
+    queryId: string;
+  }): Promise<SubmissionSnapshot | null> {
+    const record = await getItem({ pk: "CONV#" + turn.conversationId, sk: "META" });
+    if (!record || typeof record.sub !== "string" || typeof record.botId !== "string") return null;
+    return getSubmission({
+      sub: String(record.sub),
+      botId: String(record.botId),
+      queryId: turn.queryId,
+    });
+  }
+
+  return adapter;
 }

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import type { QuotaView } from "../runtime/contracts";
 
 export type ChatProfileStatus = "loading" | "incomplete" | "error" | "complete";
 export type ChatQueryStatus =
@@ -16,6 +17,10 @@ export type ChatScreenState = {
   previousTurns?: PreviousChatTurn[];
   question?: string;
   answer?: string;
+  ordinal?: number;
+  canContinue?: boolean;
+  quota?: QuotaView;
+  quotaReceivedAt?: number;
   profileError?: string;
   queryError?: string;
   projectName?: string;
@@ -23,7 +28,7 @@ export type ChatScreenState = {
 
 export type ChatScreenProps = {
   state: ChatScreenState;
-  onSubmit: (text: string) => void;
+  onSubmit: (text: string) => void | boolean;
   onSignOut: () => void | Promise<void>;
   onRetryProfile: () => void;
   onReset: () => void;
@@ -39,6 +44,27 @@ function createCopyTarget(): CopyTarget {
   return { latestOperation: 0, error: false };
 }
 
+function remainingQuotaTime(quota: QuotaView, elapsedMs = 0): string | null {
+  if (quota.blockedUntil === null) return null;
+  let remaining = quota.blockedUntil - quota.serverNow - elapsedMs;
+  if (!Number.isFinite(remaining) || remaining <= 0) return null;
+
+  const units = [
+    { duration: 86_400_000, singular: "día", plural: "días" },
+    { duration: 3_600_000, singular: "hora", plural: "horas" },
+    { duration: 60_000, singular: "minuto", plural: "minutos" },
+  ];
+  const parts: string[] = [];
+  for (const { duration, singular, plural } of units) {
+    const amount = Math.floor(remaining / duration);
+    if (amount === 0) continue;
+    parts.push(`${amount} ${amount === 1 ? singular : plural}`);
+    remaining %= duration;
+    if (parts.length === 2) break;
+  }
+  return parts.length > 0 ? parts.join(" y ") : "menos de un minuto";
+}
+
 export function ChatScreen({
   state,
   onSubmit,
@@ -48,6 +74,7 @@ export function ChatScreen({
   onCopy,
 }: ChatScreenProps) {
   const [draft, setDraft] = useState("");
+  const [quotaNow, setQuotaNow] = useState(0);
   const [, setCopyRevision] = useState(0);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const queryRef = useRef<HTMLTextAreaElement>(null);
@@ -90,12 +117,13 @@ export function ChatScreen({
   }
 
   const sending = state.queryStatus === "sending" || state.queryStatus === "streaming";
+  const canSubmitForState =
+    state.queryStatus === "idle" ||
+    (state.queryStatus === "completed" && state.canContinue !== false) ||
+    (state.queryStatus === "failed" && state.canContinue !== false) ||
+    (state.queryStatus === "rejected" && Boolean(state.quota));
   const canSubmit =
-    state.profileStatus === "complete" &&
-    (state.queryStatus === "idle" ||
-      state.queryStatus === "completed" ||
-      state.queryStatus === "failed") &&
-    draft.trim().length > 0;
+    state.profileStatus === "complete" && canSubmitForState && draft.trim().length > 0;
   const showConversation =
     state.profileStatus === "complete" ||
     previousTurns.length > 0 ||
@@ -104,7 +132,14 @@ export function ChatScreen({
   const showComposer =
     state.profileStatus === "complete" &&
     state.queryStatus !== "unconfirmed" &&
-    state.queryStatus !== "rejected";
+    (state.queryStatus !== "rejected" || Boolean(state.quota)) &&
+    (state.queryStatus !== "failed" || state.canContinue !== false);
+  const quotaElapsed =
+    state.quotaReceivedAt === undefined ? 0 : Math.max(0, quotaNow - state.quotaReceivedAt);
+  const quotaTime = state.quota ? remainingQuotaTime(state.quota, quotaElapsed) : null;
+  const quotaMessage = quotaTime
+    ? `Llegaste al límite de uso, vas a poder seguir usando la aplicación en ${quotaTime}`
+    : null;
   const progressMessage =
     state.queryStatus === "sending"
       ? "Enviando consulta…"
@@ -133,6 +168,25 @@ export function ChatScreen({
     }
   }, [state.profileStatus, state.queryStatus]);
 
+  useEffect(() => {
+    if (state.queryStatus === "rejected" && state.quota && state.question) {
+      setDraft(state.question);
+    }
+  }, [state.queryStatus, state.question, state.quota]);
+
+  useEffect(() => {
+    if (!state.quota || state.quota.blockedUntil === null || state.quotaReceivedAt === undefined) {
+      return;
+    }
+
+    setQuotaNow(performance.now());
+
+    const timer = window.setInterval(() => {
+      setQuotaNow(performance.now());
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [state.quota, state.quotaReceivedAt]);
+
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canSubmit) return;
@@ -142,8 +196,7 @@ export function ChatScreen({
     previousCopyTargetsRef.current[previousTurns.length] =
       state.queryStatus === "completed" && state.answer ? currentCopyTargetRef.current : null;
     currentCopyTargetRef.current = null;
-    onSubmit(draft);
-    setDraft("");
+    if (onSubmit(draft) !== false) setDraft("");
   }
 
   function restart() {
@@ -288,6 +341,12 @@ export function ChatScreen({
                 </p>
               ) : null}
 
+              {quotaMessage ? (
+                <p className="chat-quota-message" role="status" aria-live="polite">
+                  {quotaMessage}
+                </p>
+              ) : null}
+
               {state.answer ? (
                 <div className="chat-answer-block">
                   <p className="chat-message-label">Respuesta</p>
@@ -327,10 +386,12 @@ export function ChatScreen({
                 </>
               ) : null}
               {state.queryStatus === "rejected" ? (
-                <p className="chat-result-error" role="alert">
-                  {state.queryError ||
-                    "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
-                </p>
+                state.quota ? null : (
+                  <p className="chat-result-error" role="alert">
+                    {state.queryError ||
+                      "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
+                  </p>
+                )
               ) : null}
               {state.queryStatus === "unconfirmed" ? (
                 <p className="chat-result-error" role="alert">
@@ -341,7 +402,7 @@ export function ChatScreen({
 
               {state.queryStatus === "completed" ||
               state.queryStatus === "failed" ||
-              state.queryStatus === "rejected" ||
+              (state.queryStatus === "rejected" && !state.quota) ||
               state.queryStatus === "unconfirmed" ? (
                 <button
                   className="account-button account-button--secondary chat-restart-button"
