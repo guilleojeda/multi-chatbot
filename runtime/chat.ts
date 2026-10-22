@@ -344,6 +344,34 @@ function failureResponse(payload: unknown, failure: ReturnType<typeof safeFailur
   })();
 }
 
+async function rejectAfterSubmissionLookup(
+  request: NewChatRequest,
+  profileKey: { sub: string; botId: string },
+  store: ConversationStore,
+  failure: ReturnType<typeof safeFailure>,
+): Promise<ChatResponse> {
+  let persisted: SubmissionSnapshot | null;
+  try {
+    persisted = await store.getSubmission({ ...profileKey, queryId: request.queryId });
+  } catch {
+    return failureResponse(
+      request,
+      safeFailure("temporarily_unavailable", "unconfirmed", request.queryId),
+    );
+  }
+  if (persisted === null) return failureResponse(request, failure);
+  if (!belongsToSubmittingIdentity(persisted, { ...profileKey, queryId: request.queryId })) {
+    return failureResponse(
+      request,
+      safeFailure("conversation_unavailable", "not_admitted", request.queryId),
+    );
+  }
+  if (!matchesRequest(persisted, request)) {
+    return failureResponse(request, safeFailure("conflict", "not_admitted", request.queryId));
+  }
+  return publicSnapshot(persisted);
+}
+
 function errorCode(error: unknown): string | undefined {
   return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
 }
@@ -431,20 +459,19 @@ export function createChatHandler(dependencies: ChatDependencies) {
     if (request.operation === "recover") {
       return safeFailure("conversation_unavailable", "not_admitted", request.queryId);
     }
+    const reject = (failure: ReturnType<typeof safeFailure>) =>
+      rejectAfterSubmissionLookup(request, profileKey, store, failure);
 
     let meta: ConversationMeta | null;
     try {
       meta = await store.getMeta({ conversationId: request.conversationId });
     } catch {
-      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+      return reject(safeFailure("temporarily_unavailable", "not_admitted"));
     }
 
     if (request.operation === "start") {
       if (meta !== null) {
-        return failureResponse(
-          request,
-          safeFailure("conversation_unavailable", "not_admitted", request.queryId),
-        );
+        return reject(safeFailure("conversation_unavailable", "not_admitted", request.queryId));
       }
     } else {
       if (
@@ -454,14 +481,10 @@ export function createChatHandler(dependencies: ChatDependencies) {
           botId: config.botId,
         })
       ) {
-        return failureResponse(
-          request,
-          safeFailure("conversation_unavailable", "not_admitted", request.queryId),
-        );
+        return reject(safeFailure("conversation_unavailable", "not_admitted", request.queryId));
       }
       if (meta.closed) {
-        return failureResponse(
-          request,
+        return reject(
           safeFailure("conversation_closed", "not_admitted", request.queryId, {
             canContinue: false,
           }),
@@ -475,7 +498,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
             queryId: meta.activeQueryId,
           });
         } catch {
-          return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+          return reject(safeFailure("temporarily_unavailable", "not_admitted"));
         }
         if (
           active &&
@@ -496,7 +519,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
             });
             meta = await store.getMeta({ conversationId: request.conversationId });
           } catch {
-            return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+            return reject(safeFailure("temporarily_unavailable", "not_admitted"));
           }
           if (
             !isOwnedConversationMeta(meta, {
@@ -505,21 +528,15 @@ export function createChatHandler(dependencies: ChatDependencies) {
               botId: config.botId,
             })
           ) {
-            return failureResponse(
-              request,
-              safeFailure("conversation_unavailable", "not_admitted", request.queryId),
-            );
+            return reject(safeFailure("conversation_unavailable", "not_admitted", request.queryId));
           }
         }
         if (meta.activeQueryId) {
-          return failureResponse(
-            request,
-            safeFailure("conversation_busy", "not_admitted", request.queryId),
-          );
+          return reject(safeFailure("conversation_busy", "not_admitted", request.queryId));
         }
       }
       if (request.baseOrdinal !== meta.lastOrdinal) {
-        return failureResponse(request, safeFailure("stale_base", "not_admitted", request.queryId));
+        return reject(safeFailure("stale_base", "not_admitted", request.queryId));
       }
     }
 
@@ -527,16 +544,13 @@ export function createChatHandler(dependencies: ChatDependencies) {
     try {
       storedProfile = await profiles.getProfile(profileKey);
     } catch {
-      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+      return reject(safeFailure("temporarily_unavailable", "not_admitted"));
     }
     if (storedProfile === null) {
-      return failureResponse(
-        request,
-        safeFailure("profile_required", "not_admitted", request.queryId),
-      );
+      return reject(safeFailure("profile_required", "not_admitted", request.queryId));
     }
     if (!isStoredProfile(storedProfile, profileKey, config.profile)) {
-      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+      return reject(safeFailure("temporarily_unavailable", "not_admitted"));
     }
 
     let messages: ModelInput["messages"] = [];
@@ -547,7 +561,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
         messages = structuredClone(context.messages);
         contextReferences = structuredClone(context.references);
       } catch {
-        return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+        return reject(safeFailure("temporarily_unavailable", "not_admitted"));
       }
     }
 
@@ -566,8 +580,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
     try {
       tokenCount = await countInputTokens(modelInput);
     } catch {
-      return failureResponse(
-        request,
+      return reject(
         safeFailure("token_count_unavailable", "not_admitted", request.queryId, {
           message:
             "No pudimos comprobar si el pedido y el contexto caben en el modelo. Conservá el pedido y volvé a intentarlo.",
@@ -575,8 +588,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
       );
     }
     if (!isNativeTokenCount(tokenCount)) {
-      return failureResponse(
-        request,
+      return reject(
         safeFailure("token_count_unavailable", "not_admitted", request.queryId, {
           message:
             "No pudimos comprobar si el pedido y el contexto caben en el modelo. Conservá el pedido y volvé a intentarlo.",
@@ -595,8 +607,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
       }),
     );
     if (tokenCount.inputTokens > maxInputTokens) {
-      return failureResponse(
-        request,
+      return reject(
         safeFailure("capacity_exceeded", "not_admitted", request.queryId, {
           message:
             "El pedido y el contexto superan la capacidad del modelo. Acortá el pedido o iniciá una conversación nueva si el historial ocupa demasiado.",
@@ -612,7 +623,7 @@ export function createChatHandler(dependencies: ChatDependencies) {
     try {
       quota = await store.readQuota({ ...profileKey, now: admittedAt });
     } catch {
-      return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+      return reject(safeFailure("temporarily_unavailable", "not_admitted"));
     }
     const beforeAdmissionAt = now();
     if (!quotaPeriodsMatch(quota, beforeAdmissionAt)) {
@@ -620,15 +631,12 @@ export function createChatHandler(dependencies: ChatDependencies) {
       try {
         quota = await store.readQuota({ ...profileKey, now: admittedAt });
       } catch {
-        return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+        return reject(safeFailure("temporarily_unavailable", "not_admitted"));
       }
     }
     admittedAt = now();
     if (!quotaPeriodsMatch(quota, admittedAt)) {
-      return failureResponse(
-        request,
-        safeFailure("temporarily_unavailable", "not_admitted", request.queryId),
-      );
+      return reject(safeFailure("temporarily_unavailable", "not_admitted", request.queryId));
     }
     let resultDeadlineAt = admittedAt + resultDeadlineMs;
     const performAdmission = async (): Promise<{ queryId: string; ordinal: number }> => {
@@ -672,11 +680,11 @@ export function createChatHandler(dependencies: ChatDependencies) {
         try {
           quota = await store.readQuota({ ...profileKey, now: admittedAt });
         } catch {
-          return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+          return reject(safeFailure("temporarily_unavailable", "not_admitted"));
         }
         admittedAt = now();
         if (!quotaPeriodsMatch(quota, admittedAt)) {
-          return failureResponse(request, safeFailure("temporarily_unavailable", "not_admitted"));
+          return reject(safeFailure("temporarily_unavailable", "not_admitted"));
         }
         resultDeadlineAt = admittedAt + resultDeadlineMs;
         admitted = await performAdmission();
@@ -689,36 +697,16 @@ export function createChatHandler(dependencies: ChatDependencies) {
         throw new Error("Admission returned an invalid turn identity.");
       }
     } catch (error) {
-      let persisted: SubmissionSnapshot | null = null;
-      try {
-        persisted = await store.getSubmission({ ...profileKey, queryId: request.queryId });
-      } catch {
-        // A failed read cannot establish whether the transaction committed.
-      }
-      if (
-        persisted &&
-        belongsToSubmittingIdentity(persisted, { ...profileKey, queryId: request.queryId })
-      ) {
-        if (matchesRequest(persisted, request)) return publicSnapshot(persisted);
-        return failureResponse(request, safeFailure("conflict", "not_admitted", request.queryId));
-      }
       const code = errorCode(error);
       if (code === "quota_period_changed") {
-        return failureResponse(
-          request,
-          safeFailure("temporarily_unavailable", "not_admitted", request.queryId),
-        );
+        return reject(safeFailure("temporarily_unavailable", "not_admitted", request.queryId));
       }
       if (code === "quota_exceeded") {
         const suppliedQuota = isRecord(error) && isQuotaView(error.quota) ? error.quota : quota;
-        return failureResponse(
-          request,
-          safeFailure(code, "not_admitted", request.queryId, { quota: suppliedQuota }),
-        );
+        return reject(safeFailure(code, "not_admitted", request.queryId, { quota: suppliedQuota }));
       }
       if (code === "storage_capacity_exceeded") {
-        return failureResponse(
-          request,
+        return reject(
           safeFailure("storage_capacity_exceeded", "not_admitted", request.queryId, {
             message:
               "No pudimos admitir el pedido porque supera el límite técnico de almacenamiento de la conversación.",
@@ -726,12 +714,9 @@ export function createChatHandler(dependencies: ChatDependencies) {
         );
       }
       if (code === "conversation_busy" || code === "stale_base" || code === "conflict") {
-        return failureResponse(request, safeFailure(code, "not_admitted", request.queryId));
+        return reject(safeFailure(code, "not_admitted", request.queryId));
       }
-      return failureResponse(
-        request,
-        safeFailure("temporarily_unavailable", "unconfirmed", request.queryId),
-      );
+      return reject(safeFailure("temporarily_unavailable", "unconfirmed", request.queryId));
     }
 
     return admittedStream({

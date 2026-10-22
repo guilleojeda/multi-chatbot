@@ -58,10 +58,12 @@ function bearer(claims = { sub: "teacher-123", token_use: "access" }) {
 function makeHarness({
   generate,
   profile,
+  profileResult,
   meta = null,
   context = { messages: [], references: [] },
   continueGate,
   onContinue,
+  countInputTokens = async () => ({ inputTokens: 0 }),
   clock = () => Date.parse("2026-10-19T16:00:00.000Z"),
   storeOverrides = {},
 } = {}) {
@@ -73,6 +75,7 @@ function makeHarness({
     providerCalls: 0,
     meta,
     context,
+    admissionCalls: 0,
     submissions: new Map(),
     claims: new Set(),
   };
@@ -115,6 +118,7 @@ function makeHarness({
     },
     profiles: {
       async getProfile() {
+        if (profileResult !== undefined) return profileResult;
         return (
           profile ?? {
             sub: "teacher-123",
@@ -140,6 +144,7 @@ function makeHarness({
         return state.context;
       },
       async startTurn(input) {
+        state.admissionCalls += 1;
         const ordinal = 1;
         state.submissions.set(submissionKey(input), makeSubmission(input, ordinal));
         state.meta = {
@@ -152,6 +157,7 @@ function makeHarness({
         return { queryId: input.queryId, ordinal };
       },
       async continueTurn(input) {
+        state.admissionCalls += 1;
         state.continued.push(input);
         onContinue?.(input);
         if (continueGate) await continueGate;
@@ -227,11 +233,9 @@ function makeHarness({
           state.meta.closed = true;
         }
       },
-      ...storeOverrides,
+      ...(typeof storeOverrides === "function" ? storeOverrides(state) : storeOverrides),
     },
-    async countInputTokens() {
-      return { inputTokens: 0 };
-    },
+    countInputTokens,
     generate(input) {
       state.providerCalls += 1;
       state.providerInput = input;
@@ -964,5 +968,210 @@ describe("chat Runtime implementation regressions", () => {
     expect(harness.state.providerInput.systemPrompt).toContain(
       "pedido actual de la persona prevalece",
     );
+  });
+
+  it.each([
+    { operation: "start", outcome: "active", status: "in_progress" },
+    { operation: "start", outcome: "completed", status: "completed" },
+    { operation: "start", outcome: "failed_closed", status: "failed" },
+    { operation: "message", outcome: "active", status: "in_progress" },
+    { operation: "message", outcome: "completed", status: "completed" },
+    { operation: "message", outcome: "failed_closed", status: "failed" },
+  ])(
+    "returns the matching durable snapshot when a $operation request races an $outcome admission",
+    async ({ operation, outcome, status }) => {
+      const metadataReadStarted = deferred();
+      const releaseMetadataRead = deferred();
+      let metadataReads = 0;
+      let countCalls = 0;
+      const harness = makeHarness({
+        meta:
+          operation === "message"
+            ? { conversationId, sub: "teacher-123", botId: "bot-aurora", lastOrdinal: 2 }
+            : null,
+        countInputTokens: async () => {
+          countCalls += 1;
+          return { inputTokens: 0 };
+        },
+        storeOverrides: (state) => ({
+          async getMeta() {
+            metadataReads += 1;
+            if (metadataReads === 1) {
+              metadataReadStarted.resolve();
+              await releaseMetadataRead.promise;
+            }
+            return state.meta;
+          },
+        }),
+        generate: () =>
+          (async function* () {
+            if (outcome === "failed_closed") {
+              yield { type: "error", providerCode: "TransportError" };
+            } else {
+              yield { type: "text", text: "Respuesta durable." };
+              yield { type: "result", stopReason: "end_turn" };
+            }
+          })(),
+      });
+
+      const duplicatePending = request(harness, operation);
+      await metadataReadStarted.promise;
+      const original = await request(harness, operation);
+      if (outcome !== "active") await collect(original);
+      releaseMetadataRead.resolve();
+      const duplicate = await duplicatePending;
+
+      expect(duplicate).toMatchObject({
+        version: 2,
+        conversationId,
+        queryId,
+        status,
+      });
+      expect(await collect(duplicate)).toMatchObject({ status });
+      expect(harness.state.admissionCalls).toBe(1);
+      expect(harness.state.submissions.size).toBe(1);
+      expect(countCalls).toBe(1);
+      expect(harness.state.providerCalls).toBe(outcome === "active" ? 0 : 1);
+      if (outcome === "failed_closed") {
+        expect(harness.state.meta).toMatchObject({ closed: true });
+      }
+    },
+  );
+
+  it.each([
+    {
+      name: "profile_required",
+      options: { profileResult: null },
+      expected: { code: "profile_required", recordStatus: "not_admitted", queryId },
+      countCalls: 0,
+    },
+    {
+      name: "token_count_unavailable",
+      options: {
+        countInputTokens: async () => {
+          throw new Error("CountTokens unavailable");
+        },
+      },
+      expected: { code: "token_count_unavailable", recordStatus: "not_admitted", queryId },
+      countCalls: 1,
+    },
+    {
+      name: "capacity_exceeded",
+      options: { countInputTokens: async () => ({ inputTokens: 1_000_000 }) },
+      expected: { code: "capacity_exceeded", recordStatus: "not_admitted", queryId },
+      countCalls: 1,
+    },
+    {
+      name: "quota_exceeded",
+      options: {
+        storeOverrides: {
+          async startTurn() {
+            throw Object.assign(new Error("Daily quota reached"), {
+              code: "quota_exceeded",
+              quota: quotaView,
+            });
+          },
+        },
+      },
+      expected: {
+        code: "quota_exceeded",
+        recordStatus: "not_admitted",
+        queryId,
+        quota: quotaView,
+      },
+      countCalls: 1,
+    },
+  ])("preserves the $name preflight rejection when its marker is absent", async (testCase) => {
+    let countCalls = 0;
+    const harness = makeHarness({
+      ...testCase.options,
+      countInputTokens: async (...args) => {
+        countCalls += 1;
+        return testCase.options.countInputTokens
+          ? testCase.options.countInputTokens(...args)
+          : { inputTokens: 0 };
+      },
+    });
+
+    const events = await collect(request(harness));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject(testCase.expected);
+    expect(countCalls).toBe(testCase.countCalls);
+    expect(harness.state.admissionCalls).toBe(0);
+    expect(harness.state.providerCalls).toBe(0);
+  });
+
+  it.each([
+    {
+      name: "absent",
+      reread: async () => null,
+      expected: { code: "profile_required", recordStatus: "not_admitted", queryId },
+    },
+    {
+      name: "failed",
+      reread: async () => {
+        throw new Error("DynamoDB read failed");
+      },
+      expected: { code: "temporarily_unavailable", recordStatus: "unconfirmed", queryId },
+    },
+    {
+      name: "different content",
+      reread: async () => ({
+        sub: "teacher-123",
+        botId: "bot-aurora",
+        conversationId,
+        queryId,
+        operation: "start",
+        baseOrdinal: 0,
+        question: "Contenido privado distinto.",
+        requestFingerprint: "b".repeat(64),
+        ordinal: 1,
+        status: "in_progress",
+        answer: "Respuesta privada distinta.",
+        canContinue: false,
+      }),
+      expected: { code: "conflict", recordStatus: "not_admitted", queryId },
+    },
+    {
+      name: "cross-owner record",
+      reread: async () => ({
+        sub: "another-teacher",
+        botId: "bot-aurora",
+        conversationId,
+        queryId,
+        operation: "start",
+        baseOrdinal: 0,
+        question: "Contenido ajeno.",
+        requestFingerprint: "c".repeat(64),
+        ordinal: 1,
+        status: "in_progress",
+        answer: "Respuesta ajena.",
+        canContinue: false,
+      }),
+      expected: { code: "conversation_unavailable", recordStatus: "not_admitted", queryId },
+    },
+  ])("handles a $name marker reread without exposing stored text", async ({ reread, expected }) => {
+    let reads = 0;
+    const harness = makeHarness({
+      profileResult: null,
+      storeOverrides: {
+        async getSubmission() {
+          reads += 1;
+          return reads === 1 ? null : reread();
+        },
+      },
+    });
+
+    const events = await collect(request(harness));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject(expected);
+    expect(events[0]).not.toHaveProperty("question");
+    expect(events[0]).not.toHaveProperty("answer");
+    expect(JSON.stringify(events)).not.toMatch(/privad[oa]|ajeno/);
+    expect(reads).toBe(2);
+    expect(harness.state.admissionCalls).toBe(0);
+    expect(harness.state.providerCalls).toBe(0);
   });
 });
