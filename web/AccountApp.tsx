@@ -1342,12 +1342,13 @@ export function AccountApp({
       previousJournal !== null &&
       !previousJournal.admitted &&
       previousJournal.request.text === text;
-    const retrying =
+    const retryingUnconfirmed = pendingRequestMatches && current.queryStatus === "unconfirmed";
+    const retryingKnownCountFailure =
       pendingRequestMatches &&
-      (current.queryStatus === "unconfirmed" ||
-        (current.queryStatus === "rejected" &&
-          current.canRetry === true &&
-          current.queryErrorCode === "token_count_unavailable"));
+      current.queryStatus === "rejected" &&
+      current.canRetry === true &&
+      current.queryErrorCode === "token_count_unavailable";
+    const retrying = retryingUnconfirmed || retryingKnownCountFailure;
     const canStartNewRequest =
       current.queryStatus === "idle" ||
       ((current.queryStatus === "completed" || current.queryStatus === "failed") &&
@@ -1540,13 +1541,24 @@ export function AccountApp({
         const failureCode = result.code.toLowerCase();
         const retryableCountFailure =
           failureCode === "token_count_unavailable" && result.recordStatus === "not_admitted";
+        const preserveUnconfirmedJournal =
+          retryingUnconfirmed &&
+          result.recordStatus === "not_admitted" &&
+          failureCode !== "conflict" &&
+          failureCode !== "access_denied" &&
+          failureCode !== "unauthorized";
         if (failureCode === "access_denied") {
           invalidateChat();
           profileForbidden();
           return;
         }
         if (result.recordStatus === "not_admitted") {
-          if (retryableCountFailure) {
+          if (preserveUnconfirmedJournal) {
+            // A missing marker during recovery does not prove the original admission ended.
+            // Keep its only identity until a later recovery resolves the request.
+            chatJournalRef.current = previousJournal;
+            chatConversationIdRef.current = previousJournal.request.conversationId;
+          } else if (retryableCountFailure) {
             // CountTokens failed before admission. Keep this exact body and ID for an explicit
             // retry, even when the attempted request was a follow-up to an admitted turn.
             chatJournalRef.current = { request, admitted: false };
@@ -1597,7 +1609,7 @@ export function AccountApp({
           profileStatus: failureCode === "profile_required" ? "incomplete" : before.profileStatus,
           profileError: failureCode === "profile_required" ? undefined : before.profileError,
           queryStatus:
-            result.recordStatus === "unconfirmed"
+            preserveUnconfirmedJournal || result.recordStatus === "unconfirmed"
               ? "unconfirmed"
               : result.recordStatus === "not_admitted"
                 ? "rejected"
@@ -1610,6 +1622,7 @@ export function AccountApp({
           recovered: retrying && result.recordStatus !== "not_admitted",
           recoveryLoading: false,
           canRetry:
+            preserveUnconfirmedJournal ||
             retryableCountFailure ||
             (result.recordStatus === "unconfirmed" && !chatJournalRef.current?.admitted),
         });

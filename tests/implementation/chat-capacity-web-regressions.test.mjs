@@ -3,7 +3,11 @@ import {
   createAccountAppHookHarness,
   loadAccountAppForHookTests,
 } from "../support/account-app-hook-harness.mjs";
-import { markChatJournalAdmitted, writePendingChatJournal } from "../../web/chat-journal.ts";
+import {
+  markChatJournalAdmitted,
+  readChatJournal,
+  writePendingChatJournal,
+} from "../../web/chat-journal.ts";
 
 const config = {
   region: "us-east-1",
@@ -118,6 +122,152 @@ function mount(environment) {
 }
 
 describe("AccountApp capacity rejection regressions", () => {
+  it("keeps an uncertain journal when an explicit retry fails preflight until recovery finds the original", async () => {
+    const storage = new MemorySessionStorage();
+    vi.stubGlobal("sessionStorage", storage);
+    vi.stubGlobal("window", {
+      location: { hash: "#/chat", pathname: "/", search: "" },
+      history: { replaceState() {} },
+      crypto: { randomUUID: vi.fn() },
+      sessionStorage: storage,
+      setTimeout: (...args) => globalThis.setTimeout(...args),
+      clearTimeout: (...args) => globalThis.clearTimeout(...args),
+      setInterval: (...args) => globalThis.setInterval(...args),
+      clearInterval: (...args) => globalThis.clearInterval(...args),
+      addEventListener() {},
+      removeEventListener() {},
+    });
+
+    const session = {
+      accessToken: vi.fn(() => "temporary-access-token"),
+      idToken: vi.fn(() => "temporary-id-token"),
+      restore: vi.fn(async () => ({ accessToken: "temporary-access-token" })),
+      signOut: vi.fn(async () => undefined),
+    };
+    const request = {
+      version: 2,
+      operation: "start",
+      conversationId,
+      queryId: recoveredQueryId,
+      baseOrdinal: 0,
+      text: "La pregunta original todavía en vuelo.",
+    };
+    writePendingChatJournal(config, identity, request);
+    const runtimeRequests = [];
+    let recoveryCount = 0;
+    let resolveCommittedRecovery;
+    const committedRecovery = new Promise((resolve) => {
+      resolveCommittedRecovery = resolve;
+    });
+    const fetch = vi.fn(async (input, init = {}) => {
+      const url = String(input);
+      if (url === "/public-config.json") return jsonResponse(config);
+      if (url === "/api/account/me") return jsonResponse(identity);
+      if (url === "/api/profile") {
+        return jsonResponse({
+          sub: identity.sub,
+          botId: identity.botId,
+          profile: {
+            sub: identity.sub,
+            botId: identity.botId,
+            updatedAt: "2026-10-20T00:00:00.000Z",
+            fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
+            responsePreferenceIds: [],
+          },
+        });
+      }
+      if (url !== runtimeUrl()) throw new Error(`Unexpected web request: ${url}`);
+
+      const body = JSON.parse(String(init.body));
+      runtimeRequests.push(body);
+      if (body.operation === "recover") {
+        recoveryCount += 1;
+        if (recoveryCount === 1) {
+          return jsonResponse({
+            type: "failed",
+            code: "conversation_unavailable",
+            recordStatus: "not_admitted",
+            queryId: request.queryId,
+          });
+        }
+        return committedRecovery;
+      }
+      return sse([
+        {
+          type: "failed",
+          code: "token_count_unavailable",
+          message: "No pudimos comprobar la capacidad del pedido.",
+          recordStatus: "not_admitted",
+          queryId: request.queryId,
+        },
+      ]);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const app = mount({ session });
+    await app.flush();
+    await vi.waitFor(() => expect(recoveryCount).toBe(1));
+    await app.flush();
+    expect(app.current().props.state).toMatchObject({
+      queryStatus: "unconfirmed",
+      canRetry: true,
+    });
+    expect(app.current().props.onSubmit(request.text)).toBe(true);
+    await vi.waitFor(() =>
+      expect(runtimeRequests.filter((item) => item.operation === "start")).toHaveLength(1),
+    );
+    await app.flush();
+    await vi.waitFor(() => expect(recoveryCount).toBe(2));
+    await app.flush();
+
+    expect(app.current().props.state).toMatchObject({
+      queryStatus: "unconfirmed",
+      question: request.text,
+      canRetry: true,
+      queryErrorCode: "token_count_unavailable",
+    });
+    expect(runtimeRequests).toHaveLength(3);
+    expect(runtimeRequests.filter((item) => item.operation !== "recover")).toEqual([request]);
+    expect(readChatJournal(config, identity)).toMatchObject({
+      admitted: false,
+      request,
+    });
+
+    resolveCommittedRecovery(
+      jsonResponse({
+        version: 2,
+        conversationId,
+        queryId: recoveredQueryId,
+        ordinal: 1,
+        status: "completed",
+        question: request.text,
+        answer: "La respuesta del envío original.",
+        canContinue: true,
+      }),
+    );
+    await app.flush();
+
+    expect(app.current().props.state).toMatchObject({
+      queryStatus: "completed",
+      question: request.text,
+      answer: "La respuesta del envío original.",
+      recovered: true,
+      ordinal: 1,
+    });
+    expect(runtimeRequests.map((item) => item.operation)).toEqual(["recover", "start", "recover"]);
+    expect(runtimeRequests.every((item) => item.queryId === recoveredQueryId)).toBe(true);
+    expect(readChatJournal(config, identity)).toMatchObject({
+      admitted: true,
+      request: {
+        version: 2,
+        operation: "start",
+        conversationId,
+        queryId: recoveredQueryId,
+        baseOrdinal: 0,
+      },
+    });
+  });
+
   it("keeps the live conversation ID when its admitted journal write fails across profile navigation", async () => {
     const storage = new MemorySessionStorage();
     vi.stubGlobal("sessionStorage", storage);

@@ -842,6 +842,7 @@ describe("the conversation Runtime handler", () => {
       "getSubmission",
       "getMeta",
       "getProfile",
+      "getSubmission",
     ]);
     expect(harness.state.providerCalls).toBe(0);
   });
@@ -861,6 +862,7 @@ describe("the conversation Runtime handler", () => {
       "getMeta",
       "getProfile",
       "readContext",
+      "getSubmission",
     ]);
     expect(harness.state.providerCalls).toBe(0);
     expect(harness.state.calls.some(([name]) => name === "continueTurn")).toBe(false);
