@@ -185,9 +185,9 @@ function auxiliaryModelInput(input: ModelInput): ModelInput {
     ...input,
     systemPrompt: [
       input.systemPrompt.trim(),
-      "Prepará únicamente una consulta autónoma, breve y fiel para buscar en documentos del proyecto.",
+      "Prepará una consulta autónoma y fiel de búsqueda en una o dos frases, con un máximo total de 1.000 caracteres.",
       "Usá el perfil y el historial confirmado para resolver referentes. Priorizá las restricciones y el nivel indicados en el pedido actual.",
-      "No respondas a la persona, no agregues conocimiento externo y devolvé solo la consulta de búsqueda.",
+      "No agregues conocimiento externo ni incluyas introducciones, listas, explicaciones o una respuesta al pedido. Devolvé solo el texto de búsqueda, sin superar ese límite.",
     ].join("\n"),
   };
 }
