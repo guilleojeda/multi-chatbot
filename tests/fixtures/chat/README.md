@@ -160,9 +160,8 @@ completed turn, select `runtime-conversation-busy` or `runtime-stale-base` befor
 the corresponding public `conversation_busy` or `stale_base` rejection; neither creates an admitted
 stream or advances the fixture's ordinal. These two selections exercise the web response handling;
 runtime/store tests cover the actual occupied-thread and stale-base conditions.
-For C's input-capacity flows, these local scenarios simulate public Runtime failures before any
-fixture conversation turn or usage record is created; they do not call AWS or run the native token
-counter:
+The pre-admission document-preparation scenarios below simulate public Runtime failures before a
+fixture conversation turn or usage record is created; they do not call AWS:
 
 - **Document retrieval failure and explicit retry:** select `runtime-documents-unavailable` and
   submit a question. Confirm “Enviando consulta…” appears while the POST is pending, with no answer
@@ -180,10 +179,12 @@ counter:
   automatic POST. Click “Recargar pestaña y probar recuperación.” After reload, compare the product
   journal's pending ID/body with the `recover` request; no `start` or `message` should be sent.
   Select `ready` and use the explicit retry button if you want to continue the same query.
-- Admitted partial responses and copy are checked with the existing controls: submit under `ready`,
-  let the first fragment appear, click “Fallar generación,” then copy “Copiar texto parcial.” The
-  intercepted clipboard text must equal the visible prefix. This exercises the browser contract,
-  not model grounding or answer quality.
+
+An admitted partial response and its copy use the existing controls: submit under `ready`, let the
+first fragment appear, click “Fallar generación,” then copy “Copiar texto parcial.” The intercepted
+clipboard text must equal the visible prefix. This exercises the browser contract, not model
+grounding or answer quality.
+
 - To check history capacity, complete a turn under `ready`, select
   `runtime-capacity-exceeded`, and send a follow-up. The simulated failure applies only to
   `message`, so the completed turn remains in the fixture's stored conversation. Confirm the

@@ -107,7 +107,8 @@ Si ya existe, el primer comando devuelve `ConditionalCheckFailedException`; leer
 
 Los documentos se preparan fuera de la aplicación. El equipo técnico publica texto UTF-8 ya
 revisado en el prefijo del bucket documental; no se usa el bucket web. El stack de chat emite
-`DocumentBucketName`, `PreparedDocumentsPrefix`, `KnowledgeBaseId` y `DocumentDataSourceId`:
+outputs que contienen `DocumentBucketName`, `PreparedDocumentsPrefix`, `KnowledgeBaseId` y
+`DocumentDataSourceId` en sus claves. CDK añade el prefijo del construct y un hash a esas claves:
 
 ```sh
 aws sts get-caller-identity --query Account --output text
