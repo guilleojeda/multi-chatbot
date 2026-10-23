@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
+import { extractOriginalRequestText } from "./helpers/model-input-text.mjs";
 
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const handlerPath = path.join(projectRoot, "runtime/chat.ts");
@@ -699,7 +700,6 @@ describe("the conversation Runtime handler", () => {
     expect(terminal(events)).toMatchObject({ type: "completed", queryId });
     expect(harness.state.providerCalls).toBe(1);
     expect(harness.state.providerInputs[0]).toMatchObject({
-      text,
       messages: [],
       modelId: "global.anthropic.claude-sonnet-4-6",
       revision: "reviewed-revision-123",
@@ -712,6 +712,7 @@ describe("the conversation Runtime handler", () => {
         promptTexts: ["Incluí materiales completos y listos para usar en clase."],
       },
     });
+    expect(extractOriginalRequestText(harness.state.providerInputs[0].text)).toBe(text);
     expect(harness.state.providerInputs[0].systemPrompt).toContain(
       "Incluí materiales completos y listos para usar en clase.",
     );
@@ -787,8 +788,8 @@ describe("the conversation Runtime handler", () => {
     expect(harness.state.providerInputs).toHaveLength(1);
     expect(harness.state.providerInputs[0]).toMatchObject({
       messages: priorMessages,
-      text,
     });
+    expect(extractOriginalRequestText(harness.state.providerInputs[0].text)).toBe(text);
     expect(harness.state.providerInputs[0].messages).not.toContainEqual({
       role: "user",
       content: [{ text }],
@@ -836,8 +837,10 @@ describe("the conversation Runtime handler", () => {
     );
     expect(harness.state.providerInputs[1]).toMatchObject({
       messages: harness.state.contextMessages,
-      text: "Seguimiento con el perfil actualizado.",
     });
+    expect(extractOriginalRequestText(harness.state.providerInputs[1].text)).toBe(
+      "Seguimiento con el perfil actualizado.",
+    );
   });
 
   it("does not read context or generate when the current saved profile is invalid", async () => {

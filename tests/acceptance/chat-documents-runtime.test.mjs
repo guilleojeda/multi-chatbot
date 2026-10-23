@@ -17,6 +17,7 @@ import {
   terminal,
   validProfile,
 } from "./helpers/documents-runtime-harness.mjs";
+import { extractOriginalRequestText } from "./helpers/model-input-text.mjs";
 
 const chatPath = path.join(projectRoot, "runtime/chat.ts");
 const modelId = "global.anthropic.claude-sonnet-4-6";
@@ -156,7 +157,7 @@ describe("document preparation in the conversation Runtime", () => {
         expect(prompt).not.toContain(internalValue);
       }
     }
-    expect(harness.state.countInputs[0].text).toBe(startPayload.text);
+    expect(extractOriginalRequestText(harness.state.countInputs[0].text)).toBe(startPayload.text);
 
     const names = harness.state.calls.map(([name]) => name);
     const position = (name) => names.indexOf(name);
@@ -233,9 +234,9 @@ describe("document preparation in the conversation Runtime", () => {
       modelId,
     });
     expect(harness.state.admittedTurns[0].contextReferences).toEqual(contextReferences);
-    expect(harness.state.countInputs[0].text).toBe(payload.text);
+    expect(extractOriginalRequestText(harness.state.countInputs[0].text)).toBe(payload.text);
     expect(harness.state.countInputs[0].messages).toEqual(history);
-    expect(harness.state.generateInputs[0].text).toBe(payload.text);
+    expect(extractOriginalRequestText(harness.state.generateInputs[0].text)).toBe(payload.text);
     expect(harness.state.generateInputs[0].messages).toEqual(history);
     expect(harness.state.generateInputs[0].profileSnapshot).toEqual(
       harness.state.admittedTurns[0].profileSnapshot,

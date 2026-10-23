@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createChatHandler } from "../../runtime/chat.ts";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
+import { extractOriginalRequestText } from "./helpers/model-input-text.mjs";
 
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
@@ -489,7 +490,6 @@ describe("native model capacity admission", () => {
     expect(harness.state.providerInputs).toHaveLength(1);
     expect(harness.state.countInputs[0]).toEqual(harness.state.providerInputs[0]);
     expect(harness.state.countInputs[0]).toMatchObject({
-      text,
       messages,
       modelId,
       profileSnapshot: {
@@ -503,6 +503,7 @@ describe("native model capacity admission", () => {
         promptTexts: ["Incluí materiales completos y listos para usar en clase."],
       },
     });
+    expect(extractOriginalRequestText(harness.state.countInputs[0].text)).toBe(text);
     expect(harness.state.countInputs[0].systemPrompt).toContain(
       "Incluí materiales completos y listos para usar en clase.",
     );
@@ -554,8 +555,8 @@ describe("native model capacity admission", () => {
     expect(text.length).toBeGreaterThan(8_000);
     expect(Buffer.byteLength(text, "utf8")).toBeGreaterThan(128 * 1024);
     expect(terminal(events)).toMatchObject({ type: "completed", queryId });
-    expect(harness.state.countInputs[0].text).toBe(text);
-    expect(harness.state.providerInputs[0].text).toBe(text);
+    expect(extractOriginalRequestText(harness.state.countInputs[0].text)).toBe(text);
+    expect(extractOriginalRequestText(harness.state.providerInputs[0].text)).toBe(text);
     expect(harness.state.admissions[0].text).toBe(text);
     expectCountBeforeAdmissionAndGeneration(harness.state);
   });
@@ -644,7 +645,7 @@ describe("native model capacity admission", () => {
     expect(claimCalls).toBe(0);
     expect(harness.state.providerCalls).toBe(0);
     expect(harness.state.countInputs).toHaveLength(1);
-    expect(harness.state.countInputs[0].text).toBe(oversizedQuestion);
+    expect(extractOriginalRequestText(harness.state.countInputs[0].text)).toBe(oversizedQuestion);
   });
 
   it("repeats and recovers an existing ID without requiring current profile, policy, or count", async () => {
