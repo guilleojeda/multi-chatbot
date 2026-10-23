@@ -64,6 +64,14 @@ function makeHarness({
   continueGate,
   onContinue,
   countInputTokens = async () => ({ inputTokens: 0 }),
+  prepareDocuments = async () => ({
+    knowledgeBaseId: "kb-test-aurora",
+    query: "consulta documental de prueba",
+    revision: "documents-test-r1",
+    retrievedAt: Date.parse("2026-10-19T16:00:00.000Z"),
+    status: "empty",
+    results: [],
+  }),
   clock = () => Date.parse("2026-10-19T16:00:00.000Z"),
   storeOverrides = {},
 } = {}) {
@@ -235,16 +243,7 @@ function makeHarness({
       },
       ...(typeof storeOverrides === "function" ? storeOverrides(state) : storeOverrides),
     },
-    async prepareDocuments() {
-      return {
-        knowledgeBaseId: "kb-test-aurora",
-        query: "consulta documental de prueba",
-        revision: "documents-test-r1",
-        retrievedAt: Date.parse("2026-10-19T16:00:00.000Z"),
-        status: "empty",
-        results: [],
-      };
-    },
+    prepareDocuments,
     countInputTokens,
     generate(input) {
       state.providerCalls += 1;
@@ -958,6 +957,14 @@ describe("chat Runtime implementation regressions", () => {
     };
     const harness = makeHarness({
       profile: hostileProfile,
+      prepareDocuments: async () => ({
+        knowledgeBaseId: "kb-test-aurora",
+        query: "propuesta de ciencias para secundaria",
+        revision: "documents-test-r1",
+        retrievedAt: Date.parse("2026-10-19T16:00:00.000Z"),
+        status: "results",
+        results: [{ text: "La propuesta observa evaporación en un recipiente cerrado." }],
+      }),
       generate: () =>
         (async function* () {
           yield { type: "text", text: "Respuesta." };
@@ -977,6 +984,12 @@ describe("chat Runtime implementation regressions", () => {
     );
     expect(harness.state.providerInput.systemPrompt).toContain(
       "pedido actual de la persona prevalece",
+    );
+    expect(harness.state.providerInput.systemPrompt).toContain(
+      "incluso cuando las fuentes sean suficientes para responder",
+    );
+    expect(harness.state.providerInput.systemPrompt).toContain(
+      "La propuesta observa evaporación en un recipiente cerrado.",
     );
   });
 
