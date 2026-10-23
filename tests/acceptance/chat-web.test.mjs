@@ -130,14 +130,15 @@ describe("the chat screen", () => {
     }
   });
 
-  it("explains general-knowledge use and keeps profile, logout, and query actions available", async () => {
+  it("explains project-document use and possible general knowledge while keeping actions available", async () => {
     const html = await render(readyState());
     if (!expectRendered(html)) return;
 
     const text = plainText(html);
-    expect(text).toContain(
-      "Este asistente responde con conocimiento general. Todavía no utiliza documentos del proyecto",
-    );
+    expect(text).toMatch(/documentos del proyecto/i);
+    expect(text).toMatch(/conocimiento general/i);
+    expect(text).toMatch(/puede|complement|sumar|aportar/i);
+    expect(text).not.toMatch(/todavía no utiliza documentos/i);
     expect(
       links(html).some(
         ({ name, href }) => /mi perfil|perfil/i.test(name) && /profile/i.test(href || ""),
