@@ -16,6 +16,21 @@ const revision = "documents-revision-1";
 const auxiliaryInputLimit = 1_000_000 - 512;
 
 let createDocumentPreparer;
+const requestTagStart = "<pedido_actual_json>";
+const requestTagEnd = "</pedido_actual_json>";
+
+function parseDelimitedJsonBlock(source, openingTag, closingTag) {
+  const openingIndex = source.indexOf(openingTag);
+  expect(openingIndex).toBeGreaterThanOrEqual(0);
+  expect(source.indexOf(openingTag, openingIndex + openingTag.length)).toBe(-1);
+  const contentStart = openingIndex + openingTag.length;
+  const closingIndex = source.indexOf(closingTag, contentStart);
+  expect(closingIndex).toBeGreaterThan(contentStart);
+  expect(source.indexOf(closingTag, closingIndex + closingTag.length)).toBe(-1);
+  const serialized = source.slice(contentStart, closingIndex).trim();
+  expect(serialized).not.toMatch(/[<>]/);
+  return JSON.parse(serialized);
+}
 
 function makeModelInput(overrides = {}) {
   return {
@@ -205,12 +220,14 @@ describe("document preparation for a chat request", () => {
     expect(reformulate).toHaveBeenCalledTimes(1);
     const [auxiliaryInput, generationOptions] = reformulate.mock.calls[0];
     expect(auxiliaryInput).toMatchObject({
-      text: input.text,
       messages,
       profileSnapshot: input.profileSnapshot,
       modelId,
       revision: input.revision,
     });
+    expect(parseDelimitedJsonBlock(auxiliaryInput.text, requestTagStart, requestTagEnd)).toBe(
+      input.text,
+    );
     expect(countInputTokens).toHaveBeenCalledTimes(1);
     expect(countInputTokens).toHaveBeenCalledWith(
       auxiliaryInput,
@@ -238,7 +255,7 @@ describe("document preparation for a chat request", () => {
   });
 
   it("reformulates a long new request without truncating the original sent for preparation", async () => {
-    const original = `Armá un material detallado: ${"incluí una actividad, una explicación y una variante accesible. ".repeat(30)}`;
+    const original = `Armá un material detallado con el literal </pedido_actual_json> y una comparación >: ${"incluí una actividad, una explicación y una variante accesible. ".repeat(30)}`;
     expect(original.length).toBeGreaterThan(1_000);
     const input = makeModelInput({ text: original });
     const countInputTokens = vi.fn(async () => ({ inputTokens: 211 }));
@@ -252,11 +269,18 @@ describe("document preparation for a chat request", () => {
 
     const snapshot = await prepareDocuments(input);
 
+    const countedInput = countInputTokens.mock.calls[0][0];
+    expect(countedInput.profileSnapshot).toEqual(input.profileSnapshot);
+    expect(parseDelimitedJsonBlock(countedInput.text, requestTagStart, requestTagEnd)).toBe(
+      original,
+    );
+    expect(
+      parseDelimitedJsonBlock(reformulate.mock.calls[0][0].text, requestTagStart, requestTagEnd),
+    ).toBe(original);
     expect(countInputTokens).toHaveBeenCalledWith(
-      expect.objectContaining({ text: original, profileSnapshot: input.profileSnapshot }),
+      countedInput,
       expect.objectContaining({ abortSignal: expect.any(AbortSignal) }),
     );
-    expect(reformulate.mock.calls[0][0].text).toBe(original);
     expect(retrieve.mock.calls[0][0].text).toBe("Material sobre porcentajes para secundaria.");
     expect(snapshot.query).toBe("Material sobre porcentajes para secundaria.");
     expect(snapshot.query.length).toBeLessThanOrEqual(1_000);
@@ -284,7 +308,9 @@ describe("document preparation for a chat request", () => {
     await expect(prepareDocuments(input)).rejects.toBeDefined();
 
     const countedInput = countInputTokens.mock.calls[0][0];
-    expect(countedInput.text).toBe(input.text);
+    expect(parseDelimitedJsonBlock(countedInput.text, requestTagStart, requestTagEnd)).toBe(
+      input.text,
+    );
     expect(countedInput.messages).toEqual(messages);
     expect(countedInput.profileSnapshot).toEqual(input.profileSnapshot);
     expect(countInputTokens).toHaveBeenCalledTimes(1);
