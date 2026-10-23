@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
 import { createChatHandler, createChatInvocationHandler } from "../../runtime/chat.ts";
+import { extractOriginalRequestText } from "./helpers/model-input-text.mjs";
 
 // This double records the Runtime/store contract; it does not prove DynamoDB transaction behavior.
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
@@ -403,7 +404,9 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     expect(harness.store.startTurn.mock.calls[0][0].ownerAttemptId).toEqual(expect.any(String));
     expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
     expect(harness.state.providerCalls).toBe(1);
-    expect(harness.state.providerInputs[0].text).toBe(startPayload().text);
+    expect(extractOriginalRequestText(harness.state.providerInputs[0].text)).toBe(
+      startPayload().text,
+    );
     expect(harness.store.readQuota).toHaveBeenCalledWith({
       sub: caller.sub,
       botId,
