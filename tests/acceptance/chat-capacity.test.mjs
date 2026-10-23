@@ -332,6 +332,16 @@ function makeHarness(options = {}) {
       },
     },
     store: conversationStore,
+    async prepareDocuments() {
+      return {
+        knowledgeBaseId: "kb-test-aurora",
+        query: "consulta documental de prueba",
+        revision: "documents-test-r1",
+        retrievedAt: fixedNow,
+        status: "empty",
+        results: [],
+      };
+    },
     async countInputTokens(input) {
       const snapshot = clone(finalInput(input));
       state.calls.push(["countInputTokens", snapshot]);

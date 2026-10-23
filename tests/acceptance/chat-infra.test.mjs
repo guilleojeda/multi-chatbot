@@ -539,32 +539,48 @@ describe("chat infrastructure acceptance", () => {
       const bedrockStatements = rolePolicies(chatTemplate, roleId).filter(
         (statement) => matchingActions([statement], "bedrock:").length > 0,
       );
-      const modelActions = new Set(matchingActions(bedrockStatements, "bedrock:"));
+      const knowledgeBase = onlyRecord(chatTemplate, "AWS::Bedrock::KnowledgeBase");
+      const retrieveStatements = bedrockStatements.filter((statement) =>
+        matchingActions([statement], "bedrock:").includes("bedrock:Retrieve"),
+      );
+      const modelStatements = bedrockStatements.filter(
+        (statement) => !matchingActions([statement], "bedrock:").includes("bedrock:Retrieve"),
+      );
+      const modelActions = new Set(matchingActions(modelStatements, "bedrock:"));
       const profileArn =
         "arn:aws:bedrock:us-east-1:118903272638:inference-profile/global.anthropic.claude-sonnet-4-6";
       const sourceModelArn =
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6";
       const globalModelArn = "arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-4-6";
-      const generationStatements = bedrockStatements.filter((statement) =>
+      const generationStatements = modelStatements.filter((statement) =>
         matchingActions([statement], "bedrock:").includes("bedrock:InvokeModelWithResponseStream"),
       );
-      const countTokenStatements = bedrockStatements.filter((statement) =>
+      const countTokenStatements = modelStatements.filter((statement) =>
         matchingActions([statement], "bedrock:").includes("bedrock:CountTokens"),
       );
       const generationResources = new Set(generationStatements.flatMap(resourceArns));
       const countTokenResources = new Set(countTokenStatements.flatMap(resourceArns));
-      const resources = new Set(bedrockStatements.flatMap(resourceArns));
+      const modelResources = new Set(modelStatements.flatMap(resourceArns));
+      const retrieveResources = new Set(retrieveStatements.flatMap(resourceArns));
 
       expect(modelActions).toEqual(
         new Set(["bedrock:InvokeModelWithResponseStream", "bedrock:CountTokens"]),
       );
       expect(generationResources).toEqual(new Set([profileArn, sourceModelArn, globalModelArn]));
       expect(countTokenResources).toEqual(new Set([sourceModelArn]));
-      expect(resources).toEqual(new Set([profileArn, sourceModelArn, globalModelArn]));
+      expect(modelResources).toEqual(new Set([profileArn, sourceModelArn, globalModelArn]));
       expect(
-        [...resources].every((resource) => !resource.includes("*")),
+        [...modelResources].every((resource) => !resource.includes("*")),
         "Bedrock grants may not name other models, profiles, or wildcard resources",
       ).toBe(true);
+      expect(retrieveStatements.length).toBeGreaterThan(0);
+      expect(
+        retrieveStatements.every((statement) =>
+          referencesResource(statement.Resource, knowledgeBase.logicalId),
+        ),
+        "Retrieve may target only this chatbot's Knowledge Base",
+      ).toBe(true);
+      expect([...retrieveResources].every((resource) => !resource.includes("*"))).toBe(true);
       expect(bedrockStatements.every((statement) => statement.Effect === "Allow")).toBe(true);
       const statementsFor = (arn) =>
         generationStatements.filter((statement) => resourceArns(statement).includes(arn));

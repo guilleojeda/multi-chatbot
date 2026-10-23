@@ -164,12 +164,26 @@ For C's input-capacity flows, these local scenarios simulate public Runtime fail
 fixture conversation turn or usage record is created; they do not call AWS or run the native token
 counter:
 
-- To check a native-count failure, select `runtime-token-count-unavailable`, submit a question, and
-  confirm the message says that the count could not be checked, no quota notice appears, and the
-  composer keeps the exact text. The request list and product-journal JSON show the same query ID
-  and body. Select `ready`, then click “Reintentar el mismo envío”; compare the second request's
-  query ID, conversation ID, operation, ordinal, and text with the first. No second request should
-  appear before that explicit click.
+- **Document retrieval failure and explicit retry:** select `runtime-documents-unavailable` and
+  submit a question. Confirm “Enviando consulta…” appears while the POST is pending, with no answer
+  or copy action; the product journal contains the exact body and the request list shows no accepted
+  turn. Click “Simular falla de documentos.” The chat should show the document error and retain the
+  question without making another POST. Select `ready`, click “Reintentar el mismo envío,” and
+  compare operation, conversation ID, query ID, base ordinal, and text in the two POST bodies. The
+  admitted product journal should no longer contain the body. Emit the remaining fragment, complete,
+  and copy the answer; compare the intercepted clipboard text with the exact visible answer. The
+  fixture never writes to the operating-system clipboard.
+- **Uncertain retry and reload:** after a completed turn, select `runtime-documents-unavailable`
+  and submit a follow-up. Reject the pending preparation with “Simular falla de documentos,” then
+  select `runtime-unconfirmed` and click “Reintentar el mismo envío.” Wait for `recover` to report
+  no marker; the journal must keep the same query ID/body and the request history must contain no
+  automatic POST. Click “Recargar pestaña y probar recuperación.” After reload, compare the product
+  journal's pending ID/body with the `recover` request; no `start` or `message` should be sent.
+  Select `ready` and use the explicit retry button if you want to continue the same query.
+- Admitted partial responses and copy are checked with the existing controls: submit under `ready`,
+  let the first fragment appear, click “Fallar generación,” then copy “Copiar texto parcial.” The
+  intercepted clipboard text must equal the visible prefix. This exercises the browser contract,
+  not model grounding or answer quality.
 - To check history capacity, complete a turn under `ready`, select
   `runtime-capacity-exceeded`, and send a follow-up. The simulated failure applies only to
   `message`, so the completed turn remains in the fixture's stored conversation. Confirm the
@@ -270,7 +284,7 @@ Append `?scenario=<name>` before the hash to select an initial scenario, for exa
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-unconfirmed`, `runtime-temporary`, `runtime-recover-network`, `runtime-quota-daily`,
 `runtime-quota-monthly`, `runtime-quota-both`,
-`runtime-capacity-exceeded`, `journal-admission-write-failure`, `runtime-token-count-unavailable`,
+`runtime-capacity-exceeded`, `journal-admission-write-failure`, `runtime-documents-unavailable`,
 `runtime-storage-capacity-exceeded`, `runtime-conversation-busy`, `runtime-stale-base`,
 `runtime-401`, `runtime-401-pending`, `cognito-refresh-network`,
 `runtime-expired`, `runtime-forbidden`,

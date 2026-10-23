@@ -262,8 +262,8 @@ export function ChatScreen({
           </h1>
 
           <p className="chat-knowledge-note">
-            Este asistente responde con conocimiento general. Todavía no utiliza documentos del
-            proyecto.
+            Este asistente usa documentos del proyecto y puede complementar con conocimiento
+            general.
           </p>
           <p className="chat-limit-note">
             Se conserva el último envío de esta pestaña para recuperar su estado. Antes de que se

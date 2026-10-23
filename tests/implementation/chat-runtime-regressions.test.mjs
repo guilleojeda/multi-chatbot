@@ -235,6 +235,16 @@ function makeHarness({
       },
       ...(typeof storeOverrides === "function" ? storeOverrides(state) : storeOverrides),
     },
+    async prepareDocuments() {
+      return {
+        knowledgeBaseId: "kb-test-aurora",
+        query: "consulta documental de prueba",
+        revision: "documents-test-r1",
+        retrievedAt: Date.parse("2026-10-19T16:00:00.000Z"),
+        status: "empty",
+        results: [],
+      };
+    },
     countInputTokens,
     generate(input) {
       state.providerCalls += 1;
@@ -464,9 +474,9 @@ describe("chat Runtime implementation regressions", () => {
     expect(quotaReads).toEqual([beforeMidnight, afterMidnight]);
     expect(admissions).toHaveLength(2);
     expect(admissions[0]).toMatchObject({
-      now: beforeMidnight,
+      now: afterMidnight,
       quota: { daily: { period: "2026-10-21" } },
-      resultDeadlineAt: beforeMidnight + 60 * 60 * 1000,
+      resultDeadlineAt: afterMidnight + 60 * 60 * 1000,
     });
     expect(admissions[1]).toMatchObject({
       now: afterMidnight,
@@ -565,7 +575,7 @@ describe("chat Runtime implementation regressions", () => {
   it("closes after claim when the deadline passes before provider invocation", async () => {
     const admittedAt = Date.parse("2026-10-19T16:00:00.000Z");
     const deadline = admittedAt + 60 * 60 * 1000;
-    const clockValues = [admittedAt, admittedAt, admittedAt, deadline - 1, deadline];
+    const clockValues = [admittedAt, admittedAt, admittedAt, admittedAt, deadline - 1, deadline];
     let clockIndex = 0;
     const log = vi.spyOn(console, "info").mockImplementation(() => {});
     const harness = makeHarness({

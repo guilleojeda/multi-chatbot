@@ -142,7 +142,7 @@ function modelEventMetrics(event: unknown): Record<string, number> | undefined {
   return Object.keys(metrics).length > 0 ? metrics : undefined;
 }
 
-export function createStrandsGenerator(input: { region: string }) {
+export function createStrandsGenerator(input: { region: string; maxOutputTokens?: number }) {
   // The runtime has no transcript logger; Strands' defaults only print warnings/errors,
   // whose SDK payloads can include provider error details.
   configureLogging({ debug() {}, info() {}, warn() {}, error() {} });
@@ -153,7 +153,7 @@ export function createStrandsGenerator(input: { region: string }) {
       modelId: request.modelId,
       region: input.region,
       stream: true,
-      maxTokens: maxOutputTokens,
+      maxTokens: input.maxOutputTokens ?? maxOutputTokens,
       requestTimeout: remainingDeadlineMs,
       clientConfig: { maxAttempts: 1 },
     });
@@ -282,7 +282,10 @@ export function createStrandsGenerator(input: { region: string }) {
 export function createBedrockTokenCounter(input: { region: string }) {
   const client = new BedrockRuntimeClient({ region: input.region, maxAttempts: 1 });
 
-  return async function countInputTokens(request: ModelInput): Promise<TokenCountResult> {
+  return async function countInputTokens(
+    request: ModelInput,
+    options: { abortSignal?: AbortSignal } = {},
+  ): Promise<TokenCountResult> {
     const command = new CountTokensCommand({
       modelId: countModelId,
       input: {
@@ -295,7 +298,9 @@ export function createBedrockTokenCounter(input: { region: string }) {
         },
       },
     });
-    const result = await client.send(command);
+    const result = await client.send(command, {
+      ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+    });
     if (
       !isRecord(result) ||
       typeof result.inputTokens !== "number" ||

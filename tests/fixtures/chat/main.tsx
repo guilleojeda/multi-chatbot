@@ -147,6 +147,13 @@ function FixtureControls() {
         </button>
         <button
           type="button"
+          disabled={!state.pendingAdmissions || state.scenario !== "runtime-documents-unavailable"}
+          onClick={() => fixture.rejectDocuments()}
+        >
+          Simular falla de documentos
+        </button>
+        <button
+          type="button"
           disabled={!state.pendingAdmissions}
           onClick={() => fixture.disconnectPendingStream()}
         >

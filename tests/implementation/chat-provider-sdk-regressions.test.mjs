@@ -235,6 +235,16 @@ function makeHandler() {
         }
       },
     },
+    async prepareDocuments() {
+      return {
+        knowledgeBaseId: "kb-test-aurora",
+        query: "consulta documental de prueba",
+        revision: "documents-test-r1",
+        retrievedAt: fixedNow,
+        status: "empty",
+        results: [],
+      };
+    },
     countInputTokens: async () => ({ inputTokens: 42 }),
     generate: createStrandsGenerator({ region: "us-east-1" }),
     now: () => fixedNow,

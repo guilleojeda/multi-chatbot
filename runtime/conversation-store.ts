@@ -12,6 +12,7 @@ import type {
   ContextReference,
   ConversationContext,
   ConversationMeta,
+  DocumentContext,
   ContinueTurnInput,
   FailTurnInput,
   QuotaView,
@@ -29,6 +30,7 @@ const turnRecordPattern = /^TURN#(\d+)$/;
 const chunkPrefixPattern = /^TURN#(\d+)#/;
 const chunkRecordPattern = /^TURN#(\d+)#([0-9a-f-]{36})#(USER|ASSISTANT)#(\d+)$/i;
 const contextChunkRecordPattern = /^TURN#(\d+)#CONTEXT#(\d+)$/;
+const documentContextChunkRecordPattern = /^TURN#(\d+)#DOCUMENT#(\d+)$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -77,6 +79,96 @@ function contextManifestCount(value: unknown): number | null {
   return value.count;
 }
 
+function isJsonValue(value: unknown, ancestors = new Set<object>()): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || ancestors.has(value)) return false;
+  if (Array.isArray(value)) {
+    ancestors.add(value);
+    const valid = value.every((entry) => isJsonValue(entry, ancestors));
+    ancestors.delete(value);
+    return valid;
+  }
+  if (!isRecord(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  if (Object.getOwnPropertySymbols(value).length > 0) return false;
+  ancestors.add(value);
+  const valid = Object.values(value).every((entry) => isJsonValue(entry, ancestors));
+  ancestors.delete(value);
+  return valid;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isOptionalNonEmptyString(value: Record<string, unknown>, key: string): boolean {
+  return !Object.hasOwn(value, key) || isNonEmptyString(value[key]);
+}
+
+function isDocumentContext(value: unknown): value is DocumentContext {
+  if (
+    !isRecord(value) ||
+    !isJsonValue(value) ||
+    !isNonEmptyString(value.knowledgeBaseId) ||
+    !isNonEmptyString(value.query) ||
+    !isNonEmptyString(value.revision) ||
+    typeof value.retrievedAt !== "number" ||
+    !Number.isFinite(value.retrievedAt) ||
+    (value.status !== "results" && value.status !== "empty") ||
+    !Array.isArray(value.results) ||
+    (value.status === "empty" && value.results.length !== 0) ||
+    (value.status === "results" && value.results.length === 0) ||
+    !isOptionalNonEmptyString(value, "requestId")
+  ) {
+    return false;
+  }
+
+  if (
+    !value.results.every((result) => {
+      if (
+        !isRecord(result) ||
+        !isNonEmptyString(result.text) ||
+        (result.location !== undefined && !isRecord(result.location)) ||
+        (result.metadata !== undefined && !isRecord(result.metadata)) ||
+        (result.score !== undefined &&
+          (typeof result.score !== "number" || !Number.isFinite(result.score))) ||
+        (result.documentId !== undefined && !isNonEmptyString(result.documentId))
+      ) {
+        return false;
+      }
+      return true;
+    })
+  ) {
+    return false;
+  }
+
+  if (value.reformulation === undefined) return true;
+  const reformulation = value.reformulation;
+  return (
+    isRecord(reformulation) &&
+    isNonEmptyString(reformulation.modelId) &&
+    Number.isSafeInteger(reformulation.inputTokens) &&
+    Number(reformulation.inputTokens) >= 0 &&
+    isOptionalNonEmptyString(reformulation, "requestId") &&
+    isOptionalNonEmptyString(reformulation, "countRequestId") &&
+    (reformulation.metrics === undefined ||
+      (isRecord(reformulation.metrics) &&
+        Object.values(reformulation.metrics).every(
+          (metric) => typeof metric === "number" && Number.isFinite(metric),
+        )))
+  );
+}
+
+function serializeDocumentContext(value: DocumentContext): string[] {
+  const serialized = JSON.stringify(value);
+  if (typeof serialized !== "string") {
+    throw new TypeError("Document context cannot be serialized for admission.");
+  }
+  return splitUtf8Text(serialized);
+}
+
 function partialManifestCount(value: unknown): number | null {
   if (
     !isRecord(value) ||
@@ -106,7 +198,7 @@ function assemblePrefix(fragments: TextChunk[], count: number, queryId: string):
 function assembleText(
   fragments: TextChunk[],
   count: number,
-  role: ChunkRole | "context",
+  role: ChunkRole | "context" | "document context",
   queryId: string,
 ): string {
   if (fragments.length !== count) {
@@ -298,6 +390,7 @@ function reconstructMessages(conversationId: string, items: unknown[]): Conversa
     const turnChunks = chunks.get(turn.ordinalKey) ?? [];
     for (const chunk of turnChunks) {
       if (String(chunk.sk).includes("#CONTEXT#")) continue;
+      if (String(chunk.sk).includes("#DOCUMENT#")) continue;
       const keyMatch = chunkRecordPattern.exec(String(chunk.sk));
       const index = keyMatch ? Number(keyMatch[4]) : Number.NaN;
       const role: ChunkRole | null =
@@ -379,6 +472,13 @@ function contextChunkKey(conversationId: string, ordinal: number, index: number)
   return {
     ...conversationKey(conversationId),
     sk: `${turnKey(conversationId, ordinal).sk}#CONTEXT#${String(index).padStart(8, "0")}`,
+  };
+}
+
+function documentContextChunkKey(conversationId: string, ordinal: number, index: number) {
+  return {
+    ...conversationKey(conversationId),
+    sk: `${turnKey(conversationId, ordinal).sk}#DOCUMENT#${String(index).padStart(8, "0")}`,
   };
 }
 
@@ -677,6 +777,25 @@ export function createConversationStoreAdapter(input: {
     };
   }
 
+  function documentContextItem(input: {
+    conversationId: string;
+    ordinal: number;
+    queryId: string;
+    index: number;
+    text: string;
+    now: number;
+  }): Record<string, unknown> {
+    return {
+      ...documentContextChunkKey(input.conversationId, input.ordinal, input.index),
+      conversationId: input.conversationId,
+      queryId: input.queryId,
+      ordinal: input.ordinal,
+      index: input.index,
+      text: input.text,
+      createdAt: isoDate(input.now),
+    };
+  }
+
   function isConditionalFailure(error: unknown): boolean {
     if (!isRecord(error)) return false;
     if (error.name === "ConditionalCheckFailedException") return true;
@@ -725,6 +844,7 @@ export function createConversationStoreAdapter(input: {
       turn.text.trim().length === 0 ||
       !isRecord(turn.profileSnapshot) ||
       !isRecord(turn.invocation) ||
+      (turn.documentContext !== undefined && !isDocumentContext(turn.documentContext)) ||
       !Number.isFinite(turn.now) ||
       turn.resultDeadlineAt !== turn.now + resultDeadlineMs ||
       (operation === "start" && baseOrdinal !== 0)
@@ -820,6 +940,8 @@ export function createConversationStoreAdapter(input: {
       operation === "message"
         ? encodeContextReferences((turn as ContinueTurnInput).contextReferences, ordinal)
         : [];
+    const documentContextChunks =
+      turn.documentContext === undefined ? [] : serializeDocumentContext(turn.documentContext);
     const createdAt = isoDate(turn.now);
     const partition = conversationKey(turn.conversationId);
     const marker = {
@@ -857,6 +979,14 @@ export function createConversationStoreAdapter(input: {
       questionManifest: { count: questionChunks.length, complete: true },
       answerManifest: { count: 0, complete: false },
       contextManifest: { count: contextChunks.length, complete: true },
+      ...(turn.documentContext === undefined
+        ? {}
+        : {
+            documentContextManifest: {
+              count: documentContextChunks.length,
+              complete: true,
+            },
+          }),
       profileSnapshot: turn.profileSnapshot,
       invocation: turn.invocation,
     };
@@ -1073,7 +1203,17 @@ export function createConversationStoreAdapter(input: {
         now: turn.now,
       }),
     );
-    for (const item of [...questionItems, ...contextRecords]) {
+    const documentContextRecords = documentContextChunks.map((text, index) =>
+      documentContextItem({
+        conversationId: turn.conversationId,
+        ordinal,
+        queryId: turn.queryId,
+        index,
+        text,
+        now: turn.now,
+      }),
+    );
+    for (const item of [...questionItems, ...contextRecords, ...documentContextRecords]) {
       transactionItems.push({
         Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(pk)" },
       });
@@ -1302,6 +1442,59 @@ export function createConversationStoreAdapter(input: {
         turns: new Map(),
       });
     }
+    let documentContext: DocumentContext | undefined;
+    const documentContextRecords = chunks.filter((item) => String(item.sk).includes("#DOCUMENT#"));
+    if (turn.documentContextManifest === undefined) {
+      if (documentContextRecords.length > 0) {
+        throw new Error("Submission has document context records without a manifest.");
+      }
+    } else {
+      const documentContextCount = contextManifestCount(turn.documentContextManifest);
+      if (
+        documentContextCount === null ||
+        !isRecord(turn.documentContextManifest) ||
+        turn.documentContextManifest.complete !== true
+      ) {
+        throw new Error("Submission document context manifest is malformed.");
+      }
+      const serialized = assembleText(
+        documentContextRecords.flatMap((item) => {
+          const match = documentContextChunkRecordPattern.exec(String(item.sk));
+          if (!match) throw new Error("Submission document context record is malformed.");
+          const chunkOrdinal = Number(match[1]);
+          const index = Number(match[2]);
+          if (
+            chunkOrdinal !== ordinal ||
+            String(chunkOrdinal).padStart(8, "0") !== match[1] ||
+            !Number.isSafeInteger(index) ||
+            index < 0 ||
+            String(index).padStart(8, "0") !== match[2] ||
+            item.pk !== turn.pk ||
+            item.conversationId !== marker.conversationId ||
+            item.queryId !== input.queryId ||
+            item.ordinal !== ordinal ||
+            item.index !== index ||
+            typeof item.text !== "string"
+          ) {
+            throw new Error("Submission document context record is malformed.");
+          }
+          return [{ index, text: item.text }];
+        }),
+        documentContextCount,
+        "document context",
+        input.queryId,
+      );
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(serialized);
+      } catch {
+        throw new Error("Submission document context is malformed.");
+      }
+      if (!isDocumentContext(parsed)) {
+        throw new Error("Submission document context is malformed.");
+      }
+      documentContext = parsed;
+    }
     const meta = await getItem({ ...conversationKey(marker.conversationId), sk: "META" });
     const status = turn.status as SubmissionSnapshot["status"];
     const stage = turn.phase as SubmissionSnapshot["stage"];
@@ -1321,6 +1514,7 @@ export function createConversationStoreAdapter(input: {
       question,
       questionManifest: turn.questionManifest as TurnManifest,
       contextReferences,
+      ...(documentContext === undefined ? {} : { documentContext }),
       answer,
       answerManifest: turn.answerManifest as TurnManifest,
       cursor: Number(cursor),

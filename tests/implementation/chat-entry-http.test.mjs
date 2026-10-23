@@ -109,6 +109,9 @@ async function makeServer({ detached = false, useRuntimeEntryConfig = false } = 
         MODEL_ID: "global.anthropic.claude-sonnet-4-6",
         REVISION: "http-acceptance",
         AWS_REGION: "us-east-1",
+        KNOWLEDGE_BASE_ID: "kb-http-acceptance",
+        DOCUMENTS_REVISION: "http-documents-r1",
+        DOCUMENT_PREPARATION_TIMEOUT_MS: "120000",
       });
       await import(workerData.runtimeEntryModule);
       appConfig = globalThis.__capturedAgentCoreConfig;
@@ -308,6 +311,16 @@ async function makeServer({ detached = false, useRuntimeEntryConfig = false } = 
       accounts: { async hasMember() { return true; } },
       profiles: { async getProfile() { return profile; } },
       store,
+      async prepareDocuments() {
+        return {
+          knowledgeBaseId: "kb-http-acceptance",
+          query: "consulta documental HTTP de prueba",
+          revision: "http-documents-r1",
+          retrievedAt: now,
+          status: "empty",
+          results: [],
+        };
+      },
       async countInputTokens() { return { inputTokens: 42 }; },
       async *generate() {
         providerDispatchCount += 1;

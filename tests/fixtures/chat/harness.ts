@@ -30,7 +30,7 @@ export const fixtureScenarios = [
     id: "journal-admission-write-failure",
     label: "Storage: falla al guardar la referencia admitida",
   },
-  { id: "runtime-token-count-unavailable", label: "Runtime: conteo nativo no disponible" },
+  { id: "runtime-documents-unavailable", label: "Runtime: preparación documental retenida" },
   {
     id: "runtime-storage-capacity-exceeded",
     label: "Runtime: preflight de almacenamiento excedido",
@@ -99,6 +99,7 @@ type ControlledStream = {
   request: FixtureRequest;
   push: (value: unknown) => void;
   admit: () => void;
+  rejectDocuments: () => void;
   close: () => void;
   cancel: () => void;
   queryId: string;
@@ -917,22 +918,6 @@ export class ChatBrowserFixture {
       });
     }
 
-    if (this.selectedScenario === "runtime-token-count-unavailable") {
-      this.finish(
-        request,
-        200,
-        "conteo nativo no disponible simulado antes de admitir; sin consumo",
-      );
-      return sseResponse({
-        type: "failed",
-        code: "token_count_unavailable",
-        message:
-          "No pudimos comprobar el conteo de tokens. La consulta no fue admitida; podés reintentar el mismo envío.",
-        recordStatus: "not_admitted",
-        queryId,
-      });
-    }
-
     if (this.selectedScenario === "runtime-storage-capacity-exceeded") {
       this.finish(request, 200, "preflight de almacenamiento excedido simulado; sin consumo");
       return sseResponse({
@@ -1054,6 +1039,28 @@ export class ChatBrowserFixture {
           transportClosed: false,
           turn,
           admit,
+          rejectDocuments: () => {
+            if (stream.producerClosed || stream.admitted) return;
+            stream.push({
+              type: "failed",
+              code: "documents_unavailable",
+              message:
+                "No pudimos consultar los documentos. Conservamos tu pedido para que puedas reintentar.",
+              recordStatus: "not_admitted",
+              queryId,
+            });
+            stream.producerClosed = true;
+            if (!stream.transportClosed) {
+              stream.transportClosed = true;
+              controller.close();
+            }
+            if (operation === "start" && conversation?.turns.length === 0) {
+              this.conversations.delete(conversationId);
+              this.persistConversations();
+            }
+            this.finish(request, 200, "falla documental simulada antes de admitir; sin consumo");
+            this.changed();
+          },
           disconnect: () => {
             if (stream.transportClosed) return;
             stream.cancel();
@@ -1085,9 +1092,15 @@ export class ChatBrowserFixture {
           },
         };
         this.streams.push(stream);
-        if (this.selectedScenario === "runtime-admission-pending") {
+        if (
+          this.selectedScenario === "runtime-admission-pending" ||
+          this.selectedScenario === "runtime-documents-unavailable"
+        ) {
           request.status = "pending";
-          request.outcome = "admisión retenida; esperar el control manual";
+          request.outcome =
+            this.selectedScenario === "runtime-documents-unavailable"
+              ? "preparación documental retenida antes de admitir"
+              : "admisión retenida; esperar el control manual";
           this.changed();
         } else {
           admit();
@@ -1157,6 +1170,10 @@ export class ChatBrowserFixture {
 
   admitStream() {
     this.streams.find((item) => !item.producerClosed && !item.admitted)?.admit();
+  }
+
+  rejectDocuments() {
+    this.streams.find((item) => !item.producerClosed && !item.admitted)?.rejectDocuments();
   }
 
   disconnectPendingStream() {

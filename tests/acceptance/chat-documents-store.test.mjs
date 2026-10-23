@@ -101,7 +101,7 @@ function documentContext(overrides = {}) {
     knowledgeBaseId: "kb-docentes-dev",
     query: "Porcentajes para segundo año",
     revision: "documents-r14",
-    retrievedAt: "2026-10-19T16:00:00.000Z",
+    retrievedAt: now,
     status: "results",
     results: [
       {
@@ -222,6 +222,13 @@ describe("document context in the DynamoDB conversation store", () => {
     const capture = documentContext({
       query: "Qué plantea la segunda explicación sobre porcentajes",
       revision: "documents-r15",
+      reformulation: {
+        modelId: "global.anthropic.claude-sonnet-4-6",
+        requestId: "prepare-request-9",
+        inputTokens: 432,
+        countRequestId: "count-prepare-8",
+        metrics: { latencyMs: 87 },
+      },
       results: [
         {
           text: "La segunda propuesta inicia con equivalencias y representaciones visuales.",

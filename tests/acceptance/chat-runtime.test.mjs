@@ -399,6 +399,17 @@ function makeHarness({
             },
           },
           store,
+          async prepareDocuments(input) {
+            state.calls.push(["prepareDocuments", clone(input)]);
+            return {
+              knowledgeBaseId: "kb-test-aurora",
+              query: "consulta documental de prueba",
+              revision: "documents-test-r1",
+              retrievedAt: fixedNow,
+              status: "empty",
+              results: [],
+            };
+          },
           async countInputTokens() {
             return { inputTokens: 0 };
           },
@@ -756,6 +767,7 @@ describe("the conversation Runtime handler", () => {
       "getProfile",
       "readContext",
       "readQuota",
+      "prepareDocuments",
       "continueTurn",
       "claimInvocation",
       "generate",

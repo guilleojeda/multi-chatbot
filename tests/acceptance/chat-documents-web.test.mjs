@@ -444,11 +444,18 @@ describe("document-backed chat acceptance in the web account flow", () => {
     expect(app.current().props.onSubmit(question)).toBe(true);
     await vi.waitFor(() => expect(submissions(environment)).toHaveLength(2));
     streams[1].close();
-    await vi.waitFor(() =>
+    await app.flush();
+    expect(app.current().props.state).toMatchObject({
+      queryStatus: "unconfirmed",
+      question,
+      canRetry: true,
+    });
+    await vi.waitFor(async () => {
+      await app.flush();
       expect(
         environment.runtimeRequests.filter(({ request }) => request.operation === "recover"),
-      ).toHaveLength(1),
-    );
+      ).toHaveLength(1);
+    });
     await app.flush();
 
     const uncertain = app.current().props.state;
