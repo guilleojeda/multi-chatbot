@@ -1343,12 +1343,14 @@ export function AccountApp({
       !previousJournal.admitted &&
       previousJournal.request.text === text;
     const retryingUnconfirmed = pendingRequestMatches && current.queryStatus === "unconfirmed";
-    const retryingKnownCountFailure =
+    const retryingPreAdmissionFailure =
       pendingRequestMatches &&
       current.queryStatus === "rejected" &&
       current.canRetry === true &&
-      current.queryErrorCode === "token_count_unavailable";
-    const retrying = retryingUnconfirmed || retryingKnownCountFailure;
+      ["token_count_unavailable", "documents_unavailable"].includes(
+        current.queryErrorCode?.toLowerCase() || "",
+      );
+    const retrying = retryingUnconfirmed || retryingPreAdmissionFailure;
     const canStartNewRequest =
       current.queryStatus === "idle" ||
       ((current.queryStatus === "completed" || current.queryStatus === "failed") &&
@@ -1539,8 +1541,9 @@ export function AccountApp({
           return;
         }
         const failureCode = result.code.toLowerCase();
-        const retryableCountFailure =
-          failureCode === "token_count_unavailable" && result.recordStatus === "not_admitted";
+        const retryablePreAdmissionFailure =
+          ["token_count_unavailable", "documents_unavailable"].includes(failureCode) &&
+          result.recordStatus === "not_admitted";
         const preserveUnconfirmedJournal =
           retryingUnconfirmed &&
           result.recordStatus === "not_admitted" &&
@@ -1558,9 +1561,9 @@ export function AccountApp({
             // Keep its only identity until a later recovery resolves the request.
             chatJournalRef.current = previousJournal;
             chatConversationIdRef.current = previousJournal.request.conversationId;
-          } else if (retryableCountFailure) {
-            // CountTokens failed before admission. Keep this exact body and ID for an explicit
-            // retry, even when the attempted request was a follow-up to an admitted turn.
+          } else if (retryablePreAdmissionFailure) {
+            // Count or document preparation failed before admission. Keep this exact body and ID
+            // for an explicit retry, including when the request follows an admitted turn.
             chatJournalRef.current = { request, admitted: false };
             chatConversationIdRef.current = conversationId;
           } else if (previousJournal?.admitted) {
@@ -1623,7 +1626,7 @@ export function AccountApp({
           recoveryLoading: false,
           canRetry:
             preserveUnconfirmedJournal ||
-            retryableCountFailure ||
+            (retryablePreAdmissionFailure && !retryingUnconfirmed) ||
             (result.recordStatus === "unconfirmed" && !chatJournalRef.current?.admitted),
         });
       })

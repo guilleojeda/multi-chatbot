@@ -310,6 +310,16 @@ function makeHarness({
       },
     },
     store,
+    async prepareDocuments() {
+      return {
+        knowledgeBaseId: "kb-test-aurora",
+        query: "consulta documental de prueba",
+        revision: "documents-test-r1",
+        retrievedAt: fixedNow,
+        status: "empty",
+        results: [],
+      };
+    },
     async countInputTokens() {
       return { inputTokens: 0 };
     },
@@ -612,7 +622,7 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
         quota: exhausted,
       });
       expect(harness.state.providerCalls).toBe(0);
-      expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+      expect(harness.store.startTurn).not.toHaveBeenCalled();
       expect(harness.store.claimInvocation).not.toHaveBeenCalled();
     }
   });

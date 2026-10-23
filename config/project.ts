@@ -8,6 +8,18 @@ export const projectConfig = {
   desiredModelIds: ["anthropic.claude-haiku-5-5", "openai.gpt-6-luna"],
 } as const;
 
+export const documentConfig = {
+  preparedDocumentsPrefix: "prepared/",
+  embeddingModelId: "amazon.titan-embed-text-v2:0",
+  embeddingDimensions: 1024,
+  embeddingDataType: "float32",
+  distanceMetric: "cosine",
+  chunkMaxTokens: 500,
+  chunkOverlapPercentage: 20,
+  revision: "rag-v1",
+  preparationTimeoutMs: 120_000,
+} as const;
+
 export type EnvironmentName = "dev" | "prod";
 export type ResolvedEnvironment = {
   account: typeof projectConfig.account;

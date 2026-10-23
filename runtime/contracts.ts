@@ -7,6 +7,35 @@ export type ConversationContext = {
   references: ContextReference[];
 };
 
+export type DocumentResult = {
+  text: string;
+  location?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  score?: number;
+  documentId?: string;
+};
+
+export type DocumentReformulation = {
+  modelId: string;
+  requestId?: string;
+  inputTokens: number;
+  countRequestId?: string;
+  metrics?: Record<string, number>;
+};
+
+export type DocumentContext = {
+  knowledgeBaseId: string;
+  query: string;
+  revision: string;
+  retrievedAt: number;
+  status: "results" | "empty";
+  results: DocumentResult[];
+  requestId?: string;
+  reformulation?: DocumentReformulation;
+};
+
+export type TokenCountOptions = { abortSignal?: AbortSignal };
+
 export type ModelInput = {
   systemPrompt: string;
   profileSnapshot: Record<string, unknown>;
@@ -58,6 +87,7 @@ type TurnAdmissionInput = {
   resultDeadlineAt: number;
   text: string;
   profileSnapshot: ProfileSnapshot;
+  documentContext?: DocumentContext;
   invocation: Invocation;
   quota: QuotaView;
   requestFingerprint: string;
@@ -98,6 +128,7 @@ export type SubmissionSnapshot = {
   canContinue: boolean;
   resultDeadlineAt: number;
   profileSnapshot: ProfileSnapshot;
+  documentContext?: DocumentContext;
   invocation: Invocation;
   failure?: { code: string };
   ownerAttemptId?: string;

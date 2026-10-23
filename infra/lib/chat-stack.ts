@@ -6,6 +6,7 @@ import {
   RuntimeCustomClaim,
   RuntimeNetworkConfiguration,
 } from "aws-cdk-lib/aws-bedrockagentcore";
+import * as bedrock from "aws-cdk-lib/aws-bedrock";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ecrAssets from "aws-cdk-lib/aws-ecr-assets";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -13,8 +14,9 @@ import { Stack, Tags } from "aws-cdk-lib";
 import type { Construct } from "constructs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import type { ResolvedBotEnvironment } from "../../config/project.js";
+import { documentConfig, type ResolvedBotEnvironment } from "../../config/project.js";
 import type { AccountStack } from "./account-stack.js";
+import { DocumentInfrastructure } from "./documents.js";
 import type { SharedIdentityStack } from "./shared-identity-stack.js";
 
 const inferenceProfileId = "global.anthropic.claude-sonnet-4-6";
@@ -46,6 +48,7 @@ export class ChatStack extends Stack {
   readonly runtimeArn: string;
   readonly runtimeQualifier = "DEFAULT";
   readonly conversationTable: dynamodb.Table;
+  readonly documents: DocumentInfrastructure;
 
   constructor(
     scope: Construct,
@@ -71,6 +74,7 @@ export class ChatStack extends Stack {
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
     });
+    this.documents = new DocumentInfrastructure(this, "Documents", environment);
 
     const runtimeAssetPath = path.resolve(process.cwd(), "dist/runtime-image");
     const revision = resolveRevision();
@@ -96,6 +100,9 @@ export class ChatStack extends Stack {
         CONVERSATION_TABLE_NAME: this.conversationTable.tableName,
         MODEL_ID: inferenceProfileId,
         REVISION: revision,
+        KNOWLEDGE_BASE_ID: this.documents.knowledgeBase.attrKnowledgeBaseId,
+        DOCUMENTS_REVISION: documentConfig.revision,
+        DOCUMENT_PREPARATION_TIMEOUT_MS: String(documentConfig.preparationTimeoutMs),
         AWS_REGION: environment.region,
       },
       tags: {
@@ -106,6 +113,12 @@ export class ChatStack extends Stack {
     this.runtimeArn = this.runtime.agentRuntimeArn;
 
     account.table.grant(this.runtime.role, "dynamodb:GetItem");
+    this.runtime.role.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:Retrieve"],
+        resources: [bedrock.CfnKnowledgeBase.arnForKnowledgeBase(this.documents.knowledgeBase)],
+      }),
+    );
     this.conversationTable.grant(
       this.runtime.role,
       "dynamodb:GetItem",

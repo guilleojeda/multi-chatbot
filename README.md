@@ -1,6 +1,6 @@
 # Multi-chatbot
 
-Repositorio común para los chatbots del proyecto. Incluye el sitio público, cuenta por invitación, perfil profesional y consulta docente progresiva con Sonnet 4.6, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
+Repositorio común para los chatbots del proyecto. Incluye el sitio público, cuenta por invitación, perfil profesional y conversación docente con documentos y Sonnet 4.6, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
 
 ## Preparar un checkout
 
@@ -102,6 +102,68 @@ aws dynamodb get-item --region us-east-1 \
 ```
 
 Si ya existe, el primer comando devuelve `ConditionalCheckFailedException`; leer y validar el registro existente sin sobrescribirlo. Los límites deben ser enteros no negativos y la revisión una cadena no vacía. Repetir esta preparación conserva política y consumos. Para cambiar límites, actualizar explícitamente la política con una nueva revisión, conservando los contadores; los pedidos nuevos usan el cambio. Una política ausente o inválida impide admitir sin consumir. No hay interfaz administrativa ni tarea de reinicio de cupos. Ver [contrato del chat](docs/intent/chat.md).
+
+## Cargar documentos preparados en desarrollo
+
+Los documentos se preparan fuera de la aplicación. El equipo técnico publica texto UTF-8 ya
+revisado en el prefijo del bucket documental; no se usa el bucket web. El stack de chat emite
+outputs que contienen `DocumentBucketName`, `PreparedDocumentsPrefix`, `KnowledgeBaseId` y
+`DocumentDataSourceId` en sus claves. CDK añade el prefijo del construct y un hash a esas claves:
+
+```sh
+aws sts get-caller-identity --query Account --output text
+aws cloudformation describe-stacks --region us-east-1 \
+  --stack-name multi-chatbot-dev-docentes-chat --query 'Stacks[0].Outputs'
+```
+
+Verificar la cuenta `118903272638` y usar exclusivamente los outputs de `dev/docentes`.
+Con una AWS CLI v2 vigente, completar estas variables con esos valores, sin credenciales:
+
+```sh
+CHAT_DOCUMENT_BUCKET='<DocumentBucketName>'
+CHAT_DOCUMENT_PREFIX='<PreparedDocumentsPrefix>'
+CHAT_KB_ID='<KnowledgeBaseId>'
+CHAT_DATA_SOURCE_ID='<DocumentDataSourceId>'
+```
+
+Cuando no hay corpus real, las tres fuentes sintéticas identificadas permiten comprobar
+integración. Este comando solo añade los `.txt` bajo `fixtures/`; no borra otros objetos:
+
+```sh
+aws s3 sync tests/fixtures/documents/ \
+  "s3://${CHAT_DOCUMENT_BUCKET}/${CHAT_DOCUMENT_PREFIX}fixtures/" \
+  --region us-east-1 --exclude '*' --include '*.txt'
+aws bedrock-agent start-ingestion-job --region us-east-1 \
+  --knowledge-base-id "$CHAT_KB_ID" --data-source-id "$CHAT_DATA_SOURCE_ID"
+```
+
+Conservar el `ingestionJobId` devuelto y consultar su estado y razones de fallo:
+
+```sh
+CHAT_INGESTION_JOB_ID='<ingestionJobId>'
+aws bedrock-agent get-ingestion-job --region us-east-1 \
+  --knowledge-base-id "$CHAT_KB_ID" --data-source-id "$CHAT_DATA_SOURCE_ID" \
+  --ingestion-job-id "$CHAT_INGESTION_JOB_ID"
+aws bedrock-agent-runtime retrieve --region us-east-1 \
+  --knowledge-base-id "$CHAT_KB_ID" \
+  --retrieval-query '{"text":"Experiencia de condensación de Ladera en el aula"}' \
+  --retrieval-configuration '{"vectorSearchConfiguration":{"numberOfResults":5,"overrideSearchType":"SEMANTIC"}}'
+```
+
+`COMPLETE` no acredita por sí solo que el contenido ya esté recuperable. Comprobar textos
+reconocibles en Retrieve y después preguntar, crear material y seguir el hilo desde la UI real.
+Guardar revisión/hashes de las fuentes y correlacionar queryId, revisión y snapshot interno.
+Las fuentes de prueba no prueban calidad sobre el corpus real ni habilitan el piloto.
+
+Para documentos reales, cargar solo el contenido preparado autorizado y observar la ingestión
+del mismo modo. El parser predeterminado es textual: la información relevante de imágenes se
+transcribe durante la preparación externa. El índice usa Titan V2/1.024/cosine y segmentación
+500 tokens/20 %; cambiar embedding/dimensión o segmentación puede exigir reindexar o recrear
+el recurso y requiere revisar esa decisión. Mantener metadatos dentro de los límites de
+KB con S3 Vectors. La carga no promete publicación instantánea o atómica; los pedidos nuevos
+capturan lo que recuperaron y los anteriores conservan sus snapshots. No hay admin temporal,
+conversor, sincronizador periódico o carga de usuarios. Ver [operación documental](docs/intent/setup.md)
+y [comportamiento del chat](docs/intent/chat.md).
 
 ## CDK y entrega
 
