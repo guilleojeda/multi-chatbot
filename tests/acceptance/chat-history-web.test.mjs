@@ -522,7 +522,7 @@ describe("the conversation history in AccountApp", () => {
     expect(history(app)?.refreshRequired).toBe(true);
     expect(turnReadCount).toBe(1);
     const rejectedMarkup = renderCurrentChat(app);
-    expect(rejectedMarkup).toContain(`value="${draft}"`);
+    expect(rejectedMarkup).toContain(`>${draft}</textarea>`);
 
     await select(app, firstConversationId);
     expect(turnReadCount).toBe(2);
@@ -893,11 +893,12 @@ describe("the conversation history in AccountApp", () => {
     const uncertainRequest = environment.runtimeRequests.find(
       ({ request }) => request.operation === "message",
     ).request;
-    await vi.waitFor(() =>
+    await vi.waitFor(async () => {
+      await app.flush();
       expect(
         environment.runtimeRequests.some(({ request }) => request.operation === "recover"),
-      ).toBe(true),
-    );
+      ).toBe(true);
+    });
 
     await select(app, secondConversationId);
     const firstRecoveryCall = environment.runtimeRequests.find(

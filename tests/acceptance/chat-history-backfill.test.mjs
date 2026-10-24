@@ -125,7 +125,9 @@ function mockDocumentClient({ scans, chunks = new Map(), onUpdate, onGet } = {})
       const conversationId = String(pk || "").replace(/^CONV#/, "");
       const turn = chunks.get(conversationId)?.[ordinal];
       return {
-        Items: [...(turn?.record ? [turn.record] : []), ...(turn?.chunks || [])],
+        Items: [...(turn?.record ? [turn.record] : []), ...(turn?.chunks || [])].filter((item) =>
+          item.sk.startsWith(prefix),
+        ),
       };
     }
     if (command instanceof GetCommand) {
@@ -297,7 +299,7 @@ describe("chat history backfill acceptance", () => {
     expect(
       queries.every(({ input }) =>
         Object.values(input.ExpressionAttributeValues || {}).some(
-          (value) => typeof value === "string" && /^TURN#00000001#?$/.test(value),
+          (value) => typeof value === "string" && /^TURN#00000001#[0-9a-f-]{36}#USER#$/.test(value),
         ),
       ),
       "the label must come from the first admitted question in each conversation",
@@ -439,8 +441,9 @@ describe("chat history backfill acceptance", () => {
 
     expect(result).toMatchObject({ updated: 0, skipped: 1, incompatible: 0 });
     expect(sendCalls(send, UpdateCommand)).toHaveLength(1);
-    expect(sendCalls(send, GetCommand)).toHaveLength(1);
-    expect(sendCalls(send, GetCommand)[0].input.Key).toEqual({ pk: `CONV#${firstId}`, sk: "META" });
+    const metaReads = sendCalls(send, GetCommand).filter(metaKey);
+    expect(metaReads).toHaveLength(1);
+    expect(metaReads[0].input.Key).toEqual({ pk: `CONV#${firstId}`, sk: "META" });
   });
 
   it("preserves the last completed scan checkpoint when a later page fails", async () => {
