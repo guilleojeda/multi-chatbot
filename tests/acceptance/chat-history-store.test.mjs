@@ -473,7 +473,10 @@ describe("the public DynamoDB history store", () => {
         Items: [0, 1, 2, 3].map((index) =>
           textChunk(1, queryIds[0], "assistant", index, `p${index}`),
         ),
-        LastEvaluatedKey: textChunk(1, queryIds[0], "assistant", 3, "p3"),
+        LastEvaluatedKey: {
+          pk: `CONV#${conversationId}`,
+          sk: textChunk(1, queryIds[0], "assistant", 3, "p3").sk,
+        },
       },
       {
         Items: [4, 5, 6, 7, 8].map((index) =>
@@ -554,9 +557,10 @@ describe("the public DynamoDB history store", () => {
     expect(
       textQueries.every(({ input }) => Number.isSafeInteger(input.Limit) && input.Limit > 0),
     ).toBe(true);
-    expect(textQueries[1].input.ExclusiveStartKey).toEqual(
-      textChunk(1, queryIds[0], "assistant", 3, "p3"),
-    );
+    expect(textQueries[1].input.ExclusiveStartKey).toEqual({
+      pk: `CONV#${conversationId}`,
+      sk: textChunk(1, queryIds[0], "assistant", 3, "p3").sk,
+    });
     expect(
       textQueries.every(
         ({ input }) =>
@@ -578,7 +582,10 @@ describe("the public DynamoDB history store", () => {
       { Items: [completedTurn] },
       {
         Items: [0, 1].map((index) => textChunk(1, queryIds[0], "assistant", index, `p${index}`)),
-        LastEvaluatedKey: textChunk(1, queryIds[0], "assistant", 1, "p1"),
+        LastEvaluatedKey: {
+          pk: `CONV#${conversationId}`,
+          sk: textChunk(1, queryIds[0], "assistant", 1, "p1").sk,
+        },
       },
       {
         Items: [2, 3, 4].map((index) => textChunk(1, queryIds[0], "assistant", index, `p${index}`)),

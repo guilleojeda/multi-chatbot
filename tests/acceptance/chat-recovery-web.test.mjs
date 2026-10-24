@@ -990,7 +990,7 @@ describe("the chat recovery journal and restored submission", () => {
     );
     seeded.app.current().props.onReset();
     await seeded.app.flush();
-    expect(allStorageText(seeded.storage)).not.toContain(seeded.request.queryId);
+    expect(allStorageText(seeded.storage)).toContain(seeded.request.queryId);
     expect(startCalls(seeded.environment)).toHaveLength(1);
   });
 

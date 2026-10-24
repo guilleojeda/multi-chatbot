@@ -204,10 +204,11 @@ describe("conversation history GSI writer acceptance", () => {
 
   it("moves META activity on a follow-up while keeping the first-question label stable", async () => {
     const originalMeta = makeMeta();
+    const followupQueryId = "d66bd564-7560-4dba-b99e-8355f05d72bc";
     const send = vi.fn(async (command) => {
       if (command instanceof GetCommand) {
         const key = keyFor(command);
-        if (key.sk === `SEND#${queryId}`) return {};
+        if (key.sk === `SEND#${followupQueryId}`) return {};
         if (key.sk === "META") return { Item: originalMeta };
       }
       if (command instanceof TransactWriteCommand) return {};
@@ -220,7 +221,7 @@ describe("conversation history GSI writer acceptance", () => {
       sub,
       botId,
       conversationId,
-      queryId: "d66bd564-7560-4dba-b99e-8355f05d72bc",
+      queryId: followupQueryId,
       baseOrdinal: 1,
       now: secondActivityAt,
       ownerAttemptId: "attempt-followup",
