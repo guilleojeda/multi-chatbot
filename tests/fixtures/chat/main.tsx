@@ -81,6 +81,20 @@ function FixtureControls() {
           para comprobar el reintento y el inicio nuevo. `journal-admission-write-failure` rechaza
           la escritura del journal después de la admisión.
         </p>
+        <button
+          className="account-button account-button--secondary"
+          type="button"
+          onClick={() => {
+            fixture.seedHistoryDemo();
+            window.location.reload();
+          }}
+        >
+          Preparar historial de paginación y recargar
+        </button>
+        <p className="profile-fixture-readout">
+          Carga 22 conversaciones y un hilo con 22 turnos en los registros simulados del Runtime.
+          Incluye un hilo activo con texto en varias páginas y otro cerrado. No escribe datos AWS.
+        </p>
         <nav className="profile-fixture-links" aria-label="Rutas locales">
           <a href="#/chat">Abrir chat</a>
           <a href="#/profile">Abrir perfil</a>
@@ -204,6 +218,13 @@ function FixtureControls() {
           </button>
           <button
             type="button"
+            disabled={!state.pendingHistoryReads}
+            onClick={() => fixture.releaseHistory()}
+          >
+            Liberar historial
+          </button>
+          <button
+            type="button"
             disabled={!state.pendingSignOuts}
             onClick={() => fixture.releaseSignOut()}
           >
@@ -211,12 +232,12 @@ function FixtureControls() {
           </button>
         </div>
         <p className="profile-fixture-readout">
-          Perfiles pendientes: {state.pendingProfiles} · logout pendiente: {state.pendingSignOuts} ·
-          confirmaciones de contraseña pendientes: {state.pendingPasswordResets} · admisiones
-          pendientes: {state.pendingAdmissions} · respuestas admitidas: {state.admittedStreams}· 401
-          Runtime pendiente: {state.pendingRuntime401s} · refresh pendiente:{" "}
-          {state.pendingRefreshes} · sign-in pendiente: {state.pendingSignIns.length} · copias
-          pendientes:{" "}
+          Perfiles pendientes: {state.pendingProfiles} · historial pendiente:{" "}
+          {state.pendingHistoryReads} · logout pendiente: {state.pendingSignOuts} · confirmaciones
+          de contraseña pendientes: {state.pendingPasswordResets} · admisiones pendientes:{" "}
+          {state.pendingAdmissions} · respuestas admitidas: {state.admittedStreams}· 401 Runtime
+          pendiente: {state.pendingRuntime401s} · refresh pendiente: {state.pendingRefreshes} ·
+          sign-in pendiente: {state.pendingSignIns.length} · copias pendientes:{" "}
           {state.clipboardOperations.filter(({ status }) => status === "pending").length}
         </p>
         <p className="profile-fixture-readout">
@@ -293,7 +314,8 @@ function FixtureControls() {
       </section>
 
       <footer className="profile-fixture-footer">
-        Fixture local y volátil. El botón de reinicio limpia estado, sesión y peticiones.
+        Fixture local: al recargar, los registros sintéticos de Runtime y el journal de esta pestaña
+        permanecen en sessionStorage. Al cerrar la pestaña se eliminan.
       </footer>
     </aside>
   );

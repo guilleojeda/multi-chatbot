@@ -2,6 +2,8 @@
 
 Repositorio común para los chatbots del proyecto. Incluye el sitio público, cuenta por invitación, perfil profesional y conversación docente con documentos y Sonnet 4.6, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
 
+El [chat](docs/intent/chat.md) permite elegir conversaciones del historial y continuarlas desde otra sesión o navegador. Los originales y estados permanecen en DynamoDB; abrirlos usa la API HTTP, mientras la generación conserva el acceso directo a Runtime. Un perfil incompleto permite leer el historial y debe completarse para enviar un pedido nuevo.
+
 ## Preparar un checkout
 
 Usar Node **24.22.0** y npm **11.19.1**, indicados en `.nvmrc` y `package.json`. Instalar Node desde su [distribución oficial](https://nodejs.org/en/download/archive/v24); si ya se usa nvm, `nvm install` y `nvm use` leen `.nvmrc`.
@@ -33,7 +35,7 @@ Las pruebas con errores intencionales trabajan en copias y repositorios Git temp
 
 `tsconfig.web.json` comprueba TSX y tipos DOM; Vite transforma y empaqueta con el plugin React. Vitest utiliza esa transformación y mantiene su raíz en el repositorio. La infraestructura usa otra configuración TypeScript, NodeNext, y se ejecuta compilada a JavaScript.
 
-La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes` y define sus campos y opciones de perfil. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo. Una persona autorizada guarda su perfil y hace una consulta docente o pide un material como texto copiable. Puede continuar el mismo hilo y navegar a su perfil sin perder una respuesta en curso. El siguiente envío usa los cambios de perfil ya guardados. Cada persona dispone inicialmente de 20 consultas diarias y 200 mensuales por chatbot, con períodos de Argentina. Un envío admitido consume aunque falle; repetir el mismo ID no vuelve a consumir ni generar. Al recargar, la pestaña recupera el último envío y su estado sin volver a generar ni consumir. La tarea sigue aunque se corte su conexión; todavía no hay un historial navegable. La pregunta pendiente se guarda temporalmente en la pestaña hasta confirmar admisión; luego solo queda la referencia. Ver [cuenta e invitaciones](docs/intent/account.md), [perfil y preferencias](docs/intent/profile.md) y [chat, datos y fallos](docs/intent/chat.md).
+La entrada de producto es `web/index.html`. El componente React muestra nombre, propósito y uso de datos desde `config/site.ts`, que también identifica el chatbot como `docentes` y define sus campos y opciones de perfil. Esta configuración es pública y se incluye en el navegador: no debe contener secretos. La cuenta está disponible por invitación y admite recuperación de contraseña por email en desarrollo. Una persona autorizada guarda su perfil y hace una consulta docente o pide un material como texto copiable. Puede continuar el mismo hilo, elegir otro o navegar a su perfil sin cancelar una respuesta en curso. El siguiente envío usa los cambios de perfil ya guardados. Cada persona dispone inicialmente de 20 consultas diarias y 200 mensuales por chatbot, con períodos de Argentina. Un envío admitido consume aunque falle; repetir el mismo ID no vuelve a consumir ni generar. El historial restaura los originales y estados desde DynamoDB. Las referencias de pedidos pendientes se conservan por conversación en la pestaña; antes de confirmar admisión incluyen también la pregunta. Ver [cuenta e invitaciones](docs/intent/account.md), [perfil y preferencias](docs/intent/profile.md) y [chat, datos y fallos](docs/intent/chat.md).
 
 Antes de admitir, el servidor cuenta la entrada completa con `CountTokens`: hasta 936.000 tokens de entrada dentro de una ventana de 1.000.000, reservando 64.000 para salida. Un fallo de conteo o un exceso de capacidad conserva el borrador sin consumir. El cuerpo JSON puede ocupar hasta 32 MiB para transporte; la admisión completa sigue sujeta a los límites atómicos de DynamoDB. Los detalles de conteo, rechazos y plazo están en el [contrato del chat](docs/intent/chat.md).
 
@@ -102,6 +104,24 @@ aws dynamodb get-item --region us-east-1 \
 ```
 
 Si ya existe, el primer comando devuelve `ConditionalCheckFailedException`; leer y validar el registro existente sin sobrescribirlo. Los límites deben ser enteros no negativos y la revisión una cadena no vacía. Repetir esta preparación conserva política y consumos. Para cambiar límites, actualizar explícitamente la política con una nueva revisión, conservando los contadores; los pedidos nuevos usan el cambio. Una política ausente o inválida impide admitir sin consumir. No hay interfaz administrativa ni tarea de reinicio de cupos. Ver [contrato del chat](docs/intent/chat.md).
+
+## Incorporar conversaciones existentes al historial
+
+Con la identidad de la cuenta **118903272638** vigente, verificar en CloudFormation la tabla física del stack `multi-chatbot-dev-docentes-chat` e inventariar sus META sin registrar mensajes privados. Después del despliegue, confirmar que el índice está `ACTIVE`:
+
+```sh
+aws dynamodb describe-table --region us-east-1 \
+  --table-name multi-chatbot-dev-docentes-conversations \
+  --query 'Table.GlobalSecondaryIndexes[?IndexName==`ConversationHistory`].[IndexName,IndexStatus]'
+AWS_REGION=us-east-1 \
+  CHAT_HISTORY_TABLE=multi-chatbot-dev-docentes-conversations \
+  CHAT_HISTORY_BOT_ID=docentes \
+  node scripts/backfill-chat-history.mjs
+```
+
+El script añade únicamente los tres atributos de índice y devuelve conteos de revisadas, actualizadas, ya incorporadas e incompatibles. Repetirlo es idempotente. Para operar por páginas, importar `backfillChatHistory` desde ese mismo módulo y pasar `pageSize`, `maxPages` y el `startKey` devuelto como `nextKey`; ante un error, `error.checkpoint` conserva la última página confirmada. La importación no ejecuta el CLI ni crea clientes AWS.
+
+Comprobar cobertura de las META válidas y una segunda pasada sin cambios. Un incompatible se conserva y requiere examinar su formato autorizado; no representa una conversación migrada. Comparar los originales y metadatos anteriores, excluyendo solo los tres atributos añadidos, y clasificar cualquier actividad concurrente. `UPDATE_COMPLETE` del stack no prueba que el índice esté activo ni que el archivo esté completo. Ver [compatibilidad y límites](docs/intent/chat.md).
 
 ## Cargar documentos preparados en desarrollo
 

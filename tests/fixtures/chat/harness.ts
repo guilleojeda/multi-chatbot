@@ -10,6 +10,8 @@ import { createSession, type Session, type SessionTokens } from "../../../web/se
 export const fixtureScenarios = [
   { id: "ready", label: "Perfil completo; Runtime controlado" },
   { id: "incomplete", label: "Perfil docente incompleto" },
+  { id: "history-pending", label: "Historial: retener la primera lista" },
+  { id: "history-error", label: "Historial: error temporal al listar" },
   { id: "profile-error", label: "GET del perfil: error recuperable" },
   { id: "profile-pending", label: "GET del perfil: mantener pendiente" },
   { id: "profile-save-error", label: "PUT del perfil: 503 sin aplicar el cambio" },
@@ -83,6 +85,7 @@ class FixtureSessionStorage {
 }
 
 type PendingProfile = { release: () => void };
+type PendingHistory = { request: FixtureRequest; release: () => void };
 type PendingSignOut = { release: () => void };
 type PendingRefresh = { release: () => void };
 type PendingRuntime401 = { request: FixtureRequest; release: () => void };
@@ -123,6 +126,9 @@ type FixtureConversation = {
   conversationId: string;
   ownerSub: string;
   botId: string;
+  createdAt?: string;
+  updatedAt?: string;
+  closed?: boolean;
   nextOrdinal: number;
   turns: FixtureTurn[];
 };
@@ -133,7 +139,7 @@ type StoredFixtureState = {
 };
 
 const fixtureTabStateKey = "multi-chatbot:fixture-chat-tab-state:v1";
-const productJournalPrefix = "chat-journal:v2";
+const productJournalPrefix = "chat-journal:v3";
 
 class FixtureProductStorage {
   private rejectAdmittedJournalWrites = false;
@@ -246,6 +252,9 @@ function isFixtureConversation(value: unknown): value is FixtureConversation {
     value.conversationId.length > 0 &&
     typeof value.ownerSub === "string" &&
     typeof value.botId === "string" &&
+    (value.createdAt === undefined || typeof value.createdAt === "string") &&
+    (value.updatedAt === undefined || typeof value.updatedAt === "string") &&
+    (value.closed === undefined || typeof value.closed === "boolean") &&
     typeof value.nextOrdinal === "number" &&
     Number.isSafeInteger(value.nextOrdinal) &&
     value.nextOrdinal > 0 &&
@@ -279,9 +288,42 @@ function cloneConversation(conversation: FixtureConversation): FixtureConversati
     conversationId: conversation.conversationId,
     ownerSub: conversation.ownerSub,
     botId: conversation.botId,
+    ...(conversation.createdAt ? { createdAt: conversation.createdAt } : {}),
+    ...(conversation.updatedAt ? { updatedAt: conversation.updatedAt } : {}),
+    ...(conversation.closed === undefined ? {} : { closed: conversation.closed }),
     nextOrdinal: conversation.nextOrdinal,
     turns: conversation.turns.map((turn) => ({ ...turn })),
   };
+}
+
+const fixtureUuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const historyPageSize = 20;
+const historyTextPageSize = 2;
+
+function fixtureUuid(prefix: string, number: number) {
+  return `${prefix}-0000-4000-8000-${String(number).padStart(12, "0")}`;
+}
+
+function splitHistoryText(text: string) {
+  const characters = Array.from(text);
+  const chunks: string[] = [];
+  for (let offset = 0; offset < characters.length; offset += 72) {
+    chunks.push(characters.slice(offset, offset + 72).join(""));
+  }
+  return chunks;
+}
+
+function historyLabel(question: string) {
+  const normalized = question.replace(/\s+/gu, " ").trim();
+  const characters = Array.from(normalized);
+  return characters.length <= 120 ? normalized : `${characters.slice(0, 119).join("")}…`;
+}
+
+function publicTurnStatus(turn: FixtureTurn): "in_progress" | "completed" | "failed" {
+  if (turn.status === "completed") return "completed";
+  if (turn.status === "failed") return "failed";
+  return "in_progress";
 }
 
 function productJournalScope(config: ChatBrowserFixture["publicConfig"]) {
@@ -348,7 +390,7 @@ function readProductJournal(config: ChatBrowserFixture["publicConfig"]) {
       }
       if (
         !isRecord(parsed) ||
-        parsed.version !== 2 ||
+        parsed.version !== 3 ||
         JSON.stringify(parsed.scope) !== JSON.stringify(scope) ||
         typeof parsed.sub !== "string" ||
         typeof parsed.botId !== "string" ||
@@ -449,6 +491,7 @@ export class ChatBrowserFixture {
   private readonly requests: FixtureRequest[] = [];
   private readonly tokens = new Map<string, string>();
   private readonly pendingProfiles: PendingProfile[] = [];
+  private readonly pendingHistoryReads: PendingHistory[] = [];
   private readonly pendingSignOuts: PendingSignOut[] = [];
   private readonly pendingRefreshes: PendingRefresh[] = [];
   private readonly pendingRuntime401s: PendingRuntime401[] = [];
@@ -518,6 +561,16 @@ export class ChatBrowserFixture {
     }
   }
 
+  private touchConversation(turn: FixtureTurn) {
+    for (const conversation of this.conversations.values()) {
+      if (conversation.turns.includes(turn)) {
+        conversation.updatedAt = new Date().toISOString();
+        return conversation;
+      }
+    }
+    return undefined;
+  }
+
   private activeSessionSub() {
     const accessToken = this.session.accessToken();
     return accessToken ? (this.tokens.get(accessToken) ?? null) : null;
@@ -550,6 +603,54 @@ export class ChatBrowserFixture {
       configurable: true,
       value: { writeText: (text: string) => this.writeClipboard(text) },
     });
+    this.changed();
+  }
+
+  seedHistoryDemo() {
+    const ownerSub = this.activeSessionSub() || identities[0].sub;
+    const now = Date.now();
+    for (let conversationNumber = 1; conversationNumber <= 22; conversationNumber += 1) {
+      const conversationId = fixtureUuid("70000000", conversationNumber);
+      const turnCount = conversationNumber === 1 ? 22 : 1;
+      const closed = conversationNumber === 2;
+      const turns: FixtureTurn[] = [];
+      for (let ordinal = 1; ordinal <= turnCount; ordinal += 1) {
+        const isActive = conversationNumber === 1 && ordinal === turnCount;
+        const isFailed = closed || (conversationNumber === 1 && ordinal === 18);
+        const question =
+          conversationNumber === 1 && ordinal === 1
+            ? "Quiero planificar una clase de matemática sobre estrategias para resolver problemas."
+            : conversationNumber === 2
+              ? "Conversación cerrada de prueba: preparar una actividad breve."
+              : `Consulta de prueba ${ordinal} para la conversación ${conversationNumber}.`;
+        const answer = isActive
+          ? "Prefijo de respuesta todavía en curso. ".repeat(18)
+          : isFailed
+            ? "Texto parcial de una respuesta fallida. ".repeat(5)
+            : `Respuesta completa de prueba para la consulta ${ordinal}. `.repeat(4);
+        const queryNumber = conversationNumber * 100 + ordinal;
+        turns.push({
+          ordinal,
+          queryId: fixtureUuid("80000000", queryNumber),
+          question,
+          answer,
+          status: isActive ? "streaming" : isFailed ? "failed" : "completed",
+          canContinue: !isActive && !closed,
+        });
+      }
+      const updatedAt = new Date(now - (conversationNumber - 1) * 60_000).toISOString();
+      this.conversations.set(conversationId, {
+        conversationId,
+        ownerSub,
+        botId: this.publicConfig.botId,
+        createdAt: new Date(now - conversationNumber * 60_000).toISOString(),
+        updatedAt,
+        closed,
+        nextOrdinal: turnCount + 1,
+        turns,
+      });
+    }
+    this.persistConversations();
     this.changed();
   }
 
@@ -768,6 +869,318 @@ export class ChatBrowserFixture {
     return json({ sub, botId: "docentes", profile });
   }
 
+  private historyJson(value: unknown, status = 200) {
+    return new Response(JSON.stringify(value), {
+      status,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    });
+  }
+
+  private async historyResponse(
+    request: FixtureRequest,
+    url: URL,
+    sub: string | undefined,
+  ): Promise<Response> {
+    if (!sub) {
+      this.finish(request, 401, "historial requiere una sesión de fixture");
+      return this.historyJson({ code: "UNAUTHORIZED" }, 401);
+    }
+    if (this.selectedScenario === "membership-denied") {
+      this.finish(request, 403, "membresía denegada antes de leer el historial");
+      return this.historyJson({ code: "FORBIDDEN" }, 403);
+    }
+    if (this.selectedScenario === "membership-unauthorized") {
+      this.finish(request, 401, "sesión vencida antes de leer el historial");
+      return this.historyJson({ code: "UNAUTHORIZED" }, 401);
+    }
+    if (this.selectedScenario === "membership-temporary") {
+      this.finish(request, 503, "membresía temporalmente no disponible para historial");
+      return this.historyJson({ code: "HISTORY_UNAVAILABLE" }, 503);
+    }
+    if (this.selectedScenario === "membership-network") {
+      this.finish(request, "network-error", "fallo de red al comprobar membresía de historial");
+      throw new TypeError("Failed to fetch");
+    }
+
+    const listPath = "/api/chat/conversations";
+    if (url.pathname === listPath && request.method === "GET") {
+      if (this.selectedScenario === "history-error") {
+        this.finish(request, 503, "fallo temporal al listar el historial");
+        return this.historyJson(
+          { code: "HISTORY_UNAVAILABLE", message: "No pudimos cargar el historial." },
+          503,
+        );
+      }
+      if (this.selectedScenario === "history-pending") {
+        request.status = "pending";
+        request.outcome = "la primera lista espera el control Liberar historial";
+        this.changed();
+        await new Promise<void>((resolve) =>
+          this.pendingHistoryReads.push({ request, release: resolve }),
+        );
+        if (this.selectedScenario === "history-pending") this.selectedScenario = "ready";
+      }
+
+      const limitValue = url.searchParams.get("limit");
+      const limit =
+        limitValue === null || limitValue === ""
+          ? historyPageSize
+          : /^\d+$/.test(limitValue)
+            ? Number(limitValue)
+            : Number.NaN;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        this.finish(request, 400, "límite de lista inválido");
+        return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+      }
+      const scoped = [...this.conversations.values()].filter(
+        (conversation) =>
+          conversation.ownerSub === sub &&
+          conversation.botId === this.publicConfig.botId &&
+          conversation.turns.length > 0,
+      );
+      const conversations = scoped.sort((left, right) => {
+        const time = (right.updatedAt || "0000").localeCompare(left.updatedAt || "0000");
+        return time || right.conversationId.localeCompare(left.conversationId);
+      });
+      const cursor = url.searchParams.get("cursor");
+      let offset = 0;
+      if (cursor !== null && cursor !== "") {
+        const match = /^list:v1:([^:]+):([^:]+):(\d+)$/.exec(cursor);
+        if (
+          !match ||
+          match[1] !== sub ||
+          match[2] !== this.publicConfig.botId ||
+          !Number.isSafeInteger(Number(match[3]))
+        ) {
+          this.finish(request, 400, "cursor de lista inválido para este sujeto o bot");
+          return this.historyJson({ code: "INVALID_CURSOR" }, 400);
+        }
+        offset = Number(match[3]);
+      }
+      const page = conversations.slice(offset, offset + limit);
+      const nextOffset = offset + page.length;
+      const nextCursor =
+        nextOffset < conversations.length
+          ? `list:v1:${sub}:${this.publicConfig.botId}:${nextOffset}`
+          : undefined;
+      this.finish(request, 200, `lista de ${page.length} originales del productor para ${sub}`);
+      return this.historyJson({
+        version: 1,
+        conversations: page.map((conversation) => {
+          const firstTurn = [...conversation.turns].sort((a, b) => a.ordinal - b.ordinal)[0];
+          const latestTurn = [...conversation.turns].sort((a, b) => b.ordinal - a.ordinal)[0];
+          return {
+            conversationId: conversation.conversationId,
+            label: historyLabel(firstTurn.question),
+            ...(conversation.createdAt ? { createdAt: conversation.createdAt } : {}),
+            ...(conversation.updatedAt ? { updatedAt: conversation.updatedAt } : {}),
+            lastOrdinal: latestTurn.ordinal,
+            closed: conversation.closed === true,
+            ...(publicTurnStatus(latestTurn) === "in_progress"
+              ? { activeQueryId: latestTurn.queryId }
+              : {}),
+          };
+        }),
+        ...(nextCursor ? { nextCursor } : {}),
+      });
+    }
+
+    const textMatch = /^\/api\/chat\/conversations\/([^/]+)\/turns\/(\d+)\/text$/.exec(
+      url.pathname,
+    );
+    const turnsMatch = /^\/api\/chat\/conversations\/([^/]+)\/turns$/.exec(url.pathname);
+    if (request.method !== "GET" || (!textMatch && !turnsMatch)) {
+      this.finish(request, 404, "ruta de historial no simulada");
+      return this.historyJson({ code: "NOT_FOUND" }, 404);
+    }
+
+    let conversationId = "";
+    try {
+      conversationId = decodeURIComponent((textMatch || turnsMatch)![1]);
+    } catch {
+      this.finish(request, 400, "ID de conversación mal codificado");
+      return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+    }
+    if (!fixtureUuidPattern.test(conversationId)) {
+      this.finish(request, 400, "ID de conversación inválido");
+      return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+    }
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation) {
+      this.finish(request, 404, "conversación no disponible en el productor de fixture");
+      return this.historyJson({ code: "NOT_FOUND" }, 404);
+    }
+    if (conversation.ownerSub !== sub || conversation.botId !== this.publicConfig.botId) {
+      this.finish(request, 403, "el historial pertenece a otro sujeto o bot");
+      return this.historyJson({ code: "FORBIDDEN" }, 403);
+    }
+
+    const limitValue = url.searchParams.get("limit");
+    const limit =
+      limitValue === null || limitValue === ""
+        ? historyPageSize
+        : /^\d+$/.test(limitValue)
+          ? Number(limitValue)
+          : Number.NaN;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      this.finish(request, 400, "límite de historial inválido");
+      return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+    }
+
+    if (textMatch) {
+      const ordinal = Number(textMatch[2]);
+      const role = url.searchParams.get("role");
+      const queryId = url.searchParams.get("queryId");
+      const throughCursorValue = url.searchParams.get("throughCursor");
+      const throughCursor =
+        throughCursorValue !== null && /^\d+$/.test(throughCursorValue)
+          ? Number(throughCursorValue)
+          : Number.NaN;
+      if (
+        !Number.isSafeInteger(ordinal) ||
+        ordinal < 1 ||
+        (role !== "user" && role !== "assistant") ||
+        !queryId ||
+        !fixtureUuidPattern.test(queryId) ||
+        !Number.isSafeInteger(throughCursor) ||
+        throughCursor < 0
+      ) {
+        this.finish(request, 400, "parámetros de texto inválidos");
+        return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+      }
+      const turn = conversation.turns.find(
+        (candidate) => candidate.ordinal === ordinal && candidate.queryId === queryId,
+      );
+      if (!turn) {
+        this.finish(request, 404, "turno no disponible para ese ID de consulta");
+        return this.historyJson({ code: "NOT_FOUND" }, 404);
+      }
+      const chunks = splitHistoryText(role === "user" ? turn.question : turn.answer);
+      if (throughCursor > chunks.length || (role === "user" && throughCursor !== chunks.length)) {
+        this.finish(request, 400, "throughCursor no coincide con el manifiesto del texto original");
+        return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+      }
+      const through = throughCursor;
+      const cursor = url.searchParams.get("cursor");
+      let offset = 0;
+      if (cursor !== null && cursor !== "") {
+        const match =
+          /^text:v1:([^:]+):([^:]+):([^:]+):(\d+):([^:]+):(user|assistant):(\d+):(\d+)$/.exec(
+            cursor,
+          );
+        if (
+          !match ||
+          match[1] !== sub ||
+          match[2] !== this.publicConfig.botId ||
+          match[3] !== conversationId ||
+          Number(match[4]) !== ordinal ||
+          match[5] !== queryId ||
+          match[6] !== role ||
+          Number(match[7]) !== throughCursor
+        ) {
+          this.finish(request, 400, "cursor de texto inválido para este prefijo");
+          return this.historyJson({ code: "INVALID_CURSOR" }, 400);
+        }
+        offset = Number(match[8]);
+      }
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > through) {
+        this.finish(request, 400, "cursor de texto fuera del prefijo observado");
+        return this.historyJson({ code: "INVALID_CURSOR" }, 400);
+      }
+      const end = Math.min(offset + historyTextPageSize, through);
+      const nextCursor =
+        end < through
+          ? `text:v1:${sub}:${this.publicConfig.botId}:${conversationId}:${ordinal}:${queryId}:${role}:${throughCursor}:${end}`
+          : undefined;
+      const pageChunks = chunks
+        .slice(offset, end)
+        .map((text, index) => ({ index: offset + index, text }));
+      this.finish(request, 200, `${pageChunks.length} fragmento(s) original(es) de ${role}`);
+      return this.historyJson({
+        version: 1,
+        conversationId,
+        queryId,
+        ordinal,
+        role,
+        chunks: pageChunks,
+        complete: end >= through,
+        ...(nextCursor ? { nextCursor } : {}),
+      });
+    }
+
+    const latestOrdinal = conversation.turns.reduce((max, turn) => Math.max(max, turn.ordinal), 0);
+    let throughOrdinal = latestOrdinal;
+    let beforeOrdinal = latestOrdinal + 1;
+    const cursor = url.searchParams.get("cursor");
+    if (cursor !== null && cursor !== "") {
+      const match = /^turns:v1:([^:]+):([^:]+):([^:]+):(\d+):(\d+)$/.exec(cursor);
+      if (
+        !match ||
+        match[1] !== sub ||
+        match[2] !== this.publicConfig.botId ||
+        match[3] !== conversationId
+      ) {
+        this.finish(request, 400, "cursor de turnos inválido para este sujeto, bot o conversación");
+        return this.historyJson({ code: "INVALID_CURSOR" }, 400);
+      }
+      throughOrdinal = Number(match[4]);
+      beforeOrdinal = Number(match[5]);
+      if (
+        !Number.isSafeInteger(throughOrdinal) ||
+        !Number.isSafeInteger(beforeOrdinal) ||
+        throughOrdinal < 0 ||
+        throughOrdinal > latestOrdinal ||
+        beforeOrdinal < 1 ||
+        beforeOrdinal > throughOrdinal + 1
+      ) {
+        this.finish(request, 400, "cursor de turnos inválido para el prefijo observado");
+        return this.historyJson({ code: "INVALID_CURSOR" }, 400);
+      }
+    }
+    const eligible = conversation.turns
+      .filter((turn) => turn.ordinal <= throughOrdinal && turn.ordinal < beforeOrdinal)
+      .sort((left, right) => right.ordinal - left.ordinal);
+    const page = eligible.slice(0, limit).sort((left, right) => left.ordinal - right.ordinal);
+    const nextCursor =
+      eligible.length > page.length && page.length > 0
+        ? `turns:v1:${sub}:${this.publicConfig.botId}:${conversationId}:${throughOrdinal}:${page[0].ordinal}`
+        : undefined;
+    const latestTurn = conversation.turns.reduce<FixtureTurn | undefined>(
+      (latest, turn) => (!latest || turn.ordinal > latest.ordinal ? turn : latest),
+      undefined,
+    );
+    this.finish(request, 200, `${page.length} turnos originales para ${sub}`);
+    return this.historyJson({
+      version: 1,
+      conversationId,
+      throughOrdinal,
+      closed: conversation.closed === true,
+      canContinue:
+        conversation.closed !== true &&
+        (!latestTurn || (publicTurnStatus(latestTurn) !== "in_progress" && latestTurn.canContinue)),
+      turns: page.map((turn) => {
+        const questionChunks = splitHistoryText(turn.question);
+        const answerChunks = splitHistoryText(turn.answer);
+        const status = publicTurnStatus(turn);
+        return {
+          ordinal: turn.ordinal,
+          queryId: turn.queryId,
+          status,
+          questionManifest: { count: questionChunks.length, complete: true },
+          answerManifest: { count: answerChunks.length, complete: status !== "in_progress" },
+          cursor: answerChunks.length,
+          ...(status === "failed"
+            ? { failure: { code: turn.canContinue ? "generation_failed" : "profile_required" } }
+            : {}),
+        };
+      }),
+      ...(nextCursor ? { nextCursor } : {}),
+    });
+  }
+
   private recoverResponse(
     request: FixtureRequest,
     conversationId: string,
@@ -972,6 +1385,9 @@ export class ChatBrowserFixture {
         conversationId,
         ownerSub: sub,
         botId: this.publicConfig.botId,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        closed: false,
         nextOrdinal: 1,
         turns: [],
       };
@@ -1009,6 +1425,7 @@ export class ChatBrowserFixture {
           conversation!.nextOrdinal = turn.ordinal + 1;
           turn.status = "streaming";
           conversation!.turns.push(turn);
+          conversation!.updatedAt = new Date().toISOString();
           const firstText =
             "Propuesta: abrí la clase con una situación cotidiana y pedí que expliquen sus ideas. ";
           const firstTextIndex = stream.nextIndex++;
@@ -1134,6 +1551,12 @@ export class ChatBrowserFixture {
     this.changed();
   }
 
+  releaseHistory() {
+    this.pendingHistoryReads.shift()?.release();
+    if (this.selectedScenario === "history-pending") this.selectedScenario = "ready";
+    this.changed();
+  }
+
   releaseSignOut() {
     this.pendingSignOuts.shift()?.release();
     this.changed();
@@ -1188,12 +1611,14 @@ export class ChatBrowserFixture {
       const turn = this.restoredActiveTurns()[0];
       if (!turn) return;
       turn.answer += text;
+      this.touchConversation(turn);
       this.persistConversations();
       this.changed();
       return;
     }
     const index = stream.nextIndex++;
     stream.turn.answer += text;
+    this.touchConversation(stream.turn);
     this.persistConversations();
     stream.push({
       type: "text",
@@ -1222,6 +1647,8 @@ export class ChatBrowserFixture {
         turn.status = "unconfirmed";
         turn.canContinue = false;
       }
+      const conversation = this.touchConversation(turn);
+      if (conversation && mode === "profile-required") conversation.closed = true;
       this.persistConversations();
       this.changed();
       return;
@@ -1239,6 +1666,8 @@ export class ChatBrowserFixture {
       stream.turn.status = "unconfirmed";
       stream.turn.canContinue = false;
     }
+    const conversation = this.touchConversation(stream.turn);
+    if (conversation && mode === "profile-required") conversation.closed = true;
     this.persistConversations();
     if (mode === "complete") {
       stream.push({ type: "completed", queryId: stream.queryId });
@@ -1410,6 +1839,9 @@ export class ChatBrowserFixture {
         profile: cloneProfile(profile),
       });
     }
+    if (url.pathname.startsWith("/api/chat/conversations")) {
+      return this.historyResponse(item, url, sub);
+    }
     if (url.hostname === "bedrock-agentcore.us-east-1.amazonaws.com") {
       if (!sub) {
         this.finish(item, 401, "sin sesión");
@@ -1448,6 +1880,7 @@ export class ChatBrowserFixture {
         credentialsIncluded: false,
       },
       pendingProfiles: this.pendingProfiles.length,
+      pendingHistoryReads: this.pendingHistoryReads.length,
       pendingSignOuts: this.pendingSignOuts.length,
       pendingRefreshes: this.pendingRefreshes.length,
       pendingRuntime401s: this.pendingRuntime401s.length,
@@ -1469,6 +1902,9 @@ export class ChatBrowserFixture {
       conversations: [...this.conversations.entries()].map(([conversationId, conversation]) => ({
         conversationId,
         ownerSub: conversation.ownerSub,
+        ...(conversation.createdAt ? { createdAt: conversation.createdAt } : {}),
+        ...(conversation.updatedAt ? { updatedAt: conversation.updatedAt } : {}),
+        closed: conversation.closed === true,
         turns: conversation.turns.map((turn) => ({ ...turn })),
       })),
       productJournal: readProductJournal(this.publicConfig),

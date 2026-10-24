@@ -36,6 +36,16 @@ function createDriver(initialProps) {
   let dirty = true;
   let output;
 
+  if (!props.onDraftChange) {
+    props = {
+      ...props,
+      onDraftChange(text) {
+        props = { ...props, state: { ...props.state, draft: text } };
+        dirty = true;
+      },
+    };
+  }
+
   const runtime = {
     useState(initialValue) {
       const index = cursor++;
@@ -348,6 +358,61 @@ describe("copy feedback follows its answer and operation", () => {
     blocks = answerBlocks(driver);
     expect(alerts(blocks[0])).toHaveLength(0);
     expect(alerts(blocks[1])).toHaveLength(1);
+  });
+
+  it("keeps pending copy feedback with its turn when earlier history is prepended", async () => {
+    const copy = deferred();
+    const onCopy = vi.fn(() => copy.promise);
+    const turn = (ordinal) => ({
+      ordinal,
+      queryId: `query-${ordinal}`,
+      status: "completed",
+      question: `Pregunta ${ordinal}`,
+      answer: `Respuesta ${ordinal}`,
+      questionComplete: true,
+      answerComplete: true,
+      canContinue: true,
+    });
+    const makeProps = (turns) =>
+      props(
+        {
+          profileStatus: "complete",
+          queryStatus: "completed",
+          queryId: "query-22",
+          ordinal: 22,
+          question: "Pregunta 22",
+          answer: "Respuesta 22",
+          history: {
+            status: "ready",
+            conversations: [],
+            nextCursor: null,
+            loadingMore: false,
+            selectedConversationId: "conversation-a",
+            turnsStatus: "ready",
+            turns,
+            turnsNextCursor: null,
+            refreshRequired: false,
+          },
+        },
+        onCopy,
+      );
+    const driver = createDriver(makeProps([turn(22)]));
+    driver.render();
+    await driver.flush();
+
+    button(driver, "Copiar respuesta").props.onClick();
+    expect(onCopy).toHaveBeenCalledWith("Respuesta 22");
+
+    driver.setProps(makeProps(Array.from({ length: 22 }, (_, index) => turn(index + 1))));
+    await driver.flush();
+    copy.reject(new Error("clipboard denied"));
+    await driver.flush();
+
+    const blocks = answerBlocks(driver);
+    expect(blocks).toHaveLength(22);
+    expect(alerts(blocks[0])).toHaveLength(0);
+    expect(alerts(blocks[21])).toHaveLength(1);
+    expect(textContent(blocks[21])).toContain("Respuesta 22");
   });
 
   it("ignores an older result when two copies of the same answer settle out of order", async () => {

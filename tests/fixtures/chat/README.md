@@ -9,11 +9,14 @@ reload. The product journal and the fake Runtime's conversation records use the 
 separate from the product recovery journal and contain only the simulated conversation, question,
 answer prefix, and status.
 The mock Runtime accepts `start` once per new conversation ID and `message` for later turns with
-that same ID. The sanitized request list and state JSON show the operation, ID, ordinal, and mock
-turns. The profile route saves edits in fixture memory so navigation can exercise the real profile
-form. Those saved values are not sent by the browser to Runtime; this fixture cannot prove which
-profile snapshot the deployed server used to build model context.
-The state JSON also shows `productJournal`, read only from the product's `chat-journal:v2` prefix
+that same ID. The history GET routes read those same simulated conversation and turn records,
+derive labels, manifests, and cursors from their question/answer text, and check the fixture subject
+and bot before returning text. They do not use separate canned API responses. The sanitized request
+list and state JSON show the Runtime operation, ID, ordinal, and mock turns. The profile route saves
+edits in fixture memory so navigation can exercise the real profile form. Those saved values are not
+sent by the browser to Runtime; this fixture cannot prove which profile snapshot the deployed server
+used to build model context.
+The state JSON also shows `productJournal`, read only from the product's `chat-journal:v3` prefix
 for this fixture scope. A pending entry includes the exact request text; an admitted entry shows
 only its IDs and base ordinal. It never exposes refresh/access tokens or unrelated `sessionStorage`
 keys.
@@ -57,6 +60,28 @@ the same `streaming` state and shows the retryable status error while retaining 
 This scenario applies the one 503 control to Runtime requests, including `recover`; it does not
 simulate a lost AWS process. `runtime-recover-network` instead rejects only a `recover` request with
 a network `TypeError`, leaving start/message requests unaffected.
+
+### Historial en la interfaz
+
+En una pestaña limpia, el listado devuelve cero conversaciones y muestra “Todavía no hay
+conversaciones guardadas.” Para ver la carga retenida, abre `/?scenario=history-pending#/chat` y
+pulsa “Liberar historial”; para ver un error recuperable, abre `/?scenario=history-error#/chat`, elige
+`ready` y pulsa “Reintentar”. Estos escenarios simulan el GET de lista. Con
+`/?scenario=incomplete#/chat`, el historial sigue visible y la caja de envío queda bloqueada.
+
+“Preparar historial de paginación y recargar” agrega 22 conversaciones a los mismos registros
+simulados del Runtime. La conversación más reciente contiene 22 turnos: al abrirla, se cargan los
+20 más recientes y “Ver mensajes anteriores” carga los dos restantes. Su último turno está activo y
+su respuesta guardada tiene varios fragmentos: mientras la respuesta activa sigue incompleta, no
+debe ofrecerse para copiar. Otra conversación de la lista está cerrada y conserva una respuesta
+fallida explícitamente parcial; como su prefijo remoto está cargado por completo, sí puede ofrecerse
+“Copiar texto parcial anterior”. Para comprobar `stale_base`, termina una generación, selecciona
+`runtime-stale-base` y envía un seguimiento: el borrador debe permanecer y la interfaz debe pedir
+una actualización explícita, sin reenviar.
+
+La paginación, los manifiestos, los controles de membresía y los textos del historial son dobles de
+HTTP apoyados en registros de Runtime sintéticos en `sessionStorage`. No prueban DynamoDB, el GSI,
+Bedrock, IAM, API Gateway, Cognito, ni supervivencia de trabajos AWS.
 
 ### Recovery and retry checks
 
@@ -143,12 +168,14 @@ Use “Fallar” to close a query with a confirmed failure, then submit a new qu
 should be `message` on the same ID while the previous exchange stays visible. Use “Cerrar sin cierre”
 for an uncertain result: record the Runtime request count, let the stream reach EOF, and verify the
 count stays unchanged when the error appears and after choosing restart. Only submitting a new
-question should issue a `start` with a fresh ID. “Volver al inicio,” logout, a successful password
-reset, or definitive access loss clears the product's recovery reference; a late producer callback
-must not repopulate the visible chat. The fixture-only Runtime record remains owner-bound in the tab
-storage so a new reference can recover it during the same local run. Closing the browser tab clears
-that simulation. This behavior demonstrates the client/runtime contract locally; it does not prove
-that an AWS task survives a process loss, and the deployed development verification must inspect the
+question should issue a `start` with a fresh ID. Creating a new conversation with “Volver al inicio”
+preserves other conversations' pending recovery references; callbacks remain scoped to their
+conversation. Logout, identity change, successful password reset, or definitive access loss clears
+all product recovery references and invalidates their consumers; a late producer callback must not
+repopulate the visible chat. The fixture-only Runtime record remains owner-bound in the tab storage
+so a reference can recover it during the same local run. Closing the browser tab clears that
+simulation. This behavior demonstrates the client/runtime contract locally; it does not prove that
+an AWS task survives a process loss, and the deployed development verification must inspect the
 real saved query context independently.
 
 To inspect cupo presentation and draft retention without contacting the Runtime, select
@@ -180,9 +207,11 @@ fixture conversation turn or usage record is created; they do not call AWS:
   journal's pending ID/body with the `recover` request; no `start` or `message` should be sent.
   Select `ready` and use the explicit retry button if you want to continue the same query.
 
-An admitted partial response and its copy use the existing controls: submit under `ready`, let the
-first fragment appear, click “Fallar generación,” then copy “Copiar texto parcial.” The intercepted
-clipboard text must equal the visible prefix. This exercises the browser contract, not model
+To check an admitted partial response, submit under `ready` and let the first fragment appear. While
+the response is active, its prefix is not fully loaded and has no copy action. Click “Fallar
+generación”; the exchange stays marked incomplete, including after it moves into earlier turns. A
+failed answer whose full stored prefix is loaded can be copied only with its explicit partial-copy
+label; it is not presented as a complete answer. This exercises the browser contract, not model
 grounding or answer quality.
 
 - To check history capacity, complete a turn under `ready`, select
@@ -227,15 +256,19 @@ screen for checking its error message.
 **R4, reset and same-person re-entry:** with an admitted query visible, load the same origin
 and tab directly at `/?scenario=ready#/recover` so AccountApp mounts without first opening chat.
 Request a code and confirm a fixture-only password reset. Sign in again as identity A
-(`docente@example.test`) and open chat. The product journal must be empty and no request should
-recover or display the old query. The fixture's simulated Runtime record may still exist in its
-separate storage key; without the product reference it is not restored.
+(`docente@example.test`) and open chat. The product journal must be empty and opening the chat must
+not automatically send a Runtime `recover` for the old query. The server-backed conversation remains
+in history: select it explicitly to load its turns and text, and verify its status there. If the
+selected turn is still active, recovery belongs to that explicit selection. The fixture's simulated
+Runtime record is separate from the product journal.
 
 **R4, logout and same-person re-entry:** with another admitted query present, load the same origin
 and tab directly at `/?scenario=ready#/login`. After session restoration, click “Cerrar sesión” on
-that same login route, sign in again as the same identity, and open chat. The old query should
-remain absent and the request history should contain no `recover` for it. This tests cleanup
-without a local chat owner and without relying on a subsequent hash change to clear storage.
+that same login route, sign in again as the same identity, and open chat. Logout must invalidate all
+old product-journal references and consumers, so opening chat does not automatically recover the
+old query. The durable conversation still appears in history; select it to read its turns and text.
+An active selected turn can then be recovered explicitly. This tests cleanup without a local chat
+owner and without relying on a subsequent hash change to clear storage.
 
 The reset and refresh gates are independent: changing the scenario does not discard an already
 pending HTTP 401, refresh, password-reset confirmation, sign-in, or clipboard Promise. To exercise
@@ -272,15 +305,18 @@ the current copy, then complete the previous copy; the current answer's error mu
 to that answer. Compare each queued text with its visible completed answer to check exact copying;
 the fixture never writes to the operating-system clipboard.
 
-**R6, failed copy of a partial while a follow-up starts:** submit question A with `ready`, let the
-first prefix appear, and click “Fallar generación.” Once A is visibly failed but continuable, select
-`clipboard-pending` and click “Copiar texto parcial.” Enter and submit question B. In the fixture
-controls, reject A's pending copy operation. The alert should appear under A after it moves into
-previous turns; B must have no copy alert. A remains labeled “Respuesta incompleta” and its
-historical block has no copy button.
+**R6, distinguish an incomplete loaded prefix from a fully loaded partial answer:** while the seeded
+active answer is still loading, confirm its incomplete prefix has no copy action. After the stored
+text is fully loaded, select the closed failed conversation and confirm its answer remains labeled
+partial and exposes “Copiar texto parcial anterior”. Compare the fixture's intercepted clipboard
+text byte-for-byte with the displayed text. A failed historical answer whose `answerComplete` is
+false must not expose a copy action until its remaining stored-text pages load; the fixture's
+synthetic failed record has its entire prefix, so it exercises the explicit, labeled partial-copy
+path. The fixture does not write to the operating-system clipboard.
 
 Append `?scenario=<name>` before the hash to select an initial scenario, for example
-`/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `profile-error`,
+`/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `history-pending`,
+`history-error`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-unconfirmed`, `runtime-temporary`, `runtime-recover-network`, `runtime-quota-daily`,

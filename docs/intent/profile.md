@@ -10,6 +10,8 @@ Los descriptores tipados admiten dos controles: selección múltiple y lista de 
 
 Consultar un perfil ausente muestra «Completá tu perfil» sin crear datos. Un error de lectura muestra error y reintento, nunca un formulario nuevo que pudiera sobrescribir silenciosamente el perfil. «Guardar perfil» valida y reemplaza todo el documento después de una acción explícita. No hay autoguardado ni borradores persistidos. Las materias vacías de filas nuevas se omiten al preparar el formulario; la API rechaza materias vacías recibidas.
 
+El perfil completo es requisito para un pedido nuevo, no para consultar conversaciones propias anteriores. Un perfil incompleto permite abrir el historial y sus originales; el siguiente envío vuelve a comprobar el perfil vigente en el servidor.
+
 La confirmación aparece solo después de una respuesta válida del servidor y la edición puede continuar. Durante el envío se deshabilitan los cambios y nuevos guardados; cerrar sesión sigue disponible. «Descartar cambios» vuelve al último perfil confirmado, o al vacío inicial, sin escribir. Salir o recargar descarta cambios sin guardar.
 
 Una entrada inválida conserva las ediciones para corregirlas y no reemplaza el perfil válido. Un fallo de guardado no se presenta como éxito. Si se pierde o no se puede validar la respuesta, la escritura puede haber ocurrido: se ofrece reintentar explícitamente o descartar y recargar lo guardado. Solo un 401 permite una renovación de sesión y repetición mientras la vista siga vigente; no hay reintentos automáticos por red.

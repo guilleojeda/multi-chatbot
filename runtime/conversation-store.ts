@@ -20,6 +20,7 @@ import type {
   SubmissionSnapshot,
   TurnManifest,
 } from "./contracts.js";
+import { createHistoryLabel, createHistoryOrder } from "./history-projection.js";
 import { maxDynamoTextChunkBytes, splitUtf8Text } from "./text.js";
 
 type ChunkRole = "user" | "assistant";
@@ -708,6 +709,106 @@ export function createConversationStoreAdapter(input: {
     return result.Item;
   }
 
+  async function readFirstQuestionLabel(conversationId: string): Promise<string | undefined> {
+    const firstTurn = await getItem(turnKey(conversationId, 1));
+    if (
+      !firstTurn ||
+      firstTurn.pk !== conversationKey(conversationId).pk ||
+      firstTurn.sk !== turnKey(conversationId, 1).sk ||
+      firstTurn.conversationId !== conversationId ||
+      firstTurn.ordinal !== 1 ||
+      typeof firstTurn.queryId !== "string" ||
+      !uuidPattern.test(firstTurn.queryId) ||
+      manifestCount(firstTurn.questionManifest) === null
+    ) {
+      return undefined;
+    }
+    const prefix = `${turnKey(conversationId, 1).sk}#${firstTurn.queryId}#USER#`;
+    const result = await documentClient.send(
+      new QueryCommand({
+        TableName: tableName,
+        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+        ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+        ExpressionAttributeValues: {
+          ":pk": conversationKey(conversationId).pk,
+          ":prefix": prefix,
+        },
+        ConsistentRead: true,
+        ScanIndexForward: true,
+        Limit: 1,
+      }),
+    );
+    const chunk = result.Items?.[0];
+    if (
+      !chunk ||
+      chunk.pk !== conversationKey(conversationId).pk ||
+      chunk.conversationId !== conversationId ||
+      chunk.queryId !== firstTurn.queryId ||
+      chunk.ordinal !== 1 ||
+      chunk.role !== "user" ||
+      chunk.index !== 0 ||
+      typeof chunk.text !== "string"
+    ) {
+      return undefined;
+    }
+    try {
+      return createHistoryLabel(chunk.text);
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function historyProjectionFor(
+    previousMeta: Record<string, unknown> | undefined,
+    conversationId: string,
+    sub: string,
+    botId: string,
+    activityAt: string,
+  ): Promise<{ historyOwner: string; historyOrder: string; historyLabel: string } | undefined> {
+    const owner = `USER#${sub}#BOT#${botId}`;
+    const label =
+      typeof previousMeta?.historyLabel === "string" && previousMeta.historyLabel.trim().length > 0
+        ? previousMeta.historyLabel
+        : await readFirstQuestionLabel(conversationId);
+    // Keep legacy transitions independent of an unreadable label; let backfill report it instead of inventing text.
+    if (!label) return undefined;
+    return {
+      historyOwner: owner,
+      historyOrder: createHistoryOrder(activityAt, conversationId),
+      historyLabel: label,
+    };
+  }
+
+  function historyUpdateParts(
+    previousMeta: Record<string, unknown> | undefined,
+    projection: { historyOwner: string; historyOrder: string; historyLabel: string } | undefined,
+  ) {
+    const assignments = projection ? ["#historyOrder = :historyOrder"] : [];
+    const names: Record<string, string> = projection ? { "#historyOrder": "historyOrder" } : {};
+    const values: Record<string, unknown> = projection
+      ? { ":historyOrder": projection.historyOrder }
+      : {};
+    if (!projection) return { assignments, names, values };
+    if (previousMeta?.historyOwner !== projection.historyOwner) {
+      assignments.push("#historyOwner = :historyOwner");
+      names["#historyOwner"] = "historyOwner";
+      values[":historyOwner"] = projection.historyOwner;
+    }
+    if (previousMeta?.historyLabel !== projection.historyLabel) {
+      assignments.push("#historyLabel = :historyLabel");
+      names["#historyLabel"] = "historyLabel";
+      values[":historyLabel"] = projection.historyLabel;
+    }
+    return { assignments, names, values };
+  }
+
+  function historyMetaSetExpression(
+    updatedAtName: string,
+    historyUpdate: ReturnType<typeof historyUpdateParts>,
+  ): string {
+    return `SET ${updatedAtName} = :now${historyUpdate.assignments.length ? ", " + historyUpdate.assignments.join(", ") : ""}`;
+  }
+
   function validCounter(item: Record<string, unknown> | undefined): number {
     if (!item) return 0;
     if (!Number.isSafeInteger(item.used) || Number(item.used) < 0) {
@@ -1003,6 +1104,9 @@ export function createConversationStoreAdapter(input: {
       activeQueryId: turn.queryId,
       activeOwnerAttemptId: turn.ownerAttemptId,
       closed: false,
+      historyOwner: `USER#${turn.sub}#BOT#${turn.botId}`,
+      historyOrder: createHistoryOrder(createdAt, turn.conversationId),
+      historyLabel: createHistoryLabel(turn.text),
     };
     const day = localPeriods(turn.now).day.period;
     const month = localPeriods(turn.now).month.period;
@@ -1114,38 +1218,6 @@ export function createConversationStoreAdapter(input: {
       );
       affectedItems.push(meta, record);
     } else {
-      transactionItems.push({
-        Update: {
-          TableName: tableName,
-          Key: metaKey,
-          UpdateExpression:
-            "SET #lastOrdinal = :nextOrdinal, #lastQueryId = :queryId, #activeQueryId = :queryId, #activeOwnerAttemptId = :ownerAttemptId, #updatedAt = :updatedAt",
-          ConditionExpression:
-            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND (attribute_not_exists(#closed) OR #closed = :false)",
-          ExpressionAttributeNames: {
-            "#sub": "sub",
-            "#botId": "botId",
-            "#conversationId": "conversationId",
-            "#lastOrdinal": "lastOrdinal",
-            "#lastQueryId": "lastQueryId",
-            "#activeQueryId": "activeQueryId",
-            "#activeOwnerAttemptId": "activeOwnerAttemptId",
-            "#updatedAt": "updatedAt",
-            "#closed": "closed",
-          },
-          ExpressionAttributeValues: {
-            ":sub": turn.sub,
-            ":botId": turn.botId,
-            ":conversationId": turn.conversationId,
-            ":expectedLastOrdinal": baseOrdinal,
-            ":nextOrdinal": ordinal,
-            ":queryId": turn.queryId,
-            ":ownerAttemptId": turn.ownerAttemptId,
-            ":updatedAt": createdAt,
-            ":false": false,
-          },
-        },
-      });
       const previousMeta = await getItem(metaKey);
       if (
         previousMeta &&
@@ -1160,6 +1232,47 @@ export function createConversationStoreAdapter(input: {
       }
       if (previousMeta && previousMeta.lastOrdinal !== baseOrdinal)
         throw storeError("stale_base", "Conversation base ordinal is stale.");
+      const historyProjection = await historyProjectionFor(
+        previousMeta,
+        turn.conversationId,
+        turn.sub,
+        turn.botId,
+        createdAt,
+      );
+      const historyUpdate = historyUpdateParts(previousMeta, historyProjection);
+      transactionItems.push({
+        Update: {
+          TableName: tableName,
+          Key: metaKey,
+          UpdateExpression: `SET #lastOrdinal = :nextOrdinal, #lastQueryId = :queryId, #activeQueryId = :queryId, #activeOwnerAttemptId = :ownerAttemptId, #updatedAt = :updatedAt${historyUpdate.assignments.length ? ", " + historyUpdate.assignments.join(", ") : ""}`,
+          ConditionExpression:
+            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND (attribute_not_exists(#closed) OR #closed = :false)",
+          ExpressionAttributeNames: {
+            "#sub": "sub",
+            "#botId": "botId",
+            "#conversationId": "conversationId",
+            "#lastOrdinal": "lastOrdinal",
+            "#lastQueryId": "lastQueryId",
+            "#activeQueryId": "activeQueryId",
+            "#activeOwnerAttemptId": "activeOwnerAttemptId",
+            "#updatedAt": "updatedAt",
+            "#closed": "closed",
+            ...historyUpdate.names,
+          },
+          ExpressionAttributeValues: {
+            ":sub": turn.sub,
+            ":botId": turn.botId,
+            ":conversationId": turn.conversationId,
+            ":expectedLastOrdinal": baseOrdinal,
+            ":nextOrdinal": ordinal,
+            ":queryId": turn.queryId,
+            ":ownerAttemptId": turn.ownerAttemptId,
+            ":updatedAt": createdAt,
+            ":false": false,
+            ...historyUpdate.values,
+          },
+        },
+      });
       affectedItems.push({
         ...(previousMeta ?? {
           ...metaKey,
@@ -1173,6 +1286,7 @@ export function createConversationStoreAdapter(input: {
         activeQueryId: turn.queryId,
         activeOwnerAttemptId: turn.ownerAttemptId,
         updatedAt: createdAt,
+        ...(historyProjection ?? {}),
       });
       transactionItems.push({
         Put: {
@@ -1548,6 +1662,13 @@ export function createConversationStoreAdapter(input: {
     const metaKey = { ...conversationKey(turn.conversationId), sk: "META" };
     const [previousTurn, previousMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
     const now = isoDate(turn.now);
+    const sub = previousMeta?.sub ?? previousTurn?.sub;
+    const botId = previousMeta?.botId ?? previousTurn?.botId;
+    const historyProjection =
+      typeof sub === "string" && typeof botId === "string"
+        ? await historyProjectionFor(previousMeta, turn.conversationId, sub, botId, now)
+        : undefined;
+    const historyUpdate = historyUpdateParts(previousMeta, historyProjection);
     const cursor = previousTurn?.cursor ?? turn.answerManifest?.count ?? 0;
     const phase = turn.invocationClaimed ? "invocation_claimed" : "admitted";
     const retire = turn.invocationClaimed && !turn.providerFinished;
@@ -1573,6 +1694,7 @@ export function createConversationStoreAdapter(input: {
     const projectedMeta: Record<string, unknown> = {
       ...(previousMeta ?? metaKey),
       updatedAt: now,
+      ...historyProjection,
       ...(retire ? { closed: true } : {}),
     };
     delete projectedMeta.activeQueryId;
@@ -1629,7 +1751,7 @@ export function createConversationStoreAdapter(input: {
         TableName: tableName,
         Key: metaKey,
         UpdateExpression:
-          "SET #updatedAt = :now" +
+          historyMetaSetExpression("#updatedAt", historyUpdate) +
           (retire ? ", #closed = :true" : "") +
           " REMOVE #activeQueryId, #activeOwnerAttemptId",
         ConditionExpression:
@@ -1638,10 +1760,12 @@ export function createConversationStoreAdapter(input: {
           "#updatedAt": "updatedAt",
           "#activeQueryId": "activeQueryId",
           "#activeOwnerAttemptId": "activeOwnerAttemptId",
+          ...historyUpdate.names,
           ...(retire ? { "#closed": "closed" } : {}),
         },
         ExpressionAttributeValues: {
           ":now": now,
+          ...historyUpdate.values,
           ":queryId": turn.queryId,
           ":ownerAttemptId": turn.ownerAttemptId,
           ...(retire ? { ":true": true } : {}),
@@ -1667,6 +1791,179 @@ export function createConversationStoreAdapter(input: {
       }
       throw error;
     }
+  }
+
+  async function reconcileExpiredStoredTurn(input: {
+    sub: string;
+    botId: string;
+    conversationId: string;
+    ordinal: number;
+    queryId: string;
+    now: number;
+  }): Promise<{
+    turn: Record<string, unknown>;
+    meta: ConversationMeta;
+    confirmable: boolean;
+  }> {
+    const key = turnKey(input.conversationId, input.ordinal);
+    const metaKey = { ...conversationKey(input.conversationId), sk: "META" };
+    const [turn, meta] = await Promise.all([getItem(key), getItem(metaKey)]);
+    if (!turn || !meta) throw new Error("Conversation turn or META record is missing.");
+    if (
+      turn.pk !== key.pk ||
+      turn.sk !== key.sk ||
+      turn.conversationId !== input.conversationId ||
+      turn.ordinal !== input.ordinal ||
+      turn.queryId !== input.queryId ||
+      (turn.sub !== undefined && turn.sub !== input.sub) ||
+      (turn.botId !== undefined && turn.botId !== input.botId) ||
+      !isConversationMeta(meta, input.conversationId) ||
+      meta.sub !== input.sub ||
+      meta.botId !== input.botId
+    ) {
+      throw new Error("Conversation turn does not match its owner and META record.");
+    }
+    if (turn.status !== "in_progress") return { turn, meta, confirmable: true };
+    const phase = turn.phase;
+    const ownerAttemptId = turn.ownerAttemptId;
+    const cursor = turn.cursor;
+    const deadline = turn.resultDeadlineAt;
+    const active =
+      (phase === "admitted" || phase === "invocation_claimed") &&
+      typeof ownerAttemptId === "string" &&
+      ownerAttemptId.length > 0 &&
+      Number.isSafeInteger(cursor) &&
+      Number(cursor) >= 0 &&
+      Number.isSafeInteger(deadline) &&
+      Number(deadline) >= 0 &&
+      meta.activeQueryId === input.queryId &&
+      meta.activeOwnerAttemptId === ownerAttemptId;
+    if (!active) return { turn, meta, confirmable: false };
+    if (input.now < Number(deadline)) return { turn, meta, confirmable: true };
+
+    const now = isoDate(input.now);
+    const retired = phase === "invocation_claimed";
+    const answerManifest = { count: Number(cursor), complete: false };
+    const historyProjection = await historyProjectionFor(
+      meta,
+      input.conversationId,
+      input.sub,
+      input.botId,
+      now,
+    );
+    const historyUpdate = historyUpdateParts(meta, historyProjection);
+    const projectedTurn = {
+      ...turn,
+      status: "failed",
+      phase: "failed",
+      failure: { code: "result_timeout" },
+      failedAt: now,
+      updatedAt: now,
+      answerManifest,
+    };
+    const projectedMeta: Record<string, unknown> = {
+      ...meta,
+      updatedAt: now,
+      ...historyProjection,
+      ...(retired ? { closed: true } : {}),
+    };
+    delete projectedMeta.activeQueryId;
+    delete projectedMeta.activeOwnerAttemptId;
+    const turnUpdate = {
+      Update: {
+        TableName: tableName,
+        Key: key,
+        UpdateExpression:
+          "SET #status = :failed, #phase = :failed, #failure = :failure, #failedAt = :now, #updatedAt = :now, #answerManifest = :manifest",
+        ConditionExpression:
+          "#status = :inProgress AND #phase = :phase AND #ownerAttemptId = :ownerAttemptId AND #resultDeadlineAt <= :nowMs AND #cursor = :cursor AND #queryId = :queryId",
+        ExpressionAttributeNames: {
+          "#status": "status",
+          "#phase": "phase",
+          "#ownerAttemptId": "ownerAttemptId",
+          "#resultDeadlineAt": "resultDeadlineAt",
+          "#cursor": "cursor",
+          "#queryId": "queryId",
+          "#failure": "failure",
+          "#failedAt": "failedAt",
+          "#updatedAt": "updatedAt",
+          "#answerManifest": "answerManifest",
+        },
+        ExpressionAttributeValues: {
+          ":failed": "failed",
+          ":phase": phase,
+          ":ownerAttemptId": ownerAttemptId,
+          ":nowMs": input.now,
+          ":cursor": Number(cursor),
+          ":queryId": input.queryId,
+          ":inProgress": "in_progress",
+          ":failure": { code: "result_timeout" },
+          ":now": now,
+          ":manifest": answerManifest,
+        },
+      },
+    };
+    const metaUpdate = {
+      Update: {
+        TableName: tableName,
+        Key: metaKey,
+        UpdateExpression:
+          historyMetaSetExpression("#updatedAt", historyUpdate) +
+          (retired ? ", #closed = :true" : "") +
+          " REMOVE #activeQueryId, #activeOwnerAttemptId",
+        ConditionExpression:
+          "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #activeQueryId = :queryId AND #activeOwnerAttemptId = :ownerAttemptId",
+        ExpressionAttributeNames: {
+          "#updatedAt": "updatedAt",
+          "#sub": "sub",
+          "#botId": "botId",
+          "#conversationId": "conversationId",
+          "#activeQueryId": "activeQueryId",
+          "#activeOwnerAttemptId": "activeOwnerAttemptId",
+          ...historyUpdate.names,
+          ...(retired ? { "#closed": "closed" } : {}),
+        },
+        ExpressionAttributeValues: {
+          ":now": now,
+          ":sub": input.sub,
+          ":botId": input.botId,
+          ":conversationId": input.conversationId,
+          ":queryId": input.queryId,
+          ":ownerAttemptId": ownerAttemptId,
+          ...historyUpdate.values,
+          ...(retired ? { ":true": true } : {}),
+        },
+      },
+    };
+    const actions = [turnUpdate, metaUpdate];
+    preflight(actions, [projectedTurn, projectedMeta]);
+    try {
+      await documentClient.send(new TransactWriteCommand({ TransactItems: actions }));
+    } catch (error) {
+      if (!isConditionalFailure(error)) throw error;
+    }
+    const [currentTurn, currentMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
+    if (
+      !currentTurn ||
+      !currentMeta ||
+      !isConversationMeta(currentMeta, input.conversationId) ||
+      currentMeta.sub !== input.sub ||
+      currentMeta.botId !== input.botId
+    ) {
+      throw new Error("Reconciled conversation could not be read.");
+    }
+    return {
+      turn: currentTurn,
+      meta: currentMeta,
+      confirmable:
+        currentTurn.status !== "in_progress" ||
+        ((currentTurn.phase === "admitted" || currentTurn.phase === "invocation_claimed") &&
+          typeof currentTurn.ownerAttemptId === "string" &&
+          currentMeta.activeQueryId === currentTurn.queryId &&
+          currentMeta.activeOwnerAttemptId === currentTurn.ownerAttemptId &&
+          Number.isSafeInteger(currentTurn.resultDeadlineAt) &&
+          Number.isSafeInteger(currentTurn.cursor)),
+    };
   }
 
   const adapter = {
@@ -1979,6 +2276,13 @@ export function createConversationStoreAdapter(input: {
       const [previousTurn, previousMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
       const cursor = previousTurn?.cursor ?? turn.answerManifest.count;
       const completedAt = isoDate(turn.now);
+      const sub = previousMeta?.sub ?? previousTurn?.sub;
+      const botId = previousMeta?.botId ?? previousTurn?.botId;
+      const historyProjection =
+        typeof sub === "string" && typeof botId === "string"
+          ? await historyProjectionFor(previousMeta, turn.conversationId, sub, botId, completedAt)
+          : undefined;
+      const historyUpdate = historyUpdateParts(previousMeta, historyProjection);
       const projectedTurn = {
         ...(previousTurn ?? {
           ...key,
@@ -2000,6 +2304,7 @@ export function createConversationStoreAdapter(input: {
       const projectedMeta: Record<string, unknown> = {
         ...(previousMeta ?? metaKey),
         updatedAt: completedAt,
+        ...historyProjection,
       };
       delete projectedMeta.activeQueryId;
       delete projectedMeta.activeOwnerAttemptId;
@@ -2051,16 +2356,18 @@ export function createConversationStoreAdapter(input: {
         Update: {
           TableName: tableName,
           Key: metaKey,
-          UpdateExpression: "SET #updatedAt = :now REMOVE #activeQueryId, #activeOwnerAttemptId",
+          UpdateExpression: `${historyMetaSetExpression("#updatedAt", historyUpdate)} REMOVE #activeQueryId, #activeOwnerAttemptId`,
           ConditionExpression:
             "#activeQueryId = :queryId AND #activeOwnerAttemptId = :ownerAttemptId",
           ExpressionAttributeNames: {
             "#updatedAt": "updatedAt",
             "#activeQueryId": "activeQueryId",
             "#activeOwnerAttemptId": "activeOwnerAttemptId",
+            ...historyUpdate.names,
           },
           ExpressionAttributeValues: {
             ":now": completedAt,
+            ...historyUpdate.values,
             ":queryId": turn.queryId,
             ":ownerAttemptId": turn.ownerAttemptId,
           },
@@ -2105,104 +2412,44 @@ export function createConversationStoreAdapter(input: {
         return snapshot;
       if (input.now < snapshot.resultDeadlineAt) return snapshot;
       if (!snapshot.ownerAttemptId) throw new Error("Expired turn has no owner attempt.");
-      const key = turnKey(input.conversationId, snapshot.ordinal);
-      const metaKey = { ...conversationKey(input.conversationId), sk: "META" };
-      const [previousTurn, previousMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
-      if (!previousTurn || !previousMeta)
-        throw new Error("Expired submission is missing its turn or conversation record.");
-      const now = isoDate(input.now);
-      const claimed = snapshot.stage === "invocation_claimed";
-      const retired = claimed;
-      const answerManifest = { count: snapshot.cursor, complete: false };
-      const projectedTurn = {
-        ...previousTurn,
-        status: "failed",
-        phase: "failed",
-        failure: { code: "result_timeout" },
-        failedAt: now,
-        updatedAt: now,
-        answerManifest,
-      };
-      const projectedMeta: Record<string, unknown> = {
-        ...previousMeta,
-        updatedAt: now,
-        ...(retired ? { closed: true } : {}),
-      };
-      delete projectedMeta.activeQueryId;
-      delete projectedMeta.activeOwnerAttemptId;
-      const turnUpdate = {
-        Update: {
-          TableName: tableName,
-          Key: key,
-          UpdateExpression:
-            "SET #status = :failed, #phase = :failed, #failure = :failure, #failedAt = :now, #updatedAt = :now, #answerManifest = :manifest",
-          ConditionExpression:
-            "#status = :inProgress AND #phase = :phase AND #ownerAttemptId = :ownerAttemptId AND #resultDeadlineAt <= :nowMs AND #cursor = :cursor AND #queryId = :queryId",
-          ExpressionAttributeNames: {
-            "#status": "status",
-            "#phase": "phase",
-            "#ownerAttemptId": "ownerAttemptId",
-            "#resultDeadlineAt": "resultDeadlineAt",
-            "#cursor": "cursor",
-            "#queryId": "queryId",
-            "#failure": "failure",
-            "#failedAt": "failedAt",
-            "#updatedAt": "updatedAt",
-            "#answerManifest": "answerManifest",
-          },
-          ExpressionAttributeValues: {
-            ":failed": "failed",
-            ":phase": snapshot.stage,
-            ":ownerAttemptId": snapshot.ownerAttemptId,
-            ":nowMs": input.now,
-            ":cursor": snapshot.cursor,
-            ":queryId": input.queryId,
-            ":inProgress": "in_progress",
-            ":failure": { code: "result_timeout" },
-            ":now": now,
-            ":manifest": answerManifest,
-          },
-        },
-      };
-      const metaUpdate = {
-        Update: {
-          TableName: tableName,
-          Key: metaKey,
-          UpdateExpression:
-            "SET #updatedAt = :now" +
-            (retired ? ", #closed = :true" : "") +
-            " REMOVE #activeQueryId, #activeOwnerAttemptId",
-          ConditionExpression:
-            "#activeQueryId = :queryId AND #activeOwnerAttemptId = :ownerAttemptId",
-          ExpressionAttributeNames: {
-            "#updatedAt": "updatedAt",
-            "#activeQueryId": "activeQueryId",
-            "#activeOwnerAttemptId": "activeOwnerAttemptId",
-            ...(retired ? { "#closed": "closed" } : {}),
-          },
-          ExpressionAttributeValues: {
-            ":now": now,
-            ":queryId": input.queryId,
-            ":ownerAttemptId": snapshot.ownerAttemptId,
-            ...(retired ? { ":true": true } : {}),
-          },
-        },
-      };
-      const actions = [turnUpdate, metaUpdate];
-      preflight(actions, [projectedTurn, projectedMeta]);
-      try {
-        await documentClient.send(new TransactWriteCommand({ TransactItems: actions }));
-      } catch (error) {
-        const latest = await getSubmission({
-          sub: input.sub,
-          botId: input.botId,
-          queryId: input.queryId,
-        }).catch(() => null);
-        if (latest && latest.status !== "in_progress") return latest;
-        if (isConditionalFailure(error)) return latest;
-        throw error;
-      }
+      await reconcileExpiredStoredTurn({
+        sub: input.sub,
+        botId: input.botId,
+        conversationId: input.conversationId,
+        ordinal: snapshot.ordinal,
+        queryId: input.queryId,
+        now: input.now,
+      });
       return getSubmission({ sub: input.sub, botId: input.botId, queryId: input.queryId });
+    },
+
+    async reconcileHistoryTurn(input: {
+      sub: string;
+      botId: string;
+      conversationId: string;
+      ordinal: number;
+      queryId: string;
+      now: number;
+    }): Promise<{
+      turn: Record<string, unknown>;
+      meta: ConversationMeta;
+      confirmable: boolean;
+    }> {
+      if (
+        typeof input.sub !== "string" ||
+        input.sub.length === 0 ||
+        typeof input.botId !== "string" ||
+        input.botId.length === 0 ||
+        typeof input.conversationId !== "string" ||
+        !uuidPattern.test(input.conversationId) ||
+        !isPositiveSafeInteger(input.ordinal) ||
+        typeof input.queryId !== "string" ||
+        !uuidPattern.test(input.queryId) ||
+        !Number.isFinite(input.now)
+      ) {
+        throw new TypeError("History reconciliation input is invalid.");
+      }
+      return reconcileExpiredStoredTurn(input);
     },
   };
 
