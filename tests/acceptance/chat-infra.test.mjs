@@ -403,7 +403,16 @@ describe("chat infrastructure acceptance", () => {
         ]),
       );
       expect(conversationTable.properties.TimeToLiveSpecification).toBeUndefined();
-      expect(conversationTable.properties.GlobalSecondaryIndexes || []).toEqual([]);
+      expect(conversationTable.properties.GlobalSecondaryIndexes).toEqual([
+        {
+          IndexName: "ConversationHistory",
+          KeySchema: [
+            { AttributeName: "historyOwner", KeyType: "HASH" },
+            { AttributeName: "historyOrder", KeyType: "RANGE" },
+          ],
+          Projection: { ProjectionType: "KEYS_ONLY" },
+        },
+      ]);
       expect(conversationTable.properties.LocalSecondaryIndexes || []).toEqual([]);
       expect(conversationTable.properties.TableName).toContain(
         bot.botEnvironment.botResourcePrefix,
@@ -417,7 +426,7 @@ describe("chat infrastructure acceptance", () => {
 
       expect(records(chatTemplate, "AWS::BedrockAgentCore::RuntimeEndpoint")).toHaveLength(0);
       expect(records(chatTemplate, "AWS::ApiGatewayV2::Api")).toHaveLength(0);
-      expect(records(chatTemplate, "AWS::Lambda::Function")).toHaveLength(0);
+      expect(records(chatTemplate, "AWS::Lambda::Function")).toHaveLength(1);
       expect(records(chatTemplate, "AWS::CloudFront::Distribution")).toHaveLength(0);
       expect(records(chatTemplate, "AWS::DynamoDB::Table")).toHaveLength(1);
       expect(records(accountTemplate, "AWS::ApiGatewayV2::Api")).toHaveLength(1);
@@ -429,7 +438,7 @@ describe("chat infrastructure acceptance", () => {
   );
 
   it.each(["dev", "prod"])(
-    "%s Runtime can read only the account/profile record and owns all conversation writes",
+    "%s Runtime can read only the account/profile record and owns conversation admission",
     async (environment) => {
       const scenario = await scenarioFor(environment);
       expect(scenario, `expected the ${environment} infrastructure scenario`).toBeDefined();
