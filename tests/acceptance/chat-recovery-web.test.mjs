@@ -218,6 +218,7 @@ function createEnvironment({
   membershipStatus = 200,
   requestPasswordReset = vi.fn(async () => undefined),
   confirmPasswordReset = vi.fn(async () => undefined),
+  historySnapshot,
   streamHandler = (request) =>
     sse([
       {
@@ -301,6 +302,61 @@ function createEnvironment({
             }
           : null,
       });
+    }
+    if (url.startsWith("/api/chat/conversations")) {
+      apiRequests.push({ url, init });
+      const parsed = new URL(url, "https://fixture.invalid");
+      if (parsed.pathname === "/api/chat/conversations") {
+        return jsonResponse({
+          version: 1,
+          conversations: historySnapshot
+            ? [
+                {
+                  conversationId: historySnapshot.conversationId,
+                  label: historySnapshot.question,
+                  lastOrdinal: historySnapshot.ordinal,
+                  closed: false,
+                },
+              ]
+            : [],
+        });
+      }
+      if (!historySnapshot) return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 404);
+      const base = `/api/chat/conversations/${historySnapshot.conversationId}/turns`;
+      if (parsed.pathname === base) {
+        return jsonResponse({
+          version: 1,
+          conversationId: historySnapshot.conversationId,
+          throughOrdinal: historySnapshot.ordinal,
+          closed: false,
+          canContinue: true,
+          turns: [
+            {
+              ordinal: historySnapshot.ordinal,
+              queryId: historySnapshot.queryId,
+              status: "completed",
+              questionManifest: { count: 1, complete: true },
+              answerManifest: { count: 1, complete: true },
+              cursor: 1,
+            },
+          ],
+        });
+      }
+      if (parsed.pathname === `${base}/${historySnapshot.ordinal}/text`) {
+        const role = parsed.searchParams.get("role");
+        return jsonResponse({
+          version: 1,
+          conversationId: historySnapshot.conversationId,
+          queryId: historySnapshot.queryId,
+          ordinal: historySnapshot.ordinal,
+          role,
+          chunks: [
+            { index: 0, text: role === "user" ? historySnapshot.question : historySnapshot.answer },
+          ],
+          complete: true,
+        });
+      }
+      throw new Error(`Unexpected history request: ${url}`);
     }
     if (url === runtimeUrl(config)) {
       const headers = new Headers(init.headers);
@@ -781,7 +837,7 @@ describe("the chat recovery journal and restored submission", () => {
     for (const call of recoverCalls(restored)) {
       expect(call.request).toEqual(recoverCalls(restored)[0].request);
     }
-    expect(allStorageText(seeded.storage)).toContain(seeded.request.queryId);
+    expect(allStorageText(seeded.storage)).not.toContain(seeded.request.queryId);
     expect(await app.html()).toContain("Respuesta recuperada y durable.");
   });
 
@@ -942,10 +998,7 @@ describe("the chat recovery journal and restored submission", () => {
     await firstApp.setRoute("chat");
     await firstApp.flush();
     expect(startCalls(first)).toHaveLength(1);
-    expect(findStoredRecord(storage, original.queryId)?.value).toMatchObject({
-      conversationId: original.conversationId,
-      queryId: original.queryId,
-    });
+    expect(findStoredRecord(storage, original.queryId)).toBeNull();
     for (const { request } of recoverCalls(first)) {
       expect(request).toMatchObject({
         conversationId: original.conversationId,
@@ -956,6 +1009,10 @@ describe("the chat recovery journal and restored submission", () => {
     firstApp.dispose();
     const restored = createEnvironment({
       storage,
+      historySnapshot: snapshot(original, {
+        question: originalQuestion,
+        answer: "Respuesta completa.",
+      }),
       recoverHandler: (request) =>
         jsonResponse(
           snapshot(request, { question: originalQuestion, answer: "Respuesta completa." }),
@@ -963,7 +1020,8 @@ describe("the chat recovery journal and restored submission", () => {
     });
     const app = mount(restored);
     await initialize(app);
-    expect(recoverCalls(restored)).toHaveLength(1);
+    expect(recoverCalls(restored)).toHaveLength(0);
+    expect(restored.apiRequests.some(({ url }) => url.includes("/turns"))).toBe(true);
     expect(await app.html()).toContain("Respuesta completa.");
     await app.current().props.onCopy("Respuesta completa.");
     expect(restored.clipboardWrite).toHaveBeenCalledWith("Respuesta completa.");
@@ -990,7 +1048,7 @@ describe("the chat recovery journal and restored submission", () => {
     );
     seeded.app.current().props.onReset();
     await seeded.app.flush();
-    expect(allStorageText(seeded.storage)).not.toContain(seeded.request.queryId);
+    expect(allStorageText(seeded.storage)).toContain(seeded.request.queryId);
     expect(startCalls(seeded.environment)).toHaveLength(1);
   });
 

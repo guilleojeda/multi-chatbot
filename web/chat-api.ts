@@ -1,4 +1,4 @@
-import type { PublicConfig } from "./api";
+import { requestWithRefresh, type PublicConfig } from "./api";
 import type { Session } from "./session";
 import type { QuotaView } from "../runtime/contracts";
 
@@ -78,6 +78,51 @@ export type ChatStreamError = Error & {
   status: number;
 };
 
+export type ConversationSummary = {
+  conversationId: string;
+  label: string;
+  createdAt?: string;
+  updatedAt?: string;
+  lastOrdinal: number;
+  closed: boolean;
+  activeQueryId?: string;
+};
+
+export type ConversationTurn = {
+  ordinal: number;
+  queryId: string;
+  status: "in_progress" | "completed" | "failed";
+  questionManifest: { count: number; complete: boolean };
+  answerManifest: { count: number; complete: boolean };
+  cursor: number;
+  resultDeadlineAt?: number;
+  failure?: { code?: string; message?: string };
+};
+
+export type ConversationListPage = {
+  conversations: ConversationSummary[];
+  nextCursor: string | null;
+};
+
+export type ConversationTurnsPage = {
+  conversationId: string;
+  throughOrdinal: number;
+  closed: boolean;
+  canContinue: boolean;
+  turns: ConversationTurn[];
+  nextCursor: string | null;
+};
+
+export type ConversationTextPage = {
+  conversationId: string;
+  queryId: string;
+  ordinal: number;
+  role: "user" | "assistant";
+  chunks: { index: number; text: string }[];
+  complete: boolean;
+  nextCursor: string | null;
+};
+
 const sessionHeader = "x-amzn-bedrock-agentcore-runtime-session-id";
 
 function chatError(code: string, status: number, message: string): ChatStreamError {
@@ -99,6 +144,235 @@ function asChatError(error: unknown): ChatStreamError {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function historyError(code: string, status: number, message: string): ChatStreamError {
+  return chatError(code, status, message);
+}
+
+function cursorValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && value.length > 0) return value;
+  throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una página inválida.");
+}
+
+function parseHistoryJson(value: unknown): Record<string, unknown> {
+  if (!isRecord(value) || value.version !== 1) {
+    throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una respuesta inválida.");
+  }
+  return value;
+}
+
+function parseManifest(value: unknown): { count: number; complete: boolean } {
+  if (
+    !isRecord(value) ||
+    !Number.isSafeInteger(value.count) ||
+    (value.count as number) < 0 ||
+    typeof value.complete !== "boolean"
+  ) {
+    throw historyError("INVALID_RESPONSE", 502, "El historial devolvió un turno inválido.");
+  }
+  return { count: value.count as number, complete: value.complete };
+}
+
+export async function listChatConversations(
+  config: PublicConfig,
+  session: Session,
+  cursor: string | null,
+  isActive: () => boolean,
+): Promise<ConversationListPage> {
+  const query = new URLSearchParams();
+  if (cursor) query.set("cursor", cursor);
+  const suffix = query.size ? `?${query.toString()}` : "";
+  const payload = parseHistoryJson(
+    await requestWithRefresh(config, session, `/chat/conversations${suffix}`, {}, isActive),
+  );
+  if (!Array.isArray(payload.conversations)) {
+    throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una lista inválida.");
+  }
+  const conversations = payload.conversations.map((value): ConversationSummary => {
+    if (
+      !isRecord(value) ||
+      typeof value.conversationId !== "string" ||
+      !uuidPattern.test(value.conversationId) ||
+      typeof value.label !== "string" ||
+      !Number.isSafeInteger(value.lastOrdinal) ||
+      (value.lastOrdinal as number) < 0 ||
+      typeof value.closed !== "boolean" ||
+      (value.activeQueryId !== undefined && typeof value.activeQueryId !== "string") ||
+      (value.createdAt !== undefined && typeof value.createdAt !== "string") ||
+      (value.updatedAt !== undefined && typeof value.updatedAt !== "string")
+    ) {
+      throw historyError(
+        "INVALID_RESPONSE",
+        502,
+        "El historial devolvió una conversación inválida.",
+      );
+    }
+    return {
+      conversationId: value.conversationId,
+      label: value.label,
+      lastOrdinal: value.lastOrdinal as number,
+      closed: value.closed,
+      ...(typeof value.createdAt === "string" ? { createdAt: value.createdAt } : {}),
+      ...(typeof value.updatedAt === "string" ? { updatedAt: value.updatedAt } : {}),
+      ...(typeof value.activeQueryId === "string" ? { activeQueryId: value.activeQueryId } : {}),
+    };
+  });
+  return { conversations, nextCursor: cursorValue(payload.nextCursor) };
+}
+
+export async function readConversationTurns(
+  config: PublicConfig,
+  session: Session,
+  conversationId: string,
+  cursor: string | null,
+  isActive: () => boolean,
+): Promise<ConversationTurnsPage> {
+  if (!uuidPattern.test(conversationId)) {
+    throw historyError("INVALID_REQUEST", 400, "No pudimos abrir esta conversación.");
+  }
+  const query = new URLSearchParams();
+  if (cursor) query.set("cursor", cursor);
+  const suffix = query.size ? `?${query.toString()}` : "";
+  const payload = parseHistoryJson(
+    await requestWithRefresh(
+      config,
+      session,
+      `/chat/conversations/${encodeURIComponent(conversationId)}/turns${suffix}`,
+      {},
+      isActive,
+    ),
+  );
+  if (
+    payload.conversationId !== conversationId ||
+    !Number.isSafeInteger(payload.throughOrdinal) ||
+    (payload.throughOrdinal as number) < 0 ||
+    typeof payload.closed !== "boolean" ||
+    typeof payload.canContinue !== "boolean" ||
+    !Array.isArray(payload.turns)
+  ) {
+    throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una conversación inválida.");
+  }
+  const turns = payload.turns.map((value): ConversationTurn => {
+    if (
+      !isRecord(value) ||
+      !Number.isSafeInteger(value.ordinal) ||
+      (value.ordinal as number) <= 0 ||
+      typeof value.queryId !== "string" ||
+      !uuidPattern.test(value.queryId) ||
+      !["in_progress", "completed", "failed"].includes(String(value.status)) ||
+      !Number.isSafeInteger(value.cursor) ||
+      (value.cursor as number) < 0 ||
+      (value.resultDeadlineAt !== undefined && !Number.isSafeInteger(value.resultDeadlineAt)) ||
+      (value.failure !== undefined && !isRecord(value.failure))
+    ) {
+      throw historyError("INVALID_RESPONSE", 502, "El historial devolvió un turno inválido.");
+    }
+    const failure = value.failure;
+    if (
+      failure !== undefined &&
+      ((failure.code !== undefined && typeof failure.code !== "string") ||
+        (failure.message !== undefined && typeof failure.message !== "string"))
+    ) {
+      throw historyError("INVALID_RESPONSE", 502, "El historial devolvió un turno inválido.");
+    }
+    return {
+      ordinal: value.ordinal as number,
+      queryId: value.queryId,
+      status: value.status as ConversationTurn["status"],
+      questionManifest: parseManifest(value.questionManifest),
+      answerManifest: parseManifest(value.answerManifest),
+      cursor: value.cursor as number,
+      ...(typeof value.resultDeadlineAt === "number"
+        ? { resultDeadlineAt: value.resultDeadlineAt }
+        : {}),
+      ...(failure
+        ? {
+            failure: {
+              ...(typeof failure.code === "string" ? { code: failure.code } : {}),
+              ...(typeof failure.message === "string" ? { message: failure.message } : {}),
+            },
+          }
+        : {}),
+    };
+  });
+  return {
+    conversationId,
+    throughOrdinal: payload.throughOrdinal as number,
+    closed: payload.closed,
+    canContinue: payload.canContinue,
+    turns: [...turns].sort((left, right) => left.ordinal - right.ordinal),
+    nextCursor: cursorValue(payload.nextCursor),
+  };
+}
+
+export async function readConversationTextPage(
+  config: PublicConfig,
+  session: Session,
+  request: {
+    conversationId: string;
+    ordinal: number;
+    queryId: string;
+    role: "user" | "assistant";
+    throughCursor: number;
+    cursor: string | null;
+  },
+  isActive: () => boolean,
+): Promise<ConversationTextPage> {
+  const query = new URLSearchParams({
+    role: request.role,
+    queryId: request.queryId,
+    throughCursor: String(request.throughCursor),
+  });
+  if (request.cursor) query.set("cursor", request.cursor);
+  const payload = parseHistoryJson(
+    await requestWithRefresh(
+      config,
+      session,
+      `/chat/conversations/${encodeURIComponent(request.conversationId)}/turns/${request.ordinal}/text?${query.toString()}`,
+      {},
+      isActive,
+    ),
+  );
+  if (
+    payload.conversationId !== request.conversationId ||
+    payload.queryId !== request.queryId ||
+    payload.ordinal !== request.ordinal ||
+    payload.role !== request.role ||
+    typeof payload.complete !== "boolean" ||
+    !Array.isArray(payload.chunks)
+  ) {
+    throw historyError(
+      "INVALID_RESPONSE",
+      502,
+      "El texto del historial devolvió una página inválida.",
+    );
+  }
+  const chunks = payload.chunks.map((value) => {
+    if (
+      !isRecord(value) ||
+      !Number.isSafeInteger(value.index) ||
+      (value.index as number) < 0 ||
+      typeof value.text !== "string"
+    ) {
+      throw historyError(
+        "INVALID_RESPONSE",
+        502,
+        "El texto del historial devolvió una página inválida.",
+      );
+    }
+    return { index: value.index as number, text: value.text };
+  });
+  return {
+    conversationId: request.conversationId,
+    queryId: request.queryId,
+    ordinal: request.ordinal,
+    role: request.role,
+    chunks,
+    complete: payload.complete,
+    nextCursor: cursorValue(payload.nextCursor),
+  };
 }
 
 function runtimeUrl(config: PublicConfig): string {

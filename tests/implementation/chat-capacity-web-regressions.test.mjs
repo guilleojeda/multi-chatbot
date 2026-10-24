@@ -256,16 +256,7 @@ describe("AccountApp capacity rejection regressions", () => {
     });
     expect(runtimeRequests.map((item) => item.operation)).toEqual(["recover", "start", "recover"]);
     expect(runtimeRequests.every((item) => item.queryId === recoveredQueryId)).toBe(true);
-    expect(readChatJournal(config, identity)).toMatchObject({
-      admitted: true,
-      request: {
-        version: 2,
-        operation: "start",
-        conversationId,
-        queryId: recoveredQueryId,
-        baseOrdinal: 0,
-      },
-    });
+    expect(readChatJournal(config, identity)).toBeNull();
   });
 
   it("keeps the live conversation ID when its admitted journal write fails across profile navigation", async () => {
@@ -453,7 +444,7 @@ describe("AccountApp capacity rejection regressions", () => {
       queryStatus: "rejected",
       question: rejectedText,
       queryErrorCode: "storage_capacity_exceeded",
-      previousTurns: [{ question: firstQuestion, answer: "Respuesta corregida." }],
+      history: { turns: [{ question: firstQuestion, answer: "Respuesta corregida." }] },
     });
 
     await app.setRoute("profile");
@@ -463,15 +454,14 @@ describe("AccountApp capacity rejection regressions", () => {
       queryStatus: "rejected",
       question: rejectedText,
       queryErrorCode: "storage_capacity_exceeded",
-      previousTurns: [{ question: firstQuestion, answer: "Respuesta corregida." }],
+      history: { turns: [{ question: firstQuestion, answer: "Respuesta corregida." }] },
     });
-    expect(app.current().props.state.previousTurns).toEqual([
-      {
-        question: firstQuestion,
-        answer: "Respuesta corregida.",
-        status: "completed",
-      },
-    ]);
+    expect(app.current().props.state.history.turns).toHaveLength(1);
+    expect(app.current().props.state.history.turns[0]).toMatchObject({
+      question: firstQuestion,
+      answer: "Respuesta corregida.",
+      status: "completed",
+    });
     expect(runtimeRequests.filter((item) => item.operation === "recover")).toHaveLength(0);
   });
 

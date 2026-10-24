@@ -19,6 +19,7 @@ export class AccountStack extends Stack {
   readonly table: dynamodb.Table;
   readonly handler: nodejs.NodejsFunction;
   readonly httpApi: apigateway.HttpApi;
+  readonly jwtAuthorizer: authorizers.HttpJwtAuthorizer;
 
   constructor(
     scope: Construct,
@@ -95,7 +96,7 @@ export class AccountStack extends Stack {
       "AccountHandlerIntegration",
       this.handler,
     );
-    const jwtAuthorizer = new authorizers.HttpJwtAuthorizer(
+    this.jwtAuthorizer = new authorizers.HttpJwtAuthorizer(
       "AccountJwtAuthorizer",
       `https://cognito-idp.${environment.region}.amazonaws.com/${userPool.userPoolId}`,
       { jwtAudience: [this.userPoolClient.userPoolClientId] },
@@ -115,13 +116,13 @@ export class AccountStack extends Stack {
       path: "/api/account/me",
       methods: [apigateway.HttpMethod.GET],
       integration,
-      authorizer: jwtAuthorizer,
+      authorizer: this.jwtAuthorizer,
     });
     this.httpApi.addRoutes({
       path: "/api/profile",
       methods: [apigateway.HttpMethod.GET, apigateway.HttpMethod.PUT],
       integration,
-      authorizer: jwtAuthorizer,
+      authorizer: this.jwtAuthorizer,
     });
 
     new CfnOutput(this, "UserPoolId", {

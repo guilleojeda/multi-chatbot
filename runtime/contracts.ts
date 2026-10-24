@@ -135,13 +135,21 @@ export type SubmissionSnapshot = {
 };
 
 export type ConversationMeta = {
+  pk: string;
+  sk: "META";
   conversationId: string;
   sub: string;
   botId: string;
+  createdAt?: string;
+  updatedAt?: string;
   lastOrdinal: number;
   lastQueryId?: string;
   activeQueryId?: string;
+  activeOwnerAttemptId?: string;
   closed?: boolean;
+  historyOwner?: string;
+  historyOrder?: string;
+  historyLabel?: string;
 };
 
 export type ConversationStoreErrorCode =

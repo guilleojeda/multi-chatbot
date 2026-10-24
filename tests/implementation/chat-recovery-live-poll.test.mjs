@@ -296,7 +296,7 @@ describe("chat recovery after an uncertain stream in the current view", () => {
     }
   });
 
-  it("preserves the completed turn and admitted journal when a follow-up cannot be journaled", async () => {
+  it("preserves the completed turn and selection when a follow-up cannot be journaled", async () => {
     const values = new Map();
     const storage = {
       denyJournalWrites: false,
@@ -416,7 +416,8 @@ describe("chat recovery after an uncertain stream in the current view", () => {
       expect(rejectedHtml).toContain(firstAnswer);
       expect(rejectedHtml).toContain("Copiar respuesta");
       expect(rejectedHtml).toContain("no se envió al asistente");
-      expect([...values.values()].join("\n")).toContain(firstQueryId);
+      expect([...values.values()].join("\n")).not.toContain(firstQueryId);
+      expect([...values.values()].join("\n")).toContain(conversationId);
       expect([...values.values()].join("\n")).not.toContain(followUp);
 
       storage.denyJournalWrites = false;

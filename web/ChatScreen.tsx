@@ -5,16 +5,54 @@ export type ChatProfileStatus = "loading" | "incomplete" | "error" | "complete";
 export type ChatQueryStatus =
   "idle" | "sending" | "streaming" | "completed" | "failed" | "rejected" | "unconfirmed";
 
-export type PreviousChatTurn = {
+export type ChatHistoryConversation = {
+  conversationId: string;
+  label: string;
+  createdAt?: string;
+  updatedAt?: string;
+  lastOrdinal: number;
+  closed: boolean;
+  activeQueryId?: string;
+};
+
+export type ChatHistoryTurn = {
+  ordinal: number;
+  queryId: string;
   question: string;
   answer: string;
-  status: "completed" | "failed";
+  status: "in_progress" | "completed" | "failed";
+  questionComplete: boolean;
+  answerComplete: boolean;
+  canContinue: boolean;
+  failure?: { code?: string; message?: string };
+};
+
+export type ChatHistoryState = {
+  status: "loading" | "ready" | "empty" | "error";
+  conversations: ChatHistoryConversation[];
+  nextCursor: string | null;
+  loadingMore: boolean;
+  selectedConversationId: string | null;
+  turnsStatus: "idle" | "loading" | "ready" | "error";
+  turns: ChatHistoryTurn[];
+  turnsNextCursor: string | null;
+  refreshRequired: boolean;
+  loadingEarlier?: boolean;
+  openingConversationId?: string;
+  error?: string;
+  turnsError?: string;
+  closed?: boolean;
+  canContinue?: boolean;
+  throughOrdinal?: number;
 };
 
 export type ChatScreenState = {
   profileStatus: ChatProfileStatus;
   queryStatus: ChatQueryStatus;
-  previousTurns?: PreviousChatTurn[];
+  history?: ChatHistoryState;
+  draft?: string;
+  answerComplete?: boolean;
+  queryId?: string;
   question?: string;
   answer?: string;
   ordinal?: number;
@@ -37,6 +75,11 @@ export type ChatScreenProps = {
   onRetryProfile: () => void;
   onReset: () => void;
   onCopy: (text: string) => void | Promise<void>;
+  onSelectConversation?: (conversationId: string) => void | boolean | Promise<void | boolean>;
+  onLoadMoreHistory?: () => void | Promise<void>;
+  onRefreshHistory?: () => void | Promise<void>;
+  onLoadEarlierTurns?: () => void | Promise<void>;
+  onDraftChange?: (text: string) => void;
 };
 
 type CopyTarget = {
@@ -76,42 +119,59 @@ export function ChatScreen({
   onRetryProfile,
   onReset,
   onCopy,
+  onSelectConversation,
+  onLoadMoreHistory,
+  onRefreshHistory,
+  onLoadEarlierTurns,
+  onDraftChange,
 }: ChatScreenProps) {
-  const [draft, setDraft] = useState("");
+  const [mobileView, setMobileView] = useState<"history" | "chat">(
+    state.history?.selectedConversationId ? "chat" : "history",
+  );
+  const draft = state.draft ?? "";
   const [quotaNow, setQuotaNow] = useState(0);
   const [, setCopyRevision] = useState(0);
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const historyHeadingRef = useRef<HTMLHeadingElement>(null);
   const queryRef = useRef<HTMLTextAreaElement>(null);
   const focusQueryAfterResetRef = useRef(false);
-  const previousTurns = state.previousTurns || [];
-  const previousCopyTargetsRef = useRef<(CopyTarget | null)[]>([]);
+  const previousCopyTargetsRef = useRef(new Map<string, CopyTarget>());
   const currentCopyTargetRef = useRef<CopyTarget | null>(null);
   const copyEpochRef = useRef(0);
   const sawConversationRef = useRef(false);
+  const copyConversationRef = useRef<string | null>(state.history?.selectedConversationId ?? null);
+  if (copyConversationRef.current !== (state.history?.selectedConversationId ?? null)) {
+    copyConversationRef.current = state.history?.selectedConversationId ?? null;
+    copyEpochRef.current += 1;
+    previousCopyTargetsRef.current.clear();
+    currentCopyTargetRef.current = null;
+  }
+  const historyTurns = state.history?.turns ?? [];
+  const currentTurnAlreadyInHistory = Boolean(
+    state.queryId && historyTurns.some((turn) => turn.queryId === state.queryId),
+  );
   const hasConversation =
-    previousTurns.length > 0 ||
+    historyTurns.length > 0 ||
     Boolean(state.question || state.answer) ||
     state.queryStatus !== "idle";
 
   if (!hasConversation && sawConversationRef.current) {
     copyEpochRef.current += 1;
-    previousCopyTargetsRef.current = [];
-    currentCopyTargetRef.current = null;
-  } else if (previousCopyTargetsRef.current.length > previousTurns.length) {
-    copyEpochRef.current += 1;
-    previousCopyTargetsRef.current = [];
+    previousCopyTargetsRef.current.clear();
     currentCopyTargetRef.current = null;
   }
   sawConversationRef.current = hasConversation;
-  while (previousCopyTargetsRef.current.length < previousTurns.length) {
-    previousCopyTargetsRef.current.push(null);
+
+  function copyTargetKeyForPrevious(turn: Pick<ChatHistoryTurn, "queryId">): string {
+    return turn.queryId;
   }
 
-  function copyTargetForPrevious(index: number): CopyTarget {
-    const current = previousCopyTargetsRef.current[index];
+  function copyTargetForPrevious(turn: ChatHistoryTurn): CopyTarget {
+    const key = copyTargetKeyForPrevious(turn);
+    const current = previousCopyTargetsRef.current.get(key);
     if (current) return current;
     const target = createCopyTarget();
-    previousCopyTargetsRef.current[index] = target;
+    previousCopyTargetsRef.current.set(key, target);
     return target;
   }
 
@@ -128,10 +188,14 @@ export function ChatScreen({
     (state.queryStatus === "rejected" && Boolean(state.quota)) ||
     (state.queryStatus === "rejected" && state.queryErrorCode === "storage_capacity_exceeded");
   const canSubmit =
-    state.profileStatus === "complete" && canSubmitForState && draft.trim().length > 0;
+    state.profileStatus === "complete" &&
+    state.history?.turnsStatus !== "loading" &&
+    !state.history?.openingConversationId &&
+    canSubmitForState &&
+    draft.trim().length > 0;
   const showConversation =
     state.profileStatus === "complete" ||
-    previousTurns.length > 0 ||
+    historyTurns.length > 0 ||
     Boolean(state.question || state.answer) ||
     state.queryStatus !== "idle";
   const showComposer =
@@ -139,7 +203,8 @@ export function ChatScreen({
     state.queryStatus !== "unconfirmed" &&
     (state.queryStatus !== "rejected" ||
       Boolean(state.quota) ||
-      state.queryErrorCode === "storage_capacity_exceeded") &&
+      state.queryErrorCode === "storage_capacity_exceeded" ||
+      state.queryErrorCode === "stale_base") &&
     (state.queryStatus !== "failed" || state.canContinue !== false);
   const quotaElapsed =
     state.quotaReceivedAt === undefined ? 0 : Math.max(0, quotaNow - state.quotaReceivedAt);
@@ -156,7 +221,7 @@ export function ChatScreen({
           ? "Recuperando el último envío…"
           : "Generando respuesta…"
         : state.queryStatus === "idle"
-          ? previousTurns.length > 0
+          ? historyTurns.length > 0
             ? "Escribí un seguimiento para continuar este hilo."
             : "Escribí una consulta para empezar."
           : state.queryStatus === "completed"
@@ -164,8 +229,9 @@ export function ChatScreen({
             : "";
 
   useEffect(() => {
-    headingRef.current?.focus();
-  }, []);
+    if (mobileView === "history" && state.history) historyHeadingRef.current?.focus();
+    else headingRef.current?.focus();
+  }, [mobileView, state.history !== undefined]);
 
   useEffect(() => {
     if (
@@ -179,10 +245,10 @@ export function ChatScreen({
   }, [state.profileStatus, state.queryStatus]);
 
   useEffect(() => {
-    if (state.queryStatus === "rejected" && state.question) {
-      setDraft(state.question);
+    if (state.queryStatus === "rejected" && state.question && !draft) {
+      onDraftChange?.(state.question);
     }
-  }, [state.queryStatus, state.question]);
+  }, [state.queryStatus, state.question, draft, onDraftChange]);
 
   useEffect(() => {
     if (!state.quota || state.quota.blockedUntil === null || state.quotaReceivedAt === undefined) {
@@ -201,30 +267,28 @@ export function ChatScreen({
     event.preventDefault();
     if (!canSubmit) return;
     if (onSubmit(draft) === false) return;
-    while (previousCopyTargetsRef.current.length < previousTurns.length) {
-      previousCopyTargetsRef.current.push(null);
+    if (
+      (state.queryStatus === "completed" || state.queryStatus === "failed") &&
+      state.answer &&
+      currentCopyTargetRef.current &&
+      state.queryId
+    ) {
+      const key = copyTargetKeyForPrevious({ queryId: state.queryId });
+      previousCopyTargetsRef.current.set(key, currentCopyTargetRef.current);
     }
-    previousCopyTargetsRef.current[previousTurns.length] =
-      (state.queryStatus === "completed" || state.queryStatus === "failed") && state.answer
-        ? currentCopyTargetRef.current
-        : null;
     currentCopyTargetRef.current = null;
-    setDraft("");
+    onDraftChange?.("");
   }
 
   function restart() {
     focusQueryAfterResetRef.current = true;
-    const preserveRejectedDraft =
-      state.queryStatus === "rejected" &&
-      (state.queryErrorCode === "capacity_exceeded" ||
-        state.queryErrorCode === "storage_capacity_exceeded");
-    setDraft(preserveRejectedDraft ? draft || state.question || "" : "");
     copyEpochRef.current += 1;
-    previousCopyTargetsRef.current = [];
+    previousCopyTargetsRef.current.clear();
     currentCopyTargetRef.current = null;
     sawConversationRef.current = false;
     setCopyRevision((revision) => revision + 1);
     onReset();
+    setMobileView("chat");
   }
 
   async function copyAnswer(text: string, target: CopyTarget) {
@@ -245,6 +309,17 @@ export function ChatScreen({
     }
   }
 
+  const history = state.history;
+
+  async function openConversation(conversationId: string) {
+    const opened = await onSelectConversation?.(conversationId);
+    if (opened !== false) setMobileView("chat");
+  }
+
+  function newConversation() {
+    restart();
+  }
+
   return (
     <div className="site-shell chat-shell">
       <header className="site-header chat-header">
@@ -255,253 +330,418 @@ export function ChatScreen({
       </header>
 
       <main className="chat-main">
-        <section className="chat-card" aria-labelledby="chat-title">
-          <p className="eyebrow chat-eyebrow">Asistente para docentes</p>
-          <h1 id="chat-title" ref={headingRef} tabIndex={-1}>
-            Consultá o prepará un material
-          </h1>
-
-          <p className="chat-knowledge-note">
-            Este asistente usa documentos del proyecto y puede complementar con conocimiento
-            general.
-          </p>
-          <p className="chat-limit-note">
-            Se conserva el último envío de esta pestaña para recuperar su estado. Antes de que se
-            admita, la consulta se guarda temporalmente; después se conserva solo su referencia.
-          </p>
-
-          <nav className="chat-account-actions" aria-label="Acciones de cuenta">
-            <a className="account-button account-button--secondary" href="/#/profile">
-              Mi perfil
-            </a>
-            <button
-              className="account-button account-button--secondary"
-              type="button"
-              onClick={() => void onSignOut()}
-            >
-              Cerrar sesión
-            </button>
-          </nav>
-
-          {state.profileStatus === "loading" ? (
-            <p className="chat-profile-message" role="status" aria-live="polite">
-              Cargando tu perfil…
-            </p>
-          ) : null}
-
-          {state.profileStatus === "incomplete" ? (
-            <div className="chat-profile-message">
-              <p>Completá tu perfil para conversar.</p>
-              <a className="account-text-link" href="/#/profile">
-                Ir a Mi perfil
-              </a>
-            </div>
-          ) : null}
-
-          {state.profileStatus === "error" ? (
-            <div className="chat-profile-message" role="alert">
-              <p>{state.profileError || "No pudimos cargar tu perfil."}</p>
-              <button className="account-button" type="button" onClick={onRetryProfile}>
-                Reintentar
+        {history ? (
+          <aside
+            className={`chat-history ${mobileView === "history" ? "chat-history--mobile-visible" : ""}`}
+            aria-label="Historial de conversaciones"
+          >
+            <div className="chat-history__heading">
+              <h2 id="chat-history-title" ref={historyHeadingRef} tabIndex={-1}>
+                Historial
+              </h2>
+              <button
+                className="account-button account-button--secondary chat-history__refresh"
+                type="button"
+                aria-label="Actualizar historial"
+                onClick={() => void onRefreshHistory?.()}
+              >
+                Actualizar
+              </button>
+              <button
+                className="account-button chat-history__new"
+                type="button"
+                onClick={newConversation}
+              >
+                Nueva conversación
               </button>
             </div>
+            {history.status === "loading" ? (
+              <p className="chat-history__message" role="status" aria-live="polite">
+                Cargando historial…
+              </p>
+            ) : null}
+            {history.status === "error" ? (
+              <div className="chat-history__message" role="alert">
+                <p>{history.error || "No pudimos cargar el historial."}</p>
+                <button
+                  className="account-button account-button--secondary"
+                  type="button"
+                  onClick={() => void onLoadMoreHistory?.()}
+                >
+                  Reintentar
+                </button>
+              </div>
+            ) : null}
+            {history.status === "empty" ? (
+              <p className="chat-history__message">Todavía no hay conversaciones guardadas.</p>
+            ) : null}
+            {history.conversations.length > 0 ? (
+              <ol className="chat-history__list" aria-labelledby="chat-history-title">
+                {history.conversations.map((conversation) => {
+                  const selected = history.selectedConversationId === conversation.conversationId;
+                  return (
+                    <li key={conversation.conversationId}>
+                      <button
+                        className="chat-history__item"
+                        type="button"
+                        aria-current={selected ? "page" : undefined}
+                        onClick={() => void openConversation(conversation.conversationId)}
+                      >
+                        <span className="chat-history__label">{conversation.label}</span>
+                        <span className="chat-history__meta">
+                          {conversation.updatedAt
+                            ? new Date(conversation.updatedAt).toLocaleDateString("es-AR")
+                            : "Fecha no disponible"}
+                          {conversation.activeQueryId
+                            ? " · En curso"
+                            : conversation.closed
+                              ? " · Cerrada"
+                              : " · Abierta"}
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ol>
+            ) : null}
+            {history.nextCursor ? (
+              <button
+                className="account-button account-button--secondary chat-history__more"
+                type="button"
+                disabled={history.loadingMore}
+                onClick={() => void onLoadMoreHistory?.()}
+              >
+                {history.loadingMore ? "Cargando…" : "Ver más conversaciones"}
+              </button>
+            ) : null}
+          </aside>
+        ) : null}
+        <div
+          className={`chat-main__content ${history && mobileView === "history" ? "chat-main__content--mobile-hidden" : ""}`}
+        >
+          {history && mobileView === "chat" ? (
+            <button
+              className="account-button account-button--secondary chat-mobile-history-back"
+              type="button"
+              onClick={() => setMobileView("history")}
+            >
+              Volver al historial
+            </button>
           ) : null}
+          <section className="chat-card" aria-labelledby="chat-title">
+            <p className="eyebrow chat-eyebrow">Asistente para docentes</p>
+            <h1 id="chat-title" ref={headingRef} tabIndex={-1}>
+              Consultá o prepará un material
+            </h1>
 
-          {(state.queryStatus === "idle" || state.queryStatus === "completed") &&
-          state.queryError ? (
-            <p className="chat-result-error" role="alert">
-              {state.queryError}
+            <p className="chat-knowledge-note">
+              Este asistente usa documentos del proyecto y puede complementar con conocimiento
+              general.
             </p>
-          ) : null}
+            <p className="chat-limit-note">
+              Las conversaciones se guardan para que puedas consultarlas y continuarlas desde otra
+              sesión.
+            </p>
 
-          {showConversation ? (
-            <div className="chat-conversation">
-              {state.recovered ? (
-                <p className="chat-context-note" role="status">
-                  Recuperamos el último envío de esta conversación
-                </p>
-              ) : null}
-              {sending ? (
-                <p className="chat-context-note" role="status">
-                  El trabajo puede continuar aunque dejes esta pantalla o cierres sesión. El cupo
-                  consumido no se devuelve.
-                </p>
-              ) : null}
-              {previousTurns.length > 0 ? (
-                <ol className="chat-previous-turns" aria-label="Intercambios anteriores">
-                  {previousTurns.map((turn, index) => {
-                    const copyTarget = copyTargetForPrevious(index);
-                    return (
-                      <li className="chat-previous-turn" key={`${index}-${turn.status}`}>
-                        <p className="chat-question">
-                          <span className="chat-message-label">
-                            Tu consulta anterior {index + 1}
-                          </span>
-                          {turn.question}
-                        </p>
-                        <div className="chat-answer-block">
-                          <p className="chat-message-label">Respuesta anterior {index + 1}</p>
-                          <div className="chat-answer">{turn.answer}</div>
-                          {turn.status === "completed" ? (
-                            <button
-                              className="account-button account-button--secondary chat-copy-button"
-                              type="button"
-                              aria-label={`Copiar respuesta anterior ${index + 1}`}
-                              onClick={() => void copyAnswer(turn.answer, copyTarget)}
-                            >
-                              Copiar respuesta anterior {index + 1}
-                            </button>
-                          ) : (
-                            <p className="chat-context-note">
-                              Respuesta incompleta; este intercambio no se incluye en el contexto de
-                              seguimientos.
+            <nav className="chat-account-actions" aria-label="Acciones de cuenta">
+              <a className="account-button account-button--secondary" href="/#/profile">
+                Mi perfil
+              </a>
+              <button
+                className="account-button account-button--secondary"
+                type="button"
+                onClick={() => void onSignOut()}
+              >
+                Cerrar sesión
+              </button>
+            </nav>
+
+            {state.profileStatus === "loading" ? (
+              <p className="chat-profile-message" role="status" aria-live="polite">
+                Cargando tu perfil…
+              </p>
+            ) : null}
+
+            {state.profileStatus === "incomplete" ? (
+              <div className="chat-profile-message">
+                <p>Completá tu perfil para conversar.</p>
+                <a className="account-text-link" href="/#/profile">
+                  Ir a Mi perfil
+                </a>
+              </div>
+            ) : null}
+
+            {state.profileStatus === "error" ? (
+              <div className="chat-profile-message" role="alert">
+                <p>{state.profileError || "No pudimos cargar tu perfil."}</p>
+                <button className="account-button" type="button" onClick={onRetryProfile}>
+                  Reintentar
+                </button>
+              </div>
+            ) : null}
+
+            {(state.queryStatus === "idle" || state.queryStatus === "completed") &&
+            state.queryError ? (
+              <p className="chat-result-error" role="alert">
+                {state.queryError}
+              </p>
+            ) : null}
+
+            {showConversation ? (
+              <div className="chat-conversation">
+                {state.recovered ? (
+                  <p className="chat-context-note" role="status">
+                    Recuperamos el último envío de esta conversación
+                  </p>
+                ) : null}
+                {sending ? (
+                  <p className="chat-context-note" role="status">
+                    El trabajo puede continuar aunque dejes esta pantalla o cierres sesión. El cupo
+                    consumido no se devuelve.
+                  </p>
+                ) : null}
+                {historyTurns.length > 0 ? (
+                  <ol className="chat-previous-turns" aria-label="Intercambios anteriores">
+                    {historyTurns.map((turn, index) => {
+                      const copyTarget = copyTargetForPrevious(turn);
+                      const isCurrentTurn = Boolean(turn.queryId && turn.queryId === state.queryId);
+                      const canCopyTurn =
+                        (turn.status === "completed" && turn.answerComplete !== false) ||
+                        (turn.status === "failed" && turn.answerComplete === true);
+                      return (
+                        <li className="chat-previous-turn" key={`${index}-${turn.status}`}>
+                          <p className="chat-question">
+                            <span className="chat-message-label">
+                              {isCurrentTurn ? "Tu consulta" : `Tu consulta anterior ${index + 1}`}
+                            </span>
+                            {turn.question}
+                          </p>
+                          <div className="chat-answer-block">
+                            <p className="chat-message-label">
+                              {isCurrentTurn ? "Respuesta" : `Respuesta anterior ${index + 1}`}
                             </p>
-                          )}
-                          {copyTarget?.error ? (
-                            <p className="chat-result-error" role="alert">
-                              No pudimos copiar la respuesta. Podés seleccionar el texto y copiarlo.
-                            </p>
-                          ) : null}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ol>
-              ) : null}
+                            <div className="chat-answer">{turn.answer}</div>
+                            {canCopyTurn ? (
+                              <button
+                                className="account-button account-button--secondary chat-copy-button"
+                                type="button"
+                                aria-label={
+                                  turn.status === "failed"
+                                    ? isCurrentTurn
+                                      ? "Copiar texto parcial"
+                                      : `Copiar texto parcial anterior ${index + 1}`
+                                    : isCurrentTurn
+                                      ? "Copiar respuesta"
+                                      : `Copiar respuesta anterior ${index + 1}`
+                                }
+                                onClick={() => void copyAnswer(turn.answer, copyTarget)}
+                              >
+                                {turn.status === "failed"
+                                  ? isCurrentTurn
+                                    ? "Copiar texto parcial"
+                                    : `Copiar texto parcial anterior ${index + 1}`
+                                  : isCurrentTurn
+                                    ? "Copiar respuesta"
+                                    : `Copiar respuesta anterior ${index + 1}`}
+                              </button>
+                            ) : (
+                              <p className="chat-context-note">
+                                {turn.status === "in_progress"
+                                  ? turn.failure?.code === "unconfirmable"
+                                    ? "No pudimos confirmar el estado remoto. El texto visible es un prefijo y no se puede continuar este hilo."
+                                    : "Este envío sigue en curso."
+                                  : "Respuesta incompleta; este intercambio no se incluye en el contexto de seguimientos."}
+                              </p>
+                            )}
+                            {copyTarget?.error ? (
+                              <p className="chat-result-error" role="alert">
+                                No pudimos copiar la respuesta. Podés seleccionar el texto y
+                                copiarlo.
+                              </p>
+                            ) : null}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ol>
+                ) : null}
 
-              {state.question ? (
-                <p className="chat-question">
-                  <span className="chat-message-label">Tu consulta</span>
-                  {state.question}
-                </p>
-              ) : null}
-
-              {quotaMessage ? (
-                <p className="chat-quota-message" role="status" aria-live="polite">
-                  {quotaMessage}
-                </p>
-              ) : null}
-
-              {state.answer ? (
-                <div className="chat-answer-block">
-                  <p className="chat-message-label">Respuesta</p>
-                  <div className="chat-answer">{state.answer}</div>
-                  {state.queryStatus === "completed" || state.queryStatus === "failed" ? (
-                    <button
-                      className="account-button chat-copy-button"
-                      type="button"
-                      onClick={() => void copyAnswer(state.answer || "", copyTargetForCurrent())}
-                    >
-                      {state.queryStatus === "completed"
-                        ? "Copiar respuesta"
-                        : "Copiar texto parcial"}
-                    </button>
-                  ) : null}
-                  {currentCopyTargetRef.current?.error ? (
-                    <p className="chat-result-error" role="alert">
-                      No pudimos copiar la respuesta. Podés seleccionar el texto y copiarlo.
-                    </p>
-                  ) : null}
-                </div>
-              ) : null}
-
-              {progressMessage ? (
-                <p className="chat-progress" role="status" aria-live="polite">
-                  {progressMessage}
-                </p>
-              ) : null}
-
-              {state.queryStatus === "failed" ? (
-                <>
+                {history?.turnsStatus === "loading" ? (
+                  <p className="chat-progress" role="status" aria-live="polite">
+                    Cargando conversación…
+                  </p>
+                ) : null}
+                {history?.turnsStatus === "error" ? (
                   <p className="chat-result-error" role="alert">
-                    {state.queryError || "La respuesta quedó incompleta."}
+                    {history.turnsError || "No pudimos abrir esta conversación."}
                   </p>
-                  <p className="chat-context-note">
-                    Este intercambio incompleto no se incluirá en el contexto del siguiente
-                    seguimiento.
+                ) : null}
+                {history?.turnsNextCursor ? (
+                  <button
+                    className="account-button account-button--secondary chat-history__more-turns"
+                    type="button"
+                    disabled={history.loadingEarlier}
+                    onClick={() => void onLoadEarlierTurns?.()}
+                  >
+                    {history.loadingEarlier ? "Cargando mensajes…" : "Ver mensajes anteriores"}
+                  </button>
+                ) : null}
+                {history?.refreshRequired && history.selectedConversationId ? (
+                  <div className="chat-result-error" role="alert">
+                    <p>Otra pestaña avanzó esta conversación. Actualizala antes de continuar.</p>
+                    <button
+                      className="account-button account-button--secondary"
+                      type="button"
+                      onClick={() => void openConversation(history.selectedConversationId!)}
+                    >
+                      Actualizar conversación
+                    </button>
+                  </div>
+                ) : null}
+
+                {state.question && !currentTurnAlreadyInHistory ? (
+                  <p className="chat-question">
+                    <span className="chat-message-label">Tu consulta</span>
+                    {state.question}
                   </p>
-                </>
-              ) : null}
-              {state.queryStatus === "rejected" ? (
-                state.quota ? null : (
+                ) : null}
+
+                {quotaMessage ? (
+                  <p className="chat-quota-message" role="status" aria-live="polite">
+                    {quotaMessage}
+                  </p>
+                ) : null}
+
+                {state.answer && !currentTurnAlreadyInHistory ? (
+                  <div className="chat-answer-block">
+                    <p className="chat-message-label">Respuesta</p>
+                    <div className="chat-answer">{state.answer}</div>
+                    {(state.queryStatus === "completed" || state.queryStatus === "failed") &&
+                    state.answerComplete !== false ? (
+                      <button
+                        className="account-button chat-copy-button"
+                        type="button"
+                        onClick={() => void copyAnswer(state.answer || "", copyTargetForCurrent())}
+                      >
+                        {state.queryStatus === "completed"
+                          ? "Copiar respuesta"
+                          : "Copiar texto parcial"}
+                      </button>
+                    ) : null}
+                    {currentCopyTargetRef.current?.error ? (
+                      <p className="chat-result-error" role="alert">
+                        No pudimos copiar la respuesta. Podés seleccionar el texto y copiarlo.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {progressMessage ? (
+                  <p className="chat-progress" role="status" aria-live="polite">
+                    {progressMessage}
+                  </p>
+                ) : null}
+
+                {state.queryStatus === "failed" ? (
                   <>
                     <p className="chat-result-error" role="alert">
-                      {state.queryError ||
-                        "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
+                      {state.queryError || "La respuesta quedó incompleta."}
+                    </p>
+                    <p className="chat-context-note">
+                      Este intercambio incompleto no se incluirá en el contexto del siguiente
+                      seguimiento.
+                    </p>
+                  </>
+                ) : null}
+                {state.queryStatus === "rejected" ? (
+                  state.quota ? null : (
+                    <>
+                      <p className="chat-result-error" role="alert">
+                        {state.queryError ||
+                          "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
+                      </p>
+                      {state.canRetry && state.question ? (
+                        <button
+                          className="account-button account-button--secondary chat-restart-button"
+                          type="button"
+                          onClick={() => {
+                            if (onSubmit(state.question || "") !== false) onDraftChange?.("");
+                          }}
+                        >
+                          Reintentar el mismo envío
+                        </button>
+                      ) : null}
+                    </>
+                  )
+                ) : null}
+                {state.queryStatus === "unconfirmed" && !state.recoveryLoading ? (
+                  <>
+                    <p className="chat-result-error" role="alert">
+                      {state.queryError || "No pudimos confirmar el estado de esta consulta."}
                     </p>
                     {state.canRetry && state.question ? (
                       <button
                         className="account-button account-button--secondary chat-restart-button"
                         type="button"
                         onClick={() => {
-                          if (onSubmit(state.question || "") !== false) setDraft("");
+                          if (onSubmit(state.question || "") !== false) onDraftChange?.("");
                         }}
                       >
                         Reintentar el mismo envío
                       </button>
                     ) : null}
                   </>
-                )
-              ) : null}
-              {state.queryStatus === "unconfirmed" && !state.recoveryLoading ? (
-                <>
+                ) : null}
+                {state.queryStatus === "streaming" && state.queryError ? (
                   <p className="chat-result-error" role="alert">
-                    {state.queryError || "No pudimos confirmar el estado de esta consulta."}
+                    {state.queryError}
                   </p>
-                  {state.canRetry && state.question ? (
-                    <button
-                      className="account-button account-button--secondary chat-restart-button"
-                      type="button"
-                      onClick={() => {
-                        if (onSubmit(state.question || "") !== false) setDraft("");
-                      }}
-                    >
-                      Reintentar el mismo envío
-                    </button>
-                  ) : null}
-                </>
-              ) : null}
-              {state.queryStatus === "streaming" && state.queryError ? (
-                <p className="chat-result-error" role="alert">
-                  {state.queryError}
-                </p>
-              ) : null}
+                ) : null}
 
-              {state.queryStatus === "completed" ||
-              state.queryStatus === "failed" ||
-              sending ||
-              (state.queryStatus === "rejected" && !state.quota && !state.canRetry) ||
-              state.queryStatus === "unconfirmed" ? (
-                <button
-                  className="account-button account-button--secondary chat-restart-button"
-                  type="button"
-                  onClick={restart}
-                >
-                  Volver al inicio
-                </button>
-              ) : null}
-
-              {showComposer ? (
-                <form className="chat-form" onSubmit={submit}>
-                  <label htmlFor="chat-query">Escribí tu consulta</label>
-                  <textarea
-                    ref={queryRef}
-                    id="chat-query"
-                    name="query"
-                    value={draft}
-                    onChange={(event) => setDraft(event.currentTarget.value)}
-                    rows={4}
-                    disabled={sending}
-                    placeholder="Por ejemplo, pedí una explicación o un material para usar en clase."
-                  />
-                  <button className="account-button" type="submit" disabled={!canSubmit || sending}>
-                    {sending ? "Enviando…" : "Enviar"}
+                {state.queryStatus === "completed" ||
+                state.queryStatus === "failed" ||
+                sending ||
+                (state.queryStatus === "rejected" && !state.quota && !state.canRetry) ||
+                state.queryStatus === "unconfirmed" ? (
+                  <button
+                    className="account-button account-button--secondary chat-restart-button"
+                    type="button"
+                    onClick={restart}
+                  >
+                    Volver al inicio
                   </button>
-                </form>
-              ) : null}
-            </div>
-          ) : null}
-        </section>
+                ) : null}
+
+                {showComposer ? (
+                  <form className="chat-form" onSubmit={submit}>
+                    <label htmlFor="chat-query">Escribí tu consulta</label>
+                    <textarea
+                      ref={queryRef}
+                      id="chat-query"
+                      name="query"
+                      value={draft}
+                      onChange={(event) => onDraftChange?.(event.currentTarget.value)}
+                      rows={4}
+                      disabled={
+                        sending ||
+                        state.history?.turnsStatus === "loading" ||
+                        Boolean(state.history?.openingConversationId)
+                      }
+                      placeholder="Por ejemplo, pedí una explicación o un material para usar en clase."
+                    />
+                    <button
+                      className="account-button"
+                      type="submit"
+                      disabled={!canSubmit || sending}
+                    >
+                      {sending ? "Enviando…" : "Enviar"}
+                    </button>
+                  </form>
+                ) : null}
+              </div>
+            ) : null}
+          </section>
+        </div>
       </main>
 
       <footer className="site-footer chat-footer">

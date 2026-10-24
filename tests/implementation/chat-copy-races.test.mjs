@@ -36,6 +36,16 @@ function createDriver(initialProps) {
   let dirty = true;
   let output;
 
+  if (!props.onDraftChange) {
+    props = {
+      ...props,
+      onDraftChange(text) {
+        props = { ...props, state: { ...props.state, draft: text } };
+        dirty = true;
+      },
+    };
+  }
+
   const runtime = {
     useState(initialValue) {
       const index = cursor++;
@@ -142,6 +152,33 @@ function props(state, onCopy = vi.fn(), onSubmit = vi.fn(), onReset = vi.fn()) {
   };
 }
 
+function history(turns = [], selectedConversationId = "conversation-a") {
+  return {
+    status: "ready",
+    conversations: [],
+    nextCursor: null,
+    loadingMore: false,
+    selectedConversationId,
+    turnsStatus: "ready",
+    turns,
+    turnsNextCursor: null,
+    refreshRequired: false,
+  };
+}
+
+function turn({ ordinal, queryId, question, answer, status = "completed", answerComplete = true }) {
+  return {
+    ordinal,
+    queryId,
+    question,
+    answer,
+    status,
+    questionComplete: true,
+    answerComplete,
+    canContinue: true,
+  };
+}
+
 describe("copy feedback follows its answer and operation", () => {
   it("keeps a pending answer's failure with it after submitting a follow-up", async () => {
     const answer = "Respuesta A\ncon acentos: acción, ñ.";
@@ -153,8 +190,11 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "completed",
+          queryId: "query-a",
+          ordinal: 1,
           question: "Pregunta A",
           answer,
+          history: history([]),
         },
         onCopy,
         onSubmit,
@@ -179,9 +219,12 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "streaming",
+          queryId: "query-b",
           question: "Pregunta B",
           answer: "Prefijo B",
-          previousTurns: [{ question: "Pregunta A", answer, status: "completed" }],
+          history: history([
+            turn({ ordinal: 1, queryId: "query-a", question: "Pregunta A", answer }),
+          ]),
         },
         onCopy,
         onSubmit,
@@ -210,9 +253,12 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "failed",
+          queryId: "query-a",
+          ordinal: 1,
           question: "Pregunta A",
           answer,
           canContinue: true,
+          history: history([]),
         },
         onCopy,
         onSubmit,
@@ -237,9 +283,19 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "streaming",
+          queryId: "query-b",
           question: "Pregunta B",
           answer: "Prefijo B",
-          previousTurns: [{ question: "Pregunta A", answer, status: "failed" }],
+          history: history([
+            turn({
+              ordinal: 1,
+              queryId: "query-a",
+              question: "Pregunta A",
+              answer,
+              status: "failed",
+              answerComplete: false,
+            }),
+          ]),
         },
         onCopy,
         onSubmit,
@@ -323,9 +379,13 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "completed",
+          queryId: "query-b",
+          ordinal: 2,
           question: "Pregunta B",
           answer,
-          previousTurns: [{ question: "Pregunta A", answer, status: "completed" }],
+          history: history([
+            turn({ ordinal: 1, queryId: "query-a", question: "Pregunta A", answer }),
+          ]),
         },
         onCopy,
       ),
@@ -348,6 +408,61 @@ describe("copy feedback follows its answer and operation", () => {
     blocks = answerBlocks(driver);
     expect(alerts(blocks[0])).toHaveLength(0);
     expect(alerts(blocks[1])).toHaveLength(1);
+  });
+
+  it("keeps pending copy feedback with its turn when earlier history is prepended", async () => {
+    const copy = deferred();
+    const onCopy = vi.fn(() => copy.promise);
+    const turn = (ordinal) => ({
+      ordinal,
+      queryId: `query-${ordinal}`,
+      status: "completed",
+      question: `Pregunta ${ordinal}`,
+      answer: `Respuesta ${ordinal}`,
+      questionComplete: true,
+      answerComplete: true,
+      canContinue: true,
+    });
+    const makeProps = (turns) =>
+      props(
+        {
+          profileStatus: "complete",
+          queryStatus: "completed",
+          queryId: "query-22",
+          ordinal: 22,
+          question: "Pregunta 22",
+          answer: "Respuesta 22",
+          history: {
+            status: "ready",
+            conversations: [],
+            nextCursor: null,
+            loadingMore: false,
+            selectedConversationId: "conversation-a",
+            turnsStatus: "ready",
+            turns,
+            turnsNextCursor: null,
+            refreshRequired: false,
+          },
+        },
+        onCopy,
+      );
+    const driver = createDriver(makeProps([turn(22)]));
+    driver.render();
+    await driver.flush();
+
+    button(driver, "Copiar respuesta").props.onClick();
+    expect(onCopy).toHaveBeenCalledWith("Respuesta 22");
+
+    driver.setProps(makeProps(Array.from({ length: 22 }, (_, index) => turn(index + 1))));
+    await driver.flush();
+    copy.reject(new Error("clipboard denied"));
+    await driver.flush();
+
+    const blocks = answerBlocks(driver);
+    expect(blocks).toHaveLength(22);
+    expect(alerts(blocks[0])).toHaveLength(0);
+    expect(alerts(blocks[21])).toHaveLength(1);
+    expect(textContent(blocks[21])).toContain("Respuesta 22");
   });
 
   it("ignores an older result when two copies of the same answer settle out of order", async () => {

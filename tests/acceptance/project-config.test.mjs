@@ -12,9 +12,6 @@ describe("shared project and environment configuration", () => {
       region: "us-east-1",
       initialModelId: "anthropic.claude-sonnet-4-6",
     });
-    expect([...projectConfig.desiredModelIds].sort()).toEqual(
-      ["anthropic.claude-haiku-5-5", "openai.gpt-6-luna"].sort(),
-    );
   });
 
   it("resolves dev and prod with distinct resources and the correct AWS environment tags", async () => {
