@@ -33,6 +33,80 @@ afterEach(() => {
 });
 
 describe("AccountApp history text cursor regressions", () => {
+  it("loads a large turn page without bursting the text API into 503 responses", async () => {
+    let activeTextReads = 0;
+    let maximumTextReads = 0;
+    let totalTextReads = 0;
+    const turns = Array.from({ length: 7 }, (_, index) => {
+      const ordinal = index + 16;
+      return {
+        ordinal,
+        queryId: `550e8400-e29b-41d4-a716-${String(ordinal).padStart(12, "0")}`,
+        status: "completed",
+        questionManifest: { count: 1, complete: true },
+        answerManifest: { count: 1, complete: true },
+        cursor: 1,
+      };
+    });
+    const environment = createHistoryEnvironment({
+      listHandler: async () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Página de siete",
+              lastOrdinal: 22,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: async ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 22,
+          closed: false,
+          canContinue: true,
+          turns,
+          nextCursor: "earlier-turns",
+        }),
+      textHandler: async ({ conversationId, ordinal, url }) => {
+        activeTextReads += 1;
+        totalTextReads += 1;
+        maximumTextReads = Math.max(maximumTextReads, activeTextReads);
+        await new Promise((resolve) => setImmediate(resolve));
+        const overloaded = activeTextReads > 4;
+        activeTextReads -= 1;
+        if (overloaded) return jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503);
+        const role = url.searchParams.get("role");
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: turns.find((turn) => turn.ordinal === ordinal)?.queryId,
+          role,
+          chunks: [{ index: 0, text: `${ordinal}-${role}` }],
+          complete: true,
+        });
+      },
+    });
+    const app = mountHistoryAccountApp(environment, AccountApp);
+    apps.push(app);
+    await app.flush();
+
+    expect(await app.current()?.props?.onSelectConversation?.(firstConversationId)).toBe(true);
+    await app.flush();
+    expect(maximumTextReads).toBeLessThanOrEqual(4);
+    expect(totalTextReads).toBe(14);
+    expect(app.current()?.props?.state?.history).toMatchObject({
+      selectedConversationId: firstConversationId,
+      turnsStatus: "ready",
+      turns: turns.map(({ ordinal, queryId }) => ({ ordinal, queryId })),
+    });
+    expect(environment.runtimeRequests).toEqual([]);
+  });
+
   it("skips empty turn pages during open and earlier-page load without starting Runtime", async () => {
     const cursors = [];
     const descriptor = (ordinal, queryId) => ({

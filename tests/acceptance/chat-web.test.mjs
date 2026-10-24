@@ -302,4 +302,50 @@ describe("the chat screen", () => {
     );
     expect(buttons(reset).some(({ name }) => /enviar/i.test(name))).toBe(true);
   });
+
+  it("shows the stale-base refresh action without a contradictory generic rejection", async () => {
+    const draft = "Conservá el borrador mientras actualizo.";
+    const staleBase = await render(
+      readyState({
+        queryStatus: "rejected",
+        queryErrorCode: "stale_base",
+        queryError:
+          "No pudimos completar la consulta. Podés volver a intentarlo desde un hilo nuevo.",
+        question: draft,
+        draft,
+        history: {
+          ...historyState(),
+          selectedConversationId: "550e8400-e29b-41d4-a716-446655440000",
+          refreshRequired: true,
+        },
+      }),
+    );
+    const otherRejection = await render(
+      readyState({
+        queryStatus: "rejected",
+        queryErrorCode: "documents_unavailable",
+        queryError: "No se pudieron cargar los documentos.",
+        question: "Reintentá la consulta con el mismo texto.",
+        canRetry: true,
+      }),
+    );
+    if (![staleBase, otherRejection].every(expectRendered)) return;
+
+    const staleText = plainText(staleBase);
+    expect(staleText).toContain(
+      "Otra pestaña avanzó esta conversación. Actualizala antes de continuar.",
+    );
+    expect(staleText).not.toContain("No pudimos completar la consulta.");
+    expect(buttons(staleBase).some(({ name }) => name === "Actualizar conversación")).toBe(true);
+    expect(buttons(staleBase).some(({ name }) => name === "Reintentar el mismo envío")).toBe(false);
+    expect(staleBase).toContain(`>${draft}</textarea>`);
+    const send = buttons(staleBase).find(({ name }) => name === "Enviar");
+    expect(send).toBeDefined();
+    if (send) expect(isDisabled(send.attrs)).toBe(true);
+
+    expect(plainText(otherRejection)).toContain("No se pudieron cargar los documentos.");
+    expect(buttons(otherRejection).some(({ name }) => name === "Reintentar el mismo envío")).toBe(
+      true,
+    );
+  });
 });
