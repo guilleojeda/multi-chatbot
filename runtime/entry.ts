@@ -8,6 +8,7 @@ import { siteConfig } from "../config/site.js";
 import { createChatHandler, createChatInvocationHandler } from "./chat.js";
 import { createConversationStoreAdapter } from "./conversation-store.js";
 import { createDocumentPreparer } from "./documents.js";
+import { createContextPreparer } from "./context.js";
 import { createBedrockRetriever } from "./documents-provider.js";
 import { createBedrockTokenCounter, createStrandsGenerator } from "./provider.js";
 
@@ -65,6 +66,25 @@ const chat = createChatHandler({
   accounts,
   profiles,
   store,
+  async prepareContext(input, context) {
+    // Only new requests need the current preparation policy; recovery reads its admitted version.
+    if (modelId !== approvedModelId) throw new Error("Unsupported model configuration.");
+    const setting = (name: string): number => {
+      const value = Number(requiredEnv(name));
+      if (!Number.isSafeInteger(value) || value <= 0)
+        throw new Error("Invalid context preparation configuration.");
+      return value;
+    };
+    const prepare = createContextPreparer({
+      triggerTokens: setting("SUMMARY_TRIGGER_TOKENS"),
+      recentPairs: setting("SUMMARY_RECENT_PAIRS"),
+      preparationTimeoutMs: setting("SUMMARY_PREPARATION_TIMEOUT_MS"),
+      countInputTokens,
+      summarize: generate,
+      now: Date.now,
+    });
+    return prepare(input, context);
+  },
   async prepareDocuments(input) {
     // Documentary configuration is needed only for a new request. A known submission remains
     // recoverable without reading current KB/profile/model configuration again.

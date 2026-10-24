@@ -2,9 +2,40 @@ import type { MessageData } from "@strands-agents/sdk";
 
 export type ContextReference = { ordinal: number; queryId: string };
 
+export type SummaryVersion = {
+  version: 1;
+  summaryId: string;
+  throughOrdinal: number;
+  previousSummaryId?: string;
+  sourceReferences: ContextReference[];
+  text: string;
+  modelId: string;
+  revision: string;
+  preparedAt: string | number;
+  inputTokens: number;
+  countRequestId?: string;
+  requestId?: string;
+  metrics?: Record<string, number>;
+};
+
+export type ContextSnapshot = {
+  version: 1;
+  summary?: { summaryId: string; throughOrdinal: number };
+  recentReferences: ContextReference[];
+};
+
+export type PreparedContext = {
+  messages: MessageData[];
+  references: ContextReference[];
+  contextSnapshot: ContextSnapshot;
+  summaryCandidate?: SummaryVersion;
+  triggerCount?: TokenCountResult;
+};
+
 export type ConversationContext = {
   messages: MessageData[];
   references: ContextReference[];
+  summary?: SummaryVersion;
 };
 
 export type DocumentResult = {
@@ -88,6 +119,8 @@ type TurnAdmissionInput = {
   text: string;
   profileSnapshot: ProfileSnapshot;
   documentContext?: DocumentContext;
+  contextSnapshot?: ContextSnapshot;
+  summaryCandidate?: SummaryVersion;
   invocation: Invocation;
   quota: QuotaView;
   requestFingerprint: string;
@@ -122,6 +155,8 @@ export type SubmissionSnapshot = {
   question: string;
   questionManifest: TurnManifest;
   contextReferences: ContextReference[];
+  contextSnapshot?: ContextSnapshot;
+  summary?: SummaryVersion;
   answer: string;
   answerManifest: TurnManifest;
   cursor: number;

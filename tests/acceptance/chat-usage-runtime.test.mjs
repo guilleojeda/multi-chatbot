@@ -1,3 +1,4 @@
+import { prepareUnchangedContext } from "../support/context-preparation.mjs";
 import { describe, expect, it, vi } from "vitest";
 import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
 import { createChatHandler, createChatInvocationHandler } from "../../runtime/chat.ts";
@@ -311,6 +312,7 @@ function makeHarness({
       },
     },
     store,
+    prepareContext: prepareUnchangedContext,
     async prepareDocuments() {
       return {
         knowledgeBaseId: "kb-test-aurora",

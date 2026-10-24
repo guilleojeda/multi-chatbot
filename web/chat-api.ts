@@ -124,6 +124,8 @@ export type ConversationTextPage = {
 };
 
 const sessionHeader = "x-amzn-bedrock-agentcore-runtime-session-id";
+const contextUnavailableMessage =
+  "No pudimos preparar el contexto de esta conversación. Conservamos tu consulta para que puedas reintentarlo.";
 
 function chatError(code: string, status: number, message: string): ChatStreamError {
   return Object.assign(new Error(message), { code, status });
@@ -448,6 +450,9 @@ function applicationEvent(value: unknown): ChatApplicationEvent {
     (value.quota === undefined || isQuotaView(value.quota)) &&
     (value.canContinue === undefined || typeof value.canContinue === "boolean")
   ) {
+    if (value.code.toLowerCase() === "context_unavailable") {
+      return { ...value, message: contextUnavailableMessage } as ChatApplicationEvent;
+    }
     return value as ChatApplicationEvent;
   }
   throw chatError("INVALID_RESPONSE", 502, "El asistente devolvió un evento inválido.");

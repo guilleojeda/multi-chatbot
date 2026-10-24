@@ -1,3 +1,4 @@
+import { prepareUnchangedContext } from "../support/context-preparation.mjs";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
@@ -100,6 +101,7 @@ async function makeServer({ detached = false, useRuntimeEntryConfig = false } = 
     import { createHash } from "node:crypto";
     import { BedrockAgentCoreApp } from ${JSON.stringify(agentCoreModule)};
     const { createChatHandler, createChatInvocationHandler } = await import(workerData.chatModule);
+    const prepareContext = ${prepareUnchangedContext.toString()};
     let appConfig = { logging: { enabled: false } };
     if (workerData.runtimeEntryModule) {
       Object.assign(process.env, {
@@ -311,6 +313,7 @@ async function makeServer({ detached = false, useRuntimeEntryConfig = false } = 
       accounts: { async hasMember() { return true; } },
       profiles: { async getProfile() { return profile; } },
       store,
+      prepareContext,
       async prepareDocuments() {
         return {
           knowledgeBaseId: "kb-http-acceptance",

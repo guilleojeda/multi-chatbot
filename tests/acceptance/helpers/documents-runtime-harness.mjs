@@ -1,3 +1,4 @@
+import { prepareUnchangedContext } from "../../support/context-preparation.mjs";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -337,6 +338,7 @@ export function makeRuntimeHarness(
       },
     },
     store,
+    prepareContext: prepareUnchangedContext,
     prepareDocuments: async (input) => {
       state.calls.push(["prepareDocuments"]);
       state.prepareInputs.push(clone(input));

@@ -19,6 +19,12 @@ export const documentConfig = {
   preparationTimeoutMs: 120_000,
 } as const;
 
+export const summaryConfig = {
+  triggerTokens: 128_000,
+  recentPairs: 4,
+  preparationTimeoutMs: 3_600_000,
+} as const;
+
 export type EnvironmentName = "dev" | "prod";
 export type ResolvedEnvironment = {
   account: typeof projectConfig.account;

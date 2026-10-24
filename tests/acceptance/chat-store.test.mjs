@@ -266,12 +266,22 @@ describe("the DynamoDB conversation store adapter", () => {
         ],
       },
     ];
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      ...owner,
+      lastOrdinal: 4,
+    };
     const { documentClient, store } = makeStore(
       vi.fn(async (command) => {
-        if (!(command instanceof QueryCommand)) throw new Error("expected a paginated Query");
-        const page = pages.shift();
-        if (!page) throw new Error("unexpected extra Query page");
-        return page;
+        if (command instanceof GetCommand) return { Item: meta };
+        if (command instanceof QueryCommand) {
+          const page = pages.shift();
+          if (!page) throw new Error("unexpected extra Query page");
+          return page;
+        }
+        throw new Error("expected a consistent META Get or paginated Query");
       }),
     );
 
@@ -283,7 +293,15 @@ describe("the DynamoDB conversation store adapter", () => {
       message("assistant", "Segunda respuesta"),
     ]);
 
-    const queries = documentClient.send.mock.calls.map(([command]) => command);
+    const commands = documentClient.send.mock.calls.map(([command]) => command);
+    const metaReads = commands.filter((command) => command instanceof GetCommand);
+    const queries = commands.filter((command) => command instanceof QueryCommand);
+    expect(metaReads).toHaveLength(1);
+    expect(metaReads[0].input).toMatchObject({
+      TableName: tableName,
+      Key: { pk: `CONV#${conversationId}`, sk: "META" },
+      ConsistentRead: true,
+    });
     expect(queries).toHaveLength(3);
     expect(queries.every((command) => command instanceof QueryCommand)).toBe(true);
     expect(queries.every(({ input }) => input.TableName === tableName)).toBe(true);
@@ -308,18 +326,31 @@ describe("the DynamoDB conversation store adapter", () => {
     const failedId = "fcdd5a71-b6db-4ad9-a2c3-934cb56fe749";
     const { store } = makeStore(
       vi.fn(async (command) => {
-        if (!(command instanceof QueryCommand)) throw new Error("expected a paginated Query");
-        return {
-          Items: [
-            turnRecord(1, pendingId, {
-              status: "in_progress",
-              answerManifest: { count: 1, complete: false },
-            }),
-            textChunk(1, pendingId, "user", 0, "Consulta pendiente"),
-            turnRecord(2, failedId, { status: "failed" }),
-            textChunk(2, failedId, "assistant", 0, "Prefijo fallido"),
-          ],
-        };
+        if (command instanceof GetCommand) {
+          return {
+            Item: {
+              pk: `CONV#${conversationId}`,
+              sk: "META",
+              conversationId,
+              ...owner,
+              lastOrdinal: 2,
+            },
+          };
+        }
+        if (command instanceof QueryCommand) {
+          return {
+            Items: [
+              turnRecord(1, pendingId, {
+                status: "in_progress",
+                answerManifest: { count: 1, complete: false },
+              }),
+              textChunk(1, pendingId, "user", 0, "Consulta pendiente"),
+              turnRecord(2, failedId, { status: "failed" }),
+              textChunk(2, failedId, "assistant", 0, "Prefijo fallido"),
+            ],
+          };
+        }
+        throw new Error("expected a consistent META Get or paginated Query");
       }),
     );
 
@@ -389,8 +420,19 @@ describe("the DynamoDB conversation store adapter", () => {
     async (_label, turn, chunks) => {
       const { store } = makeStore(
         vi.fn(async (command) => {
-          if (!(command instanceof QueryCommand)) throw new Error("expected a paginated Query");
-          return { Items: [turn, ...chunks] };
+          if (command instanceof GetCommand) {
+            return {
+              Item: {
+                pk: `CONV#${conversationId}`,
+                sk: "META",
+                conversationId,
+                ...owner,
+                lastOrdinal: 1,
+              },
+            };
+          }
+          if (command instanceof QueryCommand) return { Items: [turn, ...chunks] };
+          throw new Error("expected a consistent META Get or paginated Query");
         }),
       );
 

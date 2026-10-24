@@ -10,7 +10,7 @@ Los descriptores tipados admiten dos controles: selección múltiple y lista de 
 
 Consultar un perfil ausente muestra «Completá tu perfil» sin crear datos. Un error de lectura muestra error y reintento, nunca un formulario nuevo que pudiera sobrescribir silenciosamente el perfil. «Guardar perfil» valida y reemplaza todo el documento después de una acción explícita. No hay autoguardado ni borradores persistidos. Las materias vacías de filas nuevas se omiten al preparar el formulario; la API rechaza materias vacías recibidas.
 
-El perfil completo es requisito para un pedido nuevo, no para consultar conversaciones propias anteriores. Un perfil incompleto permite abrir el historial y sus originales; el siguiente envío vuelve a comprobar el perfil vigente en el servidor.
+El perfil completo es requisito para un pedido nuevo, no para consultar conversaciones propias anteriores. Un perfil incompleto permite abrir el historial y sus originales; el siguiente envío vuelve a comprobar el perfil vigente en el servidor. El resumen de un hilo largo conserva decisiones de ese trabajo, no preferencias aprendidas; no modifica el perfil ni se incorpora automáticamente a otra conversación. Preparar el resumen no convierte el perfil actual en memoria histórica del hilo.
 
 La confirmación aparece solo después de una respuesta válida del servidor y la edición puede continuar. Durante el envío se deshabilitan los cambios y nuevos guardados; cerrar sesión sigue disponible. «Descartar cambios» vuelve al último perfil confirmado, o al vacío inicial, sin escribir. Salir o recargar descarta cambios sin guardar.
 

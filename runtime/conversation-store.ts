@@ -9,6 +9,7 @@ import type { MessageData } from "@strands-agents/sdk";
 import type {
   AppendChunkInput,
   CompleteTurnInput,
+  ContextSnapshot,
   ContextReference,
   ConversationContext,
   ConversationMeta,
@@ -17,9 +18,17 @@ import type {
   FailTurnInput,
   QuotaView,
   StartTurnInput,
+  SummaryVersion,
   SubmissionSnapshot,
   TurnManifest,
 } from "./contracts.js";
+import {
+  createContextStorage,
+  dynamoItemSize,
+  readSummaryPointer,
+  validateContextSnapshot,
+  validateSummaryVersion,
+} from "./context-storage.js";
 import { createHistoryLabel, createHistoryOrder } from "./history-projection.js";
 import { maxDynamoTextChunkBytes, splitUtf8Text } from "./text.js";
 
@@ -226,8 +235,18 @@ function parseContextReferences(input: {
   partition: string;
   conversationId: string;
   turns: Map<string, Record<string, unknown>>;
+  verifyTargets?: boolean;
 }): ContextReference[] {
-  const { ordinal, queryId, count, chunks, partition, conversationId, turns } = input;
+  const {
+    ordinal,
+    queryId,
+    count,
+    chunks,
+    partition,
+    conversationId,
+    turns,
+    verifyTargets = true,
+  } = input;
   const contextRecords = chunks.filter((chunk) => String(chunk.sk).includes("#CONTEXT#"));
   if (count === undefined) {
     if (contextRecords.length > 0) {
@@ -284,14 +303,16 @@ function parseContextReferences(input: {
     ) {
       throw new Error(`Completed conversation query ${queryId} has invalid context references.`);
     }
-    const referencedTurn = turns.get(String(value.ordinal).padStart(8, "0"));
-    if (
-      !referencedTurn ||
-      referencedTurn.status !== "completed" ||
-      referencedTurn.ordinal !== value.ordinal ||
-      referencedTurn.queryId !== value.queryId
-    ) {
-      throw new Error(`Completed conversation query ${queryId} references a missing turn.`);
+    if (verifyTargets) {
+      const referencedTurn = turns.get(String(value.ordinal).padStart(8, "0"));
+      if (
+        !referencedTurn ||
+        referencedTurn.status !== "completed" ||
+        referencedTurn.ordinal !== value.ordinal ||
+        referencedTurn.queryId !== value.queryId
+      ) {
+        throw new Error(`Completed conversation query ${queryId} references a missing turn.`);
+      }
     }
     references.push({ ordinal: value.ordinal, queryId: value.queryId });
     previousOrdinal = value.ordinal;
@@ -299,7 +320,11 @@ function parseContextReferences(input: {
   return references;
 }
 
-function reconstructMessages(conversationId: string, items: unknown[]): ConversationContext {
+function reconstructMessages(
+  conversationId: string,
+  items: unknown[],
+  options: { validateContextReferences?: boolean } = {},
+): ConversationContext {
   const partition = `CONV#${conversationId}`;
   const turns = new Map<string, Record<string, unknown>>();
   const chunks = new Map<string, Record<string, unknown>[]>();
@@ -339,6 +364,8 @@ function reconstructMessages(conversationId: string, items: unknown[]): Conversa
     questionCount: number;
     answerCount: number;
     contextCount: number | undefined;
+    contextManifest: unknown;
+    contextSnapshot: unknown;
   }[] = [];
 
   for (const [ordinalKey, turn] of turns) {
@@ -373,6 +400,8 @@ function reconstructMessages(conversationId: string, items: unknown[]): Conversa
       questionCount,
       answerCount,
       contextCount: contextCount ?? undefined,
+      contextManifest: turn.contextManifest,
+      contextSnapshot: turn.contextSnapshot,
     });
   }
 
@@ -423,15 +452,55 @@ function reconstructMessages(conversationId: string, items: unknown[]): Conversa
 
     const question = assembleText(questionChunks, turn.questionCount, "user", turn.queryId);
     const answer = assembleText(answerChunks, turn.answerCount, "assistant", turn.queryId);
-    parseContextReferences({
-      ordinal: turn.ordinal,
-      queryId: turn.queryId,
-      count: turn.contextCount,
-      chunks: turnChunks,
-      partition,
-      conversationId,
-      turns,
-    });
+    if (turn.contextSnapshot !== undefined) {
+      if (turn.contextManifest === undefined || turn.contextCount === undefined) {
+        throw new Error("Completed conversation snapshot has no context manifest.");
+      }
+      const fragmentedReferences = isChunkedContextSnapshot(turn.contextSnapshot)
+        ? parseContextReferences({
+            ordinal: turn.ordinal,
+            queryId: turn.queryId,
+            count: turn.contextCount,
+            chunks: turnChunks,
+            partition,
+            conversationId,
+            turns,
+            verifyTargets: options.validateContextReferences !== false,
+          })
+        : undefined;
+      if (fragmentedReferences === undefined) {
+        if (turn.contextCount !== 0) {
+          throw new Error("Completed conversation snapshot has conflicting context storage.");
+        }
+        parseContextReferences({
+          ordinal: turn.ordinal,
+          queryId: turn.queryId,
+          count: 0,
+          chunks: turnChunks,
+          partition,
+          conversationId,
+          turns,
+        });
+      }
+      const snapshot = hydrateStoredContextSnapshot(
+        turn.contextSnapshot,
+        turn.ordinal,
+        fragmentedReferences,
+      );
+      if (options.validateContextReferences !== false) {
+        verifySnapshotReferenceTurns(snapshot, turns);
+      }
+    } else if (options.validateContextReferences !== false) {
+      parseContextReferences({
+        ordinal: turn.ordinal,
+        queryId: turn.queryId,
+        count: turn.contextCount,
+        chunks: turnChunks,
+        partition,
+        conversationId,
+        turns,
+      });
+    }
     references.push({ ordinal: turn.ordinal, queryId: turn.queryId });
     messages.push(
       { role: "user", content: [{ text: question }] },
@@ -503,6 +572,77 @@ function encodeContextReferences(references: ContextReference[], targetOrdinal: 
   return references.length > 0 ? splitUtf8Text(JSON.stringify(references)) : [];
 }
 
+function sameContextReferences(left: ContextReference[], right: ContextReference[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (reference, index) =>
+        reference.ordinal === right[index].ordinal && reference.queryId === right[index].queryId,
+    )
+  );
+}
+
+function sameSummaryPointer(
+  left: ContextSnapshot["summary"] | undefined,
+  right: ContextSnapshot["summary"] | undefined,
+): boolean {
+  return left === undefined
+    ? right === undefined
+    : right !== undefined &&
+        left.summaryId === right.summaryId &&
+        left.throughOrdinal === right.throughOrdinal;
+}
+
+function hydrateStoredContextSnapshot(
+  value: unknown,
+  targetOrdinal: number,
+  fragmentedReferences?: ContextReference[],
+): ContextSnapshot {
+  if (isRecord(value) && Object.hasOwn(value, "recentReferencesStorage")) {
+    if (
+      value.recentReferencesStorage !== "context_chunks" ||
+      Object.hasOwn(value, "recentReferences") ||
+      !Array.isArray(fragmentedReferences) ||
+      fragmentedReferences.length === 0
+    ) {
+      throw new Error("Conversation context snapshot reference fragments are malformed.");
+    }
+    return validateContextSnapshot(
+      {
+        version: value.version,
+        ...(value.summary === undefined ? {} : { summary: value.summary }),
+        recentReferences: fragmentedReferences,
+      },
+      targetOrdinal,
+    );
+  }
+  if (fragmentedReferences !== undefined) {
+    throw new Error("Conversation context snapshot duplicates its reference fragments.");
+  }
+  return validateContextSnapshot(value, targetOrdinal);
+}
+
+function verifySnapshotReferenceTurns(
+  snapshot: ContextSnapshot,
+  turns: Map<string, Record<string, unknown>>,
+): void {
+  for (const reference of snapshot.recentReferences) {
+    const turn = turns.get(String(reference.ordinal).padStart(8, "0"));
+    if (
+      !turn ||
+      turn.status !== "completed" ||
+      turn.ordinal !== reference.ordinal ||
+      turn.queryId !== reference.queryId
+    ) {
+      throw new Error("Conversation context snapshot references a missing completed turn.");
+    }
+  }
+}
+
+function isChunkedContextSnapshot(value: unknown): boolean {
+  return isRecord(value) && value.recentReferencesStorage === "context_chunks";
+}
+
 export function createConversationStoreAdapter(input: {
   documentClient: DynamoDBDocumentClient;
   tableName: string;
@@ -510,6 +650,7 @@ export function createConversationStoreAdapter(input: {
 }) {
   const { documentClient, tableName } = input;
   const currentTime = input.now ?? Date.now;
+  const contextStorage = createContextStorage({ documentClient, tableName });
   const zone = "America/Argentina/Cordoba";
   const itemLimit = 400 * 1024;
   const transactionLimit = 4 * 1024 * 1024;
@@ -624,49 +765,6 @@ export function createConversationStoreAdapter(input: {
     };
   }
 
-  function numberSize(value: number): number {
-    if (!Number.isFinite(value))
-      throw new TypeError("DynamoDB items cannot contain non-finite numbers.");
-    const digits = String(Math.abs(value))
-      .split(/[eE]/)[0]
-      .replace(/[^0-9]/g, "")
-      .replace(/^0+|0+$/g, "");
-    return Math.max(1, Math.ceil((digits.length || 1) / 2) + 1);
-  }
-
-  function valueSize(value: unknown): number {
-    if (typeof value === "string") return Buffer.byteLength(value, "utf8");
-    if (typeof value === "number") return numberSize(value);
-    if (typeof value === "boolean" || value === null) return 1;
-    if (value instanceof Uint8Array) return value.byteLength;
-    if (Array.isArray(value)) {
-      return (
-        3 +
-        value.reduce((total, entry) => {
-          if (entry === undefined) return total;
-          return total + 1 + valueSize(entry);
-        }, 0)
-      );
-    }
-    if (isRecord(value)) {
-      return (
-        3 +
-        Object.entries(value).reduce((total, [name, entry]) => {
-          if (entry === undefined) return total;
-          return total + 1 + Buffer.byteLength(name, "utf8") + valueSize(entry);
-        }, 0)
-      );
-    }
-    throw new TypeError("DynamoDB item contains an unsupported value.");
-  }
-
-  function itemSize(item: Record<string, unknown>): number {
-    return Object.entries(item).reduce((total, [name, value]) => {
-      if (value === undefined) return total;
-      return total + Buffer.byteLength(name, "utf8") + valueSize(value);
-    }, 0);
-  }
-
   function itemKey(item: Record<string, unknown>): string {
     if (typeof item.pk !== "string" || typeof item.sk !== "string") {
       throw new TypeError("DynamoDB transaction item has no valid key.");
@@ -692,10 +790,10 @@ export function createConversationStoreAdapter(input: {
       if (keys.has(key))
         throw new TypeError("DynamoDB transactions cannot target an item more than once.");
       keys.add(key);
-      if (itemSize(item) > itemLimit)
+      if (dynamoItemSize(item) > itemLimit)
         throw storageCapacityError("DynamoDB transaction item exceeds 400 KiB.");
     }
-    if (affectedItems.reduce((total, item) => total + itemSize(item), 0) > transactionLimit) {
+    if (affectedItems.reduce((total, item) => total + dynamoItemSize(item), 0) > transactionLimit) {
       throw storageCapacityError("DynamoDB transaction exceeds 4 MiB.");
     }
   }
@@ -1035,16 +1133,80 @@ export function createConversationStoreAdapter(input: {
     const ordinal = baseOrdinal + 1;
     if (!Number.isSafeInteger(ordinal) || ordinal <= 0)
       throw new RangeError("Conversation ordinal cannot be safely incremented.");
-    const questionChunks = splitUtf8Text(turn.text);
-    if (questionChunks.length === 0) throw new TypeError("Submission question is empty.");
-    const contextChunks =
+    const createdAt = isoDate(turn.now);
+    const partition = conversationKey(turn.conversationId);
+    const metaKey = { ...partition, sk: "META" };
+    const previousMeta = operation === "message" ? await getItem(metaKey) : undefined;
+    const currentSummary = readSummaryPointer(previousMeta);
+    const contextSnapshot =
+      turn.contextSnapshot === undefined
+        ? undefined
+        : validateContextSnapshot(turn.contextSnapshot, ordinal);
+    const contextReferences =
       operation === "message"
         ? encodeContextReferences((turn as ContinueTurnInput).contextReferences, ordinal)
         : [];
+    const summaryCandidate =
+      turn.summaryCandidate === undefined
+        ? undefined
+        : validateSummaryVersion(turn.summaryCandidate);
+
+    if (summaryCandidate !== undefined && contextSnapshot === undefined) {
+      throw new TypeError("A summary candidate requires a versioned context snapshot.");
+    }
+    if (contextSnapshot !== undefined) {
+      if (
+        operation === "message" &&
+        !sameContextReferences(
+          contextSnapshot.recentReferences,
+          (turn as ContinueTurnInput).contextReferences,
+        )
+      ) {
+        throw new TypeError(
+          "Context snapshot references must match the recent context references.",
+        );
+      }
+      if (
+        operation === "start" &&
+        (contextSnapshot.summary !== undefined || contextSnapshot.recentReferences.length > 0)
+      ) {
+        throw new TypeError("A new conversation cannot begin with prior conversation context.");
+      }
+      if (summaryCandidate !== undefined) {
+        const previousThrough = currentSummary?.throughOrdinal ?? 0;
+        const snapshotMatchesCandidate = sameSummaryPointer(contextSnapshot.summary, {
+          summaryId: summaryCandidate.summaryId,
+          throughOrdinal: summaryCandidate.throughOrdinal,
+        });
+        if (
+          operation !== "message" ||
+          !snapshotMatchesCandidate ||
+          summaryCandidate.throughOrdinal > baseOrdinal ||
+          summaryCandidate.throughOrdinal <= previousThrough ||
+          summaryCandidate.sourceReferences.some(
+            (reference) =>
+              reference.ordinal <= previousThrough ||
+              reference.ordinal > summaryCandidate.throughOrdinal,
+          ) ||
+          summaryCandidate.previousSummaryId !== currentSummary?.summaryId
+        ) {
+          throw new TypeError(
+            "Summary candidate does not extend the current conversation context.",
+          );
+        }
+      } else if (!sameSummaryPointer(contextSnapshot.summary, currentSummary)) {
+        throw new TypeError("Context snapshot does not match the current conversation summary.");
+      }
+    } else if (currentSummary !== undefined) {
+      throw new TypeError("A conversation with a summary requires a versioned context snapshot.");
+    }
+
+    const questionChunks = splitUtf8Text(turn.text);
+    if (questionChunks.length === 0) throw new TypeError("Submission question is empty.");
+    let contextChunks =
+      operation === "message" && contextSnapshot === undefined ? contextReferences : [];
     const documentContextChunks =
       turn.documentContext === undefined ? [] : serializeDocumentContext(turn.documentContext);
-    const createdAt = isoDate(turn.now);
-    const partition = conversationKey(turn.conversationId);
     const marker = {
       pk: "USER#" + turn.sub + "#BOT#" + turn.botId,
       sk: "SEND#" + turn.queryId,
@@ -1060,7 +1222,7 @@ export function createConversationStoreAdapter(input: {
       resultDeadlineAt: turn.resultDeadlineAt,
       quotaSnapshot: turn.quota,
     };
-    const record = {
+    const record: Record<string, unknown> = {
       ...turnKey(turn.conversationId, ordinal),
       conversationId: turn.conversationId,
       sub: turn.sub,
@@ -1090,8 +1252,22 @@ export function createConversationStoreAdapter(input: {
           }),
       profileSnapshot: turn.profileSnapshot,
       invocation: turn.invocation,
+      ...(contextSnapshot === undefined ? {} : { contextSnapshot }),
     };
-    const metaKey = { ...partition, sk: "META" };
+    if (
+      contextSnapshot !== undefined &&
+      contextSnapshot.recentReferences.length > 0 &&
+      dynamoItemSize(record) > itemLimit
+    ) {
+      contextChunks = encodeContextReferences(contextSnapshot.recentReferences, ordinal);
+      const { version, summary } = contextSnapshot;
+      record.contextSnapshot = {
+        version,
+        ...(summary === undefined ? {} : { summary }),
+        recentReferencesStorage: "context_chunks",
+      };
+      record.contextManifest = { count: contextChunks.length, complete: true };
+    }
     const meta = {
       ...metaKey,
       conversationId: turn.conversationId,
@@ -1108,6 +1284,15 @@ export function createConversationStoreAdapter(input: {
       historyOrder: createHistoryOrder(createdAt, turn.conversationId),
       historyLabel: createHistoryLabel(turn.text),
     };
+    const summaryStorage =
+      summaryCandidate === undefined
+        ? undefined
+        : contextStorage.createSummaryItems({
+            conversationId: turn.conversationId,
+            sub: turn.sub,
+            botId: turn.botId,
+            summary: summaryCandidate,
+          });
     const day = localPeriods(turn.now).day.period;
     const month = localPeriods(turn.now).month.period;
     const usagePk = { pk: "USER#" + turn.sub + "#BOT#" + turn.botId };
@@ -1218,7 +1403,6 @@ export function createConversationStoreAdapter(input: {
       );
       affectedItems.push(meta, record);
     } else {
-      const previousMeta = await getItem(metaKey);
       if (
         previousMeta &&
         (previousMeta.sub !== turn.sub ||
@@ -1240,13 +1424,27 @@ export function createConversationStoreAdapter(input: {
         createdAt,
       );
       const historyUpdate = historyUpdateParts(previousMeta, historyProjection);
+      const summaryPointer = summaryCandidate
+        ? {
+            summaryId: summaryCandidate.summaryId,
+            throughOrdinal: summaryCandidate.throughOrdinal,
+          }
+        : undefined;
+      const summaryUpdate = summaryPointer === undefined ? "" : ", #summary = :summary";
+      const summaryCondition =
+        contextSnapshot === undefined
+          ? ""
+          : currentSummary === undefined
+            ? " AND attribute_not_exists(#summary)"
+            : " AND #summary = :expectedSummary";
       transactionItems.push({
         Update: {
           TableName: tableName,
           Key: metaKey,
-          UpdateExpression: `SET #lastOrdinal = :nextOrdinal, #lastQueryId = :queryId, #activeQueryId = :queryId, #activeOwnerAttemptId = :ownerAttemptId, #updatedAt = :updatedAt${historyUpdate.assignments.length ? ", " + historyUpdate.assignments.join(", ") : ""}`,
+          UpdateExpression: `SET #lastOrdinal = :nextOrdinal, #lastQueryId = :queryId, #activeQueryId = :queryId, #activeOwnerAttemptId = :ownerAttemptId, #updatedAt = :updatedAt${historyUpdate.assignments.length ? ", " + historyUpdate.assignments.join(", ") : ""}${summaryUpdate}`,
           ConditionExpression:
-            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND (attribute_not_exists(#closed) OR #closed = :false)",
+            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND (attribute_not_exists(#closed) OR #closed = :false)" +
+            summaryCondition,
           ExpressionAttributeNames: {
             "#sub": "sub",
             "#botId": "botId",
@@ -1257,6 +1455,7 @@ export function createConversationStoreAdapter(input: {
             "#activeOwnerAttemptId": "activeOwnerAttemptId",
             "#updatedAt": "updatedAt",
             "#closed": "closed",
+            ...(contextSnapshot === undefined ? {} : { "#summary": "summary" }),
             ...historyUpdate.names,
           },
           ExpressionAttributeValues: {
@@ -1269,6 +1468,10 @@ export function createConversationStoreAdapter(input: {
             ":ownerAttemptId": turn.ownerAttemptId,
             ":updatedAt": createdAt,
             ":false": false,
+            ...(summaryPointer === undefined ? {} : { ":summary": summaryPointer }),
+            ...(contextSnapshot === undefined || currentSummary === undefined
+              ? {}
+              : { ":expectedSummary": currentSummary }),
             ...historyUpdate.values,
           },
         },
@@ -1287,6 +1490,7 @@ export function createConversationStoreAdapter(input: {
         activeOwnerAttemptId: turn.ownerAttemptId,
         updatedAt: createdAt,
         ...(historyProjection ?? {}),
+        ...(summaryPointer === undefined ? {} : { summary: summaryPointer }),
       });
       transactionItems.push({
         Put: {
@@ -1296,6 +1500,22 @@ export function createConversationStoreAdapter(input: {
         },
       });
       affectedItems.push(record);
+    }
+    if (summaryStorage !== undefined) {
+      for (const item of [
+        summaryStorage.descriptor,
+        ...summaryStorage.textItems,
+        ...summaryStorage.sourceReferenceItems,
+      ]) {
+        transactionItems.push({
+          Put: {
+            TableName: tableName,
+            Item: item,
+            ConditionExpression: "attribute_not_exists(pk)",
+          },
+        });
+        affectedItems.push(item);
+      }
     }
     const questionItems = questionChunks.map((text, index) =>
       chunkItem({
@@ -1432,6 +1652,8 @@ export function createConversationStoreAdapter(input: {
       turn.ordinal !== marker.ordinal ||
       turn.queryId !== input.queryId ||
       turn.pk !== conversationKey(marker.conversationId).pk ||
+      (turn.sub !== undefined && turn.sub !== input.sub) ||
+      (turn.botId !== undefined && turn.botId !== input.botId) ||
       (turn.requestFingerprint !== undefined &&
         turn.requestFingerprint !== marker.requestFingerprint)
     )
@@ -1556,6 +1778,42 @@ export function createConversationStoreAdapter(input: {
         turns: new Map(),
       });
     }
+    let contextSnapshot: ContextSnapshot | undefined;
+    let summary: SummaryVersion | undefined;
+    if (turn.contextSnapshot !== undefined) {
+      if (turn.contextManifest === undefined) {
+        throw new Error("Submission context snapshot has no context manifest.");
+      }
+      contextSnapshot = hydrateStoredContextSnapshot(
+        turn.contextSnapshot,
+        ordinal,
+        rawContextCount > 0 ? contextReferences : undefined,
+      );
+      if (rawContextCount > 0) {
+        if (!sameContextReferences(contextReferences, contextSnapshot.recentReferences)) {
+          throw new Error("Submission context references do not match its context snapshot.");
+        }
+      } else {
+        contextReferences = contextSnapshot.recentReferences;
+      }
+      if (contextSnapshot.summary !== undefined) {
+        summary = await contextStorage.readSummary({
+          conversationId: marker.conversationId,
+          ...contextSnapshot.summary,
+          sub: input.sub,
+          botId: input.botId,
+        });
+        await contextStorage.verifyReferences(marker.conversationId, summary.sourceReferences, {
+          sub: input.sub,
+          botId: input.botId,
+        });
+      }
+      await contextStorage.verifyReferences(
+        marker.conversationId,
+        contextSnapshot.recentReferences,
+        { sub: input.sub, botId: input.botId },
+      );
+    }
     let documentContext: DocumentContext | undefined;
     const documentContextRecords = chunks.filter((item) => String(item.sk).includes("#DOCUMENT#"));
     if (turn.documentContextManifest === undefined) {
@@ -1628,6 +1886,8 @@ export function createConversationStoreAdapter(input: {
       question,
       questionManifest: turn.questionManifest as TurnManifest,
       contextReferences,
+      ...(contextSnapshot === undefined ? {} : { contextSnapshot }),
+      ...(summary === undefined ? {} : { summary }),
       ...(documentContext === undefined ? {} : { documentContext }),
       answer,
       answerManifest: turn.answerManifest as TurnManifest,
@@ -1985,7 +2245,80 @@ export function createConversationStoreAdapter(input: {
     }: {
       conversationId: string;
     }): Promise<ConversationContext> {
-      return reconstructMessages(conversationId, await queryItems(conversationKey(conversationId)));
+      const partition = conversationKey(conversationId);
+      const metaItem = await getItem({ ...partition, sk: "META" });
+      if (!metaItem) {
+        return reconstructMessages(conversationId, await queryItems(partition));
+      }
+      if (!isConversationMeta(metaItem, conversationId)) {
+        throw new Error("Conversation META record is malformed; refusing to use its context.");
+      }
+      const summaryPointer = readSummaryPointer(metaItem);
+      if (!summaryPointer) {
+        return reconstructMessages(conversationId, await queryItems(partition));
+      }
+      if (summaryPointer.throughOrdinal > metaItem.lastOrdinal) {
+        throw new Error("Conversation META summary is ahead of its latest turn.");
+      }
+
+      const summary = await contextStorage.readSummary({
+        conversationId,
+        ...summaryPointer,
+        sub: metaItem.sub,
+        botId: metaItem.botId,
+      });
+      await contextStorage.verifyReferences(conversationId, summary.sourceReferences, {
+        sub: metaItem.sub,
+        botId: metaItem.botId,
+      });
+
+      const items: Record<string, unknown>[] = [metaItem];
+      if (summaryPointer.throughOrdinal < metaItem.lastOrdinal) {
+        const firstOrdinal = summaryPointer.throughOrdinal + 1;
+        const turnRecords = await contextStorage.readTurnRange(
+          conversationId,
+          firstOrdinal,
+          metaItem.lastOrdinal,
+        );
+        if (turnRecords.length !== metaItem.lastOrdinal - summaryPointer.throughOrdinal) {
+          throw new Error("Conversation context is missing a turn after its summary.");
+        }
+        for (let index = 0; index < turnRecords.length; index += 1) {
+          const ordinal = firstOrdinal + index;
+          const turn = turnRecords[index];
+          if (
+            turn.pk !== partition.pk ||
+            turn.sk !== turnKey(conversationId, ordinal).sk ||
+            turn.conversationId !== conversationId ||
+            turn.ordinal !== ordinal ||
+            typeof turn.queryId !== "string" ||
+            !uuidPattern.test(turn.queryId) ||
+            !["completed", "failed", "in_progress"].includes(String(turn.status)) ||
+            (turn.sub !== undefined && turn.sub !== metaItem.sub) ||
+            (turn.botId !== undefined && turn.botId !== metaItem.botId)
+          ) {
+            throw new Error("Conversation context contains a malformed turn after its summary.");
+          }
+          items.push(turn);
+          if (turn.status === "completed") {
+            items.push(
+              ...(await queryItems(
+                partition,
+                `${turnKey(conversationId, ordinal).sk}#${turn.queryId}#`,
+              )),
+            );
+            if (isChunkedContextSnapshot(turn.contextSnapshot)) {
+              items.push(
+                ...(await queryItems(partition, `${turnKey(conversationId, ordinal).sk}#CONTEXT#`)),
+              );
+            }
+          }
+        }
+      }
+      return {
+        ...reconstructMessages(conversationId, items, { validateContextReferences: false }),
+        summary,
+      };
     },
 
     async readQuota({
