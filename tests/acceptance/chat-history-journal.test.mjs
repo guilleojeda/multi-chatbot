@@ -219,7 +219,10 @@ describe("per-conversation recovery references", () => {
     expect(rawBeforeFirstAcceptance).toContain(firstRequest.queryId);
     streams.get(firstConversationId).accept();
     streams.get(firstConversationId).text("Prefijo uno.");
-    await vi.waitFor(() => expect(state(app)?.queryStatus).toBe("streaming"));
+    await vi.waitFor(async () => {
+      await app.flush();
+      expect(state(app)?.queryStatus).toBe("streaming");
+    });
 
     await select(app, secondConversationId);
     const secondBody = "Pregunta privada del segundo hilo.";
@@ -230,7 +233,10 @@ describe("per-conversation recovery references", () => {
     expect(storageAtSecondPost).toContain(secondBody);
     streams.get(secondConversationId).accept();
     streams.get(secondConversationId).text("Prefijo dos.");
-    await vi.waitFor(() => expect(state(app)?.queryStatus).toBe("streaming"));
+    await vi.waitFor(async () => {
+      await app.flush();
+      expect(state(app)?.queryStatus).toBe("streaming");
+    });
 
     expect(entriesContaining(environment.storage, firstRequest.queryId)).toHaveLength(1);
     expect(entriesContaining(environment.storage, secondRequest.queryId)).toHaveLength(1);
@@ -241,7 +247,10 @@ describe("per-conversation recovery references", () => {
     expect(storageText(environment.storage)).not.toMatch(/educationLevels|subjects/);
 
     streams.get(secondConversationId).complete();
-    await vi.waitFor(() => expect(state(app)?.queryStatus).toBe("completed"));
+    await vi.waitFor(async () => {
+      await app.flush();
+      expect(state(app)?.queryStatus).toBe("completed");
+    });
     await app.flush();
     expect(entriesContaining(environment.storage, secondRequest.queryId)).toHaveLength(0);
     expect(entriesContaining(environment.storage, firstRequest.queryId)).toHaveLength(1);
@@ -252,7 +261,10 @@ describe("per-conversation recovery references", () => {
         environment.runtimeRequests.some(({ request }) => request.operation === "recover"),
       ).toBe(true),
     );
-    await vi.waitFor(() => expect(state(app)?.queryStatus).toBe("completed"));
+    await vi.waitFor(async () => {
+      await app.flush();
+      expect(state(app)?.queryStatus).toBe("completed");
+    });
     await app.flush();
     expect(entriesContaining(environment.storage, firstRequest.queryId)).toHaveLength(0);
   });
@@ -301,7 +313,10 @@ describe("per-conversation recovery references", () => {
     const firstRequest = environment.runtimeRequests.at(-1).request;
     streams.get(firstConversationId).accept();
     streams.get(firstConversationId).text("En curso.");
-    await vi.waitFor(() => expect(state(app)?.queryStatus).toBe("streaming"));
+    await vi.waitFor(async () => {
+      await app.flush();
+      expect(state(app)?.queryStatus).toBe("streaming");
+    });
     const previousValues = new Map(environment.storage.values);
 
     environment.storage.denyWrites = true;
@@ -517,14 +532,20 @@ describe("per-conversation recovery references", () => {
     const firstRequest = environment.runtimeRequests.at(-1).request;
     streams.get(firstConversationId).accept();
     streams.get(firstConversationId).text("Uno.");
-    await vi.waitFor(() => expect(state(app)?.queryStatus).toBe("streaming"));
+    await vi.waitFor(async () => {
+      await app.flush();
+      expect(state(app)?.queryStatus).toBe("streaming");
+    });
     await select(app, secondConversationId);
     expect(props(app).onSubmit("Pedido dos pendiente.")).toBe(true);
     await vi.waitFor(() => expect(streams.has(secondConversationId)).toBe(true));
     const secondRequest = environment.runtimeRequests.at(-1).request;
     streams.get(secondConversationId).accept();
     streams.get(secondConversationId).text("Dos.");
-    await vi.waitFor(() => expect(state(app)?.queryStatus).toBe("streaming"));
+    await vi.waitFor(async () => {
+      await app.flush();
+      expect(state(app)?.queryStatus).toBe("streaming");
+    });
     expect(entriesContaining(environment.storage, firstRequest.queryId)).toHaveLength(1);
     expect(entriesContaining(environment.storage, secondRequest.queryId)).toHaveLength(1);
 

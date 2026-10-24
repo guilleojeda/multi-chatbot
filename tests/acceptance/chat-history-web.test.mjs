@@ -511,7 +511,10 @@ describe("the conversation history in AccountApp", () => {
 
     const draft = "Mantené la rúbrica y agregá una adaptación.";
     expect(props(app).onSubmit(draft)).toBe(true);
-    await vi.waitFor(() => expect(state(app)?.queryErrorCode).toBe("stale_base"));
+    await vi.waitFor(async () => {
+      await app.flush();
+      expect(state(app)?.queryErrorCode).toBe("stale_base");
+    });
     await app.flush();
 
     expect(messageCount).toBe(1);
