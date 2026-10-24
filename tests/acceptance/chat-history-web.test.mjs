@@ -590,7 +590,6 @@ describe("the conversation history in AccountApp", () => {
     await app.flush();
 
     expect(history(app)).toMatchObject({ selectedConversationId: null, turns: [] });
-    expect(state(app)?.previousTurns || []).toEqual([]);
     expect(state(app)?.question).toBeUndefined();
     expect(state(app)?.answer).toBeUndefined();
     expect(props(app).onSubmit("Pedido de un hilo nuevo.")).toBe(true);

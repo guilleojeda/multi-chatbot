@@ -99,7 +99,29 @@ function readyState(overrides = {}) {
   return {
     profileStatus: "complete",
     queryStatus: "idle",
+    history: historyState(),
     ...overrides,
+  };
+}
+
+function historyState(turns = []) {
+  return {
+    status: "ready",
+    conversations: [],
+    nextCursor: null,
+    loadingMore: false,
+    selectedConversationId: null,
+    turnsStatus: "ready",
+    turnsNextCursor: null,
+    refreshRequired: false,
+    turns: turns.map((turn, index) => ({
+      ordinal: index + 1,
+      queryId: `550e8400-e29b-41d4-a716-${String(index + 1).padStart(12, "0")}`,
+      questionComplete: true,
+      answerComplete: true,
+      canContinue: true,
+      ...turn,
+    })),
   };
 }
 
@@ -204,10 +226,10 @@ describe("the chat screen", () => {
     const html = await render(
       readyState({
         queryStatus: "idle",
-        previousTurns: [
+        history: historyState([
           { question: firstQuestion, answer: firstAnswer, status: "completed" },
           { question: secondQuestion, answer: secondAnswer, status: "completed" },
-        ],
+        ]),
       }),
     );
     if (!expectRendered(html)) return;
@@ -224,20 +246,20 @@ describe("the chat screen", () => {
   });
 
   it("allows a new query after a confirmed failure, but makes an uncertain result restart-only", async () => {
-    const previousTurns = [
+    const history = historyState([
       {
         question: "¿Cómo explico los porcentajes?",
         answer: "Usá descuentos de una librería como ejemplo.",
         status: "completed",
       },
-    ];
+    ]);
     const failed = await render(
       readyState({
         queryStatus: "failed",
         question: "Armá una actividad.",
         answer: "Primer tramo guardado",
         queryError: "La respuesta quedó incompleta.",
-        previousTurns,
+        history,
       }),
     );
     const unconfirmed = await render(
@@ -246,7 +268,7 @@ describe("the chat screen", () => {
         question: "Armá otra actividad.",
         answer: "Texto sin cierre confirmado",
         queryError: "No pudimos confirmar que la respuesta haya terminado.",
-        previousTurns,
+        history,
       }),
     );
     const reset = await render(readyState());
