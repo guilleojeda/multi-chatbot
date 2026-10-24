@@ -5,7 +5,6 @@ export const projectConfig = {
   account,
   region,
   initialModelId: "anthropic.claude-sonnet-4-6",
-  desiredModelIds: ["anthropic.claude-haiku-5-5", "openai.gpt-6-luna"],
 } as const;
 
 export const documentConfig = {

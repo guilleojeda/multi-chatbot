@@ -10,7 +10,7 @@ Este documento fija los límites y resultados de las fases. El workflow de goal,
 - TypeScript, React y Node.js; web en S3 y CloudFront; API Gateway HTTP y Lambda para las operaciones de aplicación; infraestructura con CDK. El navegador conversa directamente con Runtime usando autenticación Cognito. Desarrollo y producción tienen recursos y datos separados.
 - Strands en AgentCore Runtime. Perfil explícito, mensajes originales y estado de las sesiones en DynamoDB; resúmenes por conversación. Inicialmente sin AgentCore Memory.
 - Documentos preparados fuera de la aplicación y almacenados en S3; una Bedrock Knowledge Base y un índice S3 Vectors por chatbot. Recuperación documental separada de generación. La información relevante de imágenes se puede transcribir durante la preparación.
-- Claude Sonnet 4.6 mediante Bedrock como modelo inicial, mientras se gestiona acceso a Claude Haiku 5.5 y GPT-6 Luna. Estos dos se conservan como candidatos posteriores, con sus respectivas APIs Converse/Messages y Responses. La elección para el piloto se hará con evaluaciones representativas.
+- Claude Sonnet 4.6 mediante Bedrock como modelo de generación. Las evaluaciones representativas comprueban la calidad del asistente con ese modelo.
 - Cuenta AWS `118903272638`, compartida por desarrollo y producción, con recursos y datos separados y tags `environment=dev` y `environment=prod`. Despliegue privilegiado compartido aceptado. Recursos en `us-east-1`; inference profiles US o global según disponibilidad, facilidad y precio. Sin restricción geográfica estricta ni presupuesto mensual fijo. Priorizar costos razonablemente bajos sin añadir complejidad para ahorros pequeños.
 - Una cuenta común con acceso, perfil y preferencias separados por chatbot. Inicialmente por invitación; email y contraseña, verificación de email y recuperación de contraseña. Para docentes, niveles educativos y materias obligatorios, admitiendo varios; preferencias opcionales y guardadas únicamente cuando el usuario las completa explícitamente.
 - El chatbot de docentes ayuda con cualquier tarea de enseñanza: información, recomendaciones y creación de materiales como texto copiable. Usa documentos y conocimiento general, indicando cuando aporta este último. No muestra citas, fragmentos ni referencias documentales al usuario. Explica discrepancias relevantes sin presentar como indiscutible una conclusión. No permite archivos de usuarios ni búsquedas web.
@@ -68,7 +68,7 @@ Se detallará solo la próxima fase contra el estado real del proyecto. Una fase
 
 **Verificación.** Desde un checkout limpio se instala el proyecto y funcionan sus comandos de setup. CI ejecuta las comprobaciones aplicables y bloquea la entrega si fallan. La identidad de CI/CD puede autenticarse en la cuenta correcta con los permisos acordados; CDK puede sintetizar y el bootstrap necesario está preparado en los ambientes definidos. Se comprueba que configuración sensible, credenciales y artefactos generados no se incorporan accidentalmente a Git. El primer despliegue funcional se verifica en la fase 2.
 
-**Límite.** No implementa login de usuarios, endpoints de negocio, chat, Runtime con un agente, persistencia conversacional ni una KB de prueba. No exige una llamada al modelo ni un recorrido de usuario para demostrar que el setup está completo. La integración funcional de Runtime, Strands y el primer modelo se verifica en la fase 4; la recuperación documental y el segundo proveedor, en la fase 6.
+**Límite.** No implementa login de usuarios, endpoints de negocio, chat, Runtime con un agente, persistencia conversacional ni una KB de prueba. No exige una llamada al modelo ni un recorrido de usuario para demostrar que el setup está completo. La integración funcional de Runtime, Strands y Sonnet se verifica en la fase 4; la recuperación documental, en la fase 6.
 
 ## Fase 2 Sitio público y cuenta
 
@@ -96,9 +96,9 @@ Se detallará solo la próxima fase contra el estado real del proyecto. Una fase
 
 **Alcance.** Interfaz de chat, Runtime con Strands, integración del modelo inicial Sonnet 4.6 y persistencia real de mensajes y estado de la conversación en DynamoDB. Usar el perfil vigente y los mensajes del hilo para responder y crear materiales como texto. Registrar desde el primer envío preguntas, respuestas, estados, contexto profesional e identificadores y datos de invocación disponibles para revisar fallos, consumo y versiones. La integración se incorpora al código de producto y se conserva en las fases siguientes.
 
-**Verificación.** Comprobar JWT directo a Runtime, streaming, la invocación del modelo exacto elegido provisionalmente y la persistencia de preguntas y resultados completos o fallidos. Resolver una consulta de enseñanza, un pedido de creación de materiales y un seguimiento dentro del mismo hilo. Comprobar que se identifica el uso de conocimiento general, se utiliza el perfil vigente y se captura su contexto profesional al registrar cada pregunta. Un perfil incompleto no puede conversar. Acceso al chatbot y propiedad de la conversación se validan antes de cargar contexto o llamar al modelo; la autenticación de Runtime no sustituye esas comprobaciones.
+**Verificación.** Comprobar JWT directo a Runtime, streaming, la invocación de Sonnet 4.6 y la persistencia de preguntas y resultados completos o fallidos. Resolver una consulta de enseñanza, un pedido de creación de materiales y un seguimiento dentro del mismo hilo. Comprobar que se identifica el uso de conocimiento general, se utiliza el perfil vigente y se captura su contexto profesional al registrar cada pregunta. Un perfil incompleto no puede conversar. Acceso al chatbot y propiedad de la conversación se validan antes de cargar contexto o llamar al modelo; la autenticación de Runtime no sustituye esas comprobaciones.
 
-**Dependencias.** Fase 3 y acceso efectivo a un modelo candidato. Sonnet 4.6 es la elección inicial confirmada; habilitar su integración no decide todavía el modelo ganador del piloto. No incluye recuperación documental, comparación de proveedores, cupos, recuperación de envíos ni listado de conversaciones anteriores: se agregan en las fases 5 a 7. Tampoco incluye selección de modelo por parte del usuario, archivos, web ni descargas de materiales.
+**Dependencias.** Fase 3 y acceso efectivo a Sonnet 4.6. No incluye recuperación documental, cupos, recuperación de envíos ni listado de conversaciones anteriores: se agregan en las fases 5 a 7. Tampoco incluye selección de modelo por parte del usuario, archivos, web ni descargas de materiales.
 
 ## Fase 5 Uso limitado y recuperación de envíos
 
@@ -112,13 +112,15 @@ Se detallará solo la próxima fase contra el estado real del proyecto. Una fase
 
 ## Fase 6 Respuestas con documentos
 
+**Estado.** Completada en desarrollo.
+
 **Resultado.** La persona consulta el contenido del proyecto y crea materiales apoyados en sus documentos. Puede hacer seguimientos, y las respuestas indican cuando añaden conocimiento general sin mostrar citas ni referencias documentales.
 
-**Alcance.** S3 para los documentos preparados, Bedrock Knowledge Base e índice S3 Vectors del chatbot; recuperación separada de generación e integrada al chat existente. La consulta de recuperación usa el contexto necesario del hilo. Incorporar el segundo proveedor candidato a ese mismo recorrido para comparar ambos modelos sobre casos equivalentes, sin agregar un selector de modelos al usuario. Registrar los datos disponibles del contenido recuperado y del modelo utilizado junto con cada consulta.
+**Alcance.** S3 para los documentos preparados, Bedrock Knowledge Base e índice S3 Vectors del chatbot; recuperación separada de generación e integrada al chat existente con Sonnet 4.6. La consulta de recuperación usa el contexto necesario del hilo. Registrar los datos disponibles del contenido recuperado y del modelo utilizado junto con cada consulta.
 
-**Verificación.** Recuperar contenido reconocible de una fuente preparada y usarlo para responder una pregunta, elaborar un material y resolver un seguimiento que dependa del hilo. Comprobar el comportamiento cuando los documentos no alcanzan y cuando contienen discrepancias: identificar el aporte general, explicar el desacuerdo y mantener la presentación sin citas visibles. Verificar las rutas exactas de ambos modelos en la cuenta elegida, con las mismas fuentes y casos. Mantener el registro del perfil y de la conversación, los cupos y la recuperación de envíos: las llamadas internas de recuperación o generación no se cuentan como nuevas consultas del usuario.
+**Verificación.** Recuperar contenido reconocible de una fuente preparada y usarlo para responder una pregunta, elaborar un material y resolver un seguimiento que dependa del hilo. Comprobar el comportamiento cuando los documentos no alcanzan y cuando contienen discrepancias: identificar el aporte general, explicar el desacuerdo y mantener la presentación sin citas visibles. Verificar la inferencia real de Sonnet 4.6 en la cuenta elegida. Mantener el registro del perfil y de la conversación, los cupos y la recuperación de envíos: las llamadas internas de recuperación o generación no se cuentan como nuevas consultas del usuario.
 
-**Dependencias.** Fase 5, documentos preparados y acceso efectivo al segundo modelo candidato. El equipo técnico carga el contenido hasta la fase 11. Si aún falta el corpus real, una fuente de prueba identificada permite verificar integración y comportamiento sobre esa fuente; no demuestra calidad del piloto. No incluye carga de archivos por usuarios, búsquedas web, edición o conversión de documentos en la aplicación ni gestión administrativa de la KB.
+**Dependencias.** Fase 5 y documentos preparados. El equipo técnico carga el contenido hasta la fase 11. Si aún falta el corpus real, una fuente de prueba identificada permite verificar integración y comportamiento sobre esa fuente; no demuestra calidad del piloto. No incluye comparación de modelos, carga de archivos por usuarios, búsquedas web, edición o conversión de documentos en la aplicación ni gestión administrativa de la KB.
 
 ## Fase 7 Historial y continuidad
 
@@ -196,7 +198,7 @@ El primer piloto queda funcionalmente completo con las fases 1 a 12. La fase 13 
 
 La apertura necesita el corpus inicial preparado y ejemplos representativos. Las evaluaciones que se incorporan desde las primeras respuestas cubren fidelidad a documentos, uso identificado de conocimiento general, utilidad de materiales, contexto profesional y continuidad. Se amplían cuando cada fase incorpora esas capacidades. No se inventan respuestas de referencia ni umbrales de aprobación antes de contar con los casos y criterios del equipo.
 
-La fase 4 empieza con Sonnet 4.6; la fase 6 habilita la comparación de Haiku y Luna con documentos. La comparación usa casos equivalentes y registra calidad, latencia y consumo para decidir el modelo del piloto. Esa elección y los ajustes de recuperación o contexto se incorporan a las entregas que los necesitan; no forman otra fase técnica separada ni sustituyen la verificación de cada incremento.
+El asistente utiliza Sonnet 4.6. Las evaluaciones orientan los ajustes de recuperación y contexto dentro de las entregas que los necesitan; no forman otra fase técnica separada ni sustituyen la verificación de cada incremento.
 
 Antes de habilitar participantes externos deben estar verificadas las capacidades del piloto, con información visible sobre el uso de preguntas y perfiles, y separación entre desarrollo y producción. Las cuentas y conversaciones del piloto se conservarán al sumar proyectos y usuarios.
 
@@ -204,8 +206,8 @@ Antes de habilitar participantes externos deben estar verificadas las capacidade
 
 - **Para preparar y verificar la fase 1:** repositorio remoto y plataforma de CI/CD, cuenta AWS y permisos para configurar accesos, roles y bootstrap. La configuración y habilitación de servicios y modelos se comprueban como parte del setup.
 - **Para el sitio y los emails de la fase 2:** identidad y textos públicos del primer proyecto, dominio y configuración de envío. No es necesario esperar estos materiales para definir el objetivo de la fase 1.
-- **Para integrar y verificar el chat en la fase 4:** acceso efectivo al candidato provisional. Los IDs, parámetros y compatibilidad de Strands y su proveedor se comprueban al implementar esta funcionalidad, no mediante una aplicación de prueba en groundwork.
-- **Para las respuestas documentales de la fase 6:** una fuente inicial preparada y acceso efectivo al segundo candidato. Verificar recuperación y compatibilidad del segundo proveedor en el recorrido de producto; usar contenido de prueba identificado si aún falta el corpus real.
+- **Para integrar y verificar el chat en la fase 4:** acceso efectivo a Sonnet 4.6. Los IDs, parámetros y compatibilidad de Strands y Bedrock se comprueban al implementar esta funcionalidad, no mediante una aplicación de prueba en groundwork.
+- **Para las respuestas documentales de la fase 6:** una fuente inicial preparada. Verificar recuperación y generación con Sonnet en el recorrido de producto; usar contenido de prueba identificado si aún falta el corpus real.
 - **Para evaluar calidad y abrir el piloto:** documentos propios preparados, ejemplos de preguntas y pedidos de materiales, y criterios de utilidad y errores inaceptables.
 - **Para la fase 13:** configuración y contenido del segundo proyecto.
 

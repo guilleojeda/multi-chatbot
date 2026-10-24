@@ -70,7 +70,7 @@ La configuración pública utilizada por CDK y los scripts vive en `config/proje
 - Cuenta **118903272638**, región **us-east-1**.
 - Ambientes `dev` y `prod`, con prefijos distintos y tags AWS `environment=dev` o `environment=prod` para sus recursos propios.
 - `resolveEnvironment(environment, botId?)` valida la selección y deriva nombres por chatbot. No crea instancias de aplicación.
-- Modelo inicial: generación Sonnet 4.6 mediante `global.anthropic.claude-sonnet-4-6` y cliente Bedrock en `us-east-1`; el conteo previo usa `CountTokens` con el modelo base `anthropic.claude-sonnet-4-6` en esa región. Haiku 5.5 y GPT-6 Luna permanecen como candidatos posteriores; no hay fallback automático.
+- Modelo: generación Sonnet 4.6 mediante `global.anthropic.claude-sonnet-4-6` y cliente Bedrock en `us-east-1`; el conteo previo usa `CountTokens` con el modelo base `anthropic.claude-sonnet-4-6` en esa región. No hay fallback automático.
 
 El acceso humano usa una sesión temporal de la identidad autorizada de esta cuenta. Obtenerla o renovarla desde el acceso AWS de la organización y cargar sus variables en la terminal, o utilizar un perfil propio de IAM Identity Center con AWS CLI v2. El start URL y el acceso de cada integrante los suministra la organización; no se comparten credenciales entre integrantes. Para un perfil configurado:
 
