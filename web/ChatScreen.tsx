@@ -5,17 +5,6 @@ export type ChatProfileStatus = "loading" | "incomplete" | "error" | "complete";
 export type ChatQueryStatus =
   "idle" | "sending" | "streaming" | "completed" | "failed" | "rejected" | "unconfirmed";
 
-export type PreviousChatTurn = {
-  question: string;
-  answer: string;
-  status: "completed" | "failed" | "in_progress";
-  queryId?: string;
-  ordinal?: number;
-  questionComplete?: boolean;
-  answerComplete?: boolean;
-  failure?: { code?: string; message?: string };
-};
-
 export type ChatHistoryConversation = {
   conversationId: string;
   label: string;
@@ -26,9 +15,11 @@ export type ChatHistoryConversation = {
   activeQueryId?: string;
 };
 
-export type ChatHistoryTurn = PreviousChatTurn & {
+export type ChatHistoryTurn = {
   ordinal: number;
   queryId: string;
+  question: string;
+  answer: string;
   status: "in_progress" | "completed" | "failed";
   questionComplete: boolean;
   answerComplete: boolean;
@@ -62,7 +53,6 @@ export type ChatScreenState = {
   draft?: string;
   answerComplete?: boolean;
   queryId?: string;
-  previousTurns?: PreviousChatTurn[];
   question?: string;
   answer?: string;
   ordinal?: number;
@@ -156,24 +146,12 @@ export function ChatScreen({
     previousCopyTargetsRef.current.clear();
     currentCopyTargetRef.current = null;
   }
-  const historyTurns = state.history?.turns || [];
-  const previousTurns: PreviousChatTurn[] = state.history
-    ? historyTurns.map((turn) => ({
-        question: turn.question,
-        answer: turn.answer,
-        status: turn.status,
-        queryId: turn.queryId,
-        ordinal: turn.ordinal,
-        questionComplete: turn.questionComplete,
-        answerComplete: turn.answerComplete,
-        failure: turn.failure,
-      }))
-    : state.previousTurns || [];
+  const historyTurns = state.history?.turns ?? [];
   const currentTurnAlreadyInHistory = Boolean(
     state.queryId && historyTurns.some((turn) => turn.queryId === state.queryId),
   );
   const hasConversation =
-    previousTurns.length > 0 ||
+    historyTurns.length > 0 ||
     Boolean(state.question || state.answer) ||
     state.queryStatus !== "idle";
 
@@ -184,17 +162,12 @@ export function ChatScreen({
   }
   sawConversationRef.current = hasConversation;
 
-  function copyTargetKeyForPrevious(
-    turn: Pick<PreviousChatTurn, "queryId" | "ordinal">,
-    index: number,
-  ): string {
-    if (turn.queryId) return `query:${turn.queryId}`;
-    if (turn.ordinal !== undefined) return `ordinal:${turn.ordinal}`;
-    return `index:${index}`;
+  function copyTargetKeyForPrevious(turn: Pick<ChatHistoryTurn, "queryId">): string {
+    return turn.queryId;
   }
 
-  function copyTargetForPrevious(turn: PreviousChatTurn, index: number): CopyTarget {
-    const key = copyTargetKeyForPrevious(turn, index);
+  function copyTargetForPrevious(turn: ChatHistoryTurn): CopyTarget {
+    const key = copyTargetKeyForPrevious(turn);
     const current = previousCopyTargetsRef.current.get(key);
     if (current) return current;
     const target = createCopyTarget();
@@ -222,7 +195,7 @@ export function ChatScreen({
     draft.trim().length > 0;
   const showConversation =
     state.profileStatus === "complete" ||
-    previousTurns.length > 0 ||
+    historyTurns.length > 0 ||
     Boolean(state.question || state.answer) ||
     state.queryStatus !== "idle";
   const showComposer =
@@ -248,7 +221,7 @@ export function ChatScreen({
           ? "Recuperando el último envío…"
           : "Generando respuesta…"
         : state.queryStatus === "idle"
-          ? previousTurns.length > 0
+          ? historyTurns.length > 0
             ? "Escribí un seguimiento para continuar este hilo."
             : "Escribí una consulta para empezar."
           : state.queryStatus === "completed"
@@ -297,19 +270,10 @@ export function ChatScreen({
     if (
       (state.queryStatus === "completed" || state.queryStatus === "failed") &&
       state.answer &&
-      currentCopyTargetRef.current
+      currentCopyTargetRef.current &&
+      state.queryId
     ) {
-      const existingIndex = previousTurns.findIndex(
-        (turn) => turn.queryId && turn.queryId === state.queryId,
-      );
-      const turn =
-        existingIndex >= 0
-          ? previousTurns[existingIndex]
-          : { queryId: state.queryId, ordinal: state.ordinal };
-      const key = copyTargetKeyForPrevious(
-        turn,
-        existingIndex >= 0 ? existingIndex : previousTurns.length,
-      );
+      const key = copyTargetKeyForPrevious({ queryId: state.queryId });
       previousCopyTargetsRef.current.set(key, currentCopyTargetRef.current);
     }
     currentCopyTargetRef.current = null;
@@ -536,10 +500,10 @@ export function ChatScreen({
                     consumido no se devuelve.
                   </p>
                 ) : null}
-                {previousTurns.length > 0 ? (
+                {historyTurns.length > 0 ? (
                   <ol className="chat-previous-turns" aria-label="Intercambios anteriores">
-                    {previousTurns.map((turn, index) => {
-                      const copyTarget = copyTargetForPrevious(turn, index);
+                    {historyTurns.map((turn, index) => {
+                      const copyTarget = copyTargetForPrevious(turn);
                       const isCurrentTurn = Boolean(turn.queryId && turn.queryId === state.queryId);
                       const canCopyTurn =
                         (turn.status === "completed" && turn.answerComplete !== false) ||

@@ -152,6 +152,33 @@ function props(state, onCopy = vi.fn(), onSubmit = vi.fn(), onReset = vi.fn()) {
   };
 }
 
+function history(turns = [], selectedConversationId = "conversation-a") {
+  return {
+    status: "ready",
+    conversations: [],
+    nextCursor: null,
+    loadingMore: false,
+    selectedConversationId,
+    turnsStatus: "ready",
+    turns,
+    turnsNextCursor: null,
+    refreshRequired: false,
+  };
+}
+
+function turn({ ordinal, queryId, question, answer, status = "completed", answerComplete = true }) {
+  return {
+    ordinal,
+    queryId,
+    question,
+    answer,
+    status,
+    questionComplete: true,
+    answerComplete,
+    canContinue: true,
+  };
+}
+
 describe("copy feedback follows its answer and operation", () => {
   it("keeps a pending answer's failure with it after submitting a follow-up", async () => {
     const answer = "Respuesta A\ncon acentos: acción, ñ.";
@@ -163,8 +190,11 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "completed",
+          queryId: "query-a",
+          ordinal: 1,
           question: "Pregunta A",
           answer,
+          history: history([]),
         },
         onCopy,
         onSubmit,
@@ -189,9 +219,12 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "streaming",
+          queryId: "query-b",
           question: "Pregunta B",
           answer: "Prefijo B",
-          previousTurns: [{ question: "Pregunta A", answer, status: "completed" }],
+          history: history([
+            turn({ ordinal: 1, queryId: "query-a", question: "Pregunta A", answer }),
+          ]),
         },
         onCopy,
         onSubmit,
@@ -220,9 +253,12 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "failed",
+          queryId: "query-a",
+          ordinal: 1,
           question: "Pregunta A",
           answer,
           canContinue: true,
+          history: history([]),
         },
         onCopy,
         onSubmit,
@@ -247,9 +283,19 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "streaming",
+          queryId: "query-b",
           question: "Pregunta B",
           answer: "Prefijo B",
-          previousTurns: [{ question: "Pregunta A", answer, status: "failed" }],
+          history: history([
+            turn({
+              ordinal: 1,
+              queryId: "query-a",
+              question: "Pregunta A",
+              answer,
+              status: "failed",
+              answerComplete: false,
+            }),
+          ]),
         },
         onCopy,
         onSubmit,
@@ -333,9 +379,13 @@ describe("copy feedback follows its answer and operation", () => {
         {
           profileStatus: "complete",
           queryStatus: "completed",
+          queryId: "query-b",
+          ordinal: 2,
           question: "Pregunta B",
           answer,
-          previousTurns: [{ question: "Pregunta A", answer, status: "completed" }],
+          history: history([
+            turn({ ordinal: 1, queryId: "query-a", question: "Pregunta A", answer }),
+          ]),
         },
         onCopy,
       ),
