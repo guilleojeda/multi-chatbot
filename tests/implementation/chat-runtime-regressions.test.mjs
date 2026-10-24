@@ -1,3 +1,4 @@
+import { prepareUnchangedContext } from "../support/context-preparation.mjs";
 import { describe, expect, it, vi } from "vitest";
 import { createChatHandler, createChatInvocationHandler } from "../../runtime/chat.ts";
 import { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
@@ -244,6 +245,7 @@ function makeHarness({
       },
       ...(typeof storeOverrides === "function" ? storeOverrides(state) : storeOverrides),
     },
+    prepareContext: prepareUnchangedContext,
     prepareDocuments,
     countInputTokens,
     generate(input) {

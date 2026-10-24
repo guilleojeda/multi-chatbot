@@ -2,7 +2,7 @@
 
 Repositorio común para los chatbots del proyecto. Incluye el sitio público, cuenta por invitación, perfil profesional y conversación docente con documentos y Sonnet 4.6, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
 
-El [chat](docs/intent/chat.md) permite elegir conversaciones del historial y continuarlas desde otra sesión o navegador. Los originales y estados permanecen en DynamoDB; abrirlos usa la API HTTP, mientras la generación conserva el acceso directo a Runtime. Un perfil incompleto permite leer el historial y debe completarse para enviar un pedido nuevo.
+El [chat](docs/intent/chat.md) permite elegir conversaciones del historial y continuarlas desde otra sesión o navegador, también después de reiniciar Runtime. Los hilos largos usan un resumen recurrente y cuatro pares recientes tanto para responder como para preparar la búsqueda documental; los originales y estados permanecen íntegros en DynamoDB. Abrirlos usa la API HTTP, mientras la generación conserva el acceso directo a Runtime. Un perfil incompleto permite leer el historial y debe completarse para enviar un pedido nuevo.
 
 ## Preparar un checkout
 

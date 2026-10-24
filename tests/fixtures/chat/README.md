@@ -199,6 +199,16 @@ fixture conversation turn or usage record is created; they do not call AWS:
   admitted product journal should no longer contain the body. Emit the remaining fragment, complete,
   and copy the answer; compare the intercepted clipboard text with the exact visible answer. The
   fixture never writes to the operating-system clipboard.
+- **Context preparation failure and explicit retry:** select `runtime-context-unavailable` before
+  either starting a conversation or following up on a completed one. The mock returns a failed SSE
+  event with `context_unavailable`, `recordStatus: "not_admitted"`, and the request's same
+  `queryId`; it creates no conversation/turn and consumes no simulated quota. The event deliberately
+  contains a private sentinel message. The UI should show only its safe public explanation, retain
+  the draft and exact pending product-journal body/IDs, and issue no second Runtime POST by itself.
+  Select `ready` and click “Reintentar el mismo envío.” Compare the retry's operation, conversation
+  ID, query ID, base ordinal, and text with the first POST. For a follow-up, the prior completed turn
+  must remain the only turn until this explicit retry succeeds. This fixture checks the client
+  behavior; Runtime acceptance verifies the actual context-preparation boundary.
 - **Uncertain retry and reload:** after a completed turn, select `runtime-documents-unavailable`
   and submit a follow-up. Reject the pending preparation with “Simular falla de documentos,” then
   select `runtime-unconfirmed` and click “Reintentar el mismo envío.” Wait for `recover` to report

@@ -62,6 +62,27 @@ function requestsForCountingAndGeneration() {
       systemPrompt,
       profileSnapshot: profile,
       text: followupText,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              text: `<resumen_contexto_json>\n${JSON.stringify('Material previo: grupos de tres; rúbrica "A/B/C"; versión de 40 minutos. 🧭')}\n</resumen_contexto_json>`,
+            },
+            ...historyPair(29)[0].content,
+          ],
+        },
+        historyPair(29)[1],
+        ...[30, 31, 32].flatMap(historyPair),
+      ],
+      modelId: generationModelId,
+      revision: "provider-acceptance-revision",
+      resultDeadlineAt,
+    },
+    {
+      systemPrompt,
+      profileSnapshot: profile,
+      text: followupText,
       messages: history,
       modelId: generationModelId,
       revision: "provider-acceptance-revision",
@@ -186,7 +207,7 @@ afterEach(() => {
 });
 
 describe("Bedrock input counting and generation request parity", () => {
-  it("counts the exact documentary system and ordered messages sent by real Strands for a start and long follow-up", async () => {
+  it("counts the exact documentary system and ordered messages sent by real Strands for a start, full history and summary with recent pairs", async () => {
     configureLogging({ debug() {}, info() {}, warn() {}, error() {} });
     const createCounter = requireCapability("createBedrockTokenCounter");
     const countInputTokens = createCounter({ region: "us-east-1" });
@@ -219,7 +240,7 @@ describe("Bedrock input counting and generation request parity", () => {
       },
     );
 
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(requests.length * 2);
     for (let index = 0; index < requests.length; index += 1) {
       const countCommand = calls[index * 2];
       const generationCommand = calls[index * 2 + 1];

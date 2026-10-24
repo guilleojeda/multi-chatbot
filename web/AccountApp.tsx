@@ -2274,7 +2274,7 @@ export function AccountApp({
       pendingRequestMatches &&
       current.queryStatus === "rejected" &&
       current.canRetry === true &&
-      ["token_count_unavailable", "documents_unavailable"].includes(
+      ["token_count_unavailable", "documents_unavailable", "context_unavailable"].includes(
         current.queryErrorCode?.toLowerCase() || "",
       );
     const retrying = retryingUnconfirmed || retryingPreAdmissionFailure;
@@ -2615,8 +2615,9 @@ export function AccountApp({
         }
         const failureCode = result.code.toLowerCase();
         const retryablePreAdmissionFailure =
-          ["token_count_unavailable", "documents_unavailable"].includes(failureCode) &&
-          result.recordStatus === "not_admitted";
+          ["token_count_unavailable", "documents_unavailable", "context_unavailable"].includes(
+            failureCode,
+          ) && result.recordStatus === "not_admitted";
         const preserveUnconfirmedJournal =
           retryingUnconfirmed &&
           result.recordStatus === "not_admitted" &&

@@ -1,3 +1,4 @@
+import { prepareUnchangedContext } from "../support/context-preparation.mjs";
 import { BedrockModel } from "@strands-agents/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createStrandsGenerator } from "../../runtime/provider.ts";
@@ -235,6 +236,7 @@ function makeHandler() {
         }
       },
     },
+    prepareContext: prepareUnchangedContext,
     async prepareDocuments() {
       return {
         knowledgeBaseId: "kb-test-aurora",

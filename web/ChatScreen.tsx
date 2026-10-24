@@ -444,6 +444,12 @@ export function ChatScreen({
               Las conversaciones se guardan para que puedas consultarlas y continuarlas desde otra
               sesión.
             </p>
+            {historyTurns.length > 0 ? (
+              <p className="chat-context-note" role="note">
+                En conversaciones largas usamos un resumen para continuar. Los mensajes originales
+                siguen disponibles en el historial
+              </p>
+            ) : null}
 
             <nav className="chat-account-actions" aria-label="Acciones de cuenta">
               <a className="account-button account-button--secondary" href="/#/profile">

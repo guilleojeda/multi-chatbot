@@ -22,6 +22,10 @@ export const fixtureScenarios = [
   { id: "config-temporary", label: "Configuración pública: fallo temporal 503" },
   { id: "runtime-admission-pending", label: "Runtime: admisión retenida" },
   { id: "runtime-unconfirmed", label: "Runtime: lookup sin confirmar (sin admisión)" },
+  {
+    id: "runtime-context-unavailable",
+    label: "Runtime: preparación de contexto no disponible (sin admisión)",
+  },
   { id: "runtime-temporary", label: "Runtime: fallo temporal 503" },
   { id: "runtime-recover-network", label: "Runtime: fallo de red solo en recover" },
   { id: "runtime-quota-daily", label: "Runtime: cupo diario agotado" },
@@ -1315,6 +1319,19 @@ export class ChatBrowserFixture {
         message: "No pudimos confirmar el estado del envío. Podés reintentar el mismo pedido.",
         recordStatus: "unconfirmed",
         queryId,
+      });
+    }
+
+    if (this.selectedScenario === "runtime-context-unavailable") {
+      this.finish(request, 200, "preparación de contexto rechazada antes de admitir; sin consumo");
+      return sseResponse({
+        type: "failed",
+        code: "context_unavailable",
+        message:
+          "INTERNAL_CONTEXT_DETAILS_DO_NOT_DISPLAY requestId=context-secret-42 prompt=private",
+        recordStatus: "not_admitted",
+        queryId,
+        canContinue: operation === "message",
       });
     }
 

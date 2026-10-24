@@ -7,14 +7,17 @@ import type {
   ConversationMeta,
   ConversationStore,
   ContextReference,
+  ContextSnapshot,
   DocumentContext,
   FailTurnInput,
   GenerationInput,
   ModelInput,
+  PreparedContext,
   QuotaView,
   StartTurnInput,
   ContinueTurnInput,
   SubmissionSnapshot,
+  SummaryVersion,
   TokenCountResult,
 } from "./contracts.js";
 import { maxInputTokens } from "./model-capacity.js";
@@ -66,6 +69,10 @@ type ChatDependencies = {
   accounts: { hasMember(input: { sub: string; botId: string }): Promise<boolean> };
   profiles: ProfileStore;
   store: ConversationStore;
+  prepareContext(
+    input: ModelInput,
+    context: { references: ContextReference[]; summary?: SummaryVersion },
+  ): Promise<PreparedContext>;
   prepareDocuments(input: ModelInput): Promise<DocumentContext>;
   countInputTokens(
     input: ModelInput,
@@ -360,7 +367,8 @@ function isDocumentContext(value: unknown): value is DocumentContext {
 }
 
 function preparationLogDetails(error: unknown): {
-  stage: DocumentPreparationStage | "preparation";
+  stage:
+    DocumentPreparationStage | "trigger_count" | "summary_count" | "summarization" | "preparation";
   reason: string;
   requestId?: string;
   metrics?: Record<string, number>;
@@ -369,7 +377,10 @@ function preparationLogDetails(error: unknown): {
   const stage =
     value.stage === "auxiliary_count" ||
     value.stage === "reformulation" ||
-    value.stage === "retrieval"
+    value.stage === "retrieval" ||
+    value.stage === "trigger_count" ||
+    value.stage === "summary_count" ||
+    value.stage === "summarization"
       ? value.stage
       : "preparation";
   const reason =
@@ -581,8 +592,20 @@ function providerDispatch(input: {
 }
 
 export function createChatHandler(dependencies: ChatDependencies) {
-  const { config, accounts, profiles, store, prepareDocuments, countInputTokens, generate, now } =
-    dependencies;
+  const {
+    config,
+    accounts,
+    profiles,
+    store,
+    prepareContext,
+    prepareDocuments,
+    countInputTokens,
+    generate,
+    now,
+  } = dependencies;
+  if (typeof prepareContext !== "function") {
+    throw new TypeError("The chat Runtime requires context preparation.");
+  }
   if (typeof prepareDocuments !== "function") {
     throw new TypeError("The chat Runtime requires document preparation.");
   }
@@ -645,6 +668,26 @@ export function createChatHandler(dependencies: ChatDependencies) {
     }
     const reject = (failure: ReturnType<typeof safeFailure>) =>
       rejectAfterSubmissionLookup(request, profileKey, store, failure);
+    const rejectContext = (error: unknown, stage?: "context_read") => {
+      const details = preparationLogDetails(error);
+      console.info(
+        JSON.stringify({
+          event: "chat_context_preparation_failed",
+          botId: config.botId,
+          conversationId: request.conversationId,
+          queryId: request.queryId,
+          revision: config.revision,
+          ...details,
+          ...(stage ? { stage } : {}),
+        }),
+      );
+      return reject(
+        safeFailure("context_unavailable", "not_admitted", request.queryId, {
+          message:
+            "No pudimos preparar el contexto de esta conversación. Conservá el texto y volvé a intentarlo.",
+        }),
+      );
+    };
 
     let meta: ConversationMeta | null;
     try {
@@ -739,20 +782,22 @@ export function createChatHandler(dependencies: ChatDependencies) {
 
     let messages: ModelInput["messages"] = [];
     let contextReferences: ContextReference[] = [];
+    let summary: SummaryVersion | undefined;
     if (request.operation === "message") {
       try {
         const context = await store.readContext({ conversationId: request.conversationId });
         messages = structuredClone(context.messages);
         contextReferences = structuredClone(context.references);
-      } catch {
-        return reject(safeFailure("temporarily_unavailable", "not_admitted"));
+        summary = context.summary === undefined ? undefined : structuredClone(context.summary);
+      } catch (error) {
+        return rejectContext(error, "context_read");
       }
     }
 
     const profileSnapshot = structuredClone(
       makeProfileSnapshot(storedProfile, config.profile, config.botId, config.revision),
     );
-    const preparationInput: ModelInput = {
+    let preparationInput: ModelInput = {
       systemPrompt: profilePrompt(profileSnapshot, config),
       profileSnapshot,
       text: request.text,
@@ -782,6 +827,57 @@ export function createChatHandler(dependencies: ChatDependencies) {
     }
     if (quota.daily.used >= quota.daily.limit || quota.monthly.used >= quota.monthly.limit) {
       return reject(safeFailure("quota_exceeded", "not_admitted", request.queryId, { quota }));
+    }
+
+    let contextSnapshot: ContextSnapshot;
+    let summaryCandidate: SummaryVersion | undefined;
+    try {
+      const prepared = await prepareContext(preparationInput, {
+        references: contextReferences,
+        ...(summary ? { summary } : {}),
+      });
+      preparationInput = { ...preparationInput, messages: structuredClone(prepared.messages) };
+      contextReferences = structuredClone(prepared.references);
+      contextSnapshot = structuredClone(prepared.contextSnapshot);
+      summaryCandidate =
+        prepared.summaryCandidate === undefined
+          ? undefined
+          : structuredClone(prepared.summaryCandidate);
+      if (prepared.triggerCount || contextSnapshot.summary)
+        console.info(
+          JSON.stringify({
+            event: "chat_context_prepared",
+            stage: "context_preparation",
+            botId: config.botId,
+            conversationId: request.conversationId,
+            queryId: request.queryId,
+            revision: config.revision,
+            recentPairs: contextReferences.length,
+            ...(contextSnapshot.summary
+              ? {
+                  summaryId: contextSnapshot.summary.summaryId,
+                  throughOrdinal: contextSnapshot.summary.throughOrdinal,
+                }
+              : {}),
+            summaryUpdated: summaryCandidate !== undefined,
+            ...(prepared.triggerCount
+              ? {
+                  triggerInputTokens: prepared.triggerCount.inputTokens,
+                  triggerCountRequestId: nativeCountRequestId(prepared.triggerCount.requestId),
+                }
+              : {}),
+            ...(summaryCandidate
+              ? {
+                  summaryInputTokens: summaryCandidate.inputTokens,
+                  countRequestId: nativeCountRequestId(summaryCandidate.countRequestId),
+                  requestId: nativeCountRequestId(summaryCandidate.requestId),
+                  ...(summaryCandidate.metrics ? { metrics: summaryCandidate.metrics } : {}),
+                }
+              : {}),
+          }),
+        );
+    } catch (error) {
+      return rejectContext(error);
     }
 
     let documentContext: DocumentContext;
@@ -872,6 +968,8 @@ export function createChatHandler(dependencies: ChatDependencies) {
         text: request.text,
         profileSnapshot,
         documentContext,
+        contextSnapshot,
+        ...(summaryCandidate ? { summaryCandidate } : {}),
         invocation,
         quota,
         requestFingerprint,

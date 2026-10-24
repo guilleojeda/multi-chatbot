@@ -1,3 +1,4 @@
+import { prepareUnchangedContext } from "../support/context-preparation.mjs";
 import { describe, expect, it } from "vitest";
 import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createChatHandler } from "../../runtime/chat.ts";
@@ -333,6 +334,7 @@ function makeHarness(options = {}) {
       },
     },
     store: conversationStore,
+    prepareContext: prepareUnchangedContext,
     async prepareDocuments() {
       return {
         knowledgeBaseId: "kb-test-aurora",

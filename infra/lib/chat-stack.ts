@@ -20,7 +20,11 @@ import type { Construct } from "constructs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { documentConfig, type ResolvedBotEnvironment } from "../../config/project.js";
+import {
+  documentConfig,
+  summaryConfig,
+  type ResolvedBotEnvironment,
+} from "../../config/project.js";
 import type { AccountStack } from "./account-stack.js";
 import { DocumentInfrastructure } from "./documents.js";
 import type { SharedIdentityStack } from "./shared-identity-stack.js";
@@ -170,6 +174,9 @@ export class ChatStack extends Stack {
         KNOWLEDGE_BASE_ID: this.documents.knowledgeBase.attrKnowledgeBaseId,
         DOCUMENTS_REVISION: documentConfig.revision,
         DOCUMENT_PREPARATION_TIMEOUT_MS: String(documentConfig.preparationTimeoutMs),
+        SUMMARY_TRIGGER_TOKENS: String(summaryConfig.triggerTokens),
+        SUMMARY_RECENT_PAIRS: String(summaryConfig.recentPairs),
+        SUMMARY_PREPARATION_TIMEOUT_MS: String(summaryConfig.preparationTimeoutMs),
         AWS_REGION: environment.region,
       },
       tags: {

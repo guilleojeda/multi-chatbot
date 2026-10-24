@@ -1,3 +1,4 @@
+import { prepareUnchangedContext } from "../support/context-preparation.mjs";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -400,6 +401,7 @@ function makeHarness({
             },
           },
           store,
+          prepareContext: prepareUnchangedContext,
           async prepareDocuments(input) {
             state.calls.push(["prepareDocuments", clone(input)]);
             return {
