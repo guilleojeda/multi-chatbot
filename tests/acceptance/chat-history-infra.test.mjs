@@ -510,7 +510,7 @@ describe("chat history infrastructure template acceptance", () => {
       const pool = onlyRecord(templates.identityTemplate, "AWS::Cognito::UserPool");
       expect(runtime.logicalId).toBe(expectedRuntimeId);
       expect(table.logicalId).toBe(expectedConversationTableId);
-      expect(api.properties.ApiName).toBe(
+      expect(api.properties.Name).toBe(
         `${resolveEnvironment(environment, "docentes").botResourcePrefix}-account`,
       );
       expect(client.properties.UserPoolId).toBeDefined();
@@ -552,7 +552,7 @@ describe("chat history infrastructure template acceptance", () => {
         botId,
         tableName: namedIdentity(table, "TableName", bot.chatStackName),
         runtimeName: namedIdentity(runtime, "AgentRuntimeName", bot.chatStackName),
-        accountApiName: namedIdentity(api, "ApiName", bot.accountStackName),
+        accountApiName: namedIdentity(api, "Name", bot.accountStackName),
         accountTableName: namedIdentity(accountTable, "TableName", bot.accountStackName),
         handler,
         stack: bot,
