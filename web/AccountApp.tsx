@@ -104,6 +104,64 @@ function emptyHistoryState(): ChatHistoryState {
   };
 }
 
+function mergeHistoryConversations(
+  local: Map<string, ChatHistoryState["conversations"][number]>,
+  serverPage: ChatHistoryState["conversations"],
+  existing: ChatHistoryState["conversations"],
+) {
+  const uniqueServerPage = new Map<string, ChatHistoryState["conversations"][number]>();
+  for (const conversation of serverPage) {
+    const previous = uniqueServerPage.get(conversation.conversationId);
+    if (!previous || conversation.lastOrdinal >= previous.lastOrdinal) {
+      uniqueServerPage.set(conversation.conversationId, conversation);
+    }
+  }
+  const authoritativePage = [...uniqueServerPage.values()];
+  const serverById = new Map(
+    authoritativePage.map((conversation) => [conversation.conversationId, conversation]),
+  );
+  for (const [conversationId, server] of serverById) {
+    const localConversation = local.get(conversationId);
+    if (localConversation && server.lastOrdinal >= localConversation.lastOrdinal) {
+      local.delete(conversationId);
+    }
+  }
+  const localById = new Map(local);
+  const localAhead = [...localById.values()]
+    .filter((conversation) => {
+      const server = serverById.get(conversation.conversationId);
+      return !server || conversation.lastOrdinal > server.lastOrdinal;
+    })
+    .sort((left, right) => {
+      const leftUpdatedAt = left.updatedAt ? Date.parse(left.updatedAt) : Number.NEGATIVE_INFINITY;
+      const rightUpdatedAt = right.updatedAt
+        ? Date.parse(right.updatedAt)
+        : Number.NEGATIVE_INFINITY;
+      return (
+        rightUpdatedAt - leftUpdatedAt || left.conversationId.localeCompare(right.conversationId)
+      );
+    });
+  const localAheadIds = new Set(localAhead.map((conversation) => conversation.conversationId));
+  const serverIds = new Set(serverById.keys());
+  const preserved = existing.filter(
+    (conversation) =>
+      !serverIds.has(conversation.conversationId) &&
+      !localAheadIds.has(conversation.conversationId),
+  );
+  const authoritativeServerPage = authoritativePage.filter((conversation) => {
+    const localConversation = localById.get(conversation.conversationId);
+    return !localConversation || localConversation.lastOrdinal <= conversation.lastOrdinal;
+  });
+  const merged = new Map<string, ChatHistoryState["conversations"][number]>();
+  for (const conversation of [...localAhead, ...preserved, ...authoritativeServerPage]) {
+    const previous = merged.get(conversation.conversationId);
+    if (!previous || conversation.lastOrdinal >= previous.lastOrdinal) {
+      merged.set(conversation.conversationId, conversation);
+    }
+  }
+  return [...merged.values()];
+}
+
 function historyErrorMessage(code: string, status: number, opening = false) {
   if (code === "FORBIDDEN" || status === 403) return "No tenés acceso a esta conversación.";
   if (code === "UNAUTHORIZED" || status === 401)
@@ -1408,6 +1466,9 @@ export function AccountApp({
         },
       });
       ensureConversationVisibleFromHistory(view);
+      if (last?.status === "completed" || last?.status === "failed") {
+        markLocalConversationTerminal(conversationId, view.throughOrdinal, view.closed);
+      }
       setChatRecoveryRevision((revision) => revision + 1);
       return true;
     } catch (error) {
@@ -1462,36 +1523,12 @@ export function AccountApp({
     try {
       const page = await listChatConversations(config, session, cursor, isActive);
       if (!isActive()) return;
-      const serverIds = new Set(
-        page.conversations.map((conversation) => conversation.conversationId),
-      );
-      const localOnly = [...localConversationsRef.current.values()]
-        .filter((conversation) => !serverIds.has(conversation.conversationId))
-        .sort((left, right) => {
-          const leftUpdatedAt = left.updatedAt
-            ? Date.parse(left.updatedAt)
-            : Number.NEGATIVE_INFINITY;
-          const rightUpdatedAt = right.updatedAt
-            ? Date.parse(right.updatedAt)
-            : Number.NEGATIVE_INFINITY;
-          return (
-            rightUpdatedAt - leftUpdatedAt ||
-            left.conversationId.localeCompare(right.conversationId)
-          );
-        });
       const existing = retryFromStart ? [] : before.conversations;
-      const combined = retryFromStart
-        ? [...page.conversations, ...localOnly]
-        : [...localOnly, ...existing, ...page.conversations];
-      const unique = new Map<string, (typeof combined)[number]>();
-      for (const conversation of combined) {
-        const prior = unique.get(conversation.conversationId);
-        unique.set(
-          conversation.conversationId,
-          prior ? { ...prior, ...conversation } : conversation,
-        );
-      }
-      const conversations = [...unique.values()];
+      const conversations = mergeHistoryConversations(
+        localConversationsRef.current,
+        page.conversations,
+        existing,
+      );
       setHistory((history) => ({
         ...history,
         status: conversations.length === 0 && !page.nextCursor ? "empty" : "ready",
@@ -1628,18 +1665,17 @@ export function AccountApp({
           }
         }
         if (!selectedId && journals.size > 0) selectedId = journals.keys().next().value ?? null;
-        const conversations = [...localConversationsRef.current.values(), ...page.conversations];
-        const unique = new Map<string, (typeof conversations)[number]>();
-        for (const conversation of conversations) {
-          const old = unique.get(conversation.conversationId);
-          unique.set(conversation.conversationId, old ? { ...old, ...conversation } : conversation);
-        }
+        const conversations = mergeHistoryConversations(
+          localConversationsRef.current,
+          page.conversations,
+          [],
+        );
         setChat({
           ...chatScreenStateRef.current,
           history: {
             ...(chatScreenStateRef.current.history ?? emptyHistoryState()),
-            status: unique.size === 0 && !page.nextCursor ? "empty" : "ready",
-            conversations: [...unique.values()],
+            status: conversations.length === 0 && !page.nextCursor ? "empty" : "ready",
+            conversations,
             nextCursor: page.nextCursor,
             loadingMore: false,
             selectedConversationId: selectedId,

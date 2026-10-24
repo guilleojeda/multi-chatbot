@@ -9,8 +9,15 @@ import {
   mountHistoryAccountApp,
   secondConversationId,
   secondQueryId,
+  thirdQueryId,
   streamResponse,
 } from "../support/history-web-harness.mjs";
+import {
+  markChatJournalAdmitted,
+  readChatJournals,
+  writeChatSelection,
+  writePendingChatJournal,
+} from "../../web/chat-journal.ts";
 
 let AccountApp;
 let disposeAccountAppModule;
@@ -589,5 +596,180 @@ describe("AccountApp history text cursor regressions", () => {
     expect(
       app.current()?.props?.state?.history?.conversations.map((item) => item.conversationId),
     ).toEqual([conversationB, conversationA]);
+  });
+
+  it("lets an indexed terminal turn supersede its stale admitted journal on remount", async () => {
+    let listCalls = 0;
+    const environment = createHistoryEnvironment({
+      listHandler: async () => {
+        listCalls += 1;
+        if (listCalls === 2) {
+          return jsonResponse({ version: 1, conversations: [], nextCursor: "overlap-page" });
+        }
+        const conversations =
+          listCalls === 3
+            ? [
+                {
+                  conversationId: secondConversationId,
+                  label: "B2 estado previo activo",
+                  lastOrdinal: 2,
+                  closed: false,
+                  activeQueryId: secondQueryId,
+                  updatedAt: "2026-10-24T18:22:35.424Z",
+                },
+              ]
+            : [
+                {
+                  conversationId: firstConversationId,
+                  label: "A3 reciente",
+                  lastOrdinal: 3,
+                  closed: false,
+                  updatedAt: "2026-10-24T18:26:34.210Z",
+                },
+                {
+                  conversationId: secondConversationId,
+                  label: "B2 terminal",
+                  lastOrdinal: 2,
+                  closed: false,
+                  updatedAt: "2026-10-24T18:22:35.424Z",
+                },
+              ];
+        return jsonResponse({
+          version: 1,
+          conversations,
+          ...(listCalls === 1 ? { nextCursor: "empty-page" } : {}),
+        });
+      },
+      turnsHandler: async ({ conversationId }) => {
+        const turns =
+          conversationId === secondConversationId
+            ? [
+                { ordinal: 1, queryId: firstQueryId },
+                { ordinal: 2, queryId: secondQueryId },
+              ]
+            : [{ ordinal: 3, queryId: thirdQueryId }];
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: turns.at(-1).ordinal,
+          closed: false,
+          canContinue: true,
+          turns: turns.map(({ ordinal, queryId }) => ({
+            ordinal,
+            queryId,
+            status: "completed",
+            questionManifest: { count: 1, complete: true },
+            answerManifest: { count: 1, complete: true },
+            cursor: 1,
+          })),
+        });
+      },
+      textHandler: async ({ conversationId, ordinal, url }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          queryId:
+            conversationId === secondConversationId
+              ? ordinal === 1
+                ? firstQueryId
+                : secondQueryId
+              : thirdQueryId,
+          ordinal,
+          role: url.searchParams.get("role"),
+          chunks: [{ index: 0, text: `turn-${ordinal}` }],
+          complete: true,
+        }),
+    });
+    const admittedRequest = {
+      version: 2,
+      operation: "message",
+      conversationId: secondConversationId,
+      queryId: secondQueryId,
+      baseOrdinal: 1,
+    };
+    writePendingChatJournal(environment.config, environment.identity, {
+      ...admittedRequest,
+      text: "B2 original request",
+    });
+    markChatJournalAdmitted(environment.config, environment.identity, admittedRequest, 2);
+    writeChatSelection(environment.config, environment.identity, firstConversationId);
+
+    const app = mountHistoryAccountApp(environment, AccountApp);
+    apps.push(app);
+    await app.flush();
+
+    expect(
+      app.current()?.props?.state?.history?.conversations.map((item) => item.conversationId),
+    ).toEqual([firstConversationId, secondConversationId]);
+    expect(app.current()?.props?.state?.history?.conversations[1]).toMatchObject({
+      lastOrdinal: 2,
+      label: "B2 terminal",
+    });
+    expect(app.current()?.props?.state?.history?.conversations[1]).not.toHaveProperty(
+      "activeQueryId",
+    );
+    expect(
+      readChatJournals(environment.config, environment.identity).get(secondConversationId),
+    ).toMatchObject({
+      admitted: true,
+      ordinal: 2,
+    });
+    expect(environment.runtimeRequests).toEqual([]);
+
+    await app.current()?.props?.onLoadMoreHistory?.();
+    await app.flush();
+    expect(
+      app.current()?.props?.state?.history?.conversations.map((item) => item.conversationId),
+    ).toEqual([firstConversationId, secondConversationId]);
+    expect(app.current()?.props?.state?.history?.conversations[1]).toMatchObject({
+      lastOrdinal: 2,
+      label: "B2 terminal",
+    });
+    expect(app.current()?.props?.state?.history?.conversations[1]).not.toHaveProperty(
+      "activeQueryId",
+    );
+    expect(
+      readChatJournals(environment.config, environment.identity).has(secondConversationId),
+    ).toBe(true);
+
+    await app.current()?.props?.onLoadMoreHistory?.();
+    await app.flush();
+    const conversations = app.current()?.props?.state?.history?.conversations;
+    expect(
+      conversations?.filter((item) => item.conversationId === secondConversationId),
+    ).toHaveLength(1);
+    expect(new Set(conversations?.map((item) => item.conversationId)).size).toBe(
+      conversations?.length,
+    );
+    expect(
+      conversations?.find((item) => item.conversationId === secondConversationId),
+    ).toMatchObject({
+      lastOrdinal: 2,
+      label: "B2 estado previo activo",
+      activeQueryId: secondQueryId,
+    });
+
+    await app.current()?.props?.onSelectConversation?.(secondConversationId);
+    await app.flush();
+    expect(app.current()?.props?.state).toMatchObject({
+      queryStatus: "completed",
+      history: { selectedConversationId: secondConversationId, turnsStatus: "ready" },
+    });
+    const selectedConversation = app
+      .current()
+      ?.props?.state?.history?.conversations.find(
+        (item) => item.conversationId === secondConversationId,
+      );
+    expect(selectedConversation).toMatchObject({
+      lastOrdinal: 2,
+      label: "B2 estado previo activo",
+      closed: false,
+    });
+    expect(selectedConversation?.activeQueryId).toBeUndefined();
+    expect(listCalls).toBe(3);
+    expect(environment.runtimeRequests).toEqual([]);
+    expect(
+      readChatJournals(environment.config, environment.identity).has(secondConversationId),
+    ).toBe(false);
   });
 });
