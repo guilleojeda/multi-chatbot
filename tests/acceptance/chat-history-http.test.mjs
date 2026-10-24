@@ -78,7 +78,7 @@ function makeHarness({
 
 function noPrivateFields(value) {
   expect(JSON.stringify(value)).not.toMatch(
-    /profileSnapshot|promptTexts|#DOCUMENT#|#CONTEXT#|documentContext|contextManifest|fingerprint|ownerAttemptId|private document text/i,
+    /profileSnapshot|promptTexts|#DOCUMENT#|#CONTEXT#|#SUMMARY#|documentContext|contextManifest|contextSnapshot|sourceReferences|summary|fingerprint|ownerAttemptId|private document text/i,
   );
 }
 
@@ -120,6 +120,8 @@ describe("the public chat history HTTP API", () => {
             lastOrdinal: 4,
             closed: false,
             activeQueryId: queryId,
+            summary: { text: "private summary text" },
+            contextSnapshot: { version: 1, summary: { summaryId: "private-summary" } },
           },
         ],
         nextCursor: "opaque-next-page",
@@ -184,6 +186,9 @@ describe("the public chat history HTTP API", () => {
             cursor: 2,
             resultDeadlineAt: 1792843200000,
             failure: { code: "model_failure" },
+            summary: { text: "private summary text" },
+            contextSnapshot: { version: 1, summary: { summaryId: "private-summary" } },
+            sourceReferences: [{ ordinal: 1, queryId }],
           },
         ],
         nextCursor: "older-turns",
@@ -245,6 +250,7 @@ describe("the public chat history HTTP API", () => {
           { index: 3, text: secondText },
         ],
         complete: true,
+        summary: { text: "private summary text" },
       },
     });
 
