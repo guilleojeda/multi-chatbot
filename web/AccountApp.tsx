@@ -1249,25 +1249,31 @@ export function AccountApp({
       if (page.turns.length > 0 || page.nextCursor === null) break;
       pageCursor = page.nextCursor;
     }
-    const turns: ChatHistoryTurn[] = await Promise.all(
-      page.turns.map(async (turn) => {
-        const [question, answer] = await Promise.all([
-          readCompleteTurnText(conversationId, turn, "user", isActive),
-          readCompleteTurnText(conversationId, turn, "assistant", isActive),
-        ]);
-        return {
-          ordinal: turn.ordinal,
-          queryId: turn.queryId,
-          status: turn.status,
-          question: question.text,
-          answer: answer.text,
-          questionComplete: question.complete,
-          answerComplete: answer.complete,
-          canContinue: page.canContinue,
-          ...(turn.failure ? { failure: turn.failure } : {}),
-        };
-      }),
-    );
+    const turns: ChatHistoryTurn[] = [];
+    // Each turn reads user and assistant text in parallel. Two turns per batch cap this
+    // page at four concurrent authenticated reads, which avoids API 503s on larger pages.
+    for (let offset = 0; offset < page.turns.length; offset += 2) {
+      const batch = await Promise.all(
+        page.turns.slice(offset, offset + 2).map(async (turn) => {
+          const [question, answer] = await Promise.all([
+            readCompleteTurnText(conversationId, turn, "user", isActive),
+            readCompleteTurnText(conversationId, turn, "assistant", isActive),
+          ]);
+          return {
+            ordinal: turn.ordinal,
+            queryId: turn.queryId,
+            status: turn.status,
+            question: question.text,
+            answer: answer.text,
+            questionComplete: question.complete,
+            answerComplete: answer.complete,
+            canContinue: page.canContinue,
+            ...(turn.failure ? { failure: turn.failure } : {}),
+          };
+        }),
+      );
+      turns.push(...batch);
+    }
     return { ...page, throughOrdinal: firstThroughOrdinal!, turns };
   }
 
