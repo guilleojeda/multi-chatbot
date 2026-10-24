@@ -310,6 +310,8 @@ export function ChatScreen({
   }
 
   const history = state.history;
+  const staleBaseRefreshRequired =
+    state.queryErrorCode === "stale_base" && history?.refreshRequired === true;
 
   async function openConversation(conversationId: string) {
     const opened = await onSelectConversation?.(conversationId);
@@ -656,10 +658,12 @@ export function ChatScreen({
                 {state.queryStatus === "rejected" ? (
                   state.quota ? null : (
                     <>
-                      <p className="chat-result-error" role="alert">
-                        {state.queryError ||
-                          "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
-                      </p>
+                      {!staleBaseRefreshRequired ? (
+                        <p className="chat-result-error" role="alert">
+                          {state.queryError ||
+                            "No se admitió esta consulta. Volvé al inicio para comenzar un hilo nuevo."}
+                        </p>
+                      ) : null}
                       {state.canRetry && state.question ? (
                         <button
                           className="account-button account-button--secondary chat-restart-button"
