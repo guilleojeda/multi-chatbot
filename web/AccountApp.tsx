@@ -376,7 +376,12 @@ export function AccountApp({
   const chatSelectionEpochRef = useRef(0);
   const historyListGenerationRef = useRef(0);
   const historySelectionGenerationRef = useRef(0);
-  const historyInitializedOwnerRef = useRef<string | null>(null);
+  const historyListInitializedOwnerRef = useRef<string | null>(null);
+  const chatJournalBootstrapOwnerRef = useRef<string | null>(null);
+  const chatPendingConversationOpenRef = useRef<{
+    ownerKey: string;
+    conversationId: string;
+  } | null>(null);
   const chatJournalsRef = useRef(new Map<string, ChatJournalEntry>());
   const chatDraftsRef = useRef(new Map<string, string>());
   const localConversationsRef = useRef(
@@ -476,7 +481,9 @@ export function AccountApp({
     chatJournalsRef.current.clear();
     chatDraftsRef.current.clear();
     localConversationsRef.current.clear();
-    historyInitializedOwnerRef.current = null;
+    historyListInitializedOwnerRef.current = null;
+    chatJournalBootstrapOwnerRef.current = null;
+    chatPendingConversationOpenRef.current = null;
   }, []);
 
   // Identity activation leaves an unowned journal available to the recovery effect.
@@ -493,6 +500,7 @@ export function AccountApp({
       chatSubmissionInFlightRef.current = false;
       chatOwnerKeyRef.current = null;
       chatConversationIdRef.current = null;
+      chatPendingConversationOpenRef.current = null;
       chatJournalsRef.current.clear();
       chatDraftsRef.current.clear();
       clearCurrentChatJournal(configToClear);
@@ -508,6 +516,49 @@ export function AccountApp({
       invalidateChat();
       chatOwnerKeyRef.current = nextOwner;
       setChat(emptyChatState());
+      const config = configRef.current;
+      if (!config || config.botId !== identity.botId) return;
+
+      chatJournalBootstrapOwnerRef.current = nextOwner;
+      const owner = { sub: identity.sub, botId: identity.botId };
+      let journals = new Map<string, ChatJournalEntry>();
+      let selectedId: string | null = null;
+      try {
+        journals = readChatJournals(config, owner);
+        selectedId = readChatSelection(config, owner);
+      } catch {
+        // History remains available when this tab cannot use session storage.
+      }
+      chatJournalsRef.current = journals;
+      chatJournalOwnerRef.current = { config, identity: owner };
+      rememberJournalConversations(journals);
+      if (!selectedId && journals.size > 0) selectedId = journals.keys().next().value ?? null;
+      if (selectedId) {
+        chatPendingConversationOpenRef.current = {
+          ownerKey: nextOwner,
+          conversationId: selectedId,
+        };
+      }
+      const current = chatScreenStateRef.current;
+      const currentHistory = current.history ?? emptyHistoryState();
+      setChat({
+        ...current,
+        history: {
+          ...currentHistory,
+          conversations: mergeHistoryConversations(
+            localConversationsRef.current,
+            currentHistory.conversations,
+            [],
+          ),
+          selectedConversationId: selectedId,
+          turnsStatus: selectedId ? "loading" : "idle",
+          turns: [],
+          turnsNextCursor: null,
+          refreshRequired: false,
+          openingConversationId: undefined,
+        },
+      });
+      chatConversationIdRef.current = selectedId;
     },
     [invalidateChat, setChat],
   );
@@ -529,6 +580,7 @@ export function AccountApp({
     chatConversationIdRef.current = null;
     chatJournalRef.current = null;
     chatDisplayedQueryIdRef.current = null;
+    chatPendingConversationOpenRef.current = null;
     chatDraftsRef.current.set("__new__", "");
     if (identity && config) {
       try {
@@ -1344,6 +1396,7 @@ export function AccountApp({
     }
     const identityKey = chatOwnerKey(identity);
     if (chatOwnerKeyRef.current !== identityKey) return false;
+    chatPendingConversationOpenRef.current = null;
 
     const previousSelected = current.history?.selectedConversationId ?? null;
     if (previousSelected !== null) {
@@ -1581,6 +1634,7 @@ export function AccountApp({
         page.conversations,
         existing,
       );
+      historyListInitializedOwnerRef.current = ownerKey;
       setHistory((history) => ({
         ...history,
         status: conversations.length === 0 && !page.nextCursor ? "empty" : "ready",
@@ -1682,9 +1736,46 @@ export function AccountApp({
     ) {
       return;
     }
+    const pending = chatPendingConversationOpenRef.current;
+    if (!pending) return;
+    if (pending.ownerKey !== chatOwnerKey(readyIdentity)) {
+      chatPendingConversationOpenRef.current = null;
+      return;
+    }
+    chatPendingConversationOpenRef.current = null;
+    void selectConversation(pending.conversationId);
+  }, [
+    apiConfig,
+    authorizedRouteIsCurrent,
+    chatScreenState.history?.openingConversationId,
+    chatScreenState.history?.selectedConversationId,
+    chatScreenState.history?.turnsStatus,
+    readyIdentity,
+    route.kind,
+    session,
+    state.view,
+  ]);
+
+  useEffect(() => {
+    if (
+      route.kind !== "chat" ||
+      !authorizedRouteIsCurrent ||
+      state.view !== "ready" ||
+      !readyIdentity ||
+      !apiConfig ||
+      !session ||
+      chatOwnerKeyRef.current !== chatOwnerKey(readyIdentity)
+    ) {
+      return;
+    }
     const identity = { sub: readyIdentity.sub, botId: readyIdentity.botId };
     const ownerKey = chatOwnerKey(identity);
-    if (historyInitializedOwnerRef.current === ownerKey) return;
+    if (
+      chatJournalBootstrapOwnerRef.current !== ownerKey ||
+      historyListInitializedOwnerRef.current === ownerKey
+    ) {
+      return;
+    }
     const generation = ++historyListGenerationRef.current;
     const chatEpoch = chatEpochRef.current;
     let active = true;
@@ -1704,42 +1795,20 @@ export function AccountApp({
     void listChatConversations(apiConfig, session, null, isActive)
       .then((page) => {
         if (!isActive()) return;
-        historyInitializedOwnerRef.current = ownerKey;
-        let journals = new Map<string, ChatJournalEntry>();
-        let selectedId: string | null = null;
-        try {
-          journals = readChatJournals(apiConfig, identity);
-          selectedId = readChatSelection(apiConfig, identity);
-        } catch {
-          // The remote archive remains readable even when this tab cannot use session storage.
-        }
-        chatJournalsRef.current = journals;
-        chatJournalOwnerRef.current = { config: apiConfig, identity };
-        rememberJournalConversations(journals);
-        if (!selectedId && journals.size > 0) selectedId = journals.keys().next().value ?? null;
+        historyListInitializedOwnerRef.current = ownerKey;
         const conversations = mergeHistoryConversations(
           localConversationsRef.current,
           page.conversations,
           [],
         );
-        setChat({
-          ...chatScreenStateRef.current,
-          history: {
-            ...(chatScreenStateRef.current.history ?? emptyHistoryState()),
-            status: conversations.length === 0 && !page.nextCursor ? "empty" : "ready",
-            conversations,
-            nextCursor: page.nextCursor,
-            loadingMore: false,
-            selectedConversationId: selectedId,
-            turnsStatus: "idle",
-            turns: [],
-            turnsNextCursor: null,
-            refreshRequired: false,
-            error: undefined,
-          },
-        });
-        chatConversationIdRef.current = selectedId;
-        if (selectedId) void selectConversation(selectedId);
+        setHistory((history) => ({
+          ...history,
+          status: conversations.length === 0 && !page.nextCursor ? "empty" : "ready",
+          conversations,
+          nextCursor: page.nextCursor,
+          loadingMore: false,
+          error: undefined,
+        }));
       })
       .catch((error: unknown) => {
         if (!isActive()) return;
@@ -1754,32 +1823,20 @@ export function AccountApp({
           profileForbidden();
           return;
         }
-        historyInitializedOwnerRef.current = ownerKey;
-        let journals = new Map<string, ChatJournalEntry>();
-        let selectedId: string | null = null;
-        try {
-          journals = readChatJournals(apiConfig, identity);
-          selectedId = readChatSelection(apiConfig, identity);
-        } catch {
-          // A storage denial cannot expose a transcript or alter the API failure state.
-        }
-        chatJournalsRef.current = journals;
-        chatJournalOwnerRef.current = { config: apiConfig, identity };
-        rememberJournalConversations(journals);
-        if (!selectedId && journals.size > 0) selectedId = journals.keys().next().value ?? null;
-        chatConversationIdRef.current = selectedId;
-        setChat({
-          ...chatScreenStateRef.current,
-          history: {
-            ...(chatScreenStateRef.current.history ?? emptyHistoryState()),
-            status: "error",
-            conversations: [...localConversationsRef.current.values()],
-            loadingMore: false,
-            selectedConversationId: selectedId,
-            turnsStatus: "idle",
-            error: historyErrorMessage(apiError.code, apiError.status),
-          },
-        });
+        historyListInitializedOwnerRef.current = ownerKey;
+        const currentHistory = chatScreenStateRef.current.history ?? emptyHistoryState();
+        const conversations = mergeHistoryConversations(
+          localConversationsRef.current,
+          [],
+          currentHistory.conversations,
+        );
+        setHistory((history) => ({
+          ...history,
+          status: "error",
+          conversations,
+          loadingMore: false,
+          error: historyErrorMessage(apiError.code, apiError.status),
+        }));
       });
 
     return () => {
@@ -1804,14 +1861,34 @@ export function AccountApp({
     if (route.kind !== "chat" || !historyOwnerKey) return;
     return () => {
       historyListGenerationRef.current += 1;
+      historySelectionGenerationRef.current += 1;
+      const history = chatScreenStateRef.current.history;
+      if (history?.openingConversationId) {
+        chatPendingConversationOpenRef.current = {
+          ownerKey: historyOwnerKey,
+          conversationId: history.openingConversationId,
+        };
+      }
       setHistory((history) => {
-        if (!history.loadingMore && history.status !== "loading") return history;
+        const openingConversation = Boolean(
+          history.openingConversationId && history.turnsStatus === "loading",
+        );
+        if (
+          !history.loadingMore &&
+          history.status !== "loading" &&
+          !openingConversation &&
+          !history.loadingEarlier
+        ) {
+          return history;
+        }
         const hasKnownHistory = history.conversations.length > 0 || history.nextCursor !== null;
         return {
           ...history,
           status:
             history.status === "loading" ? (hasKnownHistory ? "ready" : "empty") : history.status,
           loadingMore: false,
+          loadingEarlier: false,
+          ...(openingConversation ? { openingConversationId: undefined } : {}),
         };
       });
     };
@@ -1830,7 +1907,11 @@ export function AccountApp({
       return;
     }
     const selectedConversationId = chatScreenState.history?.selectedConversationId;
-    if (!selectedConversationId) {
+    if (
+      !selectedConversationId ||
+      chatScreenState.history?.turnsStatus === "loading" ||
+      Boolean(chatScreenState.history?.openingConversationId)
+    ) {
       return;
     }
     if (chatRequestRef.current && !chatRequestRef.current.signal.aborted) {
@@ -2232,7 +2313,9 @@ export function AccountApp({
     session,
     setChat,
     chatRecoveryRevision,
+    chatScreenState.history?.openingConversationId,
     chatScreenState.history?.selectedConversationId,
+    chatScreenState.history?.turnsStatus,
     state.view,
   ]);
 

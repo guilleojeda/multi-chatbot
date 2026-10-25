@@ -16,6 +16,7 @@ import {
   markChatJournalAdmitted,
   readChatJournals,
   writePendingChatJournal,
+  writeChatSelection,
 } from "../../web/chat-journal.ts";
 
 let AccountApp;
@@ -77,6 +78,27 @@ const turnText = ({ conversationId, ordinal, url }) =>
     chunks: [{ index: 0, text: `ORIGINAL_TEXT_${ordinal}` }],
     complete: true,
   });
+
+function acceptedOnlyStream(request) {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            `event: accepted\ndata: ${JSON.stringify({
+              type: "accepted",
+              conversationId: request.conversationId,
+              queryId: request.queryId,
+              ordinal: request.baseOrdinal + 1,
+            })}\n\n`,
+          ),
+        );
+      },
+    }),
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
 
 describe("phase 7 frontend repair regressions", () => {
   it("keeps an uncertain new send selectable after reset and reload without resending it", async () => {
@@ -321,6 +343,291 @@ describe("phase 7 frontend repair regressions", () => {
     expect(props(app).state.question).toBeUndefined();
     expect(props(app).state.draft).toBe("UNSENT_NEW_DRAFT");
   });
+
+  it("keeps a new-chat draft when the original history request completes after reset", async () => {
+    const initialList = deferred();
+    let request;
+    const environment = createHistoryEnvironment({
+      listHandler: () => initialList.promise,
+      runtimeHandler: (nextRequest) => {
+        request = nextRequest;
+        return acceptedOnlyStream(nextRequest);
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).state.history.status).toBe("loading");
+
+    expect(props(app).onSubmit("Accepted request A")).toBe(true);
+    await app.flush();
+    expect(props(app).state.queryStatus).toBe("streaming");
+
+    props(app).onReset();
+    await app.flush();
+    props(app).onDraftChange("UNSENT_NEW_DRAFT");
+    await app.flush();
+    initialList.resolve(historyList());
+    await app.flush();
+
+    expect(props(app).state.history.selectedConversationId).toBeNull();
+    expect(props(app).state.question).toBeUndefined();
+    expect(props(app).state.draft).toBe("UNSENT_NEW_DRAFT");
+    expect(
+      readChatJournals(environment.config, environment.identity).get(request.conversationId),
+    ).toMatchObject({
+      admitted: true,
+      request: { conversationId: request.conversationId, queryId: request.queryId },
+    });
+  });
+
+  it("keeps a new-chat draft when the original history request fails after reset", async () => {
+    const initialList = deferred();
+    const environment = createHistoryEnvironment({
+      listHandler: () => initialList.promise,
+      runtimeHandler: (request) => acceptedOnlyStream(request),
+    });
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).state.history.status).toBe("loading");
+
+    expect(props(app).onSubmit("Accepted request A")).toBe(true);
+    await app.flush();
+    props(app).onReset();
+    await app.flush();
+    props(app).onDraftChange("UNSENT_NEW_DRAFT");
+    await app.flush();
+    initialList.resolve(jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503));
+    await app.flush();
+
+    expect(props(app).state.history).toMatchObject({ status: "error", loadingMore: false });
+    expect(props(app).state.history.selectedConversationId).toBeNull();
+    expect(props(app).state.question).toBeUndefined();
+    expect(props(app).state.draft).toBe("UNSENT_NEW_DRAFT");
+  });
+
+  it("does not cold-select an active journal after refresh supersedes initial history loading", async () => {
+    const initialList = deferred();
+    let listCalls = 0;
+    let request;
+    const environment = createHistoryEnvironment({
+      listHandler: () => {
+        listCalls += 1;
+        return listCalls === 1 ? initialList.promise : historyList();
+      },
+      runtimeHandler: (nextRequest) => {
+        request = nextRequest;
+        return acceptedOnlyStream(nextRequest);
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).state.history.status).toBe("loading");
+
+    expect(props(app).onSubmit("Accepted request A")).toBe(true);
+    await app.flush();
+    props(app).onReset();
+    await app.flush();
+    props(app).onDraftChange("UNSENT_NEW_DRAFT");
+    await app.flush();
+
+    await props(app).onRefreshHistory();
+    await app.flush();
+    expect(listCalls).toBe(2);
+    expect(props(app).state.history.selectedConversationId).toBeNull();
+    expect(props(app).state.draft).toBe("UNSENT_NEW_DRAFT");
+
+    await app.setRoute("profile");
+    await app.setRoute("chat");
+    await app.flush();
+
+    expect(listCalls).toBe(2);
+    expect(props(app).state.history.selectedConversationId).toBeNull();
+    expect(props(app).state.question).toBeUndefined();
+    expect(props(app).state.draft).toBe("UNSENT_NEW_DRAFT");
+    expect(
+      readChatJournals(environment.config, environment.identity).get(request.conversationId),
+    ).toMatchObject({ admitted: true });
+  });
+
+  it("keeps a cold pending journal selectable when refresh replaces the initial list", async () => {
+    const initialList = deferred();
+    let listCalls = 0;
+    const body = "Original uncertain request";
+    const request = {
+      version: 2,
+      operation: "start",
+      conversationId: firstConversationId,
+      queryId: firstQueryId,
+      baseOrdinal: 0,
+      text: body,
+    };
+    const environment = createHistoryEnvironment({
+      listHandler: () => {
+        listCalls += 1;
+        return listCalls === 1
+          ? initialList.promise
+          : jsonResponse({ version: 1, conversations: [] });
+      },
+      runtimeHandler: (nextRequest) => acceptedOnlyStream(nextRequest),
+    });
+    writePendingChatJournal(environment.config, environment.identity, request);
+    const app = mount(environment);
+    await app.flush();
+
+    expect(props(app).state.history.conversations).toMatchObject([
+      {
+        conversationId: firstConversationId,
+        pending: true,
+      },
+    ]);
+    expect(props(app).state.history.selectedConversationId).toBe(firstConversationId);
+    expect(props(app).state.queryStatus).toBe("unconfirmed");
+    expect(
+      environment.runtimeRequests.filter(
+        (item) => item.headers.get("accept") !== "application/json",
+      ),
+    ).toHaveLength(0);
+
+    props(app).onReset();
+    await app.flush();
+    props(app).onDraftChange("UNSENT_NEW_DRAFT");
+    await app.flush();
+    await props(app).onRefreshHistory();
+    await app.flush();
+    await app.setRoute("profile");
+    await app.setRoute("chat");
+    await app.flush();
+
+    expect(listCalls).toBe(2);
+    expect(props(app).state.history.conversations).toMatchObject([
+      {
+        conversationId: firstConversationId,
+        pending: true,
+      },
+    ]);
+    expect(props(app).state.history.selectedConversationId).toBeNull();
+    expect(props(app).state.question).toBeUndefined();
+    expect(props(app).state.draft).toBe("UNSENT_NEW_DRAFT");
+    expect(
+      readChatJournals(environment.config, environment.identity).get(firstConversationId),
+    ).toMatchObject({
+      admitted: false,
+      request: { conversationId: firstConversationId, queryId: firstQueryId, text: body },
+    });
+    expect(
+      environment.runtimeRequests.filter(
+        (item) => item.headers.get("accept") !== "application/json",
+      ),
+    ).toHaveLength(0);
+
+    initialList.resolve(jsonResponse({ version: 1, conversations: [] }));
+    await app.flush();
+    expect(props(app).state.history.selectedConversationId).toBeNull();
+    expect(props(app).state.draft).toBe("UNSENT_NEW_DRAFT");
+  });
+
+  it("resumes a selected conversation read after leaving chat while its initial open is pending", async () => {
+    const firstOpen = deferred();
+    let turnsCalls = 0;
+    const page = (ordinal) => ({
+      version: 1,
+      conversationId: firstConversationId,
+      throughOrdinal: ordinal,
+      closed: false,
+      canContinue: true,
+      turns: [
+        {
+          ...turn(ordinal),
+          questionManifest: { count: 1, complete: true },
+          answerManifest: { count: 1, complete: true },
+          cursor: 1,
+        },
+      ],
+    });
+    const environment = createHistoryEnvironment({
+      listHandler: historyList,
+      turnsHandler: () => {
+        turnsCalls += 1;
+        return turnsCalls === 1 ? firstOpen.promise : jsonResponse(page(1));
+      },
+      textHandler: ({ ordinal, url }) =>
+        jsonResponse({
+          version: 1,
+          conversationId: firstConversationId,
+          ordinal,
+          queryId: firstQueryId,
+          role: url.searchParams.get("role"),
+          chunks: [{ index: 0, text: `${url.searchParams.get("role")}-${ordinal}` }],
+          complete: true,
+        }),
+    });
+    writeChatSelection(environment.config, environment.identity, firstConversationId);
+    const app = mount(environment);
+    await app.flush();
+    expect(turnsCalls).toBe(1);
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: firstConversationId,
+      turnsStatus: "loading",
+      openingConversationId: firstConversationId,
+    });
+
+    await app.setRoute("profile");
+    await app.setRoute("chat");
+    await app.flush();
+    expect(turnsCalls).toBe(2);
+    expect(props(app).state.history.turns).toMatchObject([
+      { ordinal: 1, question: "user-1", answer: "assistant-1" },
+    ]);
+
+    firstOpen.resolve(jsonResponse(page(2)));
+    await app.flush();
+    expect(props(app).state.history.turns).toMatchObject([
+      { ordinal: 1, question: "user-1", answer: "assistant-1" },
+    ]);
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: firstConversationId,
+      turnsStatus: "ready",
+    });
+  });
+
+  it.each([
+    ["successful load", () => historyList(), "ready"],
+    ["transient error", () => jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503), "error"],
+  ])(
+    "keeps a new-chat choice across a cancelled initialization retry after %s",
+    async (_, makeResponse, status) => {
+      const firstList = deferred();
+      const returnedList = deferred();
+      let listCalls = 0;
+      const environment = createHistoryEnvironment({
+        listHandler: () => {
+          listCalls += 1;
+          return listCalls === 1 ? firstList.promise : returnedList.promise;
+        },
+        runtimeHandler: (request) => acceptedOnlyStream(request),
+      });
+      const app = mount(environment);
+      await app.flush();
+
+      expect(props(app).onSubmit("Accepted request A")).toBe(true);
+      await app.flush();
+      props(app).onReset();
+      await app.flush();
+      props(app).onDraftChange("UNSENT_NEW_DRAFT");
+      await app.flush();
+
+      await app.setRoute("profile");
+      await app.setRoute("chat");
+      expect(listCalls).toBe(2);
+      returnedList.resolve(makeResponse());
+      await app.flush();
+
+      expect(props(app).state.history.status).toBe(status);
+      expect(props(app).state.history.selectedConversationId).toBeNull();
+      expect(props(app).state.question).toBeUndefined();
+      expect(props(app).state.draft).toBe("UNSENT_NEW_DRAFT");
+    },
+  );
 
   it("shows and retries an earlier-page failure while retaining already loaded turns", async () => {
     let olderCalls = 0;
