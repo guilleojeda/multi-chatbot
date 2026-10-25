@@ -320,9 +320,9 @@ export function ChatScreen({
   const staleBaseRefreshRequired =
     state.queryErrorCode === "stale_base" && history?.refreshRequired === true;
 
-  async function openConversation(conversationId: string) {
-    const opened = await onSelectConversation?.(conversationId);
-    if (opened !== false) setMobileView("chat");
+  function openConversation(conversationId: string) {
+    setMobileView("chat");
+    void onSelectConversation?.(conversationId);
   }
 
   function newConversation() {
