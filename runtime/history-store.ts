@@ -34,6 +34,9 @@ function positive(value: unknown): value is number {
 function nonNegative(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
+function isVerifiedTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && Number.isFinite(Date.parse(value));
+}
 function isLegacyGeneratingTurn(value: unknown): boolean {
   if (!isRecord(value) || value.status !== "in_progress" || value.phase !== "generating") {
     return false;
@@ -555,8 +558,8 @@ export function createHistoryStore(input: {
       ...(typeof currentMeta.historyLabel === "string" && currentMeta.historyLabel.trim()
         ? { label: currentMeta.historyLabel }
         : {}),
-      ...(typeof currentMeta.createdAt === "string" ? { createdAt: currentMeta.createdAt } : {}),
-      ...(typeof currentMeta.updatedAt === "string" ? { updatedAt: currentMeta.updatedAt } : {}),
+      ...(isVerifiedTimestamp(currentMeta.createdAt) ? { createdAt: currentMeta.createdAt } : {}),
+      ...(isVerifiedTimestamp(currentMeta.updatedAt) ? { updatedAt: currentMeta.updatedAt } : {}),
       throughOrdinal,
       closed: currentMeta.closed === true,
       canContinue: descriptors.some(

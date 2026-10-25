@@ -241,6 +241,30 @@ describe("history reader regressions", () => {
     });
   });
 
+  it("opens when META has unverifiable dates and omits them from presentation", async () => {
+    const invalidDateMeta = makeMeta({
+      lastOrdinal: 1,
+      activeQueryId: undefined,
+      activeOwnerAttemptId: undefined,
+      createdAt: "not-a-date",
+      updatedAt: "",
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) return { Item: invalidDateMeta };
+      if (command instanceof QueryCommand) return { Items: [makeTurn(1, q1)] };
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    const result = await createStore(send).readTurns({ sub, botId, conversationId, limit: 1 });
+
+    expect(result.canContinue).toBe(true);
+    expect(result.turns).toMatchObject([{ ordinal: 1, status: "completed" }]);
+    expect(result).not.toHaveProperty("createdAt");
+    expect(result).not.toHaveProperty("updatedAt");
+    expect(invalidDateMeta.createdAt).toBe("not-a-date");
+    expect(invalidDateMeta.updatedAt).toBe("");
+  });
+
   it("allows continuation after an open confirmed failure, but not after an uncertain claimed failure", async () => {
     const cases = [
       {
