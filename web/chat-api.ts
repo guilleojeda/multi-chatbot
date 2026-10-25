@@ -106,6 +106,9 @@ export type ConversationListPage = {
 
 export type ConversationTurnsPage = {
   conversationId: string;
+  label?: string;
+  createdAt?: string;
+  updatedAt?: string;
   throughOrdinal: number;
   closed: boolean;
   canContinue: boolean;
@@ -175,6 +178,18 @@ function parseManifest(value: unknown): { count: number; complete: boolean } {
     throw historyError("INVALID_RESPONSE", 502, "El historial devolvió un turno inválido.");
   }
   return { count: value.count as number, complete: value.complete };
+}
+
+function optionalHistoryTimestamp(
+  payload: Record<string, unknown>,
+  field: "createdAt" | "updatedAt",
+): string | undefined {
+  const value = payload[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim() || !Number.isFinite(Date.parse(value))) {
+    throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una conversación inválida.");
+  }
+  return value;
 }
 
 export async function listChatConversations(
@@ -256,6 +271,11 @@ export async function readConversationTurns(
   ) {
     throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una conversación inválida.");
   }
+  if (payload.label !== undefined && (typeof payload.label !== "string" || !payload.label.trim())) {
+    throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una conversación inválida.");
+  }
+  const createdAt = optionalHistoryTimestamp(payload, "createdAt");
+  const updatedAt = optionalHistoryTimestamp(payload, "updatedAt");
   const turns = payload.turns.map((value): ConversationTurn => {
     if (
       !isRecord(value) ||
@@ -301,6 +321,9 @@ export async function readConversationTurns(
   });
   return {
     conversationId,
+    ...(typeof payload.label === "string" ? { label: payload.label } : {}),
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
     throughOrdinal: payload.throughOrdinal as number,
     closed: payload.closed,
     canContinue: payload.canContinue,

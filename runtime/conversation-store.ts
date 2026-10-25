@@ -687,6 +687,10 @@ export function createConversationStoreAdapter(input: {
   const contextStorage = createContextStorage({ documentClient, tableName });
   const zone = "America/Argentina/Cordoba";
   const itemLimit = 400 * 1024;
+  // Current runtime transitions grow a TURN by about 2.1 KiB at worst: two request IDs up to
+  // 768 UTF-8 bytes each, seven metrics, and bounded failure/provider diagnostics. Keep 4 KiB
+  // available and revisit this reserve if the runtime caller bounds change.
+  const turnTransitionReserve = 4 * 1024;
   const transactionLimit = 4 * 1024 * 1024;
   const actionLimit = 100;
   const resultDeadlineMs = 60 * 60 * 1000;
@@ -830,6 +834,10 @@ export function createConversationStoreAdapter(input: {
     if (affectedItems.reduce((total, item) => total + dynamoItemSize(item), 0) > transactionLimit) {
       throw storageCapacityError("DynamoDB transaction exceeds 4 MiB.");
     }
+  }
+
+  function hasTurnTransitionReserve(turn: Record<string, unknown>): boolean {
+    return dynamoItemSize(turn) <= itemLimit - turnTransitionReserve;
   }
 
   async function getItem(
@@ -1291,7 +1299,7 @@ export function createConversationStoreAdapter(input: {
     if (
       contextSnapshot !== undefined &&
       contextSnapshot.recentReferences.length > 0 &&
-      dynamoItemSize(record) > itemLimit
+      !hasTurnTransitionReserve(record)
     ) {
       contextChunks = encodeContextReferences(contextSnapshot.recentReferences, ordinal);
       const { version, summary } = contextSnapshot;
@@ -1301,6 +1309,11 @@ export function createConversationStoreAdapter(input: {
         recentReferencesStorage: "context_chunks",
       };
       record.contextManifest = { count: contextChunks.length, complete: true };
+    }
+    if (!hasTurnTransitionReserve(record)) {
+      throw storageCapacityError(
+        "DynamoDB turn cannot reserve space for its required storage transitions.",
+      );
     }
     const meta = {
       ...metaKey,

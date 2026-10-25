@@ -165,6 +165,15 @@ function optionalTimestamp(value: Record<string, unknown>, key: string): Record<
   return { [key]: timestamp };
 }
 
+function optionalHistoryLabel(value: Record<string, unknown>): Record<string, string> {
+  const label = value.label;
+  if (label === undefined) return {};
+  if (typeof label !== "string" || !label.trim()) {
+    throw new TypeError("History store returned an invalid conversation label.");
+  }
+  return { label };
+}
+
 function normalizeListResult(value: unknown): Record<string, unknown> {
   if (!isRecord(value) || !Array.isArray(value.conversations)) {
     throw new TypeError("History store returned an invalid conversation page.");
@@ -264,6 +273,9 @@ function normalizeTurnsResult(value: unknown, conversationId: string): Record<st
   return {
     version: 1,
     conversationId,
+    ...optionalHistoryLabel(value),
+    ...optionalTimestamp(value, "createdAt"),
+    ...optionalTimestamp(value, "updatedAt"),
     throughOrdinal: value.throughOrdinal,
     closed: value.closed,
     canContinue: value.canContinue,

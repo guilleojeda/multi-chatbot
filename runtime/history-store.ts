@@ -34,6 +34,22 @@ function positive(value: unknown): value is number {
 function nonNegative(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
+function isLegacyGeneratingTurn(value: unknown): boolean {
+  if (!isRecord(value) || value.status !== "in_progress" || value.phase !== "generating") {
+    return false;
+  }
+  const question = value.questionManifest;
+  const answer = value.answerManifest;
+  return (
+    isRecord(question) &&
+    positive(question.count) &&
+    question.complete === true &&
+    isRecord(answer) &&
+    answer.count === 0 &&
+    answer.complete === false &&
+    (value.cursor === undefined || value.cursor === 0)
+  );
+}
 function hashScope(sub: string, botId: string): string {
   return createHash("sha256")
     .update(sub + "\0" + botId)
@@ -118,6 +134,9 @@ function validTurn(
   value: unknown,
   input: { id: string; ordinal?: number; sub: string; botId: string },
 ): value is Record<string, unknown> {
+  const answerCount =
+    isRecord(value) && isRecord(value.answerManifest) ? value.answerManifest.count : undefined;
+  const cursor = isRecord(value) ? value.cursor : undefined;
   return (
     isRecord(value) &&
     value.pk === "CONV#" + input.id &&
@@ -132,18 +151,19 @@ function validTurn(
     ["in_progress", "completed", "failed"].includes(String(value.status)) &&
     (value.phase === undefined ||
       (value.status === "in_progress"
-        ? ["admitted", "invocation_claimed"].includes(String(value.phase))
+        ? ["admitted", "invocation_claimed"].includes(String(value.phase)) ||
+          isLegacyGeneratingTurn(value)
         : value.status === "completed"
           ? value.phase === "complete"
           : value.phase === "failed")) &&
-    nonNegative(value.cursor) &&
     isRecord(value.questionManifest) &&
     positive(value.questionManifest.count) &&
     value.questionManifest.complete === true &&
     isRecord(value.answerManifest) &&
     nonNegative(value.answerManifest.count) &&
     typeof value.answerManifest.complete === "boolean" &&
-    value.answerManifest.count === value.cursor &&
+    (cursor === undefined || (nonNegative(cursor) && cursor === answerCount)) &&
+    (value.status !== "completed" || positive(value.answerManifest.count)) &&
     (value.status !== "in_progress" || value.answerManifest.complete === false) &&
     (value.status !== "completed" || value.answerManifest.complete === true) &&
     (value.status !== "failed" || value.answerManifest.complete === false)
@@ -160,12 +180,19 @@ function validChunk(
       textPrefix(input.id, input.ordinal, input.queryId, input.role) +
         String(value.index).padStart(8, "0") &&
     value.conversationId === input.id &&
-    value.ordinal === input.ordinal &&
+    (value.ordinal === undefined || value.ordinal === input.ordinal) &&
     value.queryId === input.queryId &&
     value.role === input.role &&
     nonNegative(value.index) &&
     typeof value.text === "string"
   );
+}
+function answerCount(value: Record<string, unknown>): number {
+  const manifest = value.answerManifest;
+  if (!isRecord(manifest) || !nonNegative(manifest.count)) {
+    throw fail("conversation_unavailable", "Conversation answer manifest is invalid.");
+  }
+  return manifest.count;
 }
 function failureCode(value: unknown): { code: string } | undefined {
   return isRecord(value) && typeof value.code === "string" ? { code: value.code } : undefined;
@@ -514,7 +541,7 @@ export function createHistoryStore(input: {
         status: current.status,
         questionManifest: current.questionManifest,
         answerManifest: current.answerManifest,
-        cursor: current.cursor,
+        cursor: answerCount(current),
         ...(nonNegative(current.resultDeadlineAt)
           ? { resultDeadlineAt: current.resultDeadlineAt }
           : {}),
@@ -525,6 +552,11 @@ export function createHistoryStore(input: {
     const response: Record<string, unknown> = {
       version: 1,
       conversationId: scope.conversationId,
+      ...(typeof currentMeta.historyLabel === "string" && currentMeta.historyLabel.trim()
+        ? { label: currentMeta.historyLabel }
+        : {}),
+      ...(typeof currentMeta.createdAt === "string" ? { createdAt: currentMeta.createdAt } : {}),
+      ...(typeof currentMeta.updatedAt === "string" ? { updatedAt: currentMeta.updatedAt } : {}),
       throughOrdinal,
       closed: currentMeta.closed === true,
       canContinue: descriptors.some(
@@ -662,7 +694,7 @@ export function createHistoryStore(input: {
       throw fail("conversation_unavailable", "Conversation text manifest is invalid.");
     }
     const manifestCount = manifest.count;
-    const available = scope.role === "user" ? manifestCount : Number(turn.cursor);
+    const available = manifestCount;
     const cursor = parseTextCursor(scope.cursor, digest, {
       conversationId: scope.conversationId,
       ordinal: scope.ordinal,
