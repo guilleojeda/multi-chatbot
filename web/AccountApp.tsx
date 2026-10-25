@@ -376,7 +376,12 @@ export function AccountApp({
   const chatSelectionEpochRef = useRef(0);
   const historyListGenerationRef = useRef(0);
   const historySelectionGenerationRef = useRef(0);
-  const historyInitializedOwnerRef = useRef<string | null>(null);
+  const historyListInitializedOwnerRef = useRef<string | null>(null);
+  const chatJournalBootstrapOwnerRef = useRef<string | null>(null);
+  const chatPendingConversationOpenRef = useRef<{
+    ownerKey: string;
+    conversationId: string;
+  } | null>(null);
   const chatJournalsRef = useRef(new Map<string, ChatJournalEntry>());
   const chatDraftsRef = useRef(new Map<string, string>());
   const localConversationsRef = useRef(
@@ -476,7 +481,9 @@ export function AccountApp({
     chatJournalsRef.current.clear();
     chatDraftsRef.current.clear();
     localConversationsRef.current.clear();
-    historyInitializedOwnerRef.current = null;
+    historyListInitializedOwnerRef.current = null;
+    chatJournalBootstrapOwnerRef.current = null;
+    chatPendingConversationOpenRef.current = null;
   }, []);
 
   // Identity activation leaves an unowned journal available to the recovery effect.
@@ -493,6 +500,7 @@ export function AccountApp({
       chatSubmissionInFlightRef.current = false;
       chatOwnerKeyRef.current = null;
       chatConversationIdRef.current = null;
+      chatPendingConversationOpenRef.current = null;
       chatJournalsRef.current.clear();
       chatDraftsRef.current.clear();
       clearCurrentChatJournal(configToClear);
@@ -508,6 +516,49 @@ export function AccountApp({
       invalidateChat();
       chatOwnerKeyRef.current = nextOwner;
       setChat(emptyChatState());
+      const config = configRef.current;
+      if (!config || config.botId !== identity.botId) return;
+
+      chatJournalBootstrapOwnerRef.current = nextOwner;
+      const owner = { sub: identity.sub, botId: identity.botId };
+      let journals = new Map<string, ChatJournalEntry>();
+      let selectedId: string | null = null;
+      try {
+        journals = readChatJournals(config, owner);
+        selectedId = readChatSelection(config, owner);
+      } catch {
+        // History remains available when this tab cannot use session storage.
+      }
+      chatJournalsRef.current = journals;
+      chatJournalOwnerRef.current = { config, identity: owner };
+      rememberJournalConversations(journals);
+      if (!selectedId && journals.size > 0) selectedId = journals.keys().next().value ?? null;
+      if (selectedId) {
+        chatPendingConversationOpenRef.current = {
+          ownerKey: nextOwner,
+          conversationId: selectedId,
+        };
+      }
+      const current = chatScreenStateRef.current;
+      const currentHistory = current.history ?? emptyHistoryState();
+      setChat({
+        ...current,
+        history: {
+          ...currentHistory,
+          conversations: mergeHistoryConversations(
+            localConversationsRef.current,
+            currentHistory.conversations,
+            [],
+          ),
+          selectedConversationId: selectedId,
+          turnsStatus: selectedId ? "loading" : "idle",
+          turns: [],
+          turnsNextCursor: null,
+          refreshRequired: false,
+          openingConversationId: undefined,
+        },
+      });
+      chatConversationIdRef.current = selectedId;
     },
     [invalidateChat, setChat],
   );
@@ -529,6 +580,7 @@ export function AccountApp({
     chatConversationIdRef.current = null;
     chatJournalRef.current = null;
     chatDisplayedQueryIdRef.current = null;
+    chatPendingConversationOpenRef.current = null;
     chatDraftsRef.current.set("__new__", "");
     if (identity && config) {
       try {
@@ -1344,6 +1396,7 @@ export function AccountApp({
     }
     const identityKey = chatOwnerKey(identity);
     if (chatOwnerKeyRef.current !== identityKey) return false;
+    chatPendingConversationOpenRef.current = null;
 
     const previousSelected = current.history?.selectedConversationId ?? null;
     if (previousSelected !== null) {
@@ -1370,6 +1423,58 @@ export function AccountApp({
     }));
 
     try {
+      const pendingJournal = chatJournalsRef.current.get(conversationId);
+      if (
+        pendingJournal &&
+        !pendingJournal.admitted &&
+        pendingJournal.request.operation === "start"
+      ) {
+        const request = pendingJournal.request;
+        chatJournalRef.current = pendingJournal;
+        chatJournalOwnerRef.current = { config, identity };
+        chatConversationIdRef.current = conversationId;
+        chatDisplayedQueryIdRef.current = request.queryId;
+        try {
+          writeChatSelection(config, identity, conversationId);
+        } catch {
+          // The journal remains selectable in this page if selection storage is unavailable.
+        }
+        setChat({
+          ...chatScreenStateRef.current,
+          draft: "",
+          queryId: request.queryId,
+          question: request.text,
+          answer: "",
+          answerComplete: false,
+          ordinal: request.baseOrdinal,
+          queryStatus: "unconfirmed",
+          canContinue: false,
+          canRetry: true,
+          recovered: false,
+          recoveryLoading: false,
+          queryError:
+            "No pudimos confirmar si se admitió el envío. Podés consultar su estado o reintentar el mismo pedido.",
+          queryErrorCode: "UNCONFIRMED",
+          history: {
+            ...(chatScreenStateRef.current.history ?? emptyHistoryState()),
+            selectedConversationId: conversationId,
+            turnsStatus: "ready",
+            turns: [],
+            turnsNextCursor: null,
+            loadingEarlier: false,
+            openingConversationId: undefined,
+            turnsError: undefined,
+            refreshRequired: false,
+            closed: false,
+            canContinue: false,
+            throughOrdinal: request.baseOrdinal,
+            error: undefined,
+          },
+        });
+        setChatRecoveryRevision((revision) => revision + 1);
+        return true;
+      }
+
       const view = await readConversationView(conversationId, null, isActive);
       if (!isActive()) return false;
       const last = view.turns.at(-1);
@@ -1529,6 +1634,7 @@ export function AccountApp({
         page.conversations,
         existing,
       );
+      historyListInitializedOwnerRef.current = ownerKey;
       setHistory((history) => ({
         ...history,
         status: conversations.length === 0 && !page.nextCursor ? "empty" : "ready",
@@ -1600,6 +1706,16 @@ export function AccountApp({
     } catch (error) {
       if (!isActive()) return;
       const apiError = asApiError(error);
+      if (apiError.status === 401) {
+        invalidateChat(config);
+        profileUnauthorized();
+        return;
+      }
+      if (apiError.status === 403) {
+        invalidateChat(config);
+        profileForbidden();
+        return;
+      }
       setHistory((history) => ({
         ...history,
         loadingEarlier: false,
@@ -1620,10 +1736,46 @@ export function AccountApp({
     ) {
       return;
     }
+    const pending = chatPendingConversationOpenRef.current;
+    if (!pending) return;
+    if (pending.ownerKey !== chatOwnerKey(readyIdentity)) {
+      chatPendingConversationOpenRef.current = null;
+      return;
+    }
+    chatPendingConversationOpenRef.current = null;
+    void selectConversation(pending.conversationId);
+  }, [
+    apiConfig,
+    authorizedRouteIsCurrent,
+    chatScreenState.history?.openingConversationId,
+    chatScreenState.history?.selectedConversationId,
+    chatScreenState.history?.turnsStatus,
+    readyIdentity,
+    route.kind,
+    session,
+    state.view,
+  ]);
+
+  useEffect(() => {
+    if (
+      route.kind !== "chat" ||
+      !authorizedRouteIsCurrent ||
+      state.view !== "ready" ||
+      !readyIdentity ||
+      !apiConfig ||
+      !session ||
+      chatOwnerKeyRef.current !== chatOwnerKey(readyIdentity)
+    ) {
+      return;
+    }
     const identity = { sub: readyIdentity.sub, botId: readyIdentity.botId };
     const ownerKey = chatOwnerKey(identity);
-    if (historyInitializedOwnerRef.current === ownerKey) return;
-    historyInitializedOwnerRef.current = ownerKey;
+    if (
+      chatJournalBootstrapOwnerRef.current !== ownerKey ||
+      historyListInitializedOwnerRef.current === ownerKey
+    ) {
+      return;
+    }
     const generation = ++historyListGenerationRef.current;
     const chatEpoch = chatEpochRef.current;
     let active = true;
@@ -1643,51 +1795,20 @@ export function AccountApp({
     void listChatConversations(apiConfig, session, null, isActive)
       .then((page) => {
         if (!isActive()) return;
-        let journals = new Map<string, ChatJournalEntry>();
-        let selectedId: string | null = null;
-        try {
-          journals = readChatJournals(apiConfig, identity);
-          selectedId = readChatSelection(apiConfig, identity);
-        } catch {
-          // The remote archive remains readable even when this tab cannot use session storage.
-        }
-        chatJournalsRef.current = journals;
-        chatJournalOwnerRef.current = { config: apiConfig, identity };
-        for (const [conversationId, entry] of journals) {
-          if (entry.admitted && !localConversationsRef.current.has(conversationId)) {
-            localConversationsRef.current.set(conversationId, {
-              conversationId,
-              label: "Conversación en curso",
-              lastOrdinal: entry.ordinal,
-              closed: false,
-              activeQueryId: entry.request.queryId,
-            });
-          }
-        }
-        if (!selectedId && journals.size > 0) selectedId = journals.keys().next().value ?? null;
+        historyListInitializedOwnerRef.current = ownerKey;
         const conversations = mergeHistoryConversations(
           localConversationsRef.current,
           page.conversations,
           [],
         );
-        setChat({
-          ...chatScreenStateRef.current,
-          history: {
-            ...(chatScreenStateRef.current.history ?? emptyHistoryState()),
-            status: conversations.length === 0 && !page.nextCursor ? "empty" : "ready",
-            conversations,
-            nextCursor: page.nextCursor,
-            loadingMore: false,
-            selectedConversationId: selectedId,
-            turnsStatus: "idle",
-            turns: [],
-            turnsNextCursor: null,
-            refreshRequired: false,
-            error: undefined,
-          },
-        });
-        chatConversationIdRef.current = selectedId;
-        if (selectedId) void selectConversation(selectedId);
+        setHistory((history) => ({
+          ...history,
+          status: conversations.length === 0 && !page.nextCursor ? "empty" : "ready",
+          conversations,
+          nextCursor: page.nextCursor,
+          loadingMore: false,
+          error: undefined,
+        }));
       })
       .catch((error: unknown) => {
         if (!isActive()) return;
@@ -1702,41 +1823,20 @@ export function AccountApp({
           profileForbidden();
           return;
         }
-        let journals = new Map<string, ChatJournalEntry>();
-        let selectedId: string | null = null;
-        try {
-          journals = readChatJournals(apiConfig, identity);
-          selectedId = readChatSelection(apiConfig, identity);
-        } catch {
-          // A storage denial cannot expose a transcript or alter the API failure state.
-        }
-        chatJournalsRef.current = journals;
-        chatJournalOwnerRef.current = { config: apiConfig, identity };
-        for (const [conversationId, entry] of journals) {
-          if (entry.admitted && !localConversationsRef.current.has(conversationId)) {
-            localConversationsRef.current.set(conversationId, {
-              conversationId,
-              label: "Conversación en curso",
-              lastOrdinal: entry.ordinal,
-              closed: false,
-              activeQueryId: entry.request.queryId,
-            });
-          }
-        }
-        if (!selectedId && journals.size > 0) selectedId = journals.keys().next().value ?? null;
-        chatConversationIdRef.current = selectedId;
-        setChat({
-          ...chatScreenStateRef.current,
-          history: {
-            ...(chatScreenStateRef.current.history ?? emptyHistoryState()),
-            status: "error",
-            conversations: [...localConversationsRef.current.values()],
-            loadingMore: false,
-            selectedConversationId: selectedId,
-            turnsStatus: "idle",
-            error: historyErrorMessage(apiError.code, apiError.status),
-          },
-        });
+        historyListInitializedOwnerRef.current = ownerKey;
+        const currentHistory = chatScreenStateRef.current.history ?? emptyHistoryState();
+        const conversations = mergeHistoryConversations(
+          localConversationsRef.current,
+          [],
+          currentHistory.conversations,
+        );
+        setHistory((history) => ({
+          ...history,
+          status: "error",
+          conversations,
+          loadingMore: false,
+          error: historyErrorMessage(apiError.code, apiError.status),
+        }));
       });
 
     return () => {
@@ -1756,6 +1856,44 @@ export function AccountApp({
     state.view,
   ]);
 
+  const historyOwnerKey = readyIdentity ? chatOwnerKey(readyIdentity) : null;
+  useEffect(() => {
+    if (route.kind !== "chat" || !historyOwnerKey) return;
+    return () => {
+      historyListGenerationRef.current += 1;
+      historySelectionGenerationRef.current += 1;
+      const history = chatScreenStateRef.current.history;
+      if (history?.openingConversationId) {
+        chatPendingConversationOpenRef.current = {
+          ownerKey: historyOwnerKey,
+          conversationId: history.openingConversationId,
+        };
+      }
+      setHistory((history) => {
+        const openingConversation = Boolean(
+          history.openingConversationId && history.turnsStatus === "loading",
+        );
+        if (
+          !history.loadingMore &&
+          history.status !== "loading" &&
+          !openingConversation &&
+          !history.loadingEarlier
+        ) {
+          return history;
+        }
+        const hasKnownHistory = history.conversations.length > 0 || history.nextCursor !== null;
+        return {
+          ...history,
+          status:
+            history.status === "loading" ? (hasKnownHistory ? "ready" : "empty") : history.status,
+          loadingMore: false,
+          loadingEarlier: false,
+          ...(openingConversation ? { openingConversationId: undefined } : {}),
+        };
+      });
+    };
+  }, [historyOwnerKey, route.kind, setHistory]);
+
   useEffect(() => {
     if (
       route.kind !== "chat" ||
@@ -1769,7 +1907,11 @@ export function AccountApp({
       return;
     }
     const selectedConversationId = chatScreenState.history?.selectedConversationId;
-    if (!selectedConversationId) {
+    if (
+      !selectedConversationId ||
+      chatScreenState.history?.turnsStatus === "loading" ||
+      Boolean(chatScreenState.history?.openingConversationId)
+    ) {
       return;
     }
     if (chatRequestRef.current && !chatRequestRef.current.signal.aborted) {
@@ -1976,6 +2118,13 @@ export function AccountApp({
           snapshot.ordinal,
           !snapshot.canContinue,
         );
+      } else {
+        updateLocalConversation(
+          request.conversationId,
+          snapshot.question,
+          snapshot.ordinal,
+          snapshot.queryId,
+        );
       }
     };
 
@@ -2164,7 +2313,9 @@ export function AccountApp({
     session,
     setChat,
     chatRecoveryRevision,
+    chatScreenState.history?.openingConversationId,
     chatScreenState.history?.selectedConversationId,
+    chatScreenState.history?.turnsStatus,
     state.view,
   ]);
 
@@ -2200,6 +2351,70 @@ export function AccountApp({
       ...history,
       status: "ready",
       conversations: [summary, ...remaining],
+      error: undefined,
+    }));
+  }
+
+  function rememberJournalConversations(journals: Map<string, ChatJournalEntry>) {
+    for (const [conversationId, entry] of journals) {
+      if (localConversationsRef.current.has(conversationId)) continue;
+      localConversationsRef.current.set(
+        conversationId,
+        entry.admitted
+          ? {
+              conversationId,
+              label: "Conversación en curso",
+              lastOrdinal: entry.ordinal,
+              closed: false,
+              activeQueryId: entry.request.queryId,
+            }
+          : {
+              conversationId,
+              label: entry.request.text.trim().replace(/\s+/g, " ").slice(0, 120),
+              lastOrdinal: entry.request.baseOrdinal,
+              closed: false,
+              pending: true,
+            },
+      );
+    }
+  }
+
+  function updatePendingConversation(request: ChatRequest) {
+    const current = chatScreenStateRef.current.history ?? emptyHistoryState();
+    const prior =
+      localConversationsRef.current.get(request.conversationId) ??
+      current.conversations.find(
+        (conversation) => conversation.conversationId === request.conversationId,
+      );
+    if (request.operation === "message" && prior) {
+      localConversationsRef.current.set(request.conversationId, prior);
+      return;
+    }
+    const label =
+      prior?.label ||
+      request.text.trim().replace(/\s+/g, " ").slice(0, 120) ||
+      "Nueva conversación";
+    const summary = {
+      ...(prior?.createdAt
+        ? { createdAt: prior.createdAt }
+        : { createdAt: new Date().toISOString() }),
+      conversationId: request.conversationId,
+      label,
+      updatedAt: new Date().toISOString(),
+      lastOrdinal: Math.max(prior?.lastOrdinal ?? 0, request.baseOrdinal),
+      closed: false,
+      pending: true,
+    };
+    localConversationsRef.current.set(request.conversationId, summary);
+    setHistory((history) => ({
+      ...history,
+      status: "ready",
+      conversations: [
+        summary,
+        ...history.conversations.filter(
+          (conversation) => conversation.conversationId !== request.conversationId,
+        ),
+      ],
       error: undefined,
     }));
   }
@@ -2247,6 +2462,7 @@ export function AccountApp({
       lastOrdinal: Math.max(existing.lastOrdinal, ordinal),
       closed,
       activeQueryId: undefined,
+      pending: undefined,
     };
     localConversationsRef.current.set(conversationId, summary);
     setHistory((current) => ({
@@ -2379,6 +2595,7 @@ export function AccountApp({
         refreshRequired: false,
       },
     });
+    updatePendingConversation(request);
 
     void streamChat(apiConfig, session, request, {
       signal: controller.signal,
@@ -2554,7 +2771,13 @@ export function AccountApp({
               failure: undefined,
             }),
           );
-          updateLocalConversation(conversationId, text, result.ordinal, null, !result.canContinue);
+          updateLocalConversation(
+            conversationId,
+            text,
+            result.ordinal,
+            result.status === "in_progress" ? result.queryId : null,
+            terminal && !result.canContinue,
+          );
           return;
         }
         if (result.status === "completed") {
@@ -2698,6 +2921,17 @@ export function AccountApp({
           chatJournalsRef.current.delete(conversationId);
           chatJournalRef.current = null;
         }
+        const removeRejectedStart =
+          operation === "start" &&
+          result.recordStatus === "not_admitted" &&
+          !preserveUnconfirmedJournal &&
+          !retryablePreAdmissionFailure;
+        const remainingConversations = removeRejectedStart
+          ? (before.history?.conversations ?? []).filter(
+              (conversation) => conversation.conversationId !== conversationId,
+            )
+          : undefined;
+        if (removeRejectedStart) localConversationsRef.current.delete(conversationId);
         const nextState: ChatScreenState = {
           ...before,
           queryId,
@@ -2724,6 +2958,15 @@ export function AccountApp({
             (result.recordStatus === "unconfirmed" && !chatJournalRef.current?.admitted),
           history: {
             ...(before.history ?? emptyHistoryState()),
+            ...(removeRejectedStart
+              ? {
+                  conversations: remainingConversations,
+                  status:
+                    remainingConversations?.length === 0 && !before.history?.nextCursor
+                      ? ("empty" as const)
+                      : ("ready" as const),
+                }
+              : {}),
             selectedConversationId:
               operation === "start" &&
               result.recordStatus === "not_admitted" &&

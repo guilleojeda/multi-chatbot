@@ -331,7 +331,28 @@ export function markChatJournalAdmitted(
   request: Pick<ChatRequest, "operation" | "conversationId" | "queryId" | "baseOrdinal">,
   ordinal: number,
 ) {
+  const store = storage();
   const key = entryKey(config, owner, request.conversationId);
+  const listKey = indexKey(config, owner);
+  const pointerKey = ownerKey(config);
+  const previousIndex = store.getItem(listKey);
+  const previousOwner = store.getItem(pointerKey);
+  const ids = readIndex(config, owner);
+  const alreadyIndexed = ids.includes(request.conversationId);
+  let ownerMatches = previousOwner === owner.sub;
+  if (previousOwner !== null && !ownerMatches) {
+    try {
+      const value: unknown = JSON.parse(previousOwner);
+      ownerMatches =
+        Boolean(value) &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        (value as Owner).sub === owner.sub &&
+        (value as Owner).botId === owner.botId;
+    } catch {
+      ownerMatches = false;
+    }
+  }
   const stored: StoredJournal = {
     version: 3,
     scope: scopeFor(config),
@@ -347,10 +368,28 @@ export function markChatJournalAdmitted(
     admitted: true,
     ordinal,
   };
+  let entryWritten = false;
   try {
-    storage().setItem(key, JSON.stringify(stored));
+    store.setItem(key, JSON.stringify(stored));
+    entryWritten = true;
+    if (!alreadyIndexed) writeIndex(config, owner, [...ids, request.conversationId]);
+    if (!ownerMatches) store.setItem(pointerKey, JSON.stringify(owner));
   } catch (error) {
-    removeQuietly(key);
+    // Never restore a pending entry's body after the server has confirmed admission.
+    // Keep a minimized entry only when the existing index can still find it.
+    if (!entryWritten || !alreadyIndexed) removeQuietly(key);
+    try {
+      if (previousIndex === null) store.removeItem(listKey);
+      else store.setItem(listKey, previousIndex);
+    } catch {
+      // Other indexed conversation references remain untouched.
+    }
+    try {
+      if (previousOwner === null) store.removeItem(pointerKey);
+      else store.setItem(pointerKey, previousOwner);
+    } catch {
+      // Preserve the previous owner pointer as far as storage allows.
+    }
     throw error;
   }
 }

@@ -8,6 +8,7 @@ export type ChatQueryStatus =
 export type ChatHistoryConversation = {
   conversationId: string;
   label: string;
+  pending?: boolean;
   createdAt?: string;
   updatedAt?: string;
   lastOrdinal: number;
@@ -197,7 +198,13 @@ export function ChatScreen({
     state.profileStatus === "complete" ||
     historyTurns.length > 0 ||
     Boolean(state.question || state.answer) ||
-    state.queryStatus !== "idle";
+    state.queryStatus !== "idle" ||
+    Boolean(
+      state.history?.openingConversationId ||
+      state.history?.turnsStatus === "loading" ||
+      state.history?.turnsStatus === "error" ||
+      state.history?.turnsError,
+    );
   const showComposer =
     state.profileStatus === "complete" &&
     state.queryStatus !== "unconfirmed" &&
@@ -313,9 +320,9 @@ export function ChatScreen({
   const staleBaseRefreshRequired =
     state.queryErrorCode === "stale_base" && history?.refreshRequired === true;
 
-  async function openConversation(conversationId: string) {
-    const opened = await onSelectConversation?.(conversationId);
-    if (opened !== false) setMobileView("chat");
+  function openConversation(conversationId: string) {
+    setMobileView("chat");
+    void onSelectConversation?.(conversationId);
   }
 
   function newConversation() {
@@ -394,11 +401,13 @@ export function ChatScreen({
                           {conversation.updatedAt
                             ? new Date(conversation.updatedAt).toLocaleDateString("es-AR")
                             : "Fecha no disponible"}
-                          {conversation.activeQueryId
-                            ? " · En curso"
-                            : conversation.closed
-                              ? " · Cerrada"
-                              : " · Abierta"}
+                          {conversation.pending
+                            ? " · Sin confirmar"
+                            : conversation.activeQueryId
+                              ? " · En curso"
+                              : conversation.closed
+                                ? " · Cerrada"
+                                : " · Abierta"}
                         </span>
                       </button>
                     </li>
@@ -579,7 +588,7 @@ export function ChatScreen({
                     Cargando conversación…
                   </p>
                 ) : null}
-                {history?.turnsStatus === "error" ? (
+                {history?.turnsError ? (
                   <p className="chat-result-error" role="alert">
                     {history.turnsError || "No pudimos abrir esta conversación."}
                   </p>
@@ -591,7 +600,11 @@ export function ChatScreen({
                     disabled={history.loadingEarlier}
                     onClick={() => void onLoadEarlierTurns?.()}
                   >
-                    {history.loadingEarlier ? "Cargando mensajes…" : "Ver mensajes anteriores"}
+                    {history.loadingEarlier
+                      ? "Cargando mensajes…"
+                      : history.turnsError
+                        ? "Reintentar"
+                        : "Ver mensajes anteriores"}
                   </button>
                 ) : null}
                 {history?.refreshRequired && history.selectedConversationId ? (
