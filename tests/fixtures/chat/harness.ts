@@ -382,7 +382,19 @@ function readProductJournal(config: ChatBrowserFixture["publicConfig"]) {
       const raw = store.getItem(key);
       if (!raw) continue;
       if (key.startsWith(`${productJournalPrefix}:owner:`)) {
-        if (identities.some(({ sub }) => sub === raw)) ownerPointers.push(raw);
+        try {
+          const owner: unknown = JSON.parse(raw);
+          if (
+            isRecord(owner) &&
+            owner.botId === config.botId &&
+            typeof owner.sub === "string" &&
+            identities.some(({ sub }) => sub === owner.sub)
+          ) {
+            ownerPointers.push(owner.sub);
+          }
+        } catch {
+          // A malformed owner pointer is not a valid fixture identity.
+        }
         continue;
       }
       if (!key.startsWith(`${productJournalPrefix}:entry:`)) continue;

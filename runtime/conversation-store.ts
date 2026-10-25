@@ -323,7 +323,11 @@ function parseContextReferences(input: {
 function reconstructMessages(
   conversationId: string,
   items: unknown[],
-  options: { validateContextReferences?: boolean } = {},
+  options: {
+    validateContextReferences?: boolean;
+    lastOrdinal?: number;
+    owner?: { sub: string; botId: string };
+  } = {},
 ): ConversationContext {
   const partition = `CONV#${conversationId}`;
   const turns = new Map<string, Record<string, unknown>>();
@@ -367,14 +371,35 @@ function reconstructMessages(
     contextManifest: unknown;
     contextSnapshot: unknown;
   }[] = [];
+  const coveredOrdinals = new Set<number>();
 
   for (const [ordinalKey, turn] of turns) {
     if (turn.status !== "in_progress" && turn.status !== "failed" && turn.status !== "completed") {
       throw new Error("Conversation context contains a turn with an unknown status.");
     }
-    if (turn.status !== "completed") continue;
+    if (
+      options.owner &&
+      ((turn.sub !== undefined && turn.sub !== options.owner.sub) ||
+        (turn.botId !== undefined && turn.botId !== options.owner.botId))
+    ) {
+      throw new Error("Conversation context contains a turn for another owner.");
+    }
 
     const ordinal = Number(ordinalKey);
+    if (options.lastOrdinal !== undefined && ordinal <= options.lastOrdinal) {
+      if (
+        !isPositiveSafeInteger(ordinal) ||
+        String(ordinal).padStart(8, "0") !== ordinalKey ||
+        turn.ordinal !== ordinal ||
+        turn.pk !== partition ||
+        turn.conversationId !== conversationId
+      ) {
+        throw new Error("Conversation context contains a malformed turn record.");
+      }
+      coveredOrdinals.add(ordinal);
+    }
+    if (turn.status !== "completed") continue;
+
     const questionCount = manifestCount(turn.questionManifest);
     const answerCount = manifestCount(turn.answerManifest);
     const contextCount =
@@ -387,6 +412,11 @@ function reconstructMessages(
       turn.conversationId !== conversationId ||
       typeof turn.queryId !== "string" ||
       !uuidPattern.test(turn.queryId) ||
+      (turn.phase !== undefined && turn.phase !== "complete") ||
+      (turn.cursor !== undefined &&
+        (typeof turn.cursor !== "number" ||
+          !Number.isSafeInteger(turn.cursor) ||
+          turn.cursor !== answerCount)) ||
       questionCount === null ||
       answerCount === null ||
       (turn.contextManifest !== undefined && contextCount === null)
@@ -403,6 +433,10 @@ function reconstructMessages(
       contextManifest: turn.contextManifest,
       contextSnapshot: turn.contextSnapshot,
     });
+  }
+
+  if (options.lastOrdinal !== undefined && coveredOrdinals.size !== options.lastOrdinal) {
+    throw new Error("Conversation context is missing a turn.");
   }
 
   for (const [ordinalKey] of chunks) {
@@ -2255,7 +2289,10 @@ export function createConversationStoreAdapter(input: {
       }
       const summaryPointer = readSummaryPointer(metaItem);
       if (!summaryPointer) {
-        return reconstructMessages(conversationId, await queryItems(partition));
+        return reconstructMessages(conversationId, await queryItems(partition), {
+          lastOrdinal: metaItem.lastOrdinal,
+          owner: { sub: metaItem.sub, botId: metaItem.botId },
+        });
       }
       if (summaryPointer.throughOrdinal > metaItem.lastOrdinal) {
         throw new Error("Conversation META summary is ahead of its latest turn.");
@@ -2316,7 +2353,10 @@ export function createConversationStoreAdapter(input: {
         }
       }
       return {
-        ...reconstructMessages(conversationId, items, { validateContextReferences: false }),
+        ...reconstructMessages(conversationId, items, {
+          validateContextReferences: false,
+          owner: { sub: metaItem.sub, botId: metaItem.botId },
+        }),
         summary,
       };
     },

@@ -242,6 +242,149 @@ describe("stored context snapshot read validation", () => {
   });
 });
 
+describe("conversation context integrity", () => {
+  it.each([
+    [
+      "a missing latest turn",
+      [turnRecord(1), turnText(1, "user", "question-1"), turnText(1, "assistant", "answer-1")],
+      2,
+    ],
+    ["no turn records", [], 1],
+  ])("rejects %s when META declares it", async (_label, turns, lastOrdinal) => {
+    const db = makeDatabase([meta(lastOrdinal), ...turns]);
+
+    await expect(makeStore(db.documentClient).readContext({ conversationId })).rejects.toThrow(
+      /missing a turn/i,
+    );
+  });
+
+  it("checks coverage across failed and active turns without requiring SEND rows", async () => {
+    const items = [
+      meta(3),
+      turnRecord(1),
+      turnText(1, "user", "question-1"),
+      turnText(1, "assistant", "answer-1"),
+      turnRecord(2, {
+        status: "failed",
+        phase: "failed",
+        cursor: 0,
+        answerManifest: { count: 0, complete: false },
+      }),
+      turnText(2, "user", "failed-question"),
+      turnRecord(3, {
+        status: "in_progress",
+        phase: "admitted",
+        cursor: 0,
+        answerManifest: { count: 0, complete: false },
+      }),
+      turnText(3, "user", "active-question"),
+    ];
+    const db = makeDatabase(items);
+
+    const context = await makeStore(db.documentClient).readContext({ conversationId });
+
+    expect(context.references).toEqual([reference(1)]);
+    expect(context.messages).toEqual([
+      { role: "user", content: [{ text: "question-1" }] },
+      { role: "assistant", content: [{ text: "answer-1" }] },
+    ]);
+    expect(items.some((item) => item.sk.startsWith("SEND#"))).toBe(false);
+  });
+
+  const corruptCompletedTurns = [
+    ["a cursor that contradicts the answer manifest", { cursor: 0 }],
+    ["an explicitly failed phase", { phase: "failed" }],
+    ["an explicit foreign owner", { sub: "another-teacher" }],
+    ["an explicit foreign bot", { botId: "another-bot" }],
+  ];
+
+  it.each(["without a summary", "after a summary"])(
+    "rejects contradictory completed turns %s",
+    async (mode) => {
+      for (const [label, overrides] of corruptCompletedTurns) {
+        const ordinal = mode === "without a summary" ? 1 : 2;
+        const completed = turnRecord(ordinal, overrides);
+        let items;
+        if (mode === "without a summary") {
+          items = [
+            meta(1),
+            completed,
+            turnText(1, "user", "question-1"),
+            turnText(1, "assistant", "answer-1"),
+          ];
+        } else {
+          const summary = summaryVersion([reference(1)], `integrity-${label.replaceAll(" ", "-")}`);
+          const persistedSummary = createContextStorage({
+            documentClient: { send: async () => ({}) },
+            tableName,
+          }).createSummaryItems({ conversationId, ...owner, summary });
+          items = [
+            meta(2, { summaryId: summary.summaryId, throughOrdinal: 1 }),
+            turnRecord(1),
+            ...persistedSummary.sourceReferenceItems,
+            ...persistedSummary.textItems,
+            persistedSummary.descriptor,
+            completed,
+            turnText(2, "user", "question-2"),
+            turnText(2, "assistant", "answer-2"),
+          ];
+        }
+        const db = makeDatabase(items);
+
+        await expect(
+          makeStore(db.documentClient).readContext({ conversationId }),
+        ).rejects.toThrow();
+      }
+    },
+  );
+
+  it.each(["without a summary", "after a summary"])(
+    "preserves legacy completed turns whose optional cursor, phase, and owner are absent %s",
+    async (mode) => {
+      const ordinal = mode === "without a summary" ? 1 : 2;
+      const legacyTurn = turnRecord(ordinal);
+      delete legacyTurn.cursor;
+      delete legacyTurn.phase;
+      delete legacyTurn.sub;
+      delete legacyTurn.botId;
+      let items;
+      if (mode === "without a summary") {
+        items = [
+          meta(1),
+          legacyTurn,
+          turnText(1, "user", "legacy-question"),
+          turnText(1, "assistant", "legacy-answer"),
+        ];
+      } else {
+        const summary = summaryVersion([reference(1)], "legacy-optional-fields-summary");
+        const persistedSummary = createContextStorage({
+          documentClient: { send: async () => ({}) },
+          tableName,
+        }).createSummaryItems({ conversationId, ...owner, summary });
+        items = [
+          meta(2, { summaryId: summary.summaryId, throughOrdinal: 1 }),
+          turnRecord(1),
+          ...persistedSummary.sourceReferenceItems,
+          ...persistedSummary.textItems,
+          persistedSummary.descriptor,
+          legacyTurn,
+          turnText(2, "user", "legacy-question"),
+          turnText(2, "assistant", "legacy-answer"),
+        ];
+      }
+      const db = makeDatabase(items);
+
+      const context = await makeStore(db.documentClient).readContext({ conversationId });
+
+      expect(context.references).toEqual([reference(ordinal)]);
+      expect(context.messages).toEqual([
+        { role: "user", content: [{ text: "legacy-question" }] },
+        { role: "assistant", content: [{ text: "legacy-answer" }] },
+      ]);
+    },
+  );
+});
+
 describe("summarized history with snapshots created before coverage", () => {
   it.each(["inline", "fragmented"])(
     "keeps a historical recent reference to covered turn data when stored %s",

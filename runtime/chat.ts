@@ -761,6 +761,13 @@ export function createChatHandler(dependencies: ChatDependencies) {
           ) {
             return reject(safeFailure("conversation_unavailable", "not_admitted", request.queryId));
           }
+          if (meta.closed) {
+            return reject(
+              safeFailure("conversation_closed", "not_admitted", request.queryId, {
+                canContinue: false,
+              }),
+            );
+          }
         }
         if (meta.activeQueryId) {
           return reject(safeFailure("conversation_busy", "not_admitted", request.queryId));
