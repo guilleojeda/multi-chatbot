@@ -215,6 +215,360 @@ describe("phase 7 frontend repair regressions", () => {
     expect(props(app).state.history.conversations[0].pending).toBeUndefined();
   });
 
+  it.each(["capacity_exceeded", "storage_capacity_exceeded"])(
+    "carries a rejected follow-up draft into a clean new conversation after %s",
+    async (code) => {
+      const body = `Keep this draft after ${code}`;
+      const environment = createHistoryEnvironment({
+        listHandler: historyList,
+        turnsHandler: ({ conversationId }) =>
+          jsonResponse({
+            version: 1,
+            conversationId,
+            throughOrdinal: 2,
+            closed: false,
+            canContinue: true,
+            turns: [turn()],
+          }),
+        textHandler: turnText,
+        runtimeHandler: () =>
+          jsonResponse({
+            type: "failed",
+            code,
+            message: "The request cannot be admitted.",
+            recordStatus: "not_admitted",
+          }),
+      });
+      const app = mount(environment);
+      await app.flush();
+      await props(app).onSelectConversation(firstConversationId);
+      await app.flush();
+
+      props(app).onDraftChange(body);
+      await app.flush();
+      expect(props(app).onSubmit(body)).toBe(true);
+      await app.flush();
+      expect(props(app).state).toMatchObject({ queryStatus: "rejected", draft: body });
+
+      props(app).onReset();
+      await app.flush();
+      expect(props(app).state).toMatchObject({
+        queryStatus: "idle",
+        draft: body,
+        history: { selectedConversationId: null, turns: [] },
+      });
+      expect(props(app).state).not.toHaveProperty("queryId");
+      expect(props(app).state).not.toHaveProperty("question");
+      expect(props(app).state).not.toHaveProperty("answer");
+      expect(props(app).state.history.conversations).toMatchObject([
+        { conversationId: firstConversationId },
+      ]);
+    },
+  );
+
+  it("keeps a rejected start draft when returning to a clean home chat", async () => {
+    const body = "Keep this rejected start draft";
+    const environment = createHistoryEnvironment({
+      runtimeHandler: () =>
+        jsonResponse({
+          type: "failed",
+          code: "storage_capacity_exceeded",
+          message: "The request cannot be admitted.",
+          recordStatus: "not_admitted",
+        }),
+    });
+    const app = mount(environment);
+    await app.flush();
+    props(app).onDraftChange(body);
+    await app.flush();
+    expect(props(app).onSubmit(body)).toBe(true);
+    await app.flush();
+
+    props(app).onReset();
+    await app.flush();
+    expect(props(app).state).toMatchObject({
+      queryStatus: "idle",
+      draft: body,
+      history: { selectedConversationId: null, turns: [], conversations: [] },
+    });
+    expect(props(app).state).not.toHaveProperty("queryId");
+    expect(props(app).state).not.toHaveProperty("question");
+    expect(props(app).state).not.toHaveProperty("answer");
+  });
+
+  it("does not restore an older new-chat draft after the rejected draft was explicitly cleared", async () => {
+    const environment = createHistoryEnvironment({
+      listHandler: historyList,
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 2,
+          closed: false,
+          canContinue: true,
+          turns: [turn()],
+        }),
+      textHandler: turnText,
+      runtimeHandler: () =>
+        jsonResponse({
+          type: "failed",
+          code: "capacity_exceeded",
+          message: "The request cannot be admitted.",
+          recordStatus: "not_admitted",
+        }),
+    });
+    const app = mount(environment);
+    await app.flush();
+    props(app).onDraftChange("An older, separate new-chat draft");
+    await app.flush();
+    await props(app).onSelectConversation(firstConversationId);
+    await app.flush();
+
+    const rejectedDraft = "A follow-up that cannot fit";
+    props(app).onDraftChange(rejectedDraft);
+    await app.flush();
+    expect(props(app).onSubmit(rejectedDraft)).toBe(true);
+    await app.flush();
+    expect(props(app).state.queryStatus).toBe("rejected");
+    props(app).onDraftChange("");
+    await app.flush();
+
+    props(app).onReset();
+    await app.flush();
+    expect(props(app).state).toMatchObject({
+      queryStatus: "idle",
+      draft: "",
+      history: { selectedConversationId: null, turns: [] },
+    });
+  });
+
+  it("recovers a selected active turn from a valid in-memory journal when storage reads fail", async () => {
+    const environment = createHistoryEnvironment({
+      listHandler: historyList,
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 2,
+          closed: false,
+          canContinue: false,
+          turns: [
+            {
+              ...turn(2),
+              status: "in_progress",
+              answerManifest: { count: 0, complete: true },
+              cursor: 0,
+            },
+          ],
+        }),
+      textHandler: ({ conversationId, ordinal, url }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: url.searchParams.get("queryId"),
+          role: url.searchParams.get("role"),
+          chunks: [
+            {
+              index: 0,
+              text: url.searchParams.get("role") === "user" ? "Original question" : "",
+            },
+          ],
+          complete: true,
+        }),
+      recoverHandler: (request) =>
+        jsonResponse({
+          version: 2,
+          conversationId: request.conversationId,
+          queryId: request.queryId,
+          ordinal: 2,
+          status: "completed",
+          question: "Original question",
+          answer: "Recovered final answer",
+          canContinue: true,
+        }),
+    });
+    const app = mount(environment);
+    await app.flush();
+    environment.storage.getItem = () => {
+      throw new DOMException("Storage is unavailable", "SecurityError");
+    };
+
+    await props(app).onSelectConversation(firstConversationId);
+    await app.flush();
+    expect(props(app).state).toMatchObject({
+      queryStatus: "completed",
+      answer: "Recovered final answer",
+      history: { selectedConversationId: firstConversationId },
+    });
+    expect(
+      environment.runtimeRequests.filter(
+        (item) => item.headers.get("accept") === "application/json",
+      ),
+    ).toHaveLength(1);
+    expect(
+      environment.runtimeRequests.filter(
+        (item) => item.headers.get("accept") !== "application/json",
+      ),
+    ).toHaveLength(0);
+
+    const runtimeRequestCount = environment.runtimeRequests.length;
+    props(app).onDraftChange("A separate new request");
+    await app.flush();
+    expect(props(app).onSubmit("A separate new request")).toBe(false);
+    await app.flush();
+    expect(environment.runtimeRequests).toHaveLength(runtimeRequestCount);
+  });
+
+  it("uses selected META presentation metadata instead of a recent turn question", async () => {
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: secondConversationId,
+              label: "Another conversation",
+              lastOrdinal: 1,
+              closed: false,
+            },
+            {
+              conversationId: firstConversationId,
+              label: "Stale index label",
+              updatedAt: "2026-10-20T10:00:00.000Z",
+              lastOrdinal: 19,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          label: "Authoritative first question",
+          createdAt: "2026-10-18T10:00:00.000Z",
+          updatedAt: "2026-10-24T12:00:00.000Z",
+          throughOrdinal: 20,
+          closed: false,
+          canContinue: true,
+          turns: [turn(20)],
+        }),
+      textHandler: ({ conversationId, ordinal, url }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: url.searchParams.get("queryId"),
+          role: url.searchParams.get("role"),
+          chunks: [
+            {
+              index: 0,
+              text: url.searchParams.get("role") === "user" ? "QUESTION_20" : "ANSWER_20",
+            },
+          ],
+          complete: true,
+        }),
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    await props(app).onSelectConversation(firstConversationId);
+    await app.flush();
+
+    expect(
+      props(app).state.history.conversations.find(
+        (conversation) => conversation.conversationId === firstConversationId,
+      ),
+    ).toMatchObject({
+      label: "Authoritative first question",
+      createdAt: "2026-10-18T10:00:00.000Z",
+      updatedAt: "2026-10-24T12:00:00.000Z",
+    });
+    expect(
+      props(app).state.history.conversations.find(
+        (conversation) => conversation.conversationId === secondConversationId,
+      ).label,
+    ).toBe("Another conversation");
+  });
+
+  it.each([
+    [
+      "preserves a prior label",
+      [
+        {
+          conversationId: firstConversationId,
+          label: "Saved label",
+          lastOrdinal: 19,
+          closed: false,
+        },
+      ],
+      "Saved label",
+    ],
+    ["uses a clear placeholder when there is no prior label", [], "Conversación seleccionada"],
+  ])(
+    "does not derive a first-question label from a recent page: %s",
+    async (_scenario, listed, expectedLabel) => {
+      const environment = createHistoryEnvironment({
+        listHandler: () => jsonResponse({ version: 1, conversations: listed }),
+        turnsHandler: ({ conversationId }) =>
+          jsonResponse({
+            version: 1,
+            conversationId,
+            throughOrdinal: 20,
+            closed: false,
+            canContinue: true,
+            turns: [turn(20)],
+          }),
+        textHandler: ({ conversationId, ordinal, url }) =>
+          jsonResponse({
+            version: 1,
+            conversationId,
+            ordinal,
+            queryId: url.searchParams.get("queryId"),
+            role: url.searchParams.get("role"),
+            chunks: [{ index: 0, text: "QUESTION_20" }],
+            complete: true,
+          }),
+      });
+      const app = mount(environment);
+      await app.flush();
+
+      await props(app).onSelectConversation(firstConversationId);
+      await app.flush();
+
+      expect(
+        props(app).state.history.conversations.find(
+          (conversation) => conversation.conversationId === firstConversationId,
+        ).label,
+      ).toBe(expectedLabel);
+    },
+  );
+
+  it("rejects malformed selected-history presentation metadata", async () => {
+    const environment = createHistoryEnvironment({
+      listHandler: historyList,
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          label: "Valid label",
+          updatedAt: "not-a-date",
+          throughOrdinal: 2,
+          closed: false,
+          canContinue: true,
+          turns: [turn()],
+        }),
+      textHandler: turnText,
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(false);
+    await app.flush();
+    expect(props(app).state.history.turnsStatus).toBe("error");
+    expect(props(app).state.history.turnsError).toContain("No pudimos abrir");
+  });
+
   it("restarts a cancelled initial list and restores a cancelled refresh on return from profile", async () => {
     const initial = deferred();
     const refresh = deferred();

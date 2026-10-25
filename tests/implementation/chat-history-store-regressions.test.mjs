@@ -209,6 +209,62 @@ describe("history reader regressions", () => {
     expect(queryInputs[0].ExpressionAttributeValues[":upper"]).toBe("TURN#00000001");
   });
 
+  it("returns only available presentation metadata from META on the turn page", async () => {
+    const firstMeta = makeMeta({
+      lastOrdinal: 1,
+      activeQueryId: undefined,
+      activeOwnerAttemptId: undefined,
+      createdAt: "2026-10-20T10:00:00.000Z",
+      updatedAt: "2026-10-24T11:00:00.000Z",
+    });
+    const withoutLabel = { ...firstMeta, historyLabel: undefined };
+    const metas = [firstMeta, withoutLabel];
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) return { Item: metas.shift() };
+      if (command instanceof QueryCommand) return { Items: [makeTurn(1, q1)] };
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+    const store = createStore(send);
+
+    const labeled = await store.readTurns({ sub, botId, conversationId, limit: 1 });
+    const unlabeled = await store.readTurns({ sub, botId, conversationId, limit: 1 });
+
+    expect(labeled).toMatchObject({
+      label: "Regression",
+      createdAt: "2026-10-20T10:00:00.000Z",
+      updatedAt: "2026-10-24T11:00:00.000Z",
+    });
+    expect(unlabeled).not.toHaveProperty("label");
+    expect(unlabeled).toMatchObject({
+      createdAt: "2026-10-20T10:00:00.000Z",
+      updatedAt: "2026-10-24T11:00:00.000Z",
+    });
+  });
+
+  it("opens when META has unverifiable dates and omits them from presentation", async () => {
+    const invalidDateMeta = makeMeta({
+      lastOrdinal: 1,
+      activeQueryId: undefined,
+      activeOwnerAttemptId: undefined,
+      createdAt: "not-a-date",
+      updatedAt: "",
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) return { Item: invalidDateMeta };
+      if (command instanceof QueryCommand) return { Items: [makeTurn(1, q1)] };
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    const result = await createStore(send).readTurns({ sub, botId, conversationId, limit: 1 });
+
+    expect(result.canContinue).toBe(true);
+    expect(result.turns).toMatchObject([{ ordinal: 1, status: "completed" }]);
+    expect(result).not.toHaveProperty("createdAt");
+    expect(result).not.toHaveProperty("updatedAt");
+    expect(invalidDateMeta.createdAt).toBe("not-a-date");
+    expect(invalidDateMeta.updatedAt).toBe("");
+  });
+
   it("allows continuation after an open confirmed failure, but not after an uncertain claimed failure", async () => {
     const cases = [
       {
@@ -278,6 +334,67 @@ describe("history reader regressions", () => {
     expect(send.mock.calls.some(([command]) => command instanceof TransactWriteCommand)).toBe(
       false,
     );
+  });
+
+  it("opens the known pre-quota generating phase as unconfirmable without recovery", async () => {
+    const legacyActive = makeTurn(1, q1, {
+      status: "in_progress",
+      phase: "generating",
+      cursor: 0,
+      answerManifest: { count: 0, complete: false },
+    });
+    delete legacyActive.cursor;
+    delete legacyActive.resultDeadlineAt;
+    delete legacyActive.ownerAttemptId;
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) {
+        return {
+          Item: makeMeta({
+            lastOrdinal: 1,
+            activeQueryId: undefined,
+            activeOwnerAttemptId: undefined,
+          }),
+        };
+      }
+      if (command instanceof QueryCommand) return { Items: [legacyActive] };
+      throw new Error("Legacy active turns must not be reconciled: " + command.constructor.name);
+    });
+
+    const result = await createStore(send).readTurns({ sub, botId, conversationId, limit: 1 });
+
+    expect(result).toMatchObject({
+      canContinue: false,
+      turns: [
+        {
+          status: "in_progress",
+          cursor: 0,
+          answerManifest: { count: 0, complete: false },
+          failure: { code: "unconfirmable" },
+        },
+      ],
+    });
+    expect(send.mock.calls.some(([command]) => command instanceof TransactWriteCommand)).toBe(
+      false,
+    );
+  });
+
+  it("does not admit arbitrary or incomplete-question legacy phases", async () => {
+    const recordingQuestion = makeTurn(3, q2, {
+      status: "in_progress",
+      phase: "recording_question",
+      cursor: 0,
+      questionManifest: { count: 0, complete: false },
+      answerManifest: { count: 0, complete: false },
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) return { Item: makeMeta() };
+      if (command instanceof QueryCommand) return { Items: [recordingQuestion] };
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    await expect(
+      createStore(send).readTurns({ sub, botId, conversationId, limit: 1 }),
+    ).rejects.toMatchObject({ code: "conversation_unavailable" });
   });
 
   it("does not confirm an active turn whose owner attempt disagrees with META", async () => {
@@ -360,6 +477,144 @@ describe("history reader regressions", () => {
     await expect(store.readTurns({ sub, botId, conversationId, limit: 1 })).rejects.toMatchObject({
       code: "conversation_unavailable",
     });
+  });
+
+  it("reads pre-quota turns by deriving a missing cursor and chunk ordinal from canonical data", async () => {
+    const legacy = makeTurn(1, q1);
+    delete legacy.cursor;
+    const legacyChunks = [
+      {
+        pk: legacy.pk,
+        sk: `TURN#00000001#${q1}#USER#00000000`,
+        conversationId,
+        queryId: q1,
+        role: "user",
+        index: 0,
+        text: "Pregunta histórica íntegra.",
+      },
+      {
+        pk: legacy.pk,
+        sk: `TURN#00000001#${q1}#ASSISTANT#00000000`,
+        conversationId,
+        queryId: q1,
+        role: "assistant",
+        index: 0,
+        text: "Respuesta histórica íntegra.",
+      },
+    ];
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) {
+        return {
+          Item:
+            command.input.Key.sk === "META"
+              ? makeMeta({
+                  lastOrdinal: 1,
+                  activeQueryId: undefined,
+                  activeOwnerAttemptId: undefined,
+                })
+              : legacy,
+        };
+      }
+      if (command instanceof QueryCommand) {
+        if (command.input.FilterExpression) return { Items: [legacy] };
+        const prefix = command.input.ExpressionAttributeValues[":prefix"];
+        return { Items: legacyChunks.filter((chunk) => chunk.sk.startsWith(prefix)) };
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+    const store = createStore(send);
+
+    const turns = await store.readTurns({ sub, botId, conversationId, limit: 1 });
+    const answer = await store.readText({
+      sub,
+      botId,
+      conversationId,
+      ordinal: 1,
+      queryId: q1,
+      role: "assistant",
+    });
+
+    expect(turns.turns).toMatchObject([{ ordinal: 1, cursor: 1, status: "completed" }]);
+    expect(turns.canContinue).toBe(true);
+    expect(answer).toMatchObject({
+      chunks: [{ index: 0, text: "Respuesta histórica íntegra." }],
+      complete: true,
+    });
+    expect(legacy).not.toHaveProperty("cursor");
+    expect(legacyChunks.every((chunk) => !Object.hasOwn(chunk, "ordinal"))).toBe(true);
+  });
+
+  it("rejects an explicit chunk ordinal that disagrees with its canonical key", async () => {
+    const legacy = makeTurn(3, q2);
+    delete legacy.cursor;
+    const contradictoryChunk = {
+      pk: legacy.pk,
+      sk: `TURN#00000003#${q2}#ASSISTANT#00000000`,
+      conversationId,
+      ordinal: 2,
+      queryId: q2,
+      role: "assistant",
+      index: 0,
+      text: "No debe leerse como válida.",
+    };
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) {
+        return { Item: command.input.Key.sk === "META" ? makeMeta() : legacy };
+      }
+      if (command instanceof QueryCommand) return { Items: [contradictoryChunk] };
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    await expect(
+      createStore(send).readText({
+        sub,
+        botId,
+        conversationId,
+        ordinal: 3,
+        queryId: q2,
+        role: "assistant",
+      }),
+    ).rejects.toMatchObject({ code: "conversation_unavailable" });
+  });
+
+  it("rejects a completed empty answer before returning a continuation or reading fragments", async () => {
+    const emptyCompleted = makeTurn(3, q2, {
+      status: "completed",
+      phase: "complete",
+      cursor: 0,
+      answerManifest: { count: 0, complete: true },
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) {
+        return { Item: command.input.Key.sk === "META" ? makeMeta() : emptyCompleted };
+      }
+      if (command instanceof QueryCommand) {
+        if (command.input.FilterExpression) return { Items: [emptyCompleted] };
+        throw new Error("Completed empty answers must fail before fragment queries.");
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+    const store = createStore(send);
+
+    await expect(store.readTurns({ sub, botId, conversationId, limit: 1 })).rejects.toMatchObject({
+      code: "conversation_unavailable",
+    });
+    await expect(
+      store.readText({
+        sub,
+        botId,
+        conversationId,
+        ordinal: 3,
+        queryId: q2,
+        role: "assistant",
+      }),
+    ).rejects.toMatchObject({ code: "conversation_unavailable" });
+
+    const queries = send.mock.calls
+      .map(([command]) => command)
+      .filter((command) => command instanceof QueryCommand);
+    expect(queries).toHaveLength(1);
+    expect(queries[0].input.FilterExpression).toBe("attribute_exists(#status)");
   });
 
   it.each([

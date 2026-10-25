@@ -51,7 +51,15 @@ function validTurn(item, meta) {
     isRecord(item.questionManifest) &&
     Number.isSafeInteger(item.questionManifest.count) &&
     item.questionManifest.count > 0 &&
-    item.questionManifest.complete === true
+    item.questionManifest.complete === true &&
+    isRecord(item.answerManifest) &&
+    Number.isSafeInteger(item.answerManifest.count) &&
+    item.answerManifest.count >= 0 &&
+    typeof item.answerManifest.complete === "boolean" &&
+    (item.cursor === undefined ||
+      (Number.isSafeInteger(item.cursor) &&
+        item.cursor >= 0 &&
+        item.cursor === item.answerManifest.count))
   );
 }
 
@@ -138,7 +146,7 @@ async function readFirstQuestion(documentClient, tableName, meta, pageSize) {
         item.pk !== meta.pk ||
         item.conversationId !== meta.conversationId ||
         item.queryId !== turn.queryId ||
-        item.ordinal !== 1 ||
+        (item.ordinal !== undefined && item.ordinal !== 1) ||
         item.role !== "user" ||
         !Number.isSafeInteger(item.index) ||
         item.index < 0 ||

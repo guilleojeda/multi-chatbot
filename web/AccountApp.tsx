@@ -81,6 +81,35 @@ function sameChatJournalScope(left: PublicConfig, right: PublicConfig) {
   );
 }
 
+function isValidMemoryJournalForConversation(
+  entry: ChatJournalEntry | null,
+  conversationId: string,
+): entry is ChatJournalEntry {
+  if (!entry) return false;
+  const { request } = entry;
+  if (
+    request.version !== 2 ||
+    request.conversationId !== conversationId ||
+    !uuidPatternForHistory(request.conversationId) ||
+    !uuidPatternForHistory(request.queryId) ||
+    (request.operation !== "start" && request.operation !== "message") ||
+    !Number.isSafeInteger(request.baseOrdinal) ||
+    request.baseOrdinal < 0 ||
+    (request.operation === "start" && request.baseOrdinal !== 0) ||
+    (request.operation === "message" && request.baseOrdinal === 0)
+  ) {
+    return false;
+  }
+  if (entry.admitted) {
+    return (
+      !Object.hasOwn(request, "text") &&
+      Number.isSafeInteger(entry.ordinal) &&
+      entry.ordinal === request.baseOrdinal + 1
+    );
+  }
+  return "text" in request && typeof request.text === "string" && request.text.trim().length > 0;
+}
+
 function emptyChatState(): ChatScreenState {
   return {
     profileStatus: "loading",
@@ -566,11 +595,18 @@ export function AccountApp({
   const resetChat = useCallback(() => {
     const identity = state.view === "ready" ? state.identity : undefined;
     const config = configRef.current;
-    const previousConversationId =
-      chatScreenStateRef.current.history?.selectedConversationId ?? null;
+    const currentChat = chatScreenStateRef.current;
+    const previousConversationId = currentChat.history?.selectedConversationId ?? null;
     if (previousConversationId) {
-      chatDraftsRef.current.set(previousConversationId, chatScreenStateRef.current.draft || "");
+      chatDraftsRef.current.set(previousConversationId, currentChat.draft || "");
     }
+    const capacityRejectedDraft =
+      currentChat.queryStatus === "rejected" &&
+      ["capacity_exceeded", "storage_capacity_exceeded"].includes(
+        currentChat.queryErrorCode?.toLowerCase() || "",
+      )
+        ? (currentChat.draft ?? "")
+        : "";
     chatSelectionEpochRef.current += 1;
     historySelectionGenerationRef.current += 1;
     stopChatRecovery();
@@ -581,7 +617,7 @@ export function AccountApp({
     chatJournalRef.current = null;
     chatDisplayedQueryIdRef.current = null;
     chatPendingConversationOpenRef.current = null;
-    chatDraftsRef.current.set("__new__", "");
+    chatDraftsRef.current.set("__new__", capacityRejectedDraft);
     if (identity && config) {
       try {
         writeChatSelection(config, identity, null);
@@ -594,7 +630,7 @@ export function AccountApp({
       profileError: current.profileError,
       projectName: current.projectName,
       queryStatus: "idle",
-      draft: "",
+      draft: capacityRejectedDraft,
       history: current.history
         ? {
             ...current.history,
@@ -1331,6 +1367,10 @@ export function AccountApp({
     let pageCursor = cursor;
     let firstThroughOrdinal: number | undefined;
     let page: Awaited<ReturnType<typeof readConversationTurns>>;
+    const presentation: Pick<
+      Awaited<ReturnType<typeof readConversationTurns>>,
+      "label" | "createdAt" | "updatedAt"
+    > = {};
     const visitedCursors = new Set<string>();
     while (true) {
       if (pageCursor !== null) {
@@ -1350,6 +1390,9 @@ export function AccountApp({
         isActive,
       );
       firstThroughOrdinal ??= page.throughOrdinal;
+      presentation.label ??= page.label;
+      presentation.createdAt ??= page.createdAt;
+      presentation.updatedAt ??= page.updatedAt;
       if (page.nextCursor !== null && visitedCursors.has(page.nextCursor)) {
         throw Object.assign(new Error("History cursor repeated"), {
           code: "INVALID_RESPONSE",
@@ -1384,7 +1427,7 @@ export function AccountApp({
       );
       turns.push(...batch);
     }
-    return { ...page, throughOrdinal: firstThroughOrdinal!, turns };
+    return { ...page, ...presentation, throughOrdinal: firstThroughOrdinal!, turns };
   }
 
   async function selectConversation(conversationId: string): Promise<boolean> {
@@ -1966,25 +2009,25 @@ export function AccountApp({
         chatRecoveryControllerRef.current = null;
     };
 
-    let loadedJournals: Map<string, ChatJournalEntry>;
+    let loadedJournals = new Map<string, ChatJournalEntry>();
+    let journalStorageUnavailable = false;
     try {
       loadedJournals = readChatJournals(recoveryConfig, identity);
     } catch {
-      setChat({
-        ...chatScreenStateRef.current,
-        queryError: "No pudimos leer la referencia de recuperación de esta pestaña.",
-      });
-      return () => {
-        active = false;
-        clearTimer();
-      };
+      journalStorageUnavailable = true;
     }
 
     for (const [conversationId, entry] of loadedJournals) {
       chatJournalsRef.current.set(conversationId, entry);
     }
-    const liveJournal = chatJournalsRef.current.get(selectedConversationId) ?? null;
+    const storedLiveJournal = chatJournalsRef.current.get(selectedConversationId) ?? null;
     const liveJournalOwner = chatJournalOwnerRef.current;
+    const liveJournal = isValidMemoryJournalForConversation(
+      storedLiveJournal,
+      selectedConversationId,
+    )
+      ? storedLiveJournal
+      : null;
     const liveJournalHasCurrentOwner =
       liveJournal !== null &&
       liveJournalOwner !== null &&
@@ -1994,6 +2037,17 @@ export function AccountApp({
     const loadedJournal =
       loadedJournals.get(selectedConversationId) ??
       (liveJournalHasCurrentOwner ? liveJournal : null);
+
+    if (journalStorageUnavailable && !loadedJournal) {
+      setChat({
+        ...chatScreenStateRef.current,
+        queryError: "No pudimos leer la referencia de recuperación de esta pestaña.",
+      });
+      return () => {
+        active = false;
+        clearTimer();
+      };
+    }
 
     chatJournalOwnerRef.current = { config: recoveryConfig, identity };
     chatJournalRef.current = loadedJournal;
@@ -2423,31 +2477,36 @@ export function AccountApp({
     view: Awaited<ReturnType<typeof readConversationView>>,
   ) {
     const current = chatScreenStateRef.current.history ?? emptyHistoryState();
-    if (
-      current.conversations.some(
+    const existing =
+      localConversationsRef.current.get(view.conversationId) ??
+      current.conversations.find(
         (conversation) => conversation.conversationId === view.conversationId,
-      )
-    ) {
-      return;
-    }
-    const firstQuestion = view.turns.find((turn) => turn.question)?.question || "Conversación";
+      );
     const last = view.turns.at(-1);
     const conversation = {
+      ...existing,
       conversationId: view.conversationId,
-      label: firstQuestion.trim().replace(/\s+/g, " ").slice(0, 120),
+      label: view.label ?? existing?.label ?? "Conversación seleccionada",
+      ...(view.createdAt ? { createdAt: view.createdAt } : {}),
+      ...(view.updatedAt ? { updatedAt: view.updatedAt } : {}),
       lastOrdinal: view.throughOrdinal,
       closed: view.closed,
-      ...(last?.status === "in_progress" && last.failure?.code !== "unconfirmable"
-        ? { activeQueryId: last.queryId }
-        : {}),
+      activeQueryId:
+        last?.status === "in_progress" && last.failure?.code !== "unconfirmable"
+          ? last.queryId
+          : undefined,
+      pending: undefined,
     };
     localConversationsRef.current.set(view.conversationId, conversation);
     setHistory((history) => ({
       ...history,
-      conversations: [
-        conversation,
-        ...history.conversations.filter((item) => item.conversationId !== view.conversationId),
-      ],
+      conversations: history.conversations.some(
+        (item) => item.conversationId === view.conversationId,
+      )
+        ? history.conversations.map((item) =>
+            item.conversationId === view.conversationId ? conversation : item,
+          )
+        : [conversation, ...history.conversations],
     }));
   }
 
