@@ -2603,7 +2603,7 @@ export function AccountApp({
         last?.status === "in_progress" && last.failure?.code !== "unconfirmable"
           ? last.queryId
           : undefined,
-      pending: undefined,
+      pending: !view.closed && last?.failure?.code === "unconfirmable" ? true : undefined,
     };
     localConversationsRef.current.set(view.conversationId, conversation);
     setHistory((history) => ({
