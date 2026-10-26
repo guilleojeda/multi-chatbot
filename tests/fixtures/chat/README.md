@@ -83,6 +83,25 @@ La paginación, los manifiestos, los controles de membresía y los textos del hi
 HTTP apoyados en registros de Runtime sintéticos en `sessionStorage`. No prueban DynamoDB, el GSI,
 Bedrock, IAM, API Gateway, Cognito, ni supervivencia de trabajos AWS.
 
+Para reproducir la reconciliación de un journal viejo, dejá un envío admitido en el hilo A, elegí
+otro hilo y pulsá “Simular en otra sesión: terminar y admitir seguimiento”. El control del productor
+local cierra el turno que la pestaña dejó de observar y agrega un segundo turno activo sin modificar
+el journal. Al volver a A, el historial debe mostrar y observar el segundo turno. “Completar” puede
+terminar ese seguimiento mientras seguís en B o después de abrir A; en ambos casos, al volver a A
+el historial debe mostrarlo como terminal y el compositor debe quedar habilitado.
+
+Para reproducir una admisión cuyo `accepted` se perdió, elegí `runtime-admission-pending`, enviá un
+pedido en A, pulsá “Cerrar SSE antes de admitir” y después “Admitir consulta”. El registro local
+conserva el journal pendiente, mientras el productor simulado ya guarda el turno `streaming` con los
+mismos IDs. Creá B y usá allí “Simular en otra sesión: terminar y admitir seguimiento”; el control
+comprueba propietario, chatbot, conversación, query y turno durable, sin escribir el journal. Al
+volver a A, `recover` confirma Q1 y la lectura de historial descubre Q2. La pestaña debe minimizar el
+Q1 confirmado y observar Q2, sin volver a recuperar Q1 ni enviar un POST nuevo.
+
+Para comprobar el orden, prepará las 22 conversaciones, abrí una de las más antiguas desde la segunda
+página y actualizá el historial: debe seguir visible después de la actividad más reciente. Ambos
+recorridos prueban el frontend con datos simulados, no un GSI desplegado.
+
 ### Recovery and retry checks
 
 - **R2, uncertain result and exact retry:** select `runtime-unconfirmed` and submit a question. The

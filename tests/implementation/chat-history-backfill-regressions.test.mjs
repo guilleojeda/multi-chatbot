@@ -173,6 +173,100 @@ describe("history backfill regressions", () => {
     }
   });
 
+  it("orders legacy terminal turns by verified completion while preserving original dates", async () => {
+    const admittedAt = "2026-10-18T10:00:00.000Z";
+    const completedAt = "2026-10-18T12:00:00.000Z";
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub,
+      botId,
+      lastOrdinal: 1,
+      createdAt: admittedAt,
+      updatedAt: admittedAt,
+    };
+    const turn = firstTurnRecord(conversationId, queryId, {
+      createdAt: admittedAt,
+      updatedAt: completedAt,
+      completedAt,
+    });
+    const question = firstQuestionChunk(conversationId, queryId, "Primera pregunta histórica.");
+    const store = new Map([
+      ["META", meta],
+      ["TURN#00000001", turn],
+    ]);
+    const send = vi.fn(async (command) => {
+      if (command instanceof ScanCommand) return { Items: [store.get("META")] };
+      if (command instanceof GetCommand) return { Item: store.get(command.input.Key.sk) };
+      if (command instanceof QueryCommand) return { Items: [question] };
+      if (command instanceof UpdateCommand) {
+        const values = command.input.ExpressionAttributeValues;
+        Object.assign(store.get("META"), {
+          historyOwner: values[":historyOwner"],
+          historyOrder: values[":historyOrder"],
+          historyLabel: values[":historyLabel"],
+        });
+        return {};
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    const first = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+    const second = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+
+    expect(first).toMatchObject({ updated: 1, skipped: 0, incompatible: 0 });
+    expect(second).toMatchObject({ updated: 0, skipped: 1, incompatible: 0 });
+    expect(store.get("META").historyOrder).toBe(`${completedAt}#${conversationId}`);
+    expect(store.get("META").updatedAt).toBe(admittedAt);
+    expect(store.get("META").createdAt).toBe(admittedAt);
+    expect(turn.updatedAt).toBe(completedAt);
+    const update = send.mock.calls
+      .map(([command]) => command)
+      .find((command) => command instanceof UpdateCommand);
+    expect(update.input.UpdateExpression).not.toContain("updatedAt");
+  });
+
+  it("does not treat active answer chunk timestamps as conversation activity", async () => {
+    const admittedAt = "2026-10-18T10:00:00.000Z";
+    const chunkAt = "2026-10-18T12:00:00.000Z";
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub,
+      botId,
+      lastOrdinal: 1,
+      createdAt: admittedAt,
+      updatedAt: admittedAt,
+    };
+    const activeTurn = firstTurnRecord(conversationId, queryId, {
+      status: "in_progress",
+      phase: "generating",
+      createdAt: admittedAt,
+      updatedAt: chunkAt,
+      answerManifest: { count: 1, complete: false },
+    });
+    const question = firstQuestionChunk(conversationId, queryId, "Primera pregunta histórica.");
+    const updates = [];
+    const send = vi.fn(async (command) => {
+      if (command instanceof ScanCommand) return { Items: [meta] };
+      if (command instanceof GetCommand) return { Item: activeTurn };
+      if (command instanceof QueryCommand) return { Items: [question] };
+      if (command instanceof UpdateCommand) {
+        updates.push(command.input);
+        return {};
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    await backfillChatHistory({ documentClient: { send }, tableName, botId });
+
+    expect(updates[0].ExpressionAttributeValues[":historyOrder"]).toBe(
+      `${admittedAt}#${conversationId}`,
+    );
+  });
+
   it("reads only the first question when a turn has many assistant and private chunks", async () => {
     const meta = {
       pk: "CONV#" + conversationId,

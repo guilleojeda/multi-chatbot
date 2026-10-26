@@ -133,6 +133,20 @@ function emptyHistoryState(): ChatHistoryState {
   };
 }
 
+function conversationActivityTime(conversation: ChatHistoryState["conversations"][number]) {
+  if (!conversation.updatedAt) return Number.NEGATIVE_INFINITY;
+  const updatedAt = Date.parse(conversation.updatedAt);
+  return Number.isFinite(updatedAt) ? updatedAt : Number.NEGATIVE_INFINITY;
+}
+
+function sortHistoryConversations(conversations: ChatHistoryState["conversations"]) {
+  return [...conversations].sort(
+    (left, right) =>
+      conversationActivityTime(right) - conversationActivityTime(left) ||
+      left.conversationId.localeCompare(right.conversationId),
+  );
+}
+
 function mergeHistoryConversations(
   local: Map<string, ChatHistoryState["conversations"][number]>,
   serverPage: ChatHistoryState["conversations"],
@@ -156,20 +170,10 @@ function mergeHistoryConversations(
     }
   }
   const localById = new Map(local);
-  const localAhead = [...localById.values()]
-    .filter((conversation) => {
-      const server = serverById.get(conversation.conversationId);
-      return !server || conversation.lastOrdinal > server.lastOrdinal;
-    })
-    .sort((left, right) => {
-      const leftUpdatedAt = left.updatedAt ? Date.parse(left.updatedAt) : Number.NEGATIVE_INFINITY;
-      const rightUpdatedAt = right.updatedAt
-        ? Date.parse(right.updatedAt)
-        : Number.NEGATIVE_INFINITY;
-      return (
-        rightUpdatedAt - leftUpdatedAt || left.conversationId.localeCompare(right.conversationId)
-      );
-    });
+  const localAhead = [...localById.values()].filter((conversation) => {
+    const server = serverById.get(conversation.conversationId);
+    return !server || conversation.lastOrdinal > server.lastOrdinal;
+  });
   const localAheadIds = new Set(localAhead.map((conversation) => conversation.conversationId));
   const serverIds = new Set(serverById.keys());
   const preserved = existing.filter(
@@ -188,7 +192,7 @@ function mergeHistoryConversations(
       merged.set(conversation.conversationId, conversation);
     }
   }
-  return [...merged.values()];
+  return sortHistoryConversations([...merged.values()]);
 }
 
 function historyErrorMessage(code: string, status: number, opening = false) {
@@ -1309,7 +1313,8 @@ export function AccountApp({
     isActive: () => boolean,
   ) {
     const manifest = role === "user" ? turn.questionManifest : turn.answerManifest;
-    if (manifest.count === 0) return { text: "", complete: manifest.complete };
+    const throughCursor = role === "user" ? manifest.count : turn.cursor;
+    if (throughCursor === 0) return { text: "", complete: manifest.complete };
     const chunks: { index: number; text: string }[] = [];
     let cursor: string | null = null;
     let finished = false;
@@ -1326,7 +1331,7 @@ export function AccountApp({
           ordinal: turn.ordinal,
           queryId: turn.queryId,
           role,
-          throughCursor: role === "user" ? turn.questionManifest.count : turn.cursor,
+          throughCursor,
           cursor,
         },
         isActive,
@@ -1354,7 +1359,7 @@ export function AccountApp({
       isActive() &&
       finished &&
       transferComplete &&
-      chunks.length === manifest.count &&
+      chunks.length === throughCursor &&
       chunks.every((chunk, index) => chunk.index === index);
     return { text: chunks.map(({ text }) => text).join(""), complete };
   }
@@ -1521,7 +1526,22 @@ export function AccountApp({
       const view = await readConversationView(conversationId, null, isActive);
       if (!isActive()) return false;
       const last = view.turns.at(-1);
-      const journal = chatJournalsRef.current.get(conversationId) ?? null;
+      let journal = chatJournalsRef.current.get(conversationId) ?? null;
+      const journalIsOlderThanHistory =
+        journal?.admitted === true &&
+        journal.ordinal !== undefined &&
+        last !== undefined &&
+        (view.throughOrdinal > journal.ordinal ||
+          last.ordinal > journal.ordinal ||
+          (last.ordinal === journal.ordinal && last.queryId !== journal.request.queryId));
+      if (journalIsOlderThanHistory && journal) {
+        clearChatJournalEntry(config, identity, conversationId);
+        chatJournalsRef.current.delete(conversationId);
+        if (chatJournalRef.current?.request.queryId === journal.request.queryId) {
+          chatJournalRef.current = null;
+        }
+        journal = null;
+      }
       chatJournalRef.current = journal;
       chatJournalOwnerRef.current = { config, identity };
       chatConversationIdRef.current = conversationId;
@@ -2099,10 +2119,15 @@ export function AccountApp({
       queryError: undefined,
     });
 
-    const applySnapshot = (
+    const applySnapshot = async (
       snapshot: Extract<Awaited<ReturnType<typeof recoverChat>>, { version: 2 }>,
     ) => {
-      if (!isActive() || chatJournalRef.current?.request.queryId !== request.queryId) return;
+      const isCurrentSelection = () =>
+        isActive() &&
+        chatScreenStateRef.current.history?.selectedConversationId === request.conversationId;
+      if (!isCurrentSelection() || chatJournalRef.current?.request.queryId !== request.queryId)
+        return;
+      const isTerminal = snapshot.status === "completed" || snapshot.status === "failed";
       const reference = {
         version: 2 as const,
         operation: request.operation,
@@ -2113,7 +2138,7 @@ export function AccountApp({
       try {
         markChatJournalAdmitted(recoveryConfig, identity, reference, snapshot.ordinal);
       } catch {
-        // The current page can still render the authorized snapshot; the helper removes plaintext on failure.
+        // The snapshot confirms admission; the helper removes plaintext on storage failure.
       }
       const admittedJournal: ChatJournalEntry = {
         request: reference,
@@ -2123,8 +2148,56 @@ export function AccountApp({
       chatJournalsRef.current.set(request.conversationId, admittedJournal);
       chatJournalRef.current = admittedJournal;
       chatConversationIdRef.current = snapshot.conversationId;
+
+      let terminalHistory: Awaited<ReturnType<typeof readConversationTurns>> | undefined;
+      let terminalHistoryError: string | undefined;
+      if (isTerminal && !snapshot.canContinue) {
+        try {
+          terminalHistory = await readConversationTurns(
+            recoveryConfig,
+            recoverySession,
+            request.conversationId,
+            null,
+            isCurrentSelection,
+          );
+        } catch (error) {
+          if (!isCurrentSelection()) return;
+          const apiError = asApiError(error);
+          if (apiError.status === 401) {
+            invalidateChat(recoveryConfig);
+            profileUnauthorized();
+            return;
+          }
+          if (apiError.status === 403) {
+            invalidateChat(recoveryConfig);
+            profileForbidden();
+            return;
+          }
+          terminalHistoryError =
+            "No pudimos confirmar si el hilo sigue abierto. Volvé a seleccionarlo en el historial para actualizarlo.";
+        }
+        if (!isCurrentSelection() || chatJournalRef.current?.request.queryId !== request.queryId) {
+          return;
+        }
+        if (terminalHistory) {
+          const latestTurn = terminalHistory.turns.at(-1);
+          if (terminalHistory.throughOrdinal > snapshot.ordinal) {
+            await selectConversation(request.conversationId);
+            return;
+          }
+          if (
+            terminalHistory.throughOrdinal !== snapshot.ordinal ||
+            latestTurn?.queryId !== snapshot.queryId ||
+            latestTurn?.status !== snapshot.status
+          ) {
+            await selectConversation(request.conversationId);
+            return;
+          }
+        }
+      }
+      if (!isCurrentSelection() || chatJournalRef.current?.request.queryId !== request.queryId)
+        return;
       const before = chatScreenStateRef.current;
-      const isTerminal = snapshot.status === "completed" || snapshot.status === "failed";
       if (isTerminal) {
         clearChatJournalEntry(recoveryConfig, identity, request.conversationId);
         chatJournalsRef.current.delete(request.conversationId);
@@ -2138,6 +2211,7 @@ export function AccountApp({
         return;
       }
       chatDisplayedQueryIdRef.current = snapshot.queryId;
+      const canContinue = terminalHistory?.canContinue ?? snapshot.canContinue;
       const nextState: ChatScreenState = {
         ...before,
         queryId: snapshot.queryId,
@@ -2145,7 +2219,7 @@ export function AccountApp({
         answer: snapshot.answer,
         answerComplete: true,
         ordinal: snapshot.ordinal,
-        canContinue: snapshot.canContinue,
+        canContinue,
         quota: snapshot.quota,
         quotaReceivedAt: snapshot.quota ? performance.now() : undefined,
         queryStatus: snapshot.status === "in_progress" ? "streaming" : snapshot.status,
@@ -2153,6 +2227,23 @@ export function AccountApp({
         recovered: true,
         recoveryLoading: false,
         canRetry: false,
+        ...(before.history?.selectedConversationId === request.conversationId &&
+        (terminalHistory || terminalHistoryError)
+          ? {
+              history: {
+                ...before.history,
+                ...(terminalHistory
+                  ? {
+                      closed: terminalHistory.closed,
+                      canContinue: terminalHistory.canContinue,
+                      throughOrdinal: terminalHistory.throughOrdinal,
+                      turnsError: undefined,
+                    }
+                  : {}),
+                ...(terminalHistoryError ? { turnsError: terminalHistoryError } : {}),
+              },
+            }
+          : {}),
       };
       setChat(
         withHistoryTurn(nextState, request.conversationId, {
@@ -2163,15 +2254,32 @@ export function AccountApp({
           answer: snapshot.answer,
           questionComplete: true,
           answerComplete: snapshot.status !== "in_progress",
-          canContinue: snapshot.canContinue,
+          canContinue,
         }),
       );
       if (isTerminal) {
-        markLocalConversationTerminal(
-          request.conversationId,
-          snapshot.ordinal,
-          !snapshot.canContinue,
-        );
+        if (terminalHistory) {
+          markLocalConversationTerminal(
+            request.conversationId,
+            snapshot.ordinal,
+            terminalHistory.closed,
+          );
+        } else if (snapshot.canContinue) {
+          markLocalConversationTerminal(request.conversationId, snapshot.ordinal, false);
+        } else if (terminalHistoryError) {
+          const existing =
+            localConversationsRef.current.get(request.conversationId) ??
+            chatScreenStateRef.current.history?.conversations.find(
+              (conversation) => conversation.conversationId === request.conversationId,
+            );
+          if (existing?.activeQueryId === snapshot.queryId) {
+            markLocalConversationTerminal(
+              request.conversationId,
+              snapshot.ordinal,
+              existing.closed,
+            );
+          }
+        }
       } else {
         updateLocalConversation(
           request.conversationId,
@@ -2207,7 +2315,7 @@ export function AccountApp({
         if (!isActive() || chatJournalRef.current?.request.queryId !== request.queryId) return;
         if ("version" in result) {
           failures = 0;
-          applySnapshot(result);
+          await applySnapshot(result);
           if (result.status === "in_progress") schedule(1_000);
           else stopCycle();
           return;
@@ -2500,13 +2608,11 @@ export function AccountApp({
     localConversationsRef.current.set(view.conversationId, conversation);
     setHistory((history) => ({
       ...history,
-      conversations: history.conversations.some(
-        (item) => item.conversationId === view.conversationId,
-      )
-        ? history.conversations.map((item) =>
-            item.conversationId === view.conversationId ? conversation : item,
-          )
-        : [conversation, ...history.conversations],
+      conversations: mergeHistoryConversations(
+        localConversationsRef.current,
+        [],
+        history.conversations,
+      ),
     }));
   }
 
