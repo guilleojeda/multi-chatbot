@@ -37,6 +37,33 @@ function nonNegative(value: unknown): value is number {
 function isVerifiedTimestamp(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && Number.isFinite(Date.parse(value));
 }
+function canonicalHistoryOrderTimestamp(
+  value: unknown,
+  conversationId: string,
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const suffix = "#" + conversationId;
+  if (!value.endsWith(suffix)) return undefined;
+  const timestamp = value.slice(0, -suffix.length);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(timestamp)) {
+    return undefined;
+  }
+  const milliseconds = Date.parse(timestamp);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === timestamp
+    ? timestamp
+    : undefined;
+}
+function presentationUpdatedAt(
+  meta: Meta,
+  conversationId: string,
+  expectedHistoryOwner: string,
+): string | undefined {
+  const updatedAt = isVerifiedTimestamp(meta.updatedAt) ? meta.updatedAt : undefined;
+  if (meta.historyOwner !== expectedHistoryOwner) return updatedAt;
+  const projectedAt = canonicalHistoryOrderTimestamp(meta.historyOrder, conversationId);
+  if (!projectedAt) return updatedAt;
+  return !updatedAt || Date.parse(projectedAt) > Date.parse(updatedAt) ? projectedAt : updatedAt;
+}
 function isLegacyGeneratingTurn(value: unknown): boolean {
   if (!isRecord(value) || value.status !== "in_progress" || value.phase !== "generating") {
     return false;
@@ -345,13 +372,14 @@ export function createHistoryStore(input: {
         if (typeof meta.historyLabel !== "string" || !meta.historyLabel.trim()) {
           throw fail("history_unavailable", "Conversation history projection is invalid.");
         }
+        const updatedAt = presentationUpdatedAt(meta, id, ownerKey(scope.sub));
         const row: Record<string, unknown> = {
           conversationId: id,
           label: meta.historyLabel,
           lastOrdinal: meta.lastOrdinal,
           closed: meta.closed === true,
-          ...(typeof meta.createdAt === "string" ? { createdAt: meta.createdAt } : {}),
-          ...(typeof meta.updatedAt === "string" ? { updatedAt: meta.updatedAt } : {}),
+          ...(isVerifiedTimestamp(meta.createdAt) ? { createdAt: meta.createdAt } : {}),
+          ...(updatedAt ? { updatedAt } : {}),
           ...(typeof meta.activeQueryId === "string" ? { activeQueryId: meta.activeQueryId } : {}),
         };
         if (!fitsEnvelope({ version: 1, conversations: [...conversations, row] })) {
@@ -439,6 +467,56 @@ export function createHistoryStore(input: {
     });
   }
 
+  async function readLegacyAnswerPrefixLength(
+    id: string,
+    turn: Record<string, unknown>,
+  ): Promise<number> {
+    if (!isLegacyGeneratingTurn(turn)) return answerCount(turn);
+    const prefix = textPrefix(id, Number(turn.ordinal), String(turn.queryId), "assistant");
+    let page: Record<string, unknown>;
+    try {
+      page = await documentClient.send(
+        new QueryCommand({
+          TableName: tableName,
+          KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+          ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+          ExpressionAttributeValues: { ":pk": turn.pk, ":prefix": prefix },
+          ConsistentRead: true,
+          ScanIndexForward: false,
+          Limit: 1,
+        }),
+      );
+    } catch (error) {
+      throw asStorageError(error, "conversation_unavailable");
+    }
+    const candidates = Array.isArray(page.Items) ? page.Items.filter(isRecord) : [];
+    if (candidates.length > 1) {
+      throw fail("conversation_unavailable", "Legacy answer prefix is invalid.");
+    }
+    const last = candidates[0];
+    if (!last) {
+      if (page.LastEvaluatedKey !== undefined) {
+        throw fail("conversation_unavailable", "Legacy answer prefix is invalid.");
+      }
+      return 0;
+    }
+    if (
+      !validChunk(last, {
+        id,
+        ordinal: Number(turn.ordinal),
+        queryId: String(turn.queryId),
+        role: "assistant",
+      }) ||
+      (page.LastEvaluatedKey !== undefined &&
+        (!isKey(page.LastEvaluatedKey) ||
+          page.LastEvaluatedKey.pk !== last.pk ||
+          page.LastEvaluatedKey.sk !== last.sk))
+    ) {
+      throw fail("conversation_unavailable", "Legacy answer prefix is invalid.");
+    }
+    return last.index + 1;
+  }
+
   async function readTurns(scope: {
     sub: string;
     botId: string;
@@ -458,51 +536,41 @@ export function createHistoryStore(input: {
     }
     const throughOrdinal = continuation?.through ?? meta.lastOrdinal;
     let nextOrdinal = continuation?.nextOrdinal ?? throughOrdinal;
-    const lower = "TURN#00000001";
-    const upper = "TURN#" + String(throughOrdinal).padStart(8, "0");
-    let page: Record<string, unknown>;
-    try {
-      page = await documentClient.send(
-        new QueryCommand({
-          TableName: tableName,
-          KeyConditionExpression: "#pk = :pk AND #sk BETWEEN :lower AND :upper",
-          FilterExpression: "attribute_exists(#status)",
-          ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk", "#status": "status" },
-          ExpressionAttributeValues: {
-            ":pk": "CONV#" + scope.conversationId,
-            ":lower": lower,
-            ":upper": upper,
-          },
-          ConsistentRead: true,
-          ScanIndexForward: false,
-          Limit: limit,
-          ...(continuation?.key ? { ExclusiveStartKey: continuation.key } : {}),
-        }),
-      );
-    } catch (error) {
-      throw asStorageError(error, "conversation_unavailable");
-    }
-    const rows = Array.isArray(page.Items) ? page.Items.filter(isRecord) : [];
-    const descriptors: Record<string, unknown>[] = [];
-    const seen = new Set<number>();
-    let currentMeta = meta;
-    for (const row of rows) {
-      if (typeof row.sk !== "string" || !/^TURN#\d{8}$/.test(row.sk)) continue;
-      const keyOrdinal = Number(row.sk.slice("TURN#".length));
-      if (keyOrdinal > throughOrdinal) continue;
-      if (!positive(row.ordinal) || row.ordinal > throughOrdinal) {
-        throw fail("conversation_unavailable", "Conversation turn ordinal is invalid.");
+    const firstOrdinal = Math.max(1, nextOrdinal - limit + 1);
+    const rows: Record<string, unknown>[] = [];
+    for (let ordinal = nextOrdinal; ordinal >= firstOrdinal; ordinal -= 1) {
+      let result: Record<string, unknown>;
+      try {
+        result = await documentClient.send(
+          new GetCommand({
+            TableName: tableName,
+            Key: turnKey(scope.conversationId, ordinal),
+            ConsistentRead: true,
+          }),
+        );
+      } catch (error) {
+        throw asStorageError(error, "conversation_unavailable");
       }
-      if (!validTurn(row, { id: scope.conversationId, sub: scope.sub, botId })) {
-        throw fail("conversation_unavailable", "Conversation turn is invalid.");
-      }
-      if (row.ordinal !== nextOrdinal) {
+      if (!isRecord(result.Item)) {
         throw fail("conversation_unavailable", "Conversation history has a missing turn.");
       }
+      rows.push(result.Item);
+    }
+    const descriptors: Record<string, unknown>[] = [];
+    let currentMeta = meta;
+    for (const row of rows) {
+      if (
+        !validTurn(row, {
+          id: scope.conversationId,
+          ordinal: nextOrdinal,
+          sub: scope.sub,
+          botId,
+        }) ||
+        nextOrdinal > throughOrdinal
+      ) {
+        throw fail("conversation_unavailable", "Conversation turn is invalid.");
+      }
       nextOrdinal -= 1;
-      if (seen.has(row.ordinal))
-        throw fail("conversation_unavailable", "Conversation has duplicate turns.");
-      seen.add(row.ordinal);
       let current = row;
       let unconfirmable = false;
       if (row.status === "in_progress") {
@@ -532,19 +600,27 @@ export function createHistoryStore(input: {
           } catch (error) {
             throw asStorageError(error, "conversation_unavailable");
           }
-          if (!validTurn(current, { id: scope.conversationId, sub: scope.sub, botId })) {
+          if (
+            !validTurn(current, {
+              id: scope.conversationId,
+              ordinal: Number(row.ordinal),
+              sub: scope.sub,
+              botId,
+            })
+          ) {
             throw fail("conversation_unavailable", "Conversation turn is invalid.");
           }
         }
       }
       const failure = failureCode(current.failure);
+      const cursor = await readLegacyAnswerPrefixLength(scope.conversationId, current);
       descriptors.push({
         ordinal: current.ordinal,
         queryId: current.queryId,
         status: current.status,
         questionManifest: current.questionManifest,
         answerManifest: current.answerManifest,
-        cursor: answerCount(current),
+        cursor,
         ...(nonNegative(current.resultDeadlineAt)
           ? { resultDeadlineAt: current.resultDeadlineAt }
           : {}),
@@ -552,6 +628,7 @@ export function createHistoryStore(input: {
       });
     }
     descriptors.sort((left, right) => Number(left.ordinal) - Number(right.ordinal));
+    const updatedAt = presentationUpdatedAt(currentMeta, scope.conversationId, ownerKey(scope.sub));
     const response: Record<string, unknown> = {
       version: 1,
       conversationId: scope.conversationId,
@@ -559,7 +636,7 @@ export function createHistoryStore(input: {
         ? { label: currentMeta.historyLabel }
         : {}),
       ...(isVerifiedTimestamp(currentMeta.createdAt) ? { createdAt: currentMeta.createdAt } : {}),
-      ...(isVerifiedTimestamp(currentMeta.updatedAt) ? { updatedAt: currentMeta.updatedAt } : {}),
+      ...(updatedAt ? { updatedAt } : {}),
       throughOrdinal,
       closed: currentMeta.closed === true,
       canContinue: descriptors.some(
@@ -572,29 +649,13 @@ export function createHistoryStore(input: {
       turns: descriptors,
     };
     if (nextOrdinal > 0) {
-      if (!page.LastEvaluatedKey || !isKey(page.LastEvaluatedKey)) {
-        throw fail("conversation_unavailable", "Conversation history has a missing turn.");
-      }
-      const includedRows = rows.filter(
-        (row) =>
-          typeof row.sk === "string" &&
-          /^TURN#\d{8}$/.test(row.sk) &&
-          Number(row.sk.slice("TURN#".length)) <= throughOrdinal,
-      );
-      const lastIncluded = includedRows.at(-1);
-      const cursorKey =
-        descriptors.length >= limit &&
-        lastIncluded &&
-        typeof lastIncluded.pk === "string" &&
-        typeof lastIncluded.sk === "string"
-          ? { pk: lastIncluded.pk, sk: lastIncluded.sk }
-          : page.LastEvaluatedKey;
+      const lastIncludedOrdinal = nextOrdinal + 1;
       response.nextCursor = makeTurnCursor(
         digest,
         scope.conversationId,
         throughOrdinal,
         nextOrdinal,
-        cursorKey,
+        turnKey(scope.conversationId, lastIncludedOrdinal),
       );
     }
     if (!fitsEnvelope(response))
@@ -697,7 +758,11 @@ export function createHistoryStore(input: {
       throw fail("conversation_unavailable", "Conversation text manifest is invalid.");
     }
     const manifestCount = manifest.count;
-    const available = manifestCount;
+    const legacyPrefixLength =
+      scope.role === "assistant" && isLegacyGeneratingTurn(turn)
+        ? await readLegacyAnswerPrefixLength(scope.conversationId, turn)
+        : undefined;
+    const available = legacyPrefixLength ?? manifestCount;
     const cursor = parseTextCursor(scope.cursor, digest, {
       conversationId: scope.conversationId,
       ordinal: scope.ordinal,
@@ -720,6 +785,7 @@ export function createHistoryStore(input: {
 
     let page: Record<string, unknown> = {};
     if (startIndex < throughCursor) {
+      const remaining = throughCursor - startIndex;
       try {
         page = await documentClient.send(
           new QueryCommand({
@@ -732,7 +798,12 @@ export function createHistoryStore(input: {
             },
             ConsistentRead: true,
             ScanIndexForward: true,
-            Limit: Math.min(MAX_CHUNKS, throughCursor - startIndex),
+            Limit:
+              scope.role === "user"
+                ? remaining <= MAX_CHUNKS
+                  ? remaining + 1
+                  : MAX_CHUNKS
+                : Math.min(MAX_CHUNKS, remaining),
             ...(cursor && isKey(cursor.key) ? { ExclusiveStartKey: cursor.key } : {}),
           }),
         );
@@ -785,6 +856,51 @@ export function createHistoryStore(input: {
       throw fail("history_unavailable", "A history text chunk exceeds the response limit.");
     }
     const complete = expectedIndex === throughCursor;
+    if (scope.role === "user" && complete && page.LastEvaluatedKey) {
+      if (!lastIncludedKey) {
+        throw fail("conversation_unavailable", "Conversation question manifest is invalid.");
+      }
+      let remainder: Record<string, unknown>;
+      try {
+        remainder = await documentClient.send(
+          new QueryCommand({
+            TableName: tableName,
+            KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+            ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+            ExpressionAttributeValues: {
+              ":pk": "CONV#" + scope.conversationId,
+              ":prefix": textPrefix(scope.conversationId, scope.ordinal, scope.queryId, "user"),
+            },
+            ConsistentRead: true,
+            ScanIndexForward: true,
+            Limit: 1,
+            ExclusiveStartKey: lastIncludedKey,
+          }),
+        );
+      } catch (error) {
+        throw asStorageError(error, "conversation_unavailable");
+      }
+      const extra = Array.isArray(remainder.Items) ? remainder.Items.find(isRecord) : undefined;
+      if (extra) {
+        if (
+          !validChunk(extra, {
+            id: scope.conversationId,
+            ordinal: scope.ordinal,
+            queryId: scope.queryId,
+            role: "user",
+          })
+        ) {
+          throw fail("conversation_unavailable", "Conversation text chunk is invalid.");
+        }
+        throw fail(
+          "conversation_unavailable",
+          "Conversation question has data beyond its manifest.",
+        );
+      }
+      if (remainder.LastEvaluatedKey) {
+        throw fail("conversation_unavailable", "Conversation question prefix is invalid.");
+      }
+    }
     if (!complete && expectedIndex === startIndex && candidates.length === 0) {
       throw fail("conversation_unavailable", "Conversation text prefix is incomplete.");
     }

@@ -297,38 +297,39 @@ describe("the public DynamoDB history store", () => {
   it("starts with recent turns and pages earlier without changing the initial ordinal", async () => {
     const firstMeta = meta(conversationId, { lastOrdinal: 3, activeQueryId: queryIds[2] });
     const laterMeta = meta(conversationId, { lastOrdinal: 4, activeQueryId: queryIds[3] });
-    const queryPages = [
-      {
-        Items: [
-          turn(3, queryIds[2], {
-            status: "in_progress",
-            answerManifest: { count: 2, complete: false },
-            cursor: 2,
-            profileSnapshot: { promptTexts: ["private profile text"] },
-          }),
-          turn(2, queryIds[1], {
-            status: "failed",
-            failure: { code: "model_failure" },
-            answerManifest: { count: 2, complete: false },
-            cursor: 2,
-            requestFingerprint: "private-fingerprint",
-            ownerAttemptId: "private-attempt",
-            contextManifest: { count: 1, complete: true },
-          }),
-        ],
-        LastEvaluatedKey: {
-          pk: `CONV#${conversationId}`,
-          sk: "TURN#00000002",
-        },
-      },
-      {
-        Items: [turn(1, queryIds[0]), turn(4, queryIds[3])],
-      },
-    ];
+    const savedTurns = new Map([
+      [
+        "TURN#00000003",
+        turn(3, queryIds[2], {
+          status: "in_progress",
+          answerManifest: { count: 2, complete: false },
+          cursor: 2,
+          profileSnapshot: { promptTexts: ["private profile text"] },
+        }),
+      ],
+      [
+        "TURN#00000002",
+        turn(2, queryIds[1], {
+          status: "failed",
+          failure: { code: "model_failure" },
+          answerManifest: { count: 2, complete: false },
+          cursor: 2,
+          requestFingerprint: "private-fingerprint",
+          ownerAttemptId: "private-attempt",
+          contextManifest: { count: 1, complete: true },
+        }),
+      ],
+      ["TURN#00000001", turn(1, queryIds[0])],
+      ["TURN#00000004", turn(4, queryIds[3])],
+    ]);
     const metas = [firstMeta, laterMeta];
     const send = vi.fn(async (command) => {
-      if (command instanceof GetCommand) return { Item: metas.shift() };
-      if (command instanceof QueryCommand) return queryPages.shift() ?? {};
+      if (command instanceof GetCommand) {
+        return {
+          Item:
+            command.input.Key.sk === "META" ? metas.shift() : savedTurns.get(command.input.Key.sk),
+        };
+      }
       throw new Error(`Unexpected document operation: ${command.constructor.name}`);
     });
     const { documentClient, store } = makeStore(send);
@@ -375,26 +376,25 @@ describe("the public DynamoDB history store", () => {
     const sent = commands(documentClient);
     const reads = sent.filter((command) => command instanceof GetCommand);
     const queries = sent.filter((command) => command instanceof QueryCommand);
-    expect(reads).toHaveLength(2);
+    expect(reads).toHaveLength(5);
     expect(reads.every(({ input }) => input.ConsistentRead === true)).toBe(true);
-    expect(queries).toHaveLength(2);
-    expect(queries.every(({ input }) => input.ConsistentRead === true)).toBe(true);
-    expect(queries.every(({ input }) => input.ScanIndexForward === false)).toBe(true);
-    expect(queries.every(({ input }) => Number.isSafeInteger(input.Limit) && input.Limit > 0)).toBe(
-      true,
-    );
-    expect(queries[1].input.ExclusiveStartKey).toEqual({
-      pk: `CONV#${conversationId}`,
-      sk: "TURN#00000002",
-    });
+    expect(queries).toHaveLength(0);
+    expect(reads.map(({ input }) => input.Key.sk)).toEqual([
+      "META",
+      "TURN#00000003",
+      "TURN#00000002",
+      "META",
+      "TURN#00000001",
+    ]);
     expect(sent.some((command) => JSON.stringify(command.input).includes("SEND#"))).toBe(false);
   });
 
   it("marks an open conversation with a completed latest turn as continuable", async () => {
     const completedTurn = turn(1, queryIds[0]);
     const send = vi.fn(async (command) => {
-      if (command instanceof GetCommand) return { Item: meta() };
-      if (command instanceof QueryCommand) return { Items: [completedTurn] };
+      if (command instanceof GetCommand) {
+        return { Item: command.input.Key.sk === "META" ? meta() : completedTurn };
+      }
       throw new Error(`Unexpected document operation: ${command.constructor.name}`);
     });
     const { store } = makeStore(send);
@@ -421,7 +421,6 @@ describe("the public DynamoDB history store", () => {
     const answer = textChunk(1, queryIds[0], "assistant", 0, "Con material y rúbrica.");
     const queryPages = [
       { Items: [historyDescriptor(conversationId, savedMeta.historyOrder)] },
-      { Items: [savedTurn] },
       { Items: [question] },
       { Items: [answer] },
     ];
@@ -579,7 +578,6 @@ describe("the public DynamoDB history store", () => {
       cursor: 5,
     });
     const queryPages = [
-      { Items: [completedTurn] },
       {
         Items: [0, 1].map((index) => textChunk(1, queryIds[0], "assistant", index, `p${index}`)),
         LastEvaluatedKey: {

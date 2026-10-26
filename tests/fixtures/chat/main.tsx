@@ -183,6 +183,13 @@ function FixtureControls() {
         <div className="profile-fixture-gates">
           <button
             type="button"
+            disabled={!state.canAdvanceRemoteConversation}
+            onClick={() => fixture.advanceAdmittedTurnFromAnotherSession()}
+          >
+            Simular en otra sesión: terminar y admitir seguimiento
+          </button>
+          <button
+            type="button"
             disabled={!state.admittedStreams}
             onClick={() => fixture.finishStream("complete")}
           >
@@ -244,6 +251,12 @@ function FixtureControls() {
           El productor simulado conserva el registro aunque se cierre el consumidor SSE; tras
           recargar, estos controles actualizan el registro restaurado y AccountApp lo observa
           mediante <code>recover</code> con el mismo conversation ID y query ID.
+        </p>
+        <p className="profile-fixture-readout">
+          Para probar avance entre sesiones, dejá una generación admitida en un hilo, seleccioná
+          otro y usá el control nuevo. El productor local marca terminal el turno anterior y agrega
+          un seguimiento en curso; la operación solo cambia el estado simulado y no escribe el
+          journal de la aplicación.
         </p>
       </section>
 

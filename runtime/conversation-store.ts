@@ -1769,6 +1769,9 @@ export function createConversationStoreAdapter(input: {
     }
     const question = assembleText(questionPieces, questionCount, "user", input.queryId);
     const answer = assemblePrefix(answerPieces, Number(cursor), input.queryId);
+    if (turn.status === "completed" && !isNonEmptyString(answer)) {
+      throw new Error("Completed submission has empty answer.");
+    }
 
     let contextReferences: ContextReference[] = [];
     const rawContextCount =

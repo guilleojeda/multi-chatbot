@@ -19,6 +19,14 @@ function normalizedTimestamp(value) {
   return validTimestamp(value) ? new Date(Date.parse(value)).toISOString() : undefined;
 }
 
+function latestTimestamp(values) {
+  return values
+    .map(normalizedTimestamp)
+    .filter((value) => value !== undefined)
+    .sort((left, right) => Date.parse(left) - Date.parse(right))
+    .at(-1);
+}
+
 function validMeta(item, botId) {
   return (
     isRecord(item) &&
@@ -199,24 +207,35 @@ async function readLatestTurn(documentClient, tableName, meta) {
     !isRecord(turn) ||
     turn.pk !== meta.pk ||
     turn.conversationId !== meta.conversationId ||
+    turn.sk !== "TURN#" + String(meta.lastOrdinal).padStart(8, "0") ||
     turn.ordinal !== meta.lastOrdinal ||
-    (typeof turn.updatedAt !== "string" && typeof turn.createdAt !== "string")
+    turn.sub !== meta.sub ||
+    turn.botId !== meta.botId
   ) {
     return undefined;
   }
-  return normalizedTimestamp(turn.updatedAt) ?? normalizedTimestamp(turn.createdAt);
+  const admittedAt = turn.createdAt;
+  if (turn.status === "completed") {
+    return latestTimestamp([admittedAt, turn.completedAt, turn.updatedAt]);
+  }
+  if (turn.status === "failed") {
+    return latestTimestamp([admittedAt, turn.failedAt, turn.updatedAt]);
+  }
+  // An active writer updates TURN while streaming. That is not conversation activity.
+  return normalizedTimestamp(admittedAt);
 }
 
 async function projectionFor(documentClient, tableName, botId, meta, pageSize) {
   if (!validMeta(meta, botId)) return null;
   const original = await readFirstQuestion(documentClient, tableName, meta, pageSize);
   if (!original) return null;
-  const activityAt =
-    normalizedTimestamp(meta.updatedAt) ??
-    (await readLatestTurn(documentClient, tableName, meta)) ??
-    normalizedTimestamp(meta.createdAt) ??
-    normalizedTimestamp(original.firstTurn.updatedAt) ??
-    normalizedTimestamp(original.firstTurn.createdAt);
+  const latestTurnActivity = await readLatestTurn(documentClient, tableName, meta);
+  const activityAt = latestTimestamp([
+    meta.updatedAt,
+    latestTurnActivity,
+    meta.createdAt,
+    original.firstTurn.createdAt,
+  ]);
   return {
     historyOwner: "USER#" + meta.sub + "#BOT#" + meta.botId,
     historyOrder: createHistoryOrder(activityAt, meta.conversationId),

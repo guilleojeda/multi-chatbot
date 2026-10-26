@@ -523,6 +523,7 @@ export class ChatBrowserFixture {
   );
   private selectedScenario = initialScenario();
   private nextToken = 0;
+  private nextRemoteQueryNumber = 0;
   private restoreCount = 0;
   private restorable = true;
   private refreshSub: string = identities[0].sub;
@@ -1236,6 +1237,17 @@ export class ChatBrowserFixture {
         : turn.status === "failed"
           ? "failed"
           : "in_progress";
+    const latestTurn = conversation.turns.reduce<FixtureTurn | undefined>(
+      (latest, candidate) => (!latest || candidate.ordinal > latest.ordinal ? candidate : latest),
+      undefined,
+    );
+    const canContinue =
+      status !== "in_progress" &&
+      turn.canContinue &&
+      conversation.closed !== true &&
+      latestTurn?.ordinal === turn.ordinal &&
+      latestTurn.queryId === turn.queryId &&
+      publicTurnStatus(latestTurn) !== "in_progress";
     this.finish(request, 200, `snapshot ${status} recuperado sin nueva admisión`);
     return json({
       version: 2,
@@ -1245,7 +1257,7 @@ export class ChatBrowserFixture {
       status,
       question: turn.question,
       answer: turn.answer,
-      canContinue: status === "in_progress" ? false : turn.canContinue,
+      canContinue,
     });
   }
 
@@ -1722,6 +1734,63 @@ export class ChatBrowserFixture {
     stream.close();
   }
 
+  advanceAdmittedTurnFromAnotherSession() {
+    const sub = this.activeSessionSub();
+    if (!sub) return false;
+    const entry = readProductJournal(this.publicConfig).entries.find((candidate) => {
+      if (
+        candidate.sub !== sub ||
+        candidate.botId !== this.publicConfig.botId ||
+        !candidate.request
+      ) {
+        return false;
+      }
+      const conversation = this.conversations.get(candidate.request.conversationId);
+      return conversation?.turns.some(
+        (turn) => turn.queryId === candidate.request?.queryId && turn.status === "streaming",
+      );
+    });
+    const request = entry?.request;
+    if (!request) return false;
+    const conversation = this.conversations.get(request.conversationId);
+    const turn = conversation?.turns.find((candidate) => candidate.queryId === request.queryId);
+    if (
+      !conversation ||
+      conversation.ownerSub !== sub ||
+      conversation.botId !== this.publicConfig.botId ||
+      !turn ||
+      turn.status !== "streaming"
+    ) {
+      return false;
+    }
+
+    turn.status = "completed";
+    turn.canContinue = true;
+    const followupOrdinal = conversation.nextOrdinal;
+    const followupQueryId = fixtureUuid("90000000", ++this.nextRemoteQueryNumber);
+    conversation.turns.push({
+      ordinal: followupOrdinal,
+      queryId: followupQueryId,
+      question: "Seguimiento admitido desde otra sesión.",
+      answer: "Prefijo de respuesta del seguimiento iniciado desde otra sesión.",
+      status: "streaming",
+      canContinue: false,
+    });
+    conversation.nextOrdinal = followupOrdinal + 1;
+    conversation.closed = false;
+    conversation.updatedAt = new Date().toISOString();
+    this.persistConversations();
+
+    const stream = this.streams.find((candidate) => candidate.queryId === turn.queryId);
+    if (stream && !stream.producerClosed) {
+      stream.push({ type: "completed", queryId: turn.queryId });
+      stream.close();
+    } else {
+      this.changed();
+    }
+    return true;
+  }
+
   async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const requestInput = input instanceof Request ? input : null;
     const url = new URL(requestInput ? requestInput.url : String(input), window.location.href);
@@ -1898,10 +1967,22 @@ export class ChatBrowserFixture {
     const sessionSub = accessToken ? (this.tokens.get(accessToken) ?? null) : null;
     const sessionIdentity = identities.find(({ sub }) => sub === sessionSub) || null;
     const restoredActiveCount = this.restoredActiveTurns().length;
+    const remoteAdvanceEntry = readProductJournal(this.publicConfig).entries.find(
+      (entry) =>
+        entry.sub === sessionSub &&
+        entry.botId === this.publicConfig.botId &&
+        entry.request !== null &&
+        this.conversations
+          .get(entry.request.conversationId)
+          ?.turns.some(
+            (turn) => turn.queryId === entry.request?.queryId && turn.status === "streaming",
+          ),
+    );
     return {
       fixture: "chat-browser-local",
       route,
       scenario: this.selectedScenario,
+      canAdvanceRemoteConversation: Boolean(remoteAdvanceEntry),
       session: {
         active: Boolean(accessToken),
         sub: sessionSub,
