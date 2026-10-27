@@ -150,7 +150,6 @@ function continuationInput({
     requestFingerprint: `fingerprint-${ordinal}`,
     operation: "message",
     baseOrdinal,
-    expectedLastOrdinal: baseOrdinal,
     contextReferences: refs,
     contextSnapshot: snapshot,
     ...(summary ? { summaryCandidate: summary } : {}),
@@ -158,7 +157,7 @@ function continuationInput({
 }
 
 function finishAdmittedTurn(db, input, { status, answerText }) {
-  const ordinal = input.expectedLastOrdinal + 1;
+  const ordinal = input.baseOrdinal + 1;
   const pk = `CONV#${conversationId}`;
   const turnKey = { pk, sk: `TURN#${String(ordinal).padStart(8, "0")}` };
   const turn = db.records.get(keyFor(turnKey));
@@ -205,8 +204,13 @@ function completedPair(ordinal, { contextReferences = [] } = {}) {
       ...owner,
       ordinal,
       queryId: id,
+      operation: ordinal === 1 ? "start" : "message",
+      baseOrdinal: ordinal - 1,
+      requestFingerprint: `fingerprint-${ordinal}`,
       status: "completed",
       phase: "complete",
+      ownerAttemptId: `attempt-${ordinal}`,
+      resultDeadlineAt: now + 60 * 60 * 1000,
       cursor: 1,
       questionManifest: { count: 1, complete: true },
       answerManifest: { count: 1, complete: true },
@@ -216,13 +220,18 @@ function completedPair(ordinal, { contextReferences = [] } = {}) {
       },
       contextSnapshot: { version: 1, recentReferences: contextReferences },
       documentContextManifest: { count: 1, complete: true },
+      profileSnapshot,
+      invocation: {
+        modelId: "global.anthropic.claude-sonnet-4-6",
+        revision: "reviewed-runtime-revision",
+      },
     },
     {
       pk,
       sk: `TURN#${String(ordinal).padStart(8, "0")}#${id}#USER#00000000`,
       conversationId,
-      ordinal,
       queryId: id,
+      ordinal,
       role: "user",
       index: 0,
       text: question,
@@ -241,6 +250,7 @@ function completedPair(ordinal, { contextReferences = [] } = {}) {
       pk,
       sk: `TURN#${String(ordinal).padStart(8, "0")}#DOCUMENT#00000000`,
       conversationId,
+      queryId: id,
       ordinal,
       index: 0,
       text: JSON.stringify(documentCapture),
@@ -655,7 +665,11 @@ describe("versioned conversation summary storage acceptance", () => {
       summary: null,
       snapshot: contextSnapshot(candidate, recent),
       refs: recent,
-      documents: null,
+      documents: {
+        ...documentContext(),
+        status: "empty",
+        results: [],
+      },
     });
 
     await store.continueTurn(input);

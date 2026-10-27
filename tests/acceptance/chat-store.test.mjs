@@ -49,6 +49,8 @@ function startInput(overrides = {}) {
     ...owner,
     conversationId,
     queryId,
+    operation: "start",
+    baseOrdinal: 0,
     now,
     ownerAttemptId: "attempt-admitted",
     resultDeadlineAt: now + 60 * 60 * 1000,
@@ -536,7 +538,6 @@ describe("the DynamoDB conversation store adapter", () => {
       ...input,
       operation: "message",
       baseOrdinal: 1,
-      expectedLastOrdinal: 1,
       contextReferences: [],
     });
 
@@ -641,7 +642,6 @@ describe("the DynamoDB conversation store adapter", () => {
       ...input,
       operation: "message",
       baseOrdinal: expectedLastOrdinal,
-      expectedLastOrdinal,
       contextReferences: [],
     });
 

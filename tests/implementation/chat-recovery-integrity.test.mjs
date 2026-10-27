@@ -15,6 +15,22 @@ const text = "Saved question.";
 const requestFingerprint = createHash("sha256")
   .update(JSON.stringify(["message", conversationId, 7, text]))
   .digest("hex");
+const resultDeadlineAt = now + 60_000;
+const documentContext = {
+  knowledgeBaseId: "kb-recovery-integrity",
+  query: "saved recovery context",
+  revision: "documents-recovery-r1",
+  retrievedAt: now,
+  status: "empty",
+  results: [],
+};
+const quotaSnapshot = {
+  daily: { used: 1, limit: 20, resetAt: now + 12 * 60 * 60 * 1000, period: "2026-10-25" },
+  monthly: { used: 1, limit: 200, resetAt: now + 10 * 24 * 60 * 60 * 1000, period: "2026-10" },
+  serverNow: now,
+  blockedUntil: null,
+  policyRevision: "recovery-integrity-policy",
+};
 const conversationPk = `CONV#${conversationId}`;
 const turnSk = "TURN#00000008";
 
@@ -52,12 +68,14 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
     requestFingerprint,
     status,
     phase,
+    ownerAttemptId: "attempt-recovery-integrity",
     cursor: answerCount,
     questionManifest: { count: 1, complete: true },
     answerManifest: { count: answerCount, complete: answerComplete },
     contextManifest: { count: 0, complete: true },
     contextSnapshot: { version: 1, recentReferences },
-    resultDeadlineAt: now + 60_000,
+    resultDeadlineAt,
+    documentContextManifest: { count: 1, complete: true },
     profileSnapshot: { historical: true },
     invocation: { modelId: "historical-model" },
   };
@@ -72,6 +90,9 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
     operation: "message",
     baseOrdinal: 7,
     requestFingerprint,
+    admittedAt: now,
+    resultDeadlineAt,
+    quotaSnapshot,
   };
   put(meta);
   put(turn);
@@ -88,10 +109,17 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
       queryId: reference.queryId,
       status: "completed",
       phase: "complete",
+      operation: reference.ordinal === 1 ? "start" : "message",
+      baseOrdinal: reference.ordinal - 1,
+      requestFingerprint: `source-fingerprint-${reference.ordinal}`,
+      ownerAttemptId: `source-attempt-${reference.ordinal}`,
+      resultDeadlineAt,
       cursor: 1,
       questionManifest: { count: 1, complete: true },
       answerManifest: { count: 1, complete: true },
       contextManifest: { count: 0, complete: true },
+      contextSnapshot: { version: 1, recentReferences: [] },
+      documentContextManifest: { count: 1, complete: true },
     });
     for (const role of ["user", "assistant"]) {
       put({
@@ -105,6 +133,15 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
         text: `Valid ${role} turn ${reference.ordinal}.`,
       });
     }
+    put({
+      pk: conversationPk,
+      sk: `${ordinalKey}#DOCUMENT#00000000`,
+      conversationId,
+      queryId: reference.queryId,
+      ordinal: reference.ordinal,
+      index: 0,
+      text: JSON.stringify(documentContext),
+    });
   }
   put({
     pk: conversationPk,
@@ -128,6 +165,15 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
       text: answer,
     });
   }
+  put({
+    pk: conversationPk,
+    sk: `${turnSk}#DOCUMENT#00000000`,
+    conversationId,
+    queryId,
+    ordinal: 8,
+    index: 0,
+    text: JSON.stringify(documentContext),
+  });
 
   const sentCommands = [];
   const documentClient = {

@@ -412,7 +412,7 @@ describe("hidden conversations in the Runtime handler", () => {
         "Actividad lista para aplicar.",
       );
       expect(harness.state.meta.hiddenAt).toBe("2026-10-24T12:00:00.000Z");
-      expect(harness.store.completeTurn).toHaveBeenCalledTimes(1);
+      expect(harness.state.calls.filter(([name]) => name === "completeTurn")).toHaveLength(1);
       expect(tasks.completeAsyncTask).toHaveBeenCalledTimes(1);
     } finally {
       releaseAppend.resolve();

@@ -2,7 +2,7 @@ const verifiedIsoTimestampPattern =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const isoCalendarDatePrefix = /^(\d{4})-(\d{2})-(\d{2})T/;
 
-// History writers and backfill use ISO timestamps; Date.parse alone normalizes impossible days.
+// History writers use ISO timestamps; Date.parse alone normalizes impossible days.
 function isValidCalendarDate(year: number, month: number, day: number): boolean {
   if (!Number.isInteger(year) || month < 1 || month > 12 || day < 1) return false;
   const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
@@ -37,8 +37,6 @@ export function createHistoryLabel(question: string): string {
 
 export function createHistoryOrder(activityAt: unknown, conversationId: string): string {
   const normalized = normalizeVerifiedHistoryTimestamp(activityAt);
-  if (normalized) {
-    return `${normalized}#${conversationId}`;
-  }
-  return `0000#${conversationId}`;
+  if (!normalized) throw new TypeError("Conversation history activity time is invalid.");
+  return `${normalized}#${conversationId}`;
 }

@@ -10,6 +10,7 @@ type HistoryListInput = {
 };
 
 type HistoryTurnsInput = HistoryListInput & { conversationId: string };
+type ConversationInput = { sub: string; botId: string; conversationId: string };
 
 type HistoryTextInput = {
   sub: string;
@@ -26,13 +27,14 @@ type ChatHistoryStore = {
   listConversations(input: HistoryListInput): Promise<unknown>;
   readTurns(input: HistoryTurnsInput): Promise<unknown>;
   readText(input: HistoryTextInput): Promise<unknown>;
+  hideConversation(input: ConversationInput): Promise<unknown>;
+  readConversationMeta(input: ConversationInput): Promise<unknown>;
 };
 
 type HistoryHandlerDependencies = {
   botId: string;
   store: ChatHistoryStore;
   getMembership(input: { sub: string; botId: string }): Promise<boolean>;
-  now: () => number;
 };
 
 type HttpEvent = {
@@ -53,11 +55,14 @@ type ApiResponse = {
 
 type Route =
   | { kind: "list" }
+  | { kind: "hide" | "meta"; conversationId: string }
   | { kind: "turns"; conversationId: string }
   | { kind: "text"; conversationId: string; ordinal: number };
 
 type PreparedRequest =
   | { kind: "list"; input: HistoryListInput }
+  | { kind: "hide"; input: ConversationInput }
+  | { kind: "meta"; input: ConversationInput }
   | { kind: "turns"; input: HistoryTurnsInput }
   | { kind: "text"; input: HistoryTextInput };
 
@@ -101,8 +106,14 @@ function errorResponse(statusCode: number, code: string, message: string): ApiRe
 }
 
 function routeFor(path: string, method: string): Route | null {
+  const hideMatch = /^\/api\/chat\/conversations\/([^/]+)\/hide$/.exec(path);
+  if (method === "POST" && hideMatch) {
+    return { kind: "hide", conversationId: decodePathSegment(hideMatch[1]) };
+  }
   if (method !== "GET") return null;
   if (path === listPath) return { kind: "list" };
+  const metaMatch = /^\/api\/chat\/conversations\/([^/]+)$/.exec(path);
+  if (metaMatch) return { kind: "meta", conversationId: decodePathSegment(metaMatch[1]) };
 
   const textMatch = /^\/api\/chat\/conversations\/([^/]+)\/turns\/(\d+)\/text$/.exec(path);
   if (textMatch) {
@@ -178,36 +189,41 @@ function normalizeListResult(value: unknown): Record<string, unknown> {
   if (!isRecord(value) || !Array.isArray(value.conversations)) {
     throw new TypeError("History store returned an invalid conversation page.");
   }
-  const conversations = value.conversations.map((entry) => {
-    if (
-      !isRecord(entry) ||
-      typeof entry.conversationId !== "string" ||
-      !uuidPattern.test(entry.conversationId) ||
-      typeof entry.label !== "string" ||
-      !Number.isSafeInteger(entry.lastOrdinal) ||
-      Number(entry.lastOrdinal) < 1 ||
-      typeof entry.closed !== "boolean"
-    ) {
-      throw new TypeError("History store returned an invalid conversation descriptor.");
-    }
-    const activeQueryId = entry.activeQueryId;
-    if (
-      activeQueryId !== undefined &&
-      (typeof activeQueryId !== "string" || !uuidPattern.test(activeQueryId))
-    ) {
-      throw new TypeError("History store returned an invalid active query identifier.");
-    }
-    return {
-      conversationId: entry.conversationId,
-      label: entry.label,
-      ...optionalTimestamp(entry, "createdAt"),
-      ...optionalTimestamp(entry, "updatedAt"),
-      lastOrdinal: entry.lastOrdinal,
-      closed: entry.closed,
-      ...(typeof activeQueryId === "string" ? { activeQueryId } : {}),
-    };
-  });
-  return { version: 1, conversations, ...optionalCursor(value) };
+  return {
+    version: 1,
+    conversations: value.conversations.map(normalizeConversationSummary),
+    ...optionalCursor(value),
+  };
+}
+
+function normalizeConversationSummary(entry: unknown): Record<string, unknown> {
+  if (
+    !isRecord(entry) ||
+    typeof entry.conversationId !== "string" ||
+    !uuidPattern.test(entry.conversationId) ||
+    typeof entry.label !== "string" ||
+    !Number.isSafeInteger(entry.lastOrdinal) ||
+    Number(entry.lastOrdinal) < 1 ||
+    typeof entry.closed !== "boolean"
+  ) {
+    throw new TypeError("History store returned an invalid conversation descriptor.");
+  }
+  const activeQueryId = entry.activeQueryId;
+  if (
+    activeQueryId !== undefined &&
+    (typeof activeQueryId !== "string" || !uuidPattern.test(activeQueryId))
+  ) {
+    throw new TypeError("History store returned an invalid active query identifier.");
+  }
+  return {
+    conversationId: entry.conversationId,
+    label: entry.label,
+    ...optionalTimestamp(entry, "createdAt"),
+    ...optionalTimestamp(entry, "updatedAt"),
+    lastOrdinal: entry.lastOrdinal,
+    closed: entry.closed,
+    ...(typeof activeQueryId === "string" ? { activeQueryId } : {}),
+  };
 }
 
 function normalizeManifest(value: unknown): { count: number; complete: boolean } {
@@ -220,6 +236,26 @@ function normalizeManifest(value: unknown): { count: number; complete: boolean }
     throw new TypeError("History store returned an invalid turn manifest.");
   }
   return { count: Number(value.count), complete: value.complete };
+}
+
+function normalizeMetaResult(value: unknown, conversationId: string): Record<string, unknown> {
+  if (!isRecord(value) || value.version !== 1 || value.conversationId !== conversationId) {
+    throw new TypeError("History store returned invalid conversation metadata.");
+  }
+  return { version: 1, ...normalizeConversationSummary(value) };
+}
+
+function normalizeHideResult(value: unknown, conversationId: string): Record<string, unknown> {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    value.conversationId !== conversationId ||
+    typeof value.hiddenAt !== "string" ||
+    !Number.isFinite(Date.parse(value.hiddenAt))
+  ) {
+    throw new TypeError("History store did not confirm the conversation removal.");
+  }
+  return { version: 1, conversationId, hiddenAt: value.hiddenAt };
 }
 
 function normalizeTurnsResult(value: unknown, conversationId: string): Record<string, unknown> {
@@ -333,6 +369,12 @@ function storeErrorResponse(error: unknown): ApiResponse {
       return errorResponse(403, "FORBIDDEN", "No tenés acceso a esta conversación.");
     case "conversation_unavailable":
       return errorResponse(404, "NOT_FOUND", "No encontramos esa conversación.");
+    case "conversation_hidden":
+      return errorResponse(
+        404,
+        "CONVERSATION_HIDDEN",
+        "Esta conversación fue quitada del historial.",
+      );
     case "history_unavailable":
       return errorResponse(
         503,
@@ -348,10 +390,7 @@ export function createChatHistoryHandler({
   botId,
   store,
   getMembership,
-  now,
 }: HistoryHandlerDependencies) {
-  void now;
-
   return async function handler(event: HttpEvent): Promise<ApiResponse> {
     const method = event.requestContext?.http?.method?.toUpperCase() || "";
     const path = event.requestContext?.http?.path || event.rawPath || "";
@@ -363,7 +402,12 @@ export function createChatHistoryHandler({
     if (!sub) return errorResponse(401, "UNAUTHORIZED", "Iniciá sesión para continuar.");
 
     let prepared: PreparedRequest;
-    if (route.kind === "text") {
+    if (route.kind === "hide" || route.kind === "meta") {
+      if (!uuidPattern.test(route.conversationId)) {
+        return errorResponse(400, "INVALID_REQUEST", "La solicitud del historial no es válida.");
+      }
+      prepared = { kind: route.kind, input: { sub, botId, conversationId: route.conversationId } };
+    } else if (route.kind === "text") {
       const role = getQuery(event, "role");
       const queryId = getQuery(event, "queryId");
       const throughCursorValue = getQuery(event, "throughCursor");
@@ -435,6 +479,24 @@ export function createChatHistoryHandler({
       return errorResponse(403, "FORBIDDEN", "Esta cuenta no tiene acceso a este proyecto.");
 
     try {
+      if (prepared.kind === "hide") {
+        return jsonResponse(
+          200,
+          normalizeHideResult(
+            await store.hideConversation(prepared.input),
+            prepared.input.conversationId,
+          ),
+        );
+      }
+      if (prepared.kind === "meta") {
+        return jsonResponse(
+          200,
+          normalizeMetaResult(
+            await store.readConversationMeta(prepared.input),
+            prepared.input.conversationId,
+          ),
+        );
+      }
       if (prepared.kind === "list") {
         return jsonResponse(
           200,

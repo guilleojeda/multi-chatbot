@@ -37,6 +37,11 @@ function makeTurn(ordinal, queryId, overrides = {}) {
     botId,
     ordinal,
     queryId,
+    requestFingerprint: `fingerprint-${ordinal}`,
+    operation: ordinal === 1 ? "start" : "message",
+    baseOrdinal: ordinal - 1,
+    ownerAttemptId: `attempt-${ordinal}`,
+    resultDeadlineAt: Date.parse("2026-10-24T13:00:00.000Z"),
     status,
     phase:
       status === "completed" ? "complete" : status === "failed" ? "failed" : "invocation_claimed",
@@ -115,6 +120,45 @@ function createStore(send, now = () => Date.parse("2026-10-24T12:00:00.000Z")) {
 }
 
 describe("history reader regressions", () => {
+  it.each(["readConversationMeta", "readTurns", "readText"])(
+    "%s distinguishes a hidden owned META from a missing META before reading content",
+    async (method) => {
+      for (const [meta, expectedCode] of [
+        [makeMeta({ hiddenAt: null }), "conversation_hidden"],
+        [undefined, "conversation_unavailable"],
+      ]) {
+        const send = vi.fn(async (command) => {
+          if (command instanceof GetCommand && command.input.Key.sk === "META") {
+            return { Item: meta };
+          }
+          throw new Error("The public gate must reject before reading content.");
+        });
+        const store = createStore(send);
+        const request = {
+          sub,
+          botId,
+          conversationId,
+          ordinal: 1,
+          queryId: q1,
+          role: "user",
+          limit: 1,
+        };
+        const operation =
+          method === "readConversationMeta"
+            ? store.readConversationMeta({ sub, botId, conversationId })
+            : store[method](request);
+
+        await expect(operation).rejects.toMatchObject({ code: expectedCode });
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(send.mock.calls[0][0]).toBeInstanceOf(GetCommand);
+        expect(send.mock.calls[0][0].input.Key).toEqual({
+          pk: `CONV#${conversationId}`,
+          sk: "META",
+        });
+      }
+    },
+  );
+
   it("reads only known turn ordinals instead of evaluating earlier child rows", async () => {
     const meta = makeMeta({ lastOrdinal: 3 });
     const turns = new Map([
@@ -590,11 +634,6 @@ describe("history reader regressions", () => {
       cursor: 0,
       answerManifest: { count: 0, complete: false },
     });
-    delete outdatedActive.cursor;
-    delete outdatedActive.resultDeadlineAt;
-    delete outdatedActive.ownerAttemptId;
-    delete outdatedActive.contextSnapshot;
-    delete outdatedActive.documentContextManifest;
     const queries = [];
     const send = vi.fn(async (command) => {
       if (command instanceof GetCommand) {
@@ -688,10 +727,10 @@ describe("history reader regressions", () => {
 
     const gappedTurn = makeTurn(1, q1, {
       status: "in_progress",
-      phase: "generating",
-      answerManifest: { count: 0, complete: false },
+      phase: "invocation_claimed",
+      cursor: 3,
+      answerManifest: { count: 3, complete: false },
     });
-    delete gappedTurn.cursor;
     const gappedChunks = [
       chunk(1, q1, "assistant", 0, "first"),
       chunk(1, q1, "assistant", 2, "third"),

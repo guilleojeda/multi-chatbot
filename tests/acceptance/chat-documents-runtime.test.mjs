@@ -332,6 +332,7 @@ describe("document preparation in the conversation Runtime", () => {
         answer: "La respuesta del intento ya admitido.",
         documentContext: clone(documentContext),
       });
+      state.meta = { conversationId, sub: caller.sub, botId, lastOrdinal: 1 };
       return { inputTokens: 936_001 };
     });
     const harness = makeRuntimeHarness(createChatHandler, {
@@ -425,6 +426,7 @@ describe("document preparation in the conversation Runtime", () => {
         answer: "La respuesta del intento que ganó.",
         documentContext: winningContext,
       });
+      state.meta = { conversationId, sub: caller.sub, botId, lastOrdinal: 1 };
       throw new Error("preparation lost a concurrent admission race");
     };
     const winnerHarness = makeRuntimeHarness(createChatHandler, {
@@ -485,6 +487,7 @@ describe("document preparation in the conversation Runtime", () => {
           answer: "La respuesta ganadora del envío.",
           documentContext: clone(documentContext),
         });
+        state.meta = { conversationId, sub: caller.sub, botId, lastOrdinal: 1 };
         return fullQuota;
       },
     });

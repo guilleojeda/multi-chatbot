@@ -142,13 +142,41 @@ describe("completed assistant text integrity regressions", () => {
       botId,
       ordinal: 1,
       queryId,
+      operation: "start",
+      baseOrdinal: 0,
+      requestFingerprint: "sha256:current-api-regression",
       status: "completed",
       phase: "complete",
+      ownerAttemptId: "attempt-api-regression",
+      resultDeadlineAt: Date.parse("2026-10-25T13:00:00.000Z"),
       cursor: 1,
       questionManifest: { count: 1, complete: true },
       answerManifest: { count: 1, complete: true },
+      contextManifest: { count: 0, complete: true },
+      contextSnapshot: { version: 1, recentReferences: [] },
+      documentContextManifest: { count: 1, complete: true },
+      profileSnapshot: { fields: {} },
+      invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "runtime-r1" },
+    };
+    const documentContext = {
+      knowledgeBaseId: "kb-history-api",
+      query: "respuesta de prueba",
+      revision: "documents-r1",
+      retrievedAt: Date.parse("2026-10-25T12:00:00.000Z"),
+      status: "empty",
+      results: [],
     };
     const rows = [
+      {
+        pk,
+        sk: `TURN#00000001#${queryId}#USER#00000000`,
+        conversationId,
+        ordinal: 1,
+        queryId,
+        role: "user",
+        index: 0,
+        text: "Pregunta de prueba.",
+      },
       {
         pk,
         sk: `TURN#00000001#${queryId}#ASSISTANT#00000000`,
@@ -158,6 +186,15 @@ describe("completed assistant text integrity regressions", () => {
         role: "assistant",
         index: 0,
         text: answer,
+      },
+      {
+        pk,
+        sk: "TURN#00000001#DOCUMENT#00000000",
+        conversationId,
+        queryId,
+        ordinal: 1,
+        index: 0,
+        text: JSON.stringify(documentContext),
       },
     ];
     const documentClient = {

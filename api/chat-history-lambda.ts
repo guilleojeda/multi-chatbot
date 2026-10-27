@@ -37,5 +37,4 @@ export const handler = createChatHistoryHandler({
   store: historyStore,
   getMembership: ({ sub, botId: requestedBotId }) =>
     accountStore.hasMember({ sub, botId: requestedBotId }),
-  now: Date.now,
 });

@@ -127,6 +127,8 @@ export function createHistoryEnvironment({
   membershipStatus = 200,
   session: providedSession,
   listHandler = async () => jsonResponse({ version: 1, conversations: [] }),
+  metaHandler,
+  hideHandler,
   turnsHandler = async () =>
     jsonResponse({ version: 1, throughOrdinal: 0, closed: false, canContinue: true, turns: [] }),
   textHandler = async () => jsonResponse({ version: 1, chunks: [], complete: true }),
@@ -142,6 +144,7 @@ export function createHistoryEnvironment({
 } = {}) {
   const apiRequests = [];
   const runtimeRequests = [];
+  const conversationMeta = new Map();
   const counters = { uuid: 0 };
   let token = accessToken;
   const session = providedSession || {
@@ -219,6 +222,10 @@ export function createHistoryEnvironment({
       const call = { path, url: parsed, method, headers, init, body: init.body };
       apiRequests.push(call);
       if (path === "/chat/conversations") return listHandler(call);
+      const hideMatch = path.match(/^\/chat\/conversations\/([^/]+)\/hide$/);
+      if (hideMatch && method === "POST" && hideHandler) {
+        return hideHandler({ ...call, conversationId: decodeURIComponent(hideMatch[1]) });
+      }
       const textMatch = path.match(/^\/chat\/conversations\/([^/]+)\/turns\/(\d+)\/text$/);
       if (textMatch) {
         return textHandler({
@@ -230,6 +237,13 @@ export function createHistoryEnvironment({
       const turnsMatch = path.match(/^\/chat\/conversations\/([^/]+)\/turns$/);
       if (turnsMatch)
         return turnsHandler({ ...call, conversationId: decodeURIComponent(turnsMatch[1]) });
+      const metaMatch = path.match(/^\/chat\/conversations\/([^/]+)$/);
+      if (metaMatch && method === "GET") {
+        const metaCall = { ...call, conversationId: decodeURIComponent(metaMatch[1]) };
+        if (metaHandler) return metaHandler(metaCall);
+        const metadata = conversationMeta.get(metaCall.conversationId);
+        return metadata ? jsonResponse(metadata) : jsonResponse({ code: "NOT_FOUND" }, 404);
+      }
       return jsonResponse({ code: "NOT_FOUND" }, 404);
     }
     if (url === runtimeUrl(config)) {
@@ -250,7 +264,16 @@ export function createHistoryEnvironment({
   });
   vi.stubGlobal("fetch", fetch);
 
-  return { storage, identity, config, session, apiRequests, runtimeRequests, fetch };
+  return {
+    storage,
+    identity,
+    config,
+    session,
+    apiRequests,
+    runtimeRequests,
+    conversationMeta,
+    fetch,
+  };
 }
 
 export async function loadHistoryAccountApp() {

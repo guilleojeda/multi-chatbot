@@ -93,7 +93,7 @@ function makeEnvironment({
         const value = byId.get(conversationId);
         return value
           ? jsonResponse(visibleMetadata(value))
-          : jsonResponse({ code: "CONVERSATION_NOT_FOUND" }, 404);
+          : jsonResponse({ code: "NOT_FOUND" }, 404);
       }),
   });
   return env;
@@ -412,7 +412,7 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
     expect(visibleHistoryState(app).removal?.status).toBe("hiding");
 
     await selectConversation(app, secondLabel);
-    await clickText(app, "Actualizar");
+    await clickText(app, "Actualizar historial");
     expect(listNumber).toBe(2);
 
     hideRequest.resolve(
@@ -718,12 +718,12 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
       ),
     ).toBe(true);
     expect(domState.document.body.textContent).not.toContain("consulta aún no admitida");
-    pendingMeta.resolve(jsonResponse({ code: "CONVERSATION_NOT_FOUND" }, 404));
+    pendingMeta.resolve(jsonResponse({ code: "NOT_FOUND" }, 404));
     await render(app);
 
     expect(readChatJournals(env.config, historyIdentity).has(firstConversationId)).toBe(true);
     expect(visibleHistoryState(app).selectedConversationId).toBe(firstConversationId);
-    expect(visibleHistoryState(app).queryStatus).toBe("unconfirmed");
+    expect(componentProps(app).state.queryStatus).toBe("unconfirmed");
     expect(env.runtimeRequests.length).toBeLessThanOrEqual(1);
 
     app.dispose();
@@ -742,7 +742,7 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
     const admittedApp = await mount(admittedEnv);
 
     expect(domState.document.body.textContent).not.toContain("texto no restaurable");
-    admittedMeta.resolve(jsonResponse({ code: "CONVERSATION_NOT_FOUND" }, 404));
+    admittedMeta.resolve(jsonResponse({ code: "NOT_FOUND" }, 404));
     await render(admittedApp);
 
     expect(domState.document.body.textContent).not.toContain("texto no restaurable");

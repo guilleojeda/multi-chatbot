@@ -211,6 +211,12 @@ async function makeServer({ detached = false, useRuntimeEntryConfig = false } = 
       invocation: { modelId: "global.anthropic.claude-sonnet-4-6" },
       failure: { code: "provider_error" },
     });
+    metas.set(savedConversationId, {
+      conversationId: savedConversationId,
+      sub: "teacher-123",
+      botId: "bot-aurora",
+      lastOrdinal: 1,
+    });
 
     const store = {
       async getSubmission({ queryId }) { return submissions.get(queryId) ?? null; },

@@ -1023,6 +1023,12 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
       storeOverrides: {
         async startTurn(input) {
           this._harnessState.submissions.set(keyOf(input), createSubmission(input, 1));
+          this._harnessState.metaByConversation.set(input.conversationId, {
+            conversationId: input.conversationId,
+            sub: input.sub,
+            botId: input.botId,
+            lastOrdinal: 1,
+          });
           throw new Error("transaction response timed out");
         },
       },

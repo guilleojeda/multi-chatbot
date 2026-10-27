@@ -79,6 +79,26 @@ pulsa “Liberar historial”; para ver un error recuperable, abre `/?scenario=h
 `ready` y pulsa “Reintentar”. Estos escenarios simulan el GET de lista. Con
 `/?scenario=incomplete#/chat`, el historial sigue visible y la caja de envío queda bloqueada.
 
+Para quitar una conversación, usa “Preparar historial de paginación y recargar”, selecciona un hilo
+y elige “Quitar del historial”. `history-hide-pending` retiene el POST hasta pulsar “Liberar
+historial”; mientras espera, la UI debe mostrar “Quitando…” y bloquear otro envío en ese hilo.
+`history-hide-ack-lost` guarda `hiddenAt` en el registro simulado y pierde la primera respuesta
+HTTP. La UI debe dejar la acción como no confirmada y ofrecer un reintento explícito; el segundo
+POST confirma el mismo `hiddenAt`, sin cambiar turnos ni iniciar otra admisión. El historial de
+peticiones muestra ambos POST y el estado JSON conserva el original junto a `hiddenAt`.
+
+Para comprobar el reingreso de una referencia local, deja sin reintentar la ocultación con ACK
+perdido y recarga en la misma pestaña con `/?scenario=history-meta-pending#/chat`. La lista no debe
+incluir el hilo oculto; el GET breve de META de la referencia local queda pendiente hasta “Liberar
+historial”, luego devuelve `CONVERSATION_HIDDEN` y la aplicación debe retirar selección y journal
+locales, dejando la lista vacía confirmada. Usa `/?scenario=history-meta-error#/chat` para devolver
+503 en esa misma comprobación y verificar que la UI conserva un error recuperable, no una lista
+vacía sin explicación. En `ready`, los GET breves devuelven solo el resumen visible del mismo
+registro. Un oculto también rechaza turns/text, recover, replay y un nuevo follow-up con
+`conversation_hidden`; la denegación no agrega turnos ni detiene una respuesta ya admitida. Puedes
+ocultar un hilo activo y usar “Completar” para comprobar que el productor persiste su terminal
+mientras el hilo sigue fuera del historial.
+
 “Preparar historial de paginación y recargar” agrega 22 conversaciones a los mismos registros
 simulados del Runtime. La conversación más reciente contiene 22 turnos: al abrirla, se cargan los
 20 más recientes y “Ver mensajes anteriores” carga los dos restantes. Su último turno está activo y
@@ -380,7 +400,8 @@ path. The fixture does not write to the operating-system clipboard.
 
 Append `?scenario=<name>` before the hash to select an initial scenario, for example
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `history-pending`,
-`history-error`, `history-earlier-pending`, `profile-error`,
+`history-snapshot-pending`, `history-error`, `history-meta-pending`, `history-meta-error`,
+`history-hide-pending`, `history-hide-ack-lost`, `history-earlier-pending`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-unconfirmed`, `runtime-temporary`, `runtime-recover-network`, `runtime-quota-daily`,

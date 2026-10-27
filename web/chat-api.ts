@@ -88,6 +88,11 @@ export type ConversationSummary = {
   activeQueryId?: string;
 };
 
+export type HideChatConversationResult = {
+  conversationId: string;
+  hiddenAt: string;
+};
+
 export type ConversationTurn = {
   ordinal: number;
   queryId: string;
@@ -237,6 +242,78 @@ export async function listChatConversations(
     };
   });
   return { conversations, nextCursor: cursorValue(payload.nextCursor) };
+}
+
+export async function hideChatConversation(
+  config: PublicConfig,
+  session: Session,
+  conversationId: string,
+  isActive: () => boolean,
+): Promise<HideChatConversationResult> {
+  if (!uuidPattern.test(conversationId)) {
+    throw historyError("INVALID_REQUEST", 400, "No pudimos quitar esta conversación.");
+  }
+  const payload = parseHistoryJson(
+    await requestWithRefresh(
+      config,
+      session,
+      `/chat/conversations/${encodeURIComponent(conversationId)}/hide`,
+      { method: "POST" },
+      isActive,
+    ),
+  );
+  if (
+    payload.conversationId !== conversationId ||
+    typeof payload.hiddenAt !== "string" ||
+    !payload.hiddenAt.trim() ||
+    !Number.isFinite(Date.parse(payload.hiddenAt))
+  ) {
+    throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una confirmación inválida.");
+  }
+  return { conversationId, hiddenAt: payload.hiddenAt };
+}
+
+export async function readChatConversationMeta(
+  config: PublicConfig,
+  session: Session,
+  conversationId: string,
+  isActive: () => boolean,
+): Promise<ConversationSummary> {
+  if (!uuidPattern.test(conversationId)) {
+    throw historyError("INVALID_REQUEST", 400, "No pudimos verificar esta conversación.");
+  }
+  const payload = parseHistoryJson(
+    await requestWithRefresh(
+      config,
+      session,
+      `/chat/conversations/${encodeURIComponent(conversationId)}`,
+      {},
+      isActive,
+    ),
+  );
+  const createdAt = optionalHistoryTimestamp(payload, "createdAt");
+  const updatedAt = optionalHistoryTimestamp(payload, "updatedAt");
+  if (
+    payload.conversationId !== conversationId ||
+    typeof payload.label !== "string" ||
+    !payload.label.trim() ||
+    !Number.isSafeInteger(payload.lastOrdinal) ||
+    (payload.lastOrdinal as number) < 0 ||
+    typeof payload.closed !== "boolean" ||
+    (payload.activeQueryId !== undefined &&
+      (typeof payload.activeQueryId !== "string" || !uuidPattern.test(payload.activeQueryId)))
+  ) {
+    throw historyError("INVALID_RESPONSE", 502, "El historial devolvió una conversación inválida.");
+  }
+  return {
+    conversationId,
+    label: payload.label,
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
+    lastOrdinal: payload.lastOrdinal as number,
+    closed: payload.closed,
+    ...(typeof payload.activeQueryId === "string" ? { activeQueryId: payload.activeQueryId } : {}),
+  };
 }
 
 export async function readConversationTurns(

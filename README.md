@@ -2,7 +2,7 @@
 
 Repositorio común para los chatbots del proyecto. Incluye el sitio público, cuenta por invitación, perfil profesional y conversación docente con documentos y Sonnet 4.6, herramientas TypeScript y React, infraestructura CDK y entrega automática a AWS mediante GitHub Actions. El mapa de funcionalidades está en [PHASES.md](PHASES.md).
 
-El [chat](docs/intent/chat.md) permite elegir conversaciones del historial y continuarlas desde otra sesión o navegador, también después de reiniciar Runtime. Los hilos largos usan un resumen recurrente y cuatro pares recientes tanto para responder como para preparar la búsqueda documental; los originales y estados permanecen íntegros en DynamoDB. Abrirlos usa la API HTTP, mientras la generación conserva el acceso directo a Runtime. Un perfil incompleto permite leer el historial y debe completarse para enviar un pedido nuevo.
+El [chat](docs/intent/chat.md) permite elegir conversaciones del historial y continuarlas desde otra sesión o navegador, también después de reiniciar Runtime. Los hilos largos usan un resumen recurrente y cuatro pares recientes tanto para responder como para preparar la búsqueda documental; los originales y estados permanecen íntegros en DynamoDB. Abrirlos usa la API HTTP, mientras la generación conserva el acceso directo a Runtime. Un perfil incompleto permite leer y quitar conversaciones del historial y debe completarse para enviar un pedido nuevo. Quitar impide nuevos accesos del dueño, conserva el contenido para administración y análisis y no cancela envíos admitidos ni devuelve cupo.
 
 ## Preparar un checkout
 
@@ -104,24 +104,6 @@ aws dynamodb get-item --region us-east-1 \
 ```
 
 Si ya existe, el primer comando devuelve `ConditionalCheckFailedException`; leer y validar el registro existente sin sobrescribirlo. Los límites deben ser enteros no negativos y la revisión una cadena no vacía. Repetir esta preparación conserva política y consumos. Para cambiar límites, actualizar explícitamente la política con una nueva revisión, conservando los contadores; los pedidos nuevos usan el cambio. Una política ausente o inválida impide admitir sin consumir. No hay interfaz administrativa ni tarea de reinicio de cupos. Ver [contrato del chat](docs/intent/chat.md).
-
-## Incorporar conversaciones existentes al historial
-
-Con la identidad de la cuenta **118903272638** vigente, verificar en CloudFormation la tabla física del stack `multi-chatbot-dev-docentes-chat` e inventariar sus META sin registrar mensajes privados. Después del despliegue, confirmar que el índice está `ACTIVE`:
-
-```sh
-aws dynamodb describe-table --region us-east-1 \
-  --table-name multi-chatbot-dev-docentes-conversations \
-  --query 'Table.GlobalSecondaryIndexes[?IndexName==`ConversationHistory`].[IndexName,IndexStatus]'
-AWS_REGION=us-east-1 \
-  CHAT_HISTORY_TABLE=multi-chatbot-dev-docentes-conversations \
-  CHAT_HISTORY_BOT_ID=docentes \
-  node scripts/backfill-chat-history.mjs
-```
-
-El script añade únicamente los tres atributos de índice y devuelve conteos de revisadas, actualizadas, ya incorporadas e incompatibles. Repetirlo es idempotente. Para operar por páginas, importar `backfillChatHistory` desde ese mismo módulo y pasar `pageSize`, `maxPages` y el `startKey` devuelto como `nextKey`; ante un error, `error.checkpoint` conserva la última página confirmada. La importación no ejecuta el CLI ni crea clientes AWS.
-
-Comprobar cobertura de las META válidas y una segunda pasada sin cambios. Un incompatible se conserva y requiere examinar su formato autorizado; no representa una conversación migrada. Comparar los originales y metadatos anteriores, excluyendo solo los tres atributos añadidos, y clasificar cualquier actividad concurrente. `UPDATE_COMPLETE` del stack no prueba que el índice esté activo ni que el archivo esté completo. Ver [compatibilidad y límites](docs/intent/chat.md).
 
 ## Cargar documentos preparados en desarrollo
 

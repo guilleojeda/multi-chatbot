@@ -326,8 +326,8 @@ function reconstructMessages(
   options: {
     validateContextReferences?: boolean;
     lastOrdinal?: number;
-    owner?: { sub: string; botId: string };
-  } = {},
+    owner: { sub: string; botId: string };
+  },
 ): ConversationContext {
   const partition = `CONV#${conversationId}`;
   const turns = new Map<string, Record<string, unknown>>();
@@ -367,8 +367,7 @@ function reconstructMessages(
     queryId: string;
     questionCount: number;
     answerCount: number;
-    contextCount: number | undefined;
-    contextManifest: unknown;
+    contextCount: number;
     contextSnapshot: unknown;
   }[] = [];
   const coveredOrdinals = new Set<number>();
@@ -377,60 +376,82 @@ function reconstructMessages(
     if (turn.status !== "in_progress" && turn.status !== "failed" && turn.status !== "completed") {
       throw new Error("Conversation context contains a turn with an unknown status.");
     }
-    if (
-      options.owner &&
-      ((turn.sub !== undefined && turn.sub !== options.owner.sub) ||
-        (turn.botId !== undefined && turn.botId !== options.owner.botId))
-    ) {
-      throw new Error("Conversation context contains a turn for another owner.");
-    }
-
     const ordinal = Number(ordinalKey);
-    if (options.lastOrdinal !== undefined && ordinal <= options.lastOrdinal) {
-      if (
-        !isPositiveSafeInteger(ordinal) ||
-        String(ordinal).padStart(8, "0") !== ordinalKey ||
-        turn.ordinal !== ordinal ||
-        turn.pk !== partition ||
-        turn.conversationId !== conversationId
-      ) {
-        throw new Error("Conversation context contains a malformed turn record.");
-      }
-      coveredOrdinals.add(ordinal);
-    }
-    if (turn.status !== "completed") continue;
-
     const questionCount = manifestCount(turn.questionManifest);
-    const answerCount = manifestCount(turn.answerManifest);
-    const contextCount =
-      turn.contextManifest === undefined ? undefined : contextManifestCount(turn.contextManifest);
+    const answerCount = partialManifestCount(turn.answerManifest);
+    const answerManifest = isRecord(turn.answerManifest) ? turn.answerManifest : undefined;
+    const contextCount = contextManifestCount(turn.contextManifest);
+    const documentCount = contextManifestCount(turn.documentContextManifest);
+    const validPhase =
+      (turn.status === "in_progress" &&
+        (turn.phase === "admitted" || turn.phase === "invocation_claimed")) ||
+      (turn.status === "completed" && turn.phase === "complete") ||
+      (turn.status === "failed" && turn.phase === "failed");
+    let snapshotIsCurrent = false;
+    try {
+      if (isChunkedContextSnapshot(turn.contextSnapshot)) {
+        snapshotIsCurrent =
+          isRecord(turn.contextSnapshot) &&
+          turn.contextSnapshot.version === 1 &&
+          !Object.hasOwn(turn.contextSnapshot, "recentReferences") &&
+          contextCount !== null &&
+          contextCount > 0;
+      } else {
+        validateContextSnapshot(turn.contextSnapshot, ordinal);
+        snapshotIsCurrent = contextCount === 0;
+      }
+    } catch {
+      snapshotIsCurrent = false;
+    }
+    if (!snapshotIsCurrent) {
+      throw new Error("Conversation context snapshot or references are malformed.");
+    }
     if (
       !isPositiveSafeInteger(ordinal) ||
       String(ordinal).padStart(8, "0") !== ordinalKey ||
       turn.ordinal !== ordinal ||
       turn.pk !== partition ||
       turn.conversationId !== conversationId ||
+      turn.sub !== options.owner.sub ||
+      turn.botId !== options.owner.botId ||
       typeof turn.queryId !== "string" ||
       !uuidPattern.test(turn.queryId) ||
-      (turn.phase !== undefined && turn.phase !== "complete") ||
-      (turn.cursor !== undefined &&
-        (typeof turn.cursor !== "number" ||
-          !Number.isSafeInteger(turn.cursor) ||
-          turn.cursor !== answerCount)) ||
+      typeof turn.requestFingerprint !== "string" ||
+      turn.requestFingerprint.length === 0 ||
+      turn.operation !== (ordinal === 1 ? "start" : "message") ||
+      turn.baseOrdinal !== ordinal - 1 ||
+      typeof turn.ownerAttemptId !== "string" ||
+      turn.ownerAttemptId.length === 0 ||
+      typeof turn.resultDeadlineAt !== "number" ||
+      !Number.isSafeInteger(turn.resultDeadlineAt) ||
+      turn.resultDeadlineAt < 0 ||
+      !validPhase ||
       questionCount === null ||
       answerCount === null ||
-      (turn.contextManifest !== undefined && contextCount === null)
+      !Number.isSafeInteger(turn.cursor) ||
+      turn.cursor !== answerCount ||
+      contextCount === null ||
+      documentCount === null ||
+      documentCount < 1 ||
+      (turn.status === "completed" &&
+        (!answerManifest ||
+          !isPositiveSafeInteger(answerManifest.count) ||
+          answerManifest.complete !== true)) ||
+      (turn.status !== "completed" && (!answerManifest || answerManifest.complete !== false))
     ) {
-      throw new Error("Completed conversation context has an invalid turn record.");
+      throw new Error("Conversation context contains a malformed current turn record.");
     }
+    if (options.lastOrdinal !== undefined && ordinal <= options.lastOrdinal) {
+      coveredOrdinals.add(ordinal);
+    }
+    if (turn.status !== "completed") continue;
     completedTurns.push({
       ordinal,
       ordinalKey,
       queryId: turn.queryId,
       questionCount,
       answerCount,
-      contextCount: contextCount ?? undefined,
-      contextManifest: turn.contextManifest,
+      contextCount,
       contextSnapshot: turn.contextSnapshot,
     });
   }
@@ -473,7 +494,7 @@ function reconstructMessages(
         String(index).padStart(8, "0") !== keyMatch[4] ||
         chunk.pk !== partition ||
         chunk.conversationId !== conversationId ||
-        (chunk.ordinal !== undefined && chunk.ordinal !== turn.ordinal) ||
+        chunk.ordinal !== turn.ordinal ||
         chunk.queryId !== turn.queryId ||
         chunk.role !== role ||
         chunk.index !== index ||
@@ -487,54 +508,39 @@ function reconstructMessages(
 
     const question = assembleText(questionChunks, turn.questionCount, "user", turn.queryId);
     const answer = assembleText(answerChunks, turn.answerCount, "assistant", turn.queryId);
-    if (turn.contextSnapshot !== undefined) {
-      if (turn.contextManifest === undefined || turn.contextCount === undefined) {
-        throw new Error("Completed conversation snapshot has no context manifest.");
-      }
-      const fragmentedReferences = isChunkedContextSnapshot(turn.contextSnapshot)
-        ? parseContextReferences({
-            ordinal: turn.ordinal,
-            queryId: turn.queryId,
-            count: turn.contextCount,
-            chunks: turnChunks,
-            partition,
-            conversationId,
-            turns,
-            verifyTargets: options.validateContextReferences !== false,
-          })
-        : undefined;
-      if (fragmentedReferences === undefined) {
-        if (turn.contextCount !== 0) {
-          throw new Error("Completed conversation snapshot has conflicting context storage.");
-        }
-        parseContextReferences({
+    const fragmentedReferences = isChunkedContextSnapshot(turn.contextSnapshot)
+      ? parseContextReferences({
           ordinal: turn.ordinal,
           queryId: turn.queryId,
-          count: 0,
+          count: turn.contextCount,
           chunks: turnChunks,
           partition,
           conversationId,
           turns,
-        });
+          verifyTargets: options.validateContextReferences !== false,
+        })
+      : undefined;
+    if (fragmentedReferences === undefined) {
+      if (turn.contextCount !== 0) {
+        throw new Error("Completed conversation snapshot has conflicting context storage.");
       }
-      const snapshot = hydrateStoredContextSnapshot(
-        turn.contextSnapshot,
-        turn.ordinal,
-        fragmentedReferences,
-      );
-      if (options.validateContextReferences !== false) {
-        verifySnapshotReferenceTurns(snapshot, turns);
-      }
-    } else if (options.validateContextReferences !== false) {
       parseContextReferences({
         ordinal: turn.ordinal,
         queryId: turn.queryId,
-        count: turn.contextCount,
+        count: 0,
         chunks: turnChunks,
         partition,
         conversationId,
         turns,
       });
+    }
+    const snapshot = hydrateStoredContextSnapshot(
+      turn.contextSnapshot,
+      turn.ordinal,
+      fragmentedReferences,
+    );
+    if (options.validateContextReferences !== false) {
+      verifySnapshotReferenceTurns(snapshot, turns);
     }
     references.push({ ordinal: turn.ordinal, queryId: turn.queryId });
     messages.push(
@@ -710,6 +716,7 @@ export function createConversationStoreAdapter(input: {
     code:
       | "quota_exceeded"
       | "conversation_busy"
+      | "conversation_hidden"
       | "stale_base"
       | "conflict"
       | "quota_period_changed"
@@ -850,102 +857,17 @@ export function createConversationStoreAdapter(input: {
     return result.Item;
   }
 
-  async function readFirstQuestionLabel(conversationId: string): Promise<string | undefined> {
-    const firstTurn = await getItem(turnKey(conversationId, 1));
-    if (
-      !firstTurn ||
-      firstTurn.pk !== conversationKey(conversationId).pk ||
-      firstTurn.sk !== turnKey(conversationId, 1).sk ||
-      firstTurn.conversationId !== conversationId ||
-      firstTurn.ordinal !== 1 ||
-      typeof firstTurn.queryId !== "string" ||
-      !uuidPattern.test(firstTurn.queryId) ||
-      manifestCount(firstTurn.questionManifest) === null
-    ) {
-      return undefined;
-    }
-    const prefix = `${turnKey(conversationId, 1).sk}#${firstTurn.queryId}#USER#`;
-    const result = await documentClient.send(
-      new QueryCommand({
-        TableName: tableName,
-        KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
-        ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
-        ExpressionAttributeValues: {
-          ":pk": conversationKey(conversationId).pk,
-          ":prefix": prefix,
-        },
-        ConsistentRead: true,
-        ScanIndexForward: true,
-        Limit: 1,
-      }),
-    );
-    const chunk = result.Items?.[0];
-    if (
-      !chunk ||
-      chunk.pk !== conversationKey(conversationId).pk ||
-      chunk.conversationId !== conversationId ||
-      chunk.queryId !== firstTurn.queryId ||
-      chunk.ordinal !== 1 ||
-      chunk.role !== "user" ||
-      chunk.index !== 0 ||
-      typeof chunk.text !== "string"
-    ) {
-      return undefined;
-    }
-    try {
-      return createHistoryLabel(chunk.text);
-    } catch {
-      return undefined;
-    }
-  }
-
-  async function historyProjectionFor(
-    previousMeta: Record<string, unknown> | undefined,
-    conversationId: string,
-    sub: string,
-    botId: string,
-    activityAt: string,
-  ): Promise<{ historyOwner: string; historyOrder: string; historyLabel: string } | undefined> {
-    const owner = `USER#${sub}#BOT#${botId}`;
-    const label =
-      typeof previousMeta?.historyLabel === "string" && previousMeta.historyLabel.trim().length > 0
-        ? previousMeta.historyLabel
-        : await readFirstQuestionLabel(conversationId);
-    // Keep legacy transitions independent of an unreadable label; let backfill report it instead of inventing text.
-    if (!label) return undefined;
+  function historyActivityUpdateParts(activityAt: string, conversationId: string) {
     return {
-      historyOwner: owner,
-      historyOrder: createHistoryOrder(activityAt, conversationId),
-      historyLabel: label,
+      assignments: ["#historyOrder = :historyOrder"],
+      names: { "#historyOrder": "historyOrder" },
+      values: { ":historyOrder": createHistoryOrder(activityAt, conversationId) },
     };
-  }
-
-  function historyUpdateParts(
-    previousMeta: Record<string, unknown> | undefined,
-    projection: { historyOwner: string; historyOrder: string; historyLabel: string } | undefined,
-  ) {
-    const assignments = projection ? ["#historyOrder = :historyOrder"] : [];
-    const names: Record<string, string> = projection ? { "#historyOrder": "historyOrder" } : {};
-    const values: Record<string, unknown> = projection
-      ? { ":historyOrder": projection.historyOrder }
-      : {};
-    if (!projection) return { assignments, names, values };
-    if (previousMeta?.historyOwner !== projection.historyOwner) {
-      assignments.push("#historyOwner = :historyOwner");
-      names["#historyOwner"] = "historyOwner";
-      values[":historyOwner"] = projection.historyOwner;
-    }
-    if (previousMeta?.historyLabel !== projection.historyLabel) {
-      assignments.push("#historyLabel = :historyLabel");
-      names["#historyLabel"] = "historyLabel";
-      values[":historyLabel"] = projection.historyLabel;
-    }
-    return { assignments, names, values };
   }
 
   function historyMetaSetExpression(
     updatedAtName: string,
-    historyUpdate: ReturnType<typeof historyUpdateParts>,
+    historyUpdate: ReturnType<typeof historyActivityUpdateParts>,
   ): string {
     return `SET ${updatedAtName} = :now${historyUpdate.assignments.length ? ", " + historyUpdate.assignments.join(", ") : ""}`;
   }
@@ -1051,14 +973,8 @@ export function createConversationStoreAdapter(input: {
   }
 
   function inputBaseOrdinal(turn: ContinueTurnInput): number {
-    const value = turn.baseOrdinal ?? turn.expectedLastOrdinal;
-    if (
-      !isPositiveSafeInteger(value) ||
-      (turn.baseOrdinal !== undefined &&
-        turn.expectedLastOrdinal !== undefined &&
-        turn.baseOrdinal !== turn.expectedLastOrdinal) ||
-      !Number.isSafeInteger(value + 1)
-    ) {
+    const value = turn.baseOrdinal;
+    if (!isPositiveSafeInteger(value) || !Number.isSafeInteger(value + 1)) {
       throw new RangeError("Conversation base ordinal is invalid.");
     }
     return value;
@@ -1082,11 +998,13 @@ export function createConversationStoreAdapter(input: {
       turn.ownerAttemptId.length === 0 ||
       typeof turn.requestFingerprint !== "string" ||
       turn.requestFingerprint.length === 0 ||
+      turn.operation !== operation ||
+      turn.baseOrdinal !== baseOrdinal ||
       typeof turn.text !== "string" ||
       turn.text.trim().length === 0 ||
       !isRecord(turn.profileSnapshot) ||
       !isRecord(turn.invocation) ||
-      (turn.documentContext !== undefined && !isDocumentContext(turn.documentContext)) ||
+      !isDocumentContext(turn.documentContext) ||
       !Number.isFinite(turn.now) ||
       turn.resultDeadlineAt !== turn.now + resultDeadlineMs ||
       (operation === "start" && baseOrdinal !== 0)
@@ -1188,6 +1106,9 @@ export function createConversationStoreAdapter(input: {
       ) {
         throw storeError("conflict", "Conversation does not belong to this user and chatbot.");
       }
+      if (Object.hasOwn(previousMeta, "hiddenAt")) {
+        throw storeError("conversation_hidden", "Conversation is unavailable.");
+      }
       if (previousMeta.activeQueryId || previousMeta.closed === true) {
         throw storeError("conversation_busy", "Conversation already has an active or closed turn.");
       }
@@ -1195,75 +1116,54 @@ export function createConversationStoreAdapter(input: {
         throw storeError("stale_base", "Conversation base ordinal is stale.");
     }
     const currentSummary = readSummaryPointer(previousMeta);
-    const contextSnapshot =
-      turn.contextSnapshot === undefined
-        ? undefined
-        : validateContextSnapshot(turn.contextSnapshot, ordinal);
-    const contextReferences =
-      operation === "message"
-        ? encodeContextReferences((turn as ContinueTurnInput).contextReferences, ordinal)
-        : [];
+    const contextSnapshot = validateContextSnapshot(turn.contextSnapshot, ordinal);
     const summaryCandidate =
       turn.summaryCandidate === undefined
         ? undefined
         : validateSummaryVersion(turn.summaryCandidate);
-
-    if (summaryCandidate !== undefined && contextSnapshot === undefined) {
-      throw new TypeError("A summary candidate requires a versioned context snapshot.");
+    if (
+      operation === "message" &&
+      !sameContextReferences(
+        contextSnapshot.recentReferences,
+        (turn as ContinueTurnInput).contextReferences,
+      )
+    ) {
+      throw new TypeError("Context snapshot references must match the recent context references.");
     }
-    if (contextSnapshot !== undefined) {
+    if (
+      operation === "start" &&
+      (contextSnapshot.summary !== undefined || contextSnapshot.recentReferences.length > 0)
+    ) {
+      throw new TypeError("A new conversation cannot begin with prior conversation context.");
+    }
+    if (summaryCandidate !== undefined) {
+      const previousThrough = currentSummary?.throughOrdinal ?? 0;
+      const snapshotMatchesCandidate = sameSummaryPointer(contextSnapshot.summary, {
+        summaryId: summaryCandidate.summaryId,
+        throughOrdinal: summaryCandidate.throughOrdinal,
+      });
       if (
-        operation === "message" &&
-        !sameContextReferences(
-          contextSnapshot.recentReferences,
-          (turn as ContinueTurnInput).contextReferences,
-        )
+        operation !== "message" ||
+        !snapshotMatchesCandidate ||
+        summaryCandidate.throughOrdinal > baseOrdinal ||
+        summaryCandidate.throughOrdinal <= previousThrough ||
+        summaryCandidate.sourceReferences.some(
+          (reference) =>
+            reference.ordinal <= previousThrough ||
+            reference.ordinal > summaryCandidate.throughOrdinal,
+        ) ||
+        summaryCandidate.previousSummaryId !== currentSummary?.summaryId
       ) {
-        throw new TypeError(
-          "Context snapshot references must match the recent context references.",
-        );
+        throw new TypeError("Summary candidate does not extend the current conversation context.");
       }
-      if (
-        operation === "start" &&
-        (contextSnapshot.summary !== undefined || contextSnapshot.recentReferences.length > 0)
-      ) {
-        throw new TypeError("A new conversation cannot begin with prior conversation context.");
-      }
-      if (summaryCandidate !== undefined) {
-        const previousThrough = currentSummary?.throughOrdinal ?? 0;
-        const snapshotMatchesCandidate = sameSummaryPointer(contextSnapshot.summary, {
-          summaryId: summaryCandidate.summaryId,
-          throughOrdinal: summaryCandidate.throughOrdinal,
-        });
-        if (
-          operation !== "message" ||
-          !snapshotMatchesCandidate ||
-          summaryCandidate.throughOrdinal > baseOrdinal ||
-          summaryCandidate.throughOrdinal <= previousThrough ||
-          summaryCandidate.sourceReferences.some(
-            (reference) =>
-              reference.ordinal <= previousThrough ||
-              reference.ordinal > summaryCandidate.throughOrdinal,
-          ) ||
-          summaryCandidate.previousSummaryId !== currentSummary?.summaryId
-        ) {
-          throw new TypeError(
-            "Summary candidate does not extend the current conversation context.",
-          );
-        }
-      } else if (!sameSummaryPointer(contextSnapshot.summary, currentSummary)) {
-        throw new TypeError("Context snapshot does not match the current conversation summary.");
-      }
-    } else if (currentSummary !== undefined) {
-      throw new TypeError("A conversation with a summary requires a versioned context snapshot.");
+    } else if (!sameSummaryPointer(contextSnapshot.summary, currentSummary)) {
+      throw new TypeError("Context snapshot does not match the current conversation summary.");
     }
 
     const questionChunks = splitUtf8Text(turn.text);
     if (questionChunks.length === 0) throw new TypeError("Submission question is empty.");
-    let contextChunks =
-      operation === "message" && contextSnapshot === undefined ? contextReferences : [];
-    const documentContextChunks =
-      turn.documentContext === undefined ? [] : serializeDocumentContext(turn.documentContext);
+    let contextChunks: string[] = [];
+    const documentContextChunks = serializeDocumentContext(turn.documentContext);
     const marker = {
       pk: "USER#" + turn.sub + "#BOT#" + turn.botId,
       sk: "SEND#" + turn.queryId,
@@ -1299,23 +1199,12 @@ export function createConversationStoreAdapter(input: {
       questionManifest: { count: questionChunks.length, complete: true },
       answerManifest: { count: 0, complete: false },
       contextManifest: { count: contextChunks.length, complete: true },
-      ...(turn.documentContext === undefined
-        ? {}
-        : {
-            documentContextManifest: {
-              count: documentContextChunks.length,
-              complete: true,
-            },
-          }),
+      documentContextManifest: { count: documentContextChunks.length, complete: true },
       profileSnapshot: turn.profileSnapshot,
       invocation: turn.invocation,
-      ...(contextSnapshot === undefined ? {} : { contextSnapshot }),
+      contextSnapshot,
     };
-    if (
-      contextSnapshot !== undefined &&
-      contextSnapshot.recentReferences.length > 0 &&
-      !hasTurnTransitionReserve(record)
-    ) {
+    if (contextSnapshot.recentReferences.length > 0 && !hasTurnTransitionReserve(record)) {
       contextChunks = encodeContextReferences(contextSnapshot.recentReferences, ordinal);
       const { version, summary } = contextSnapshot;
       record.contextSnapshot = {
@@ -1465,14 +1354,7 @@ export function createConversationStoreAdapter(input: {
       );
       affectedItems.push(meta, record);
     } else {
-      const historyProjection = await historyProjectionFor(
-        previousMeta,
-        turn.conversationId,
-        turn.sub,
-        turn.botId,
-        createdAt,
-      );
-      const historyUpdate = historyUpdateParts(previousMeta, historyProjection);
+      const historyUpdate = historyActivityUpdateParts(createdAt, turn.conversationId);
       const summaryPointer = summaryCandidate
         ? {
             summaryId: summaryCandidate.summaryId,
@@ -1481,18 +1363,16 @@ export function createConversationStoreAdapter(input: {
         : undefined;
       const summaryUpdate = summaryPointer === undefined ? "" : ", #summary = :summary";
       const summaryCondition =
-        contextSnapshot === undefined
-          ? ""
-          : currentSummary === undefined
-            ? " AND attribute_not_exists(#summary)"
-            : " AND #summary = :expectedSummary";
+        currentSummary === undefined
+          ? " AND attribute_not_exists(#summary)"
+          : " AND #summary = :expectedSummary";
       transactionItems.push({
         Update: {
           TableName: tableName,
           Key: metaKey,
           UpdateExpression: `SET #lastOrdinal = :nextOrdinal, #lastQueryId = :queryId, #activeQueryId = :queryId, #activeOwnerAttemptId = :ownerAttemptId, #updatedAt = :updatedAt${historyUpdate.assignments.length ? ", " + historyUpdate.assignments.join(", ") : ""}${summaryUpdate}`,
           ConditionExpression:
-            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND (attribute_not_exists(#closed) OR #closed = :false)" +
+            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND attribute_not_exists(#hiddenAt) AND (attribute_not_exists(#closed) OR #closed = :false)" +
             summaryCondition,
           ExpressionAttributeNames: {
             "#sub": "sub",
@@ -1504,7 +1384,8 @@ export function createConversationStoreAdapter(input: {
             "#activeOwnerAttemptId": "activeOwnerAttemptId",
             "#updatedAt": "updatedAt",
             "#closed": "closed",
-            ...(contextSnapshot === undefined ? {} : { "#summary": "summary" }),
+            "#summary": "summary",
+            "#hiddenAt": "hiddenAt",
             ...historyUpdate.names,
           },
           ExpressionAttributeValues: {
@@ -1518,9 +1399,7 @@ export function createConversationStoreAdapter(input: {
             ":updatedAt": createdAt,
             ":false": false,
             ...(summaryPointer === undefined ? {} : { ":summary": summaryPointer }),
-            ...(contextSnapshot === undefined || currentSummary === undefined
-              ? {}
-              : { ":expectedSummary": currentSummary }),
+            ...(currentSummary === undefined ? {} : { ":expectedSummary": currentSummary }),
             ...historyUpdate.values,
           },
         },
@@ -1538,7 +1417,7 @@ export function createConversationStoreAdapter(input: {
         activeQueryId: turn.queryId,
         activeOwnerAttemptId: turn.ownerAttemptId,
         updatedAt: createdAt,
-        ...(historyProjection ?? {}),
+        historyOrder: historyUpdate.values[":historyOrder"],
         ...(summaryPointer === undefined ? {} : { summary: summaryPointer }),
       });
       transactionItems.push({
@@ -1634,20 +1513,30 @@ export function createConversationStoreAdapter(input: {
       throw storeError("submission_exists", "Admission is already durable; load its snapshot.");
     }
     if (!isConditionalFailure(original)) throw original;
+    const meta = await adapter.getMeta({ conversationId: turn.conversationId });
+    if (
+      meta &&
+      meta.sub === turn.sub &&
+      meta.botId === turn.botId &&
+      meta.conversationId === turn.conversationId &&
+      Object.hasOwn(meta, "hiddenAt")
+    ) {
+      throw storeError("conversation_hidden", "Conversation is unavailable.");
+    }
     const quota = await adapter.readQuota({ sub: turn.sub, botId: turn.botId, now: turn.now });
     if (quota.daily.used >= quota.daily.limit || quota.monthly.used >= quota.monthly.limit) {
       throw storeError("quota_exceeded", "A submission quota is exhausted.", quota);
     }
     if (operation === "message") {
-      const meta = await adapter.getMeta({ conversationId: turn.conversationId });
       if (!meta) throw storeError("stale_base", "Conversation does not exist.");
       if (meta?.activeQueryId || meta?.closed === true)
         throw storeError("conversation_busy", "Conversation is busy or closed.");
       if (meta && meta.lastOrdinal !== baseOrdinal)
         throw storeError("stale_base", "Conversation base ordinal is stale.");
     } else {
-      const meta = await adapter.getMeta({ conversationId: turn.conversationId });
-      if (meta) throw storeError("conversation_busy", "Conversation already exists.");
+      if (meta) {
+        throw storeError("conversation_busy", "Conversation already exists.");
+      }
     }
     throw storeError("conflict", "Admission was conditionally rejected.");
   }
@@ -1691,7 +1580,13 @@ export function createConversationStoreAdapter(input: {
       marker.botId !== input.botId ||
       marker.queryId !== input.queryId ||
       typeof marker.conversationId !== "string" ||
-      !isPositiveSafeInteger(marker.ordinal)
+      !uuidPattern.test(marker.conversationId) ||
+      !isPositiveSafeInteger(marker.ordinal) ||
+      marker.operation !== (marker.ordinal === 1 ? "start" : "message") ||
+      marker.baseOrdinal !== marker.ordinal - 1 ||
+      typeof marker.requestFingerprint !== "string" ||
+      marker.requestFingerprint.length === 0 ||
+      !Number.isSafeInteger(marker.resultDeadlineAt)
     )
       throw new Error("Submission marker is malformed or outside the requested scope.");
     const turn = await getItem(turnKey(marker.conversationId, marker.ordinal));
@@ -1701,10 +1596,17 @@ export function createConversationStoreAdapter(input: {
       turn.ordinal !== marker.ordinal ||
       turn.queryId !== input.queryId ||
       turn.pk !== conversationKey(marker.conversationId).pk ||
-      (turn.sub !== undefined && turn.sub !== input.sub) ||
-      (turn.botId !== undefined && turn.botId !== input.botId) ||
-      (turn.requestFingerprint !== undefined &&
-        turn.requestFingerprint !== marker.requestFingerprint)
+      turn.sub !== input.sub ||
+      turn.botId !== input.botId ||
+      turn.requestFingerprint !== marker.requestFingerprint ||
+      turn.operation !== marker.operation ||
+      turn.baseOrdinal !== marker.baseOrdinal ||
+      turn.resultDeadlineAt !== marker.resultDeadlineAt ||
+      typeof turn.ownerAttemptId !== "string" ||
+      turn.ownerAttemptId.length === 0 ||
+      !isRecord(turn.profileSnapshot) ||
+      !isRecord(turn.invocation) ||
+      !isNonEmptyString(turn.invocation.modelId)
     )
       throw new Error("Submission marker does not match its turn.");
     const ordinal = Number(marker.ordinal);
@@ -1728,7 +1630,7 @@ export function createConversationStoreAdapter(input: {
       typeof cursor !== "number" ||
       !Number.isSafeInteger(cursor) ||
       Number(cursor) < 0 ||
-      Number(cursor) > answerCount ||
+      Number(cursor) !== answerCount ||
       !validStatusPhasePair
     )
       throw new Error("Submission turn is malformed.");
@@ -1780,12 +1682,11 @@ export function createConversationStoreAdapter(input: {
     }
 
     let contextReferences: ContextReference[] = [];
-    const rawContextCount =
-      turn.contextManifest === undefined ? 0 : contextManifestCount(turn.contextManifest);
+    const rawContextCount = contextManifestCount(turn.contextManifest);
     if (
       rawContextCount === null ||
-      (turn.contextManifest !== undefined &&
-        (!isRecord(turn.contextManifest) || turn.contextManifest.complete !== true))
+      !isRecord(turn.contextManifest) ||
+      turn.contextManifest.complete !== true
     ) {
       throw new Error("Submission context manifest is malformed.");
     }
@@ -1834,96 +1735,91 @@ export function createConversationStoreAdapter(input: {
         turns: new Map(),
       });
     }
-    let contextSnapshot: ContextSnapshot | undefined;
+    const contextSnapshot = hydrateStoredContextSnapshot(
+      turn.contextSnapshot,
+      ordinal,
+      rawContextCount > 0 ? contextReferences : undefined,
+    );
     let summary: SummaryVersion | undefined;
-    if (turn.contextSnapshot !== undefined) {
-      if (turn.contextManifest === undefined) {
-        throw new Error("Submission context snapshot has no context manifest.");
-      }
-      contextSnapshot = hydrateStoredContextSnapshot(
-        turn.contextSnapshot,
-        ordinal,
-        rawContextCount > 0 ? contextReferences : undefined,
-      );
-      if (rawContextCount > 0) {
-        if (!sameContextReferences(contextReferences, contextSnapshot.recentReferences)) {
-          throw new Error("Submission context references do not match its context snapshot.");
-        }
-      } else {
-        contextReferences = contextSnapshot.recentReferences;
-      }
-      if (contextSnapshot.summary !== undefined) {
-        summary = await contextStorage.readSummary({
-          conversationId: marker.conversationId,
-          ...contextSnapshot.summary,
-          sub: input.sub,
-          botId: input.botId,
-        });
-        await contextStorage.verifyReferences(marker.conversationId, summary.sourceReferences, {
-          sub: input.sub,
-          botId: input.botId,
-        });
-      }
-      await contextStorage.verifyReferences(
-        marker.conversationId,
-        contextSnapshot.recentReferences,
-        { sub: input.sub, botId: input.botId },
-      );
-    }
-    let documentContext: DocumentContext | undefined;
-    const documentContextRecords = chunks.filter((item) => String(item.sk).includes("#DOCUMENT#"));
-    if (turn.documentContextManifest === undefined) {
-      if (documentContextRecords.length > 0) {
-        throw new Error("Submission has document context records without a manifest.");
+    if (rawContextCount > 0) {
+      if (!sameContextReferences(contextReferences, contextSnapshot.recentReferences)) {
+        throw new Error("Submission context references do not match its context snapshot.");
       }
     } else {
-      const documentContextCount = contextManifestCount(turn.documentContextManifest);
-      if (
-        documentContextCount === null ||
-        !isRecord(turn.documentContextManifest) ||
-        turn.documentContextManifest.complete !== true
-      ) {
-        throw new Error("Submission document context manifest is malformed.");
-      }
-      const serialized = assembleText(
-        documentContextRecords.flatMap((item) => {
-          const match = documentContextChunkRecordPattern.exec(String(item.sk));
-          if (!match) throw new Error("Submission document context record is malformed.");
-          const chunkOrdinal = Number(match[1]);
-          const index = Number(match[2]);
-          if (
-            chunkOrdinal !== ordinal ||
-            String(chunkOrdinal).padStart(8, "0") !== match[1] ||
-            !Number.isSafeInteger(index) ||
-            index < 0 ||
-            String(index).padStart(8, "0") !== match[2] ||
-            item.pk !== turn.pk ||
-            item.conversationId !== marker.conversationId ||
-            item.queryId !== input.queryId ||
-            item.ordinal !== ordinal ||
-            item.index !== index ||
-            typeof item.text !== "string"
-          ) {
-            throw new Error("Submission document context record is malformed.");
-          }
-          return [{ index, text: item.text }];
-        }),
-        documentContextCount,
-        "document context",
-        input.queryId,
-      );
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(serialized);
-      } catch {
-        throw new Error("Submission document context is malformed.");
-      }
-      if (!isDocumentContext(parsed)) {
-        throw new Error("Submission document context is malformed.");
-      }
-      documentContext = parsed;
+      contextReferences = contextSnapshot.recentReferences;
     }
+    if (contextSnapshot.summary !== undefined) {
+      summary = await contextStorage.readSummary({
+        conversationId: marker.conversationId,
+        ...contextSnapshot.summary,
+        sub: input.sub,
+        botId: input.botId,
+      });
+      await contextStorage.verifyReferences(marker.conversationId, summary.sourceReferences, {
+        sub: input.sub,
+        botId: input.botId,
+      });
+    }
+    await contextStorage.verifyReferences(marker.conversationId, contextSnapshot.recentReferences, {
+      sub: input.sub,
+      botId: input.botId,
+    });
+    const documentContextRecords = chunks.filter((item) => String(item.sk).includes("#DOCUMENT#"));
+    const documentContextCount = contextManifestCount(turn.documentContextManifest);
+    if (
+      documentContextCount === null ||
+      documentContextCount < 1 ||
+      !isRecord(turn.documentContextManifest) ||
+      turn.documentContextManifest.complete !== true
+    ) {
+      throw new Error("Submission document context manifest is malformed.");
+    }
+    const serialized = assembleText(
+      documentContextRecords.flatMap((item) => {
+        const match = documentContextChunkRecordPattern.exec(String(item.sk));
+        if (!match) throw new Error("Submission document context record is malformed.");
+        const chunkOrdinal = Number(match[1]);
+        const index = Number(match[2]);
+        if (
+          chunkOrdinal !== ordinal ||
+          String(chunkOrdinal).padStart(8, "0") !== match[1] ||
+          !Number.isSafeInteger(index) ||
+          index < 0 ||
+          String(index).padStart(8, "0") !== match[2] ||
+          item.pk !== turn.pk ||
+          item.conversationId !== marker.conversationId ||
+          item.queryId !== input.queryId ||
+          item.ordinal !== ordinal ||
+          item.index !== index ||
+          typeof item.text !== "string"
+        ) {
+          throw new Error("Submission document context record is malformed.");
+        }
+        return [{ index, text: item.text }];
+      }),
+      documentContextCount,
+      "document context",
+      input.queryId,
+    );
+    let parsedDocumentContext: unknown;
+    try {
+      parsedDocumentContext = JSON.parse(serialized);
+    } catch {
+      throw new Error("Submission document context is malformed.");
+    }
+    if (!isDocumentContext(parsedDocumentContext)) {
+      throw new Error("Submission document context is malformed.");
+    }
+    const documentContext = parsedDocumentContext;
     const meta = await getItem({ ...conversationKey(marker.conversationId), sk: "META" });
+    if (
+      !meta ||
+      !isConversationMeta(meta, marker.conversationId) ||
+      meta.sub !== input.sub ||
+      meta.botId !== input.botId
+    ) {
+      throw new Error("Submission META record is missing or outside the requested scope.");
+    }
     const status = turn.status as SubmissionSnapshot["status"];
     const stage = turn.phase as SubmissionSnapshot["stage"];
     const snapshot: SubmissionSnapshot = {
@@ -1931,33 +1827,30 @@ export function createConversationStoreAdapter(input: {
       botId: input.botId,
       conversationId: marker.conversationId,
       queryId: input.queryId,
-      requestFingerprint: String(marker.requestFingerprint ?? turn.requestFingerprint ?? ""),
-      operation: (marker.operation ??
-        turn.operation ??
-        (ordinal === 1 ? "start" : "message")) as SubmissionSnapshot["operation"],
-      baseOrdinal: Number(marker.baseOrdinal ?? turn.baseOrdinal ?? ordinal - 1),
+      requestFingerprint: marker.requestFingerprint,
+      operation: marker.operation as SubmissionSnapshot["operation"],
+      baseOrdinal: marker.baseOrdinal as number,
       ordinal,
       status,
       stage,
       question,
       questionManifest: turn.questionManifest as TurnManifest,
       contextReferences,
-      ...(contextSnapshot === undefined ? {} : { contextSnapshot }),
+      contextSnapshot,
       ...(summary === undefined ? {} : { summary }),
-      ...(documentContext === undefined ? {} : { documentContext }),
+      documentContext,
       answer,
       answerManifest: turn.answerManifest as TurnManifest,
       cursor: Number(cursor),
       canContinue:
         status !== "in_progress" &&
+        !Object.hasOwn(meta, "hiddenAt") &&
         meta?.closed !== true &&
         !meta?.activeQueryId &&
         meta?.lastOrdinal === ordinal,
-      resultDeadlineAt: Number(turn.resultDeadlineAt ?? marker.resultDeadlineAt),
-      profileSnapshot: isRecord(turn.profileSnapshot) ? turn.profileSnapshot : {},
-      invocation: isRecord(turn.invocation)
-        ? (turn.invocation as SubmissionSnapshot["invocation"])
-        : { modelId: "" },
+      resultDeadlineAt: Number(turn.resultDeadlineAt),
+      profileSnapshot: turn.profileSnapshot,
+      invocation: turn.invocation as SubmissionSnapshot["invocation"],
       ...(isRecord(turn.failure) && typeof turn.failure.code === "string"
         ? { failure: { code: turn.failure.code } }
         : {}),
@@ -1978,13 +1871,7 @@ export function createConversationStoreAdapter(input: {
     const metaKey = { ...conversationKey(turn.conversationId), sk: "META" };
     const [previousTurn, previousMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
     const now = isoDate(turn.now);
-    const sub = previousMeta?.sub ?? previousTurn?.sub;
-    const botId = previousMeta?.botId ?? previousTurn?.botId;
-    const historyProjection =
-      typeof sub === "string" && typeof botId === "string"
-        ? await historyProjectionFor(previousMeta, turn.conversationId, sub, botId, now)
-        : undefined;
-    const historyUpdate = historyUpdateParts(previousMeta, historyProjection);
+    const historyUpdate = historyActivityUpdateParts(now, turn.conversationId);
     const cursor = previousTurn?.cursor ?? turn.answerManifest?.count ?? 0;
     const phase = turn.invocationClaimed ? "invocation_claimed" : "admitted";
     const retire = turn.invocationClaimed && !turn.providerFinished;
@@ -2010,7 +1897,7 @@ export function createConversationStoreAdapter(input: {
     const projectedMeta: Record<string, unknown> = {
       ...(previousMeta ?? metaKey),
       updatedAt: now,
-      ...historyProjection,
+      historyOrder: historyUpdate.values[":historyOrder"],
       ...(retire ? { closed: true } : {}),
     };
     delete projectedMeta.activeQueryId;
@@ -2131,13 +2018,27 @@ export function createConversationStoreAdapter(input: {
       turn.conversationId !== input.conversationId ||
       turn.ordinal !== input.ordinal ||
       turn.queryId !== input.queryId ||
-      (turn.sub !== undefined && turn.sub !== input.sub) ||
-      (turn.botId !== undefined && turn.botId !== input.botId) ||
+      turn.sub !== input.sub ||
+      turn.botId !== input.botId ||
+      turn.operation !== (input.ordinal === 1 ? "start" : "message") ||
+      turn.baseOrdinal !== input.ordinal - 1 ||
+      typeof turn.requestFingerprint !== "string" ||
+      turn.requestFingerprint.length === 0 ||
       !isConversationMeta(meta, input.conversationId) ||
       meta.sub !== input.sub ||
       meta.botId !== input.botId
     ) {
       throw new Error("Conversation turn does not match its owner and META record.");
+    }
+    if (
+      (turn.status === "completed" && turn.phase !== "complete") ||
+      (turn.status === "failed" && turn.phase !== "failed") ||
+      (turn.status === "in_progress" &&
+        turn.phase !== "admitted" &&
+        turn.phase !== "invocation_claimed") ||
+      !["completed", "failed", "in_progress"].includes(String(turn.status))
+    ) {
+      throw new Error("Conversation turn lifecycle is malformed.");
     }
     if (turn.status !== "in_progress") return { turn, meta, confirmable: true };
     const phase = turn.phase;
@@ -2160,14 +2061,7 @@ export function createConversationStoreAdapter(input: {
     const now = isoDate(input.now);
     const retired = phase === "invocation_claimed";
     const answerManifest = { count: Number(cursor), complete: false };
-    const historyProjection = await historyProjectionFor(
-      meta,
-      input.conversationId,
-      input.sub,
-      input.botId,
-      now,
-    );
-    const historyUpdate = historyUpdateParts(meta, historyProjection);
+    const historyUpdate = historyActivityUpdateParts(now, input.conversationId);
     const projectedTurn = {
       ...turn,
       status: "failed",
@@ -2180,7 +2074,7 @@ export function createConversationStoreAdapter(input: {
     const projectedMeta: Record<string, unknown> = {
       ...meta,
       updatedAt: now,
-      ...historyProjection,
+      historyOrder: historyUpdate.values[":historyOrder"],
       ...(retired ? { closed: true } : {}),
     };
     delete projectedMeta.activeQueryId;
@@ -2304,7 +2198,7 @@ export function createConversationStoreAdapter(input: {
       const partition = conversationKey(conversationId);
       const metaItem = await getItem({ ...partition, sk: "META" });
       if (!metaItem) {
-        return reconstructMessages(conversationId, await queryItems(partition));
+        throw new Error("Conversation META record is missing.");
       }
       if (!isConversationMeta(metaItem, conversationId)) {
         throw new Error("Conversation META record is malformed; refusing to use its context.");
@@ -2353,8 +2247,8 @@ export function createConversationStoreAdapter(input: {
             typeof turn.queryId !== "string" ||
             !uuidPattern.test(turn.queryId) ||
             !["completed", "failed", "in_progress"].includes(String(turn.status)) ||
-            (turn.sub !== undefined && turn.sub !== metaItem.sub) ||
-            (turn.botId !== undefined && turn.botId !== metaItem.botId)
+            turn.sub !== metaItem.sub ||
+            turn.botId !== metaItem.botId
           ) {
             throw new Error("Conversation context contains a malformed turn after its summary.");
           }
@@ -2442,8 +2336,8 @@ export function createConversationStoreAdapter(input: {
     getSubmission,
 
     async startTurn(turn: StartTurnInput): Promise<{ queryId: string; ordinal: number }> {
-      const operation = turn.operation ?? "start";
-      const baseOrdinal = turn.baseOrdinal ?? 0;
+      const operation = turn.operation;
+      const baseOrdinal = turn.baseOrdinal;
       if (operation !== "start") throw new TypeError("Start admission operation is invalid.");
       validateAdmission(turn, operation, baseOrdinal);
       const prior = await existingAdmission(turn, operation, baseOrdinal);
@@ -2464,7 +2358,7 @@ export function createConversationStoreAdapter(input: {
     },
 
     async continueTurn(turn: ContinueTurnInput): Promise<{ queryId: string; ordinal: number }> {
-      const operation = turn.operation ?? "message";
+      const operation = turn.operation;
       const baseOrdinal = inputBaseOrdinal(turn);
       if (operation !== "message") throw new TypeError("Continue admission operation is invalid.");
       validateAdmission(turn, operation, baseOrdinal);
@@ -2671,13 +2565,7 @@ export function createConversationStoreAdapter(input: {
       const [previousTurn, previousMeta] = await Promise.all([getItem(key), getItem(metaKey)]);
       const cursor = previousTurn?.cursor ?? turn.answerManifest.count;
       const completedAt = isoDate(turn.now);
-      const sub = previousMeta?.sub ?? previousTurn?.sub;
-      const botId = previousMeta?.botId ?? previousTurn?.botId;
-      const historyProjection =
-        typeof sub === "string" && typeof botId === "string"
-          ? await historyProjectionFor(previousMeta, turn.conversationId, sub, botId, completedAt)
-          : undefined;
-      const historyUpdate = historyUpdateParts(previousMeta, historyProjection);
+      const historyUpdate = historyActivityUpdateParts(completedAt, turn.conversationId);
       const projectedTurn = {
         ...(previousTurn ?? {
           ...key,
@@ -2699,7 +2587,7 @@ export function createConversationStoreAdapter(input: {
       const projectedMeta: Record<string, unknown> = {
         ...(previousMeta ?? metaKey),
         updatedAt: completedAt,
-        ...historyProjection,
+        historyOrder: historyUpdate.values[":historyOrder"],
       };
       delete projectedMeta.activeQueryId;
       delete projectedMeta.activeOwnerAttemptId;

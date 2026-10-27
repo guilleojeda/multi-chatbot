@@ -143,7 +143,7 @@ describe("chat removal API client", () => {
 
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(fetch.mock.calls[0][0]).toBe(`/api/chat/conversations/${conversationId}`);
-    expect(fetch.mock.calls[0][1].method).toBeUndefined();
+    expect(fetch.mock.calls[0][1].method).toBe("GET");
     expect(fetch.mock.calls[0][1].body).toBeUndefined();
   });
 

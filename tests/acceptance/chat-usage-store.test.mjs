@@ -694,7 +694,6 @@ describe("the DynamoDB usage and submission store adapter", () => {
       contextSnapshot: { version: 1, recentReferences: references },
       operation: "message",
       baseOrdinal: 4,
-      expectedLastOrdinal: 4,
     });
     const { documentClient, store } = makeStore();
     const continueTurn = requireMethod(store, "continueTurn");
@@ -829,7 +828,6 @@ describe("the DynamoDB usage and submission store adapter", () => {
     const input = admissionInput({
       operation: "message",
       baseOrdinal: 4,
-      expectedLastOrdinal: 4,
       contextReferences: [],
     });
 
@@ -851,7 +849,7 @@ describe("the DynamoDB usage and submission store adapter", () => {
     expect(meta.ConditionExpression).toBeTruthy();
     expect(meta.ConditionExpression).toMatch(/ordinal/i);
     expect(conditionNameText(meta)).toMatch(/active|reserv/i);
-    expect(hasValue(meta.ExpressionAttributeValues, input.expectedLastOrdinal)).toBe(true);
+    expect(hasValue(meta.ExpressionAttributeValues, input.baseOrdinal)).toBe(true);
     expect(documentClient.send.mock.calls.flatMap(([command]) => commandWrites(command))).toEqual(
       [],
     );
@@ -875,6 +873,11 @@ describe("the DynamoDB usage and submission store adapter", () => {
       [
         record,
         turn,
+        metaRecord({
+          lastOrdinal: 2,
+          activeQueryId: undefined,
+          activeOwnerAttemptId: undefined,
+        }),
         question,
         firstAnswer,
         secondAnswer,

@@ -54,6 +54,11 @@ function completedTurn(ordinal, queryId, overrides = {}) {
     botId: "bot-aurora",
     queryId,
     ordinal,
+    operation: ordinal === 1 ? "start" : "message",
+    baseOrdinal: ordinal - 1,
+    requestFingerprint: "fingerprint-" + queryId,
+    ownerAttemptId: "attempt-" + queryId,
+    resultDeadlineAt: now + 60 * 60 * 1000,
     status: "completed",
     phase: "complete",
     cursor: 1,
@@ -91,7 +96,6 @@ const continuation = {
   text: "Seguí con una adaptación.",
   profileSnapshot: { fields: {} },
   invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "revision-123" },
-  expectedLastOrdinal: 3,
 };
 
 describe("conversation context references", () => {
@@ -148,7 +152,7 @@ describe("conversation context references", () => {
         ...completedTurn(2, queryIds[1]),
         status: "failed",
         phase: "failed",
-        questionManifest: { count: 1, complete: false },
+        questionManifest: { count: 1, complete: true },
         answerManifest: { count: 1, complete: false },
       },
       turnChunk(2, queryIds[1], "user", "Pregunta fallida."),
@@ -254,7 +258,6 @@ describe("conversation context references", () => {
     await store.continueTurn({
       ...continuation,
       baseOrdinal: 7000,
-      expectedLastOrdinal: 7000,
       contextReferences: references,
       contextSnapshot: { version: 1, recentReferences: references },
     });
@@ -316,19 +319,30 @@ describe("conversation context references", () => {
   });
 
   it("rejects a completed turn with a missing context reference chunk", async () => {
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub: "teacher-123",
+      botId: "bot-aurora",
+      lastOrdinal: 1,
+    };
     const documentClient = {
-      send: vi.fn(async () => ({
-        Items: [
-          {
-            ...completedTurn(1, queryIds[0], {
-              contextManifest: { count: 1, complete: true },
-              contextSnapshot: { version: 1, recentReferencesStorage: "context_chunks" },
-            }),
-          },
-          turnChunk(1, queryIds[0], "user", "Pregunta completa."),
-          turnChunk(1, queryIds[0], "assistant", "Respuesta completa."),
-        ],
-      })),
+      send: vi.fn(async (command) => {
+        if (command instanceof GetCommand) return { Item: meta };
+        return {
+          Items: [
+            {
+              ...completedTurn(1, queryIds[0], {
+                contextManifest: { count: 1, complete: true },
+                contextSnapshot: { version: 1, recentReferencesStorage: "context_chunks" },
+              }),
+            },
+            turnChunk(1, queryIds[0], "user", "Pregunta completa."),
+            turnChunk(1, queryIds[0], "assistant", "Respuesta completa."),
+          ],
+        };
+      }),
     };
     const store = createConversationStoreAdapter({
       documentClient,

@@ -86,7 +86,6 @@ function admissionInput(overrides = {}) {
     queryId,
     operation: "message",
     baseOrdinal: 3,
-    expectedLastOrdinal: 3,
     now: Date.parse("2026-10-24T12:00:00.000Z"),
     ownerAttemptId: "attempt-admitted",
     resultDeadlineAt: Date.parse("2026-10-24T13:00:00.000Z"),

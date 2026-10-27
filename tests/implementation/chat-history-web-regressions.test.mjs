@@ -1,9 +1,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  accessToken,
   createHistoryEnvironment,
   deferred,
   firstConversationId,
   firstQueryId,
+  historyConfig,
+  historyIdentity,
   jsonResponse,
   loadHistoryAccountApp,
   mountHistoryAccountApp,
@@ -39,6 +42,34 @@ afterEach(() => {
   delete globalThis.__accountScreens;
   delete globalThis.__accountSession;
 });
+
+function confirmedMetadataHandler(metadata) {
+  const confirmed = {
+    ...metadata,
+    ownerSub: historyIdentity.sub,
+    botId: historyConfig.botId,
+  };
+  return ({ conversationId, headers }) => {
+    if (
+      conversationId !== confirmed.conversationId ||
+      confirmed.ownerSub !== historyIdentity.sub ||
+      confirmed.botId !== historyConfig.botId ||
+      headers.get("authorization") !== `Bearer ${accessToken}`
+    ) {
+      return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 404);
+    }
+    return jsonResponse({
+      version: 1,
+      conversationId: confirmed.conversationId,
+      label: confirmed.label,
+      lastOrdinal: confirmed.lastOrdinal,
+      closed: confirmed.closed,
+      ...(confirmed.createdAt ? { createdAt: confirmed.createdAt } : {}),
+      ...(confirmed.updatedAt ? { updatedAt: confirmed.updatedAt } : {}),
+      ...(confirmed.activeQueryId ? { activeQueryId: confirmed.activeQueryId } : {}),
+    });
+  };
+}
 
 describe("AccountApp history text cursor regressions", () => {
   it("loads a large turn page without bursting the text API into 503 responses", async () => {
@@ -1069,9 +1100,16 @@ describe("AccountApp history transition and pending-label regressions", () => {
     });
   });
 
-  it("uses a provisional label for a cold pending follow-up while list and open return 503", async () => {
+  it("uses the confirmed first-question META label for a cold follow-up while list and turns return 503", async () => {
     const text = "REPLACE THE LAST THREE CRITERIA WITH ONLY TWO";
+    const firstQuestion = "FIRST QUESTION";
     const environment = createHistoryEnvironment({
+      metaHandler: confirmedMetadataHandler({
+        conversationId: firstConversationId,
+        label: firstQuestion,
+        lastOrdinal: 12,
+        closed: false,
+      }),
       listHandler: () => jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503),
       turnsHandler: () => jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503),
     });
@@ -1093,11 +1131,17 @@ describe("AccountApp history transition and pending-label regressions", () => {
     expect(history?.turnsStatus).toBe("error");
     expect(history?.conversations[0]).toMatchObject({
       conversationId: firstConversationId,
-      label: "Conversación pendiente",
+      label: firstQuestion,
       lastOrdinal: 12,
-      pending: true,
     });
-    expect(await app.html()).toContain("Conversación pendiente");
+    expect(history?.conversations[0]?.pending).toBeUndefined();
+    expect(
+      environment.apiRequests.filter(
+        ({ path, method }) =>
+          path === `/chat/conversations/${firstConversationId}` && method === "GET",
+      ),
+    ).toHaveLength(1);
+    expect(await app.html()).toContain(firstQuestion);
     expect(await app.html()).not.toContain(`chat-history__label">${text}`);
   });
 
@@ -1128,11 +1172,18 @@ describe("AccountApp history transition and pending-label regressions", () => {
     expect(await app.html()).toContain(text);
   });
 
-  it("replaces a provisional follow-up label after authoritative history reads recover", async () => {
+  it("keeps the confirmed first-question META label through list and turns recovery", async () => {
     const text = "CHANGE THE LAST STEP";
+    const firstQuestion = "FIRST QUESTION";
     let listCalls = 0;
     let turnCalls = 0;
     const environment = createHistoryEnvironment({
+      metaHandler: confirmedMetadataHandler({
+        conversationId: firstConversationId,
+        label: firstQuestion,
+        lastOrdinal: 12,
+        closed: false,
+      }),
       listHandler: () => {
         listCalls += 1;
         if (listCalls === 1) return jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503);
@@ -1141,7 +1192,7 @@ describe("AccountApp history transition and pending-label regressions", () => {
           conversations: [
             {
               conversationId: firstConversationId,
-              label: "FIRST QUESTION",
+              label: firstQuestion,
               updatedAt: "2026-10-27T11:00:00.000Z",
               lastOrdinal: 12,
               closed: false,
@@ -1155,7 +1206,7 @@ describe("AccountApp history transition and pending-label regressions", () => {
         return jsonResponse({
           version: 1,
           conversationId,
-          label: "FIRST QUESTION",
+          label: firstQuestion,
           updatedAt: "2026-10-27T11:00:00.000Z",
           throughOrdinal: 12,
           closed: false,
@@ -1176,20 +1227,19 @@ describe("AccountApp history transition and pending-label regressions", () => {
     const app = mountHistoryAccountApp(environment, AccountApp);
     apps.push(app);
     await app.flush();
-    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe(
-      "Conversación pendiente",
-    );
+    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe(firstQuestion);
     expect(turnCalls).toBe(1);
+    expect(await app.html()).not.toContain(`chat-history__label">${text}`);
 
     await app.current()?.props?.onRefreshHistory?.();
     await app.flush();
-    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe("FIRST QUESTION");
+    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe(firstQuestion);
 
     expect(await app.current()?.props?.onSelectConversation?.(firstConversationId)).toBe(true);
     await app.flush();
     expect(app.current()?.props?.state?.history?.turnsStatus).toBe("ready");
-    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe("FIRST QUESTION");
-    expect(await app.html()).toContain("FIRST QUESTION");
+    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe(firstQuestion);
+    expect(await app.html()).toContain(firstQuestion);
     expect(await app.html()).not.toContain(`chat-history__label">${text}`);
     expect(
       environment.runtimeRequests.every(({ request }) => request.operation === "recover"),

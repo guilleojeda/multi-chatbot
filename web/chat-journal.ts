@@ -16,18 +16,7 @@ type StoredJournal = {
   ordinal?: number;
 };
 
-type LegacyStoredJournal = {
-  version: 2;
-  scope: string[];
-  sub: string;
-  botId: string;
-  request: ChatRequest | Omit<ChatRequest, "text">;
-  admitted: boolean;
-  ordinal?: number;
-};
-
 const prefix = "chat-journal:v3";
-const legacyPrefix = "chat-journal:v2";
 const selectionPrefix = "chat-selection:v1";
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -56,14 +45,6 @@ function ownerKey(config: PublicConfig) {
 
 function indexKey(config: PublicConfig, owner: Owner) {
   return `${prefix}:index:${encoded([...scopeFor(config), owner.sub, owner.botId])}`;
-}
-
-function legacyEntryKey(config: PublicConfig, owner: Owner) {
-  return `${legacyPrefix}:entry:${encoded([...scopeFor(config), owner.sub, owner.botId])}`;
-}
-
-function legacyOwnerKey(config: PublicConfig) {
-  return `${legacyPrefix}:owner:${encoded(scopeFor(config))}`;
 }
 
 function selectionKey(config: PublicConfig) {
@@ -95,12 +76,11 @@ function validStoredJournal(
   value: unknown,
   config: PublicConfig,
   owner: Owner,
-  version: 2 | 3,
-): value is StoredJournal | LegacyStoredJournal {
+): value is StoredJournal {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   if (
-    record.version !== version ||
+    record.version !== 3 ||
     JSON.stringify(record.scope) !== JSON.stringify(scopeFor(config)) ||
     record.sub !== owner.sub ||
     record.botId !== owner.botId ||
@@ -147,7 +127,7 @@ function readIndex(config: PublicConfig, owner: Owner): string[] {
   return [];
 }
 
-function publicEntry(record: StoredJournal | LegacyStoredJournal): ChatJournalEntry {
+function publicEntry(record: StoredJournal): ChatJournalEntry {
   return record.admitted
     ? {
         request: record.request as Omit<ChatRequest, "text">,
@@ -161,67 +141,6 @@ function writeIndex(config: PublicConfig, owner: Owner, ids: string[]) {
   storage().setItem(indexKey(config, owner), JSON.stringify([...new Set(ids)]));
 }
 
-function migrateLegacy(config: PublicConfig, owner: Owner): ChatJournalEntry | null {
-  const store = storage();
-  const oldOwnerKey = legacyOwnerKey(config);
-  const oldEntryKey = legacyEntryKey(config, owner);
-  const pointedSub = store.getItem(oldOwnerKey);
-  if (pointedSub && pointedSub !== owner.sub) {
-    removeQuietly(legacyEntryKey(config, { sub: pointedSub, botId: owner.botId }));
-    removeQuietly(oldOwnerKey);
-    return null;
-  }
-  const raw = store.getItem(oldEntryKey);
-  if (raw === null) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw) as unknown;
-  } catch {
-    removeQuietly(oldEntryKey);
-    return null;
-  }
-  if (!validStoredJournal(parsed, config, owner, 2)) {
-    removeQuietly(oldEntryKey);
-    return null;
-  }
-
-  const legacy = parsed as LegacyStoredJournal;
-  const conversationId = legacy.request.conversationId;
-  const nextEntry = { ...legacy, version: 3 } as StoredJournal;
-  const ids = readIndex(config, owner);
-  const previousEntry = store.getItem(entryKey(config, owner, conversationId));
-  const previousIndex = store.getItem(indexKey(config, owner));
-  const previousOwner = store.getItem(ownerKey(config));
-  try {
-    store.setItem(entryKey(config, owner, conversationId), JSON.stringify(nextEntry));
-    writeIndex(config, owner, [...ids, conversationId]);
-    store.setItem(ownerKey(config), JSON.stringify(owner));
-  } catch (error) {
-    try {
-      if (previousEntry === null) store.removeItem(entryKey(config, owner, conversationId));
-      else store.setItem(entryKey(config, owner, conversationId), previousEntry);
-    } catch {
-      // Keep every other conversation reference intact when rollback is constrained.
-    }
-    try {
-      if (previousIndex === null) store.removeItem(indexKey(config, owner));
-      else store.setItem(indexKey(config, owner), previousIndex);
-    } catch {
-      // The old journal remains available for another migration attempt.
-    }
-    try {
-      if (previousOwner === null) store.removeItem(ownerKey(config));
-      else store.setItem(ownerKey(config), previousOwner);
-    } catch {
-      // The old journal remains available for another migration attempt.
-    }
-    throw error;
-  }
-  removeQuietly(oldEntryKey);
-  removeQuietly(oldOwnerKey);
-  return publicEntry(nextEntry);
-}
-
 export function readChatJournals(
   config: PublicConfig,
   owner: Owner,
@@ -230,18 +149,20 @@ export function readChatJournals(
   const pointerKey = ownerKey(config);
   const pointedRaw = store.getItem(pointerKey);
   if (pointedRaw) {
-    let pointed: unknown = pointedRaw;
+    let pointed: unknown;
     try {
       pointed = JSON.parse(pointedRaw) as unknown;
     } catch {
-      // The v2 pointer stored the subject directly.
+      pointed = null;
     }
     const pointedOwner =
-      typeof pointed === "string"
-        ? { sub: pointed, botId: owner.botId }
-        : pointed && typeof pointed === "object" && !Array.isArray(pointed)
-          ? (pointed as Owner)
-          : null;
+      pointed &&
+      typeof pointed === "object" &&
+      !Array.isArray(pointed) &&
+      typeof (pointed as Owner).sub === "string" &&
+      typeof (pointed as Owner).botId === "string"
+        ? (pointed as Owner)
+        : null;
     if (pointedOwner && (pointedOwner.sub !== owner.sub || pointedOwner.botId !== owner.botId)) {
       clearChatJournal(config, pointedOwner);
     }
@@ -261,7 +182,7 @@ export function readChatJournals(
       continue;
     }
     if (
-      !validStoredJournal(parsed, config, owner, 3) ||
+      !validStoredJournal(parsed, config, owner) ||
       (parsed as StoredJournal).request.conversationId !== conversationId
     ) {
       removeQuietly(key);
@@ -270,8 +191,6 @@ export function readChatJournals(
     journals.set(conversationId, publicEntry(parsed as StoredJournal));
   }
 
-  const legacy = migrateLegacy(config, owner);
-  if (legacy) journals.set(legacy.request.conversationId, legacy);
   return journals;
 }
 
@@ -339,8 +258,8 @@ export function markChatJournalAdmitted(
   const previousOwner = store.getItem(pointerKey);
   const ids = readIndex(config, owner);
   const alreadyIndexed = ids.includes(request.conversationId);
-  let ownerMatches = previousOwner === owner.sub;
-  if (previousOwner !== null && !ownerMatches) {
+  let ownerMatches = false;
+  if (previousOwner !== null) {
     try {
       const value: unknown = JSON.parse(previousOwner);
       ownerMatches =
@@ -410,23 +329,25 @@ export function clearChatJournal(config: PublicConfig, owner: Owner) {
   const ids = readIndex(config, owner);
   for (const id of ids) removeQuietly(entryKey(config, owner, id));
   removeQuietly(indexKey(config, owner));
-  removeQuietly(legacyEntryKey(config, owner));
   removeQuietly(selectionKey(config));
   try {
     const raw = store.getItem(ownerKey(config));
     if (raw) {
-      let pointed: unknown = raw;
+      let pointed: unknown = null;
       try {
         pointed = JSON.parse(raw) as unknown;
       } catch {
-        // A legacy v2 pointer stores the subject directly.
+        pointed = null;
       }
-      if (pointed === owner.sub || (pointed as Owner)?.sub === owner.sub) {
+      if (
+        pointed &&
+        typeof pointed === "object" &&
+        !Array.isArray(pointed) &&
+        (pointed as Owner).sub === owner.sub &&
+        (pointed as Owner).botId === owner.botId
+      ) {
         store.removeItem(ownerKey(config));
       }
-    }
-    if (store.getItem(legacyOwnerKey(config)) === owner.sub) {
-      store.removeItem(legacyOwnerKey(config));
     }
   } catch {
     // Logout still invalidates in-memory consumers if storage is unavailable.
@@ -435,26 +356,26 @@ export function clearChatJournal(config: PublicConfig, owner: Owner) {
 
 export function clearChatJournalForConfiguredBot(config: PublicConfig) {
   const store = storage();
-  const raw = store.getItem(ownerKey(config)) ?? store.getItem(legacyOwnerKey(config));
+  const raw = store.getItem(ownerKey(config));
   if (!raw) return;
-  let owner: Owner = { sub: raw, botId: config.botId };
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      !Array.isArray(parsed) &&
-      typeof (parsed as Owner).sub === "string" &&
-      typeof (parsed as Owner).botId === "string"
-    ) {
-      owner = parsed as Owner;
-    }
+    parsed = JSON.parse(raw) as unknown;
   } catch {
-    // v2 stored only the subject.
+    return;
   }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    typeof (parsed as Owner).sub !== "string" ||
+    (parsed as Owner).botId !== config.botId
+  ) {
+    return;
+  }
+  const owner = parsed as Owner;
   clearChatJournal(config, owner);
   removeQuietly(ownerKey(config));
-  removeQuietly(legacyOwnerKey(config));
 }
 
 export function readChatSelection(config: PublicConfig, owner: Owner): string | null {
