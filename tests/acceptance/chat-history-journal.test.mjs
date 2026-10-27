@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { markChatJournalAdmitted, writeChatSelection } from "../../web/chat-journal.ts";
 import {
   createHistoryEnvironment,
   firstConversationId,
@@ -141,6 +142,37 @@ function legacyJournalKeys(config, owner) {
     owner: `chat-journal:v2:owner:${encodedScope}`,
     scope,
   };
+}
+
+function installConversationMetaRoute(environment, conversations) {
+  const defaultFetch = environment.fetch.getMockImplementation();
+  const byId = new Map(
+    conversations.map((conversation) => [conversation.conversationId, conversation]),
+  );
+  environment.fetch.mockImplementation(async (input, init = {}) => {
+    const url = String(input);
+    const parsed = new URL(url, "https://app.invalid");
+    const path = parsed.pathname.slice("/api".length);
+    const method = init.method || "GET";
+    const match = path.match(/^\/chat\/conversations\/([^/]+)$/);
+    if (method === "GET" && match) {
+      const conversationId = decodeURIComponent(match[1]);
+      environment.apiRequests.push({
+        path,
+        url: parsed,
+        method,
+        headers: new Headers(init.headers),
+        init,
+        body: init.body,
+        conversationId,
+      });
+      const conversation = byId.get(conversationId);
+      return conversation
+        ? jsonResponse({ version: 1, ...conversation })
+        : jsonResponse({ code: "CONVERSATION_NOT_FOUND" }, 404);
+    }
+    return defaultFetch(input, init);
+  });
 }
 
 describe("per-conversation recovery references", () => {
@@ -334,10 +366,10 @@ describe("per-conversation recovery references", () => {
     expect(storageText(environment.storage)).not.toContain("Pedido dos no persistible.");
   });
 
-  it("migrates a v2 journal to a per-conversation reference that survives reload", async () => {
+  it("does not restore or migrate a v2 journal and keeps an independent current v3 reference", async () => {
     const storage = new MemorySessionStorage();
     const keys = legacyJournalKeys(historyConfig, legacyIdentity);
-    const request = {
+    const oldRequest = {
       version: 2,
       operation: "message",
       conversationId: firstConversationId,
@@ -352,26 +384,48 @@ describe("per-conversation recovery references", () => {
         scope: keys.scope,
         sub: legacyIdentity.sub,
         botId: legacyIdentity.botId,
-        request,
+        request: oldRequest,
         admitted: true,
         ordinal: 3,
       }),
     );
-    const listHandler = async () =>
-      jsonResponse({
-        version: 1,
-        conversations: [
-          {
-            conversationId: firstConversationId,
-            label: "Hilo anterior",
-            lastOrdinal: 3,
-            closed: false,
-          },
-        ],
-      });
-    const firstEnvironment = createHistoryEnvironment({
+    const conversations = [
+      {
+        conversationId: firstConversationId,
+        label: "Conversación con journal retirado",
+        lastOrdinal: 3,
+        closed: false,
+      },
+      {
+        conversationId: secondConversationId,
+        label: "Conversación con journal actual",
+        lastOrdinal: 3,
+        closed: false,
+      },
+    ];
+    const listHandler = async () => jsonResponse({ version: 1, conversations });
+    const environment = createHistoryEnvironment({
       storage,
       listHandler,
+      turnsHandler: async ({ conversationId }) => {
+        const current = conversations.find((item) => item.conversationId === conversationId);
+        const queryId = conversationId === firstConversationId ? firstQueryId : secondQueryId;
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          label: current?.label,
+          throughOrdinal: 3,
+          closed: false,
+          canContinue: false,
+          turns: [
+            makeTurn(3, queryId, {
+              status: "in_progress",
+              answerManifest: { count: 1, complete: false },
+              cursor: 1,
+            }),
+          ],
+        });
+      },
       recoverHandler: async (recoverRequest) =>
         jsonResponse({
           version: 2,
@@ -379,79 +433,55 @@ describe("per-conversation recovery references", () => {
           queryId: recoverRequest.queryId,
           ordinal: 3,
           status: "in_progress",
-          question: "Pedido recuperado del journal anterior.",
-          answer: "Prefijo persistido.",
+          question:
+            recoverRequest.conversationId === secondConversationId
+              ? "Pedido recuperado del journal actual."
+              : "Pedido procedente del journal v2.",
+          answer:
+            recoverRequest.conversationId === secondConversationId
+              ? "Respuesta recuperada del formato actual."
+              : "Respuesta procedente del journal v2.",
           canContinue: false,
         }),
     });
-    const firstApp = mount(firstEnvironment);
-    await initialize(firstApp);
-    await vi.waitFor(() =>
-      expect(
-        firstEnvironment.runtimeRequests.some(
-          ({ request: actual }) => actual.operation === "recover",
-        ),
-      ).toBe(true),
-    );
-    await firstApp.flush();
-
-    expect(
-      firstEnvironment.runtimeRequests.filter(({ request: actual }) =>
-        ["start", "message"].includes(actual.operation),
-      ),
-    ).toHaveLength(0);
-    expect(
-      firstEnvironment.runtimeRequests.find(({ request: actual }) => actual.operation === "recover")
-        ?.request,
-    ).toEqual({
+    installConversationMetaRoute(environment, conversations);
+    const currentRequest = {
       version: 2,
-      operation: "recover",
-      conversationId: firstConversationId,
-      queryId: firstQueryId,
-    });
-    expect(state(firstApp)?.queryStatus).toBe("streaming");
-    expect(state(firstApp)?.question).toBe("Pedido recuperado del journal anterior.");
-    expect(state(firstApp)?.answer).toBe("Prefijo persistido.");
-    expect(storage.getItem(keys.entry)).toBeNull();
-    expect(storage.getItem(keys.owner)).toBeNull();
-    const migrated = entriesContaining(storage, firstQueryId);
-    expect(migrated).toHaveLength(1);
-    expect(migrated[0][0]).not.toBe(keys.entry);
-    expect(migrated[0][1]).not.toContain("Pedido recuperado del journal anterior.");
-
-    firstApp.dispose();
-    const secondEnvironment = createHistoryEnvironment({
-      storage,
-      listHandler,
-      recoverHandler: async (recoverRequest) =>
-        jsonResponse({
-          version: 2,
-          conversationId: recoverRequest.conversationId,
-          queryId: recoverRequest.queryId,
-          ordinal: 3,
-          status: "completed",
-          question: "Pedido recuperado del journal anterior.",
-          answer: "Respuesta ya admitida.",
-          canContinue: true,
-        }),
-    });
-    const secondApp = mount(secondEnvironment);
-    await initialize(secondApp);
+      operation: "message",
+      conversationId: secondConversationId,
+      queryId: secondQueryId,
+      baseOrdinal: 2,
+      text: "se elimina al confirmar admitted",
+    };
+    markChatJournalAdmitted(environment.config, legacyIdentity, currentRequest, 3);
+    writeChatSelection(environment.config, legacyIdentity, secondConversationId);
+    const app = mount(environment);
+    await initialize(app);
     await vi.waitFor(() =>
       expect(
-        secondEnvironment.runtimeRequests.some(
-          ({ request: actual }) => actual.operation === "recover",
-        ),
+        environment.runtimeRequests.some(({ request: actual }) => actual.operation === "recover"),
       ).toBe(true),
     );
-    await secondApp.flush();
-    expect(
-      secondEnvironment.runtimeRequests.filter(({ request: actual }) =>
-        ["start", "message"].includes(actual.operation),
-      ),
-    ).toHaveLength(0);
-    expect(state(secondApp)?.question).toBe("Pedido recuperado del journal anterior.");
-    expect(state(secondApp)?.answer).toBe("Respuesta ya admitida.");
+    await app.flush();
+
+    expect(state(app)?.history.selectedConversationId).toBe(secondConversationId);
+    expect(environment.runtimeRequests.map(({ request: actual }) => actual)).toEqual([
+      {
+        version: 2,
+        operation: "recover",
+        conversationId: secondConversationId,
+        queryId: secondQueryId,
+      },
+    ]);
+    expect(state(app)?.queryStatus).toBe("streaming");
+    expect(state(app)?.question).toBe("Pedido recuperado del journal actual.");
+    expect(state(app)?.answer).toBe("Respuesta recuperada del formato actual.");
+    const staleFormatEntries = [...storage.values].filter(
+      ([key, raw]) =>
+        key.startsWith("chat-journal:v3:entry:") && String(raw).includes(firstQueryId),
+    );
+    expect(staleFormatEntries).toHaveLength(0);
+    expect(entriesContaining(storage, secondQueryId)).toHaveLength(1);
   });
 
   it("keeps active references across New conversation, blocks a second send, and clears all on logout", async () => {

@@ -16,6 +16,15 @@ function admissionFields(queryId, timestamp = now) {
     ownerAttemptId: "attempt-" + queryId,
     resultDeadlineAt: timestamp + 60 * 60 * 1000,
     requestFingerprint: "fingerprint-" + queryId,
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContext: {
+      knowledgeBaseId: "kb-docentes-dev",
+      query: "referencias de conversación",
+      revision: "documents-r1",
+      retrievedAt: timestamp,
+      status: "empty",
+      results: [],
+    },
     quota: {
       daily: {
         used: 1,
@@ -36,16 +45,29 @@ function admissionFields(queryId, timestamp = now) {
   };
 }
 
-function completedTurn(ordinal, queryId) {
+function completedTurn(ordinal, queryId, overrides = {}) {
   return {
     pk: `CONV#${conversationId}`,
     sk: `TURN#${String(ordinal).padStart(8, "0")}`,
     conversationId,
+    sub: "teacher-123",
+    botId: "bot-aurora",
     queryId,
     ordinal,
+    operation: ordinal === 1 ? "start" : "message",
+    baseOrdinal: ordinal - 1,
+    requestFingerprint: "fingerprint-" + queryId,
+    ownerAttemptId: "attempt-" + queryId,
+    resultDeadlineAt: now + 60 * 60 * 1000,
     status: "completed",
+    phase: "complete",
+    cursor: 1,
     questionManifest: { count: 1, complete: true },
     answerManifest: { count: 1, complete: true },
+    contextManifest: { count: 0, complete: true },
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContextManifest: { count: 1, complete: true },
+    ...overrides,
   };
 }
 
@@ -69,10 +91,11 @@ const continuation = {
   queryId: queryIds[3],
   now,
   ...admissionFields(queryIds[3]),
+  operation: "message",
+  baseOrdinal: 3,
   text: "Seguí con una adaptación.",
   profileSnapshot: { fields: {} },
   invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "revision-123" },
-  expectedLastOrdinal: 3,
 };
 
 describe("conversation context references", () => {
@@ -89,10 +112,21 @@ describe("conversation context references", () => {
       botId: "bot-aurora",
       conversationId,
       queryId: queryIds[0],
+      operation: "start",
+      baseOrdinal: 0,
       now,
       ...admissionFields(queryIds[0]),
       text: "Primera pregunta.",
       profileSnapshot: { fields: {} },
+      contextSnapshot: { version: 1, recentReferences: [] },
+      documentContext: {
+        knowledgeBaseId: "kb-docentes-dev",
+        query: "primera pregunta",
+        revision: "documents-r1",
+        retrievedAt: now,
+        status: "empty",
+        results: [],
+      },
       invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "revision-123" },
     });
 
@@ -117,7 +151,8 @@ describe("conversation context references", () => {
       {
         ...completedTurn(2, queryIds[1]),
         status: "failed",
-        questionManifest: { count: 1, complete: false },
+        phase: "failed",
+        questionManifest: { count: 1, complete: true },
         answerManifest: { count: 1, complete: false },
       },
       turnChunk(2, queryIds[1], "user", "Pregunta fallida."),
@@ -125,6 +160,10 @@ describe("conversation context references", () => {
       {
         ...completedTurn(3, queryIds[2]),
         status: "in_progress",
+        phase: "invocation_claimed",
+        cursor: 0,
+        ownerAttemptId: "attempt-active",
+        resultDeadlineAt: now + 60 * 60 * 1000,
         questionManifest: { count: 1, complete: true },
         answerManifest: { count: 0, complete: false },
       },
@@ -165,7 +204,11 @@ describe("conversation context references", () => {
     // T1 finishes after the consistent Query returned, before this continuation is allocated.
     items[6] = completedTurn(3, queryIds[2]);
     items.push(turnChunk(3, queryIds[2], "assistant", "T1 terminó tarde."));
-    await store.continueTurn({ ...continuation, contextReferences: selectedContext.references });
+    await store.continueTurn({
+      ...continuation,
+      contextReferences: selectedContext.references,
+      contextSnapshot: { version: 1, recentReferences: selectedContext.references },
+    });
 
     const commands = documentClient.send.mock.calls.map(([command]) => command);
     const allocation = commands.find((command) => command instanceof TransactWriteCommand);
@@ -174,20 +217,17 @@ describe("conversation context references", () => {
     ).Put;
     expect(turnPut.Item).toMatchObject({
       ordinal: 4,
-      contextManifest: { count: 1, complete: true },
+      contextManifest: { count: 0, complete: true },
+      contextSnapshot: { version: 1, recentReferences: selectedContext.references },
     });
     expect(Object.hasOwn(turnPut.Item, "messages")).toBe(false);
 
-    const contextPut = allocation.input.TransactItems.find(({ Put }) =>
-      Put?.Item?.sk.includes("#CONTEXT#"),
-    ).Put;
-    expect(contextPut.Item.text).toBe(JSON.stringify(selectedContext.references));
-    expect(JSON.parse(contextPut.Item.text)).not.toContainEqual({
-      ordinal: 3,
-      queryId: queryIds[2],
-    });
+    expect(
+      allocation.input.TransactItems.some(({ Put }) => Put?.Item?.sk.includes("#CONTEXT#")),
+    ).toBe(false);
+    expect(JSON.stringify(turnPut.Item.contextSnapshot)).not.toContain(queryIds[2]);
     expect(turnPut.Item.questionManifest).toEqual({ count: 1, complete: true });
-    expect(turnPut.Item.contextManifest).toEqual({ count: 1, complete: true });
+    expect(turnPut.Item.contextManifest).toEqual({ count: 0, complete: true });
     expect(commands.some((command) => command instanceof TransactWriteCommand)).toBe(true);
   });
 
@@ -217,8 +257,9 @@ describe("conversation context references", () => {
 
     await store.continueTurn({
       ...continuation,
-      expectedLastOrdinal: 7000,
+      baseOrdinal: 7000,
       contextReferences: references,
+      contextSnapshot: { version: 1, recentReferences: references },
     });
 
     const commands = documentClient.send.mock.calls.map(([command]) => command);
@@ -262,6 +303,8 @@ describe("conversation context references", () => {
         botId: "bot-aurora",
         conversationId,
         queryId: queryIds[0],
+        operation: "start",
+        baseOrdinal: 0,
         now: admittedAt,
         ...fields,
         text: "Primera pregunta.",
@@ -276,23 +319,38 @@ describe("conversation context references", () => {
   });
 
   it("rejects a completed turn with a missing context reference chunk", async () => {
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub: "teacher-123",
+      botId: "bot-aurora",
+      lastOrdinal: 1,
+    };
     const documentClient = {
-      send: vi.fn(async () => ({
-        Items: [
-          {
-            ...completedTurn(1, queryIds[0]),
-            contextManifest: { count: 1, complete: true },
-          },
-          turnChunk(1, queryIds[0], "user", "Pregunta completa."),
-          turnChunk(1, queryIds[0], "assistant", "Respuesta completa."),
-        ],
-      })),
+      send: vi.fn(async (command) => {
+        if (command instanceof GetCommand) return { Item: meta };
+        return {
+          Items: [
+            {
+              ...completedTurn(1, queryIds[0], {
+                contextManifest: { count: 1, complete: true },
+                contextSnapshot: { version: 1, recentReferencesStorage: "context_chunks" },
+              }),
+            },
+            turnChunk(1, queryIds[0], "user", "Pregunta completa."),
+            turnChunk(1, queryIds[0], "assistant", "Respuesta completa."),
+          ],
+        };
+      }),
     };
     const store = createConversationStoreAdapter({
       documentClient,
       tableName: "conversations-aurora-dev",
     });
 
-    await expect(store.readContext({ conversationId })).rejects.toThrow(/reference manifest/);
+    await expect(store.readContext({ conversationId })).rejects.toThrow(
+      /incomplete reference manifest/,
+    );
   });
 });

@@ -98,6 +98,31 @@ function runtimeUrl() {
   );
 }
 
+function confirmedMetadataResponse(url, init, metadata) {
+  const expectedUrl = `/api/chat/conversations/${encodeURIComponent(metadata.conversationId)}`;
+  const headers = new Headers(init.headers);
+  if (
+    url !== expectedUrl ||
+    metadata.ownerSub !== identity.sub ||
+    metadata.botId !== config.botId ||
+    headers.get("authorization") !== "Bearer temporary-access-token"
+  ) {
+    return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 404);
+  }
+  const { conversationId, label, lastOrdinal, closed, createdAt, updatedAt, activeQueryId } =
+    metadata;
+  return jsonResponse({
+    version: 1,
+    conversationId,
+    label,
+    lastOrdinal,
+    closed,
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
+    ...(activeQueryId ? { activeQueryId } : {}),
+  });
+}
+
 function accepted(request) {
   return sse([
     {
@@ -174,6 +199,16 @@ describe("AccountApp capacity rejection regressions", () => {
             fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
             responsePreferenceIds: [],
           },
+        });
+      }
+      if (url === `/api/chat/conversations/${conversationId}`) {
+        return confirmedMetadataResponse(url, init, {
+          conversationId,
+          ownerSub: identity.sub,
+          botId: identity.botId,
+          label: "Conversación confirmada de prueba",
+          lastOrdinal: 1,
+          closed: false,
         });
       }
       if (url !== runtimeUrl()) throw new Error(`Unexpected web request: ${url}`);
@@ -519,6 +554,16 @@ describe("AccountApp capacity rejection regressions", () => {
             fields: { educationLevels: ["secundario"], subjects: ["Matemática"] },
             responsePreferenceIds: [],
           },
+        });
+      }
+      if (url === `/api/chat/conversations/${conversationId}`) {
+        return confirmedMetadataResponse(url, init, {
+          conversationId,
+          ownerSub: identity.sub,
+          botId: identity.botId,
+          label: "Conversación de prueba con seguimiento recuperado",
+          lastOrdinal: 5,
+          closed: false,
         });
       }
       if (url !== runtimeUrl()) throw new Error(`Unexpected web request: ${url}`);

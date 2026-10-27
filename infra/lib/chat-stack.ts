@@ -134,14 +134,32 @@ export class ChatStack extends Stack {
       historyHandler,
     );
     const historyRoutes = [
-      ["ChatHistoryConversationsRoute", "/api/chat/conversations"],
-      ["ChatHistoryTurnsRoute", "/api/chat/conversations/{conversationId}/turns"],
-      ["ChatHistoryTextRoute", "/api/chat/conversations/{conversationId}/turns/{ordinal}/text"],
+      ["ChatHistoryConversationsRoute", "/api/chat/conversations", apigateway.HttpMethod.GET],
+      [
+        "ChatHistoryMetaRoute",
+        "/api/chat/conversations/{conversationId}",
+        apigateway.HttpMethod.GET,
+      ],
+      [
+        "ChatHistoryHideRoute",
+        "/api/chat/conversations/{conversationId}/hide",
+        apigateway.HttpMethod.POST,
+      ],
+      [
+        "ChatHistoryTurnsRoute",
+        "/api/chat/conversations/{conversationId}/turns",
+        apigateway.HttpMethod.GET,
+      ],
+      [
+        "ChatHistoryTextRoute",
+        "/api/chat/conversations/{conversationId}/turns/{ordinal}/text",
+        apigateway.HttpMethod.GET,
+      ],
     ] as const;
-    for (const [routeId, routePath] of historyRoutes) {
+    for (const [routeId, routePath, method] of historyRoutes) {
       new apigateway.HttpRoute(this, routeId, {
         httpApi: account.httpApi,
-        routeKey: apigateway.HttpRouteKey.with(routePath, apigateway.HttpMethod.GET),
+        routeKey: apigateway.HttpRouteKey.with(routePath, method),
         integration: historyIntegration,
         authorizer: account.jwtAuthorizer,
       });
@@ -151,7 +169,7 @@ export class ChatStack extends Stack {
     const revision = resolveRevision();
     const inferenceProfileArn = `arn:aws:bedrock:${environment.region}:${environment.account}:inference-profile/${inferenceProfileId}`;
     const sourceModelArn = `arn:aws:bedrock:${environment.region}::foundation-model/${modelId}`;
-    this.runtime = new Runtime(this, "ChatRuntime", {
+    this.runtime = new Runtime(this, "ConversationRuntime", {
       agentRuntimeArtifact: AgentRuntimeArtifact.fromAsset(runtimeAssetPath, {
         platform: ecrAssets.Platform.LINUX_ARM64,
       }),

@@ -50,6 +50,33 @@ function runtimeUrl() {
   );
 }
 
+function confirmedMetadataResponse(url, init) {
+  const metadata = {
+    conversationId,
+    ownerSub: "teacher-a",
+    botId: config.botId,
+    label: question,
+    lastOrdinal: 1,
+    closed: false,
+  };
+  const headers = new Headers(init.headers);
+  if (
+    url !== `/api/chat/conversations/${metadata.conversationId}` ||
+    metadata.ownerSub !== "teacher-a" ||
+    metadata.botId !== "docentes" ||
+    headers.get("authorization") !== "Bearer access-token"
+  ) {
+    return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 404);
+  }
+  return jsonResponse({
+    version: 1,
+    conversationId: metadata.conversationId,
+    label: metadata.label,
+    lastOrdinal: metadata.lastOrdinal,
+    closed: metadata.closed,
+  });
+}
+
 describe("chat recovery after an uncertain stream in the current view", () => {
   it("keeps an admitted turn unconfirmed and continues polling after a transient error", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -98,6 +125,9 @@ describe("chat recovery after an uncertain stream in the current view", () => {
               responsePreferenceIds: [],
             },
           });
+        }
+        if (url === `/api/chat/conversations/${conversationId}`) {
+          return confirmedMetadataResponse(url, init);
         }
         if (url === runtimeUrl()) {
           const actual = JSON.parse(String(init.body));
@@ -611,6 +641,9 @@ describe("chat recovery after an uncertain stream in the current view", () => {
               responsePreferenceIds: [],
             },
           });
+        }
+        if (url === `/api/chat/conversations/${conversationId}`) {
+          return confirmedMetadataResponse(url, init);
         }
         if (url === runtimeUrl()) {
           const currentRequest = JSON.parse(String(init.body));

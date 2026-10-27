@@ -315,8 +315,8 @@ function parseDescriptor(
     conversationId: string;
     summaryId: string;
     throughOrdinal?: number;
-    sub?: string;
-    botId?: string;
+    sub: string;
+    botId: string;
   },
 ): {
   metadata: SummaryMetadata;
@@ -334,8 +334,8 @@ function parseDescriptor(
     value.version !== 1 ||
     !isPositiveOrdinal(value.throughOrdinal) ||
     (input.throughOrdinal !== undefined && value.throughOrdinal !== input.throughOrdinal) ||
-    (input.sub !== undefined && value.sub !== input.sub) ||
-    (input.botId !== undefined && value.botId !== input.botId) ||
+    value.sub !== input.sub ||
+    value.botId !== input.botId ||
     !isRecord(value.textManifest) ||
     value.textManifest.complete !== true ||
     !Number.isSafeInteger(value.textManifest.count) ||
@@ -463,7 +463,7 @@ export function createContextStorage(input: {
   async function verifyReferences(
     conversationId: string,
     references: ContextReference[],
-    owner?: { sub?: string; botId?: string },
+    owner: { sub: string; botId: string },
   ): Promise<void> {
     const normalized = referenceList(references, "Conversation context references");
     if (normalized.length === 0) return;
@@ -479,6 +479,29 @@ export function createContextStorage(input: {
         row.sk !== `TURN#${String(ordinal).padStart(8, "0")}` ||
         row.conversationId !== conversationId ||
         !isPositiveOrdinal(ordinal) ||
+        row.operation !== (ordinal === 1 ? "start" : "message") ||
+        row.baseOrdinal !== ordinal - 1 ||
+        typeof row.requestFingerprint !== "string" ||
+        row.requestFingerprint.length === 0 ||
+        typeof row.ownerAttemptId !== "string" ||
+        row.ownerAttemptId.length === 0 ||
+        !Number.isSafeInteger(row.resultDeadlineAt) ||
+        !isRecord(row.questionManifest) ||
+        row.questionManifest.complete !== true ||
+        !isPositiveOrdinal(row.questionManifest.count) ||
+        !isRecord(row.answerManifest) ||
+        row.answerManifest.complete !== true ||
+        !isPositiveOrdinal(row.answerManifest.count) ||
+        row.cursor !== row.answerManifest.count ||
+        !isRecord(row.contextManifest) ||
+        row.contextManifest.complete !== true ||
+        !Number.isSafeInteger(row.contextManifest.count) ||
+        Number(row.contextManifest.count) < 0 ||
+        !isRecord(row.contextSnapshot) ||
+        row.contextSnapshot.version !== 1 ||
+        !isRecord(row.documentContextManifest) ||
+        row.documentContextManifest.complete !== true ||
+        !isPositiveOrdinal(row.documentContextManifest.count) ||
         byOrdinal.has(ordinal)
       ) {
         throw new Error("Conversation summary source turns are malformed.");
@@ -491,8 +514,9 @@ export function createContextStorage(input: {
         !turn ||
         turn.status !== "completed" ||
         turn.queryId !== reference.queryId ||
-        (owner?.sub !== undefined && turn.sub !== undefined && turn.sub !== owner.sub) ||
-        (owner?.botId !== undefined && turn.botId !== undefined && turn.botId !== owner.botId)
+        turn.phase !== "complete" ||
+        turn.sub !== owner.sub ||
+        turn.botId !== owner.botId
       ) {
         throw new Error("Conversation context reference does not identify a completed owned turn.");
       }
@@ -503,8 +527,8 @@ export function createContextStorage(input: {
     conversationId: string;
     summaryId: string;
     throughOrdinal?: number;
-    sub?: string;
-    botId?: string;
+    sub: string;
+    botId: string;
   }): Promise<SummaryVersion> {
     const descriptorResult = await documentClient.send(
       new GetCommand({
@@ -552,8 +576,8 @@ export function createContextStorage(input: {
         chunk.conversationId !== options.conversationId ||
         chunk.summaryId !== options.summaryId ||
         chunk.version !== 1 ||
-        (options.sub !== undefined && chunk.sub !== options.sub) ||
-        (options.botId !== undefined && chunk.botId !== options.botId) ||
+        chunk.sub !== options.sub ||
+        chunk.botId !== options.botId ||
         chunk.index !== index ||
         typeof chunk.text !== "string" ||
         chunk.text.length === 0
@@ -602,8 +626,8 @@ export function createContextStorage(input: {
           chunk.conversationId !== options.conversationId ||
           chunk.summaryId !== options.summaryId ||
           chunk.version !== 1 ||
-          (options.sub !== undefined && chunk.sub !== options.sub) ||
-          (options.botId !== undefined && chunk.botId !== options.botId) ||
+          chunk.sub !== options.sub ||
+          chunk.botId !== options.botId ||
           chunk.index !== index ||
           typeof chunk.text !== "string" ||
           chunk.text.length === 0

@@ -14,6 +14,14 @@ export type ChatHistoryConversation = {
   lastOrdinal: number;
   closed: boolean;
   activeQueryId?: string;
+  hasDraft?: boolean;
+  durable?: boolean;
+};
+
+export type ChatHistoryRemovalState = {
+  conversationId: string;
+  status: "hiding" | "unconfirmed";
+  error?: string;
 };
 
 export type ChatHistoryTurn = {
@@ -45,6 +53,7 @@ export type ChatHistoryState = {
   closed?: boolean;
   canContinue?: boolean;
   throughOrdinal?: number;
+  removal?: ChatHistoryRemovalState;
 };
 
 export type ChatScreenState = {
@@ -81,6 +90,7 @@ export type ChatScreenProps = {
   onRefreshHistory?: () => void | Promise<void>;
   onLoadEarlierTurns?: () => void | Promise<void>;
   onDraftChange?: (text: string) => void;
+  onHideConversation?: (conversationId: string) => Promise<boolean>;
 };
 
 type CopyTarget = {
@@ -125,10 +135,13 @@ export function ChatScreen({
   onRefreshHistory,
   onLoadEarlierTurns,
   onDraftChange,
+  onHideConversation,
 }: ChatScreenProps) {
   const [mobileView, setMobileView] = useState<"history" | "chat">(
     state.history?.selectedConversationId ? "chat" : "history",
   );
+  const [confirmingRemovalId, setConfirmingRemovalId] = useState<string | null>(null);
+  const [removalAnnouncement, setRemovalAnnouncement] = useState("");
   const draft = state.draft ?? "";
   const [quotaNow, setQuotaNow] = useState(0);
   const [, setCopyRevision] = useState(0);
@@ -136,6 +149,12 @@ export function ChatScreen({
   const historyHeadingRef = useRef<HTMLHeadingElement>(null);
   const queryRef = useRef<HTMLTextAreaElement>(null);
   const focusQueryAfterResetRef = useRef(false);
+  const hideTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
+  const openConversationRefs = useRef(new Map<string, HTMLButtonElement>());
+  const cancelRemovalRefs = useRef(new Map<string, HTMLButtonElement>());
+  const newConversationRef = useRef<HTMLButtonElement>(null);
+  const focusAfterCancelRef = useRef<string | null>(null);
+  const focusAfterRemovalRef = useRef<string[] | null>(null);
   const previousCopyTargetsRef = useRef(new Map<string, CopyTarget>());
   const currentCopyTargetRef = useRef<CopyTarget | null>(null);
   const copyEpochRef = useRef(0);
@@ -156,6 +175,7 @@ export function ChatScreen({
     Boolean(state.question || state.answer) ||
     state.queryStatus !== "idle";
   const history = state.history;
+  const removal = history?.removal;
   const terminalCurrentnessUnconfirmed =
     (state.queryStatus === "completed" || state.queryStatus === "failed") &&
     state.canContinue === false &&
@@ -198,11 +218,17 @@ export function ChatScreen({
     typeof state.ordinal === "number" &&
     Number.isSafeInteger(state.ordinal) &&
     state.ordinal > 0;
+  const removalBlocksSelectedConversation = Boolean(
+    history?.selectedConversationId &&
+    removal?.conversationId === history.selectedConversationId &&
+    (removal.status === "hiding" || removal.status === "unconfirmed"),
+  );
   const canSubmit =
     state.profileStatus === "complete" &&
     state.history?.turnsStatus !== "loading" &&
     (state.history?.turnsStatus !== "error" || hasUsableContinuationBase) &&
     !state.history?.openingConversationId &&
+    !removalBlocksSelectedConversation &&
     canSubmitForState &&
     draft.trim().length > 0;
   const showConversation =
@@ -254,6 +280,45 @@ export function ChatScreen({
     if (mobileView === "history" && state.history) historyHeadingRef.current?.focus();
     else headingRef.current?.focus();
   }, [mobileView, state.history !== undefined]);
+
+  useEffect(() => {
+    if (!confirmingRemovalId) return;
+    cancelRemovalRefs.current.get(confirmingRemovalId)?.focus();
+  }, [confirmingRemovalId]);
+
+  useEffect(() => {
+    if (confirmingRemovalId !== null && focusAfterCancelRef.current === null) return;
+    const conversationId = focusAfterCancelRef.current;
+    if (confirmingRemovalId !== null || !conversationId) return;
+    hideTriggerRefs.current.get(conversationId)?.focus();
+    focusAfterCancelRef.current = null;
+  }, [confirmingRemovalId, history?.conversations]);
+
+  useEffect(() => {
+    const candidates = focusAfterRemovalRef.current;
+    if (!candidates) return;
+    const removedConversationId = candidates.at(-1);
+    if (
+      removedConversationId &&
+      history?.conversations.some(
+        (conversation) => conversation.conversationId === removedConversationId,
+      )
+    ) {
+      return;
+    }
+    const remainingFocus = candidates
+      .slice(0, -1)
+      .map((conversationId) => openConversationRefs.current.get(conversationId))
+      .find((button): button is HTMLButtonElement => Boolean(button));
+    (remainingFocus ?? newConversationRef.current)?.focus();
+    focusAfterRemovalRef.current = null;
+  }, [history?.conversations]);
+
+  useEffect(() => {
+    if (!removalAnnouncement) return;
+    const timeout = window.setTimeout(() => setRemovalAnnouncement(""), 8_000);
+    return () => window.clearTimeout(timeout);
+  }, [removalAnnouncement]);
 
   useEffect(() => {
     if (
@@ -339,6 +404,41 @@ export function ChatScreen({
     void onSelectConversation?.(conversationId);
   }
 
+  function cancelRemoval(conversationId: string) {
+    focusAfterCancelRef.current = conversationId;
+    setConfirmingRemovalId(null);
+  }
+
+  async function confirmRemoval(conversationId: string) {
+    if (!onHideConversation || removal?.status === "hiding") return;
+    const conversations = history?.conversations ?? [];
+    const index = conversations.findIndex(
+      (conversation) => conversation.conversationId === conversationId,
+    );
+    const candidates = [
+      ...conversations.slice(index + 1).map((conversation) => conversation.conversationId),
+      ...conversations
+        .slice(0, index)
+        .reverse()
+        .map((conversation) => conversation.conversationId),
+      conversationId,
+    ];
+    focusAfterRemovalRef.current = candidates;
+    setRemovalAnnouncement("");
+    let confirmed = false;
+    try {
+      confirmed = await onHideConversation(conversationId);
+    } catch {
+      confirmed = false;
+    }
+    if (!confirmed) {
+      focusAfterRemovalRef.current = null;
+      return;
+    }
+    setConfirmingRemovalId(null);
+    setRemovalAnnouncement("Conversación quitada del historial.");
+  }
+
   function newConversation() {
     restart();
   }
@@ -373,11 +473,17 @@ export function ChatScreen({
               <button
                 className="account-button chat-history__new"
                 type="button"
+                ref={newConversationRef}
                 onClick={newConversation}
               >
                 Nueva conversación
               </button>
             </div>
+            {removalAnnouncement ? (
+              <p className="chat-history__message" role="status" aria-live="polite">
+                {removalAnnouncement}
+              </p>
+            ) : null}
             {history.status === "loading" ? (
               <p className="chat-history__message" role="status" aria-live="polite">
                 Cargando historial…
@@ -402,12 +508,24 @@ export function ChatScreen({
               <ol className="chat-history__list" aria-labelledby="chat-history-title">
                 {history.conversations.map((conversation) => {
                   const selected = history.selectedConversationId === conversation.conversationId;
+                  const confirming = confirmingRemovalId === conversation.conversationId;
+                  const removalForConversation =
+                    removal?.conversationId === conversation.conversationId ? removal : undefined;
+                  const anotherRemovalActive = Boolean(
+                    removal && removal.conversationId !== conversation.conversationId,
+                  );
+                  const removalId = `chat-history-removal-${conversation.conversationId}`;
                   return (
-                    <li key={conversation.conversationId}>
+                    <li className="chat-history__conversation" key={conversation.conversationId}>
                       <button
                         className="chat-history__item"
                         type="button"
                         aria-current={selected ? "page" : undefined}
+                        ref={(button) => {
+                          if (button)
+                            openConversationRefs.current.set(conversation.conversationId, button);
+                          else openConversationRefs.current.delete(conversation.conversationId);
+                        }}
                         onClick={() => void openConversation(conversation.conversationId)}
                       >
                         <span className="chat-history__label">{conversation.label}</span>
@@ -424,6 +542,110 @@ export function ChatScreen({
                                 : " · Abierta"}
                         </span>
                       </button>
+                      {!conversation.pending || conversation.durable ? (
+                        <button
+                          className="account-button account-button--secondary chat-history__remove"
+                          type="button"
+                          aria-label={`${removalForConversation?.status === "unconfirmed" ? "Reintentar quitar del historial" : "Quitar del historial"}: ${conversation.label}`}
+                          disabled={
+                            anotherRemovalActive || removalForConversation?.status === "hiding"
+                          }
+                          ref={(button) => {
+                            if (button)
+                              hideTriggerRefs.current.set(conversation.conversationId, button);
+                            else hideTriggerRefs.current.delete(conversation.conversationId);
+                          }}
+                          onClick={() => {
+                            focusAfterCancelRef.current = null;
+                            setRemovalAnnouncement("");
+                            setConfirmingRemovalId(conversation.conversationId);
+                          }}
+                        >
+                          {removalForConversation?.status === "hiding"
+                            ? "Quitando…"
+                            : removalForConversation?.status === "unconfirmed"
+                              ? "Reintentar quitar"
+                              : "Quitar del historial"}
+                        </button>
+                      ) : null}
+                      {removalForConversation?.status === "hiding" && !confirming ? (
+                        <p
+                          className="chat-history__removal-status"
+                          role="status"
+                          aria-live="polite"
+                        >
+                          Quitando…
+                        </p>
+                      ) : null}
+                      {removalForConversation?.status === "unconfirmed" && !confirming ? (
+                        <p className="chat-history__removal-error" role="alert">
+                          {removalForConversation.error ||
+                            "No pudimos confirmar si se quitó. Reintentá para resolverlo."}
+                        </p>
+                      ) : null}
+                      {confirming ? (
+                        <div
+                          className="chat-history__remove-confirmation"
+                          role="group"
+                          aria-labelledby={`${removalId}-title`}
+                          aria-describedby={`${removalId}-description`}
+                          onKeyDown={(event) => {
+                            if (event.key === "Escape") cancelRemoval(conversation.conversationId);
+                          }}
+                        >
+                          <p id={`${removalId}-title`} className="chat-history__remove-title">
+                            ¿Quitar «{conversation.label}» del historial?
+                          </p>
+                          <p id={`${removalId}-description`}>
+                            Esta conversación dejará de aparecer en tu historial. Su contenido
+                            seguirá disponible para el equipo administrador y el análisis de
+                            consultas. No vas a poder volver a abrirla ni continuarla. Quitarla no
+                            devuelve cupo.
+                          </p>
+                          {conversation.hasDraft ? (
+                            <p>El borrador de esta conversación se descartará.</p>
+                          ) : null}
+                          {conversation.activeQueryId ? (
+                            <p>
+                              El pedido en curso puede terminar de procesarse. Quitarla no cancela
+                              ese pedido ni devuelve su consumo.
+                            </p>
+                          ) : null}
+                          {removalForConversation?.status === "unconfirmed" ? (
+                            <p className="chat-history__removal-error" role="alert">
+                              {removalForConversation.error ||
+                                "No pudimos confirmar si se quitó. Podés reintentar de forma segura."}
+                            </p>
+                          ) : null}
+                          <div className="chat-history__remove-actions">
+                            <button
+                              className="account-button account-button--secondary"
+                              type="button"
+                              ref={(button) => {
+                                if (button)
+                                  cancelRemovalRefs.current.set(
+                                    conversation.conversationId,
+                                    button,
+                                  );
+                                else cancelRemovalRefs.current.delete(conversation.conversationId);
+                              }}
+                              onClick={() => cancelRemoval(conversation.conversationId)}
+                            >
+                              Cancelar
+                            </button>
+                            <button
+                              className="account-button chat-history__remove-confirm"
+                              type="button"
+                              disabled={removalForConversation?.status === "hiding"}
+                              onClick={() => void confirmRemoval(conversation.conversationId)}
+                            >
+                              {removalForConversation?.status === "hiding"
+                                ? "Quitando…"
+                                : "Quitar del historial"}
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
                     </li>
                   );
                 })}
@@ -703,6 +925,7 @@ export function ChatScreen({
                         <button
                           className="account-button account-button--secondary chat-restart-button"
                           type="button"
+                          disabled={removalBlocksSelectedConversation}
                           onClick={() => {
                             if (onSubmit(state.question || "") !== false) onDraftChange?.("");
                           }}
@@ -722,6 +945,7 @@ export function ChatScreen({
                       <button
                         className="account-button account-button--secondary chat-restart-button"
                         type="button"
+                        disabled={removalBlocksSelectedConversation}
                         onClick={() => {
                           if (onSubmit(state.question || "") !== false) onDraftChange?.("");
                         }}

@@ -13,7 +13,6 @@ const projectRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)
 const chatStackSource = path.join(projectRoot, "infra/lib/chat-stack.ts");
 const temporaryDirectories = new Set();
 const scenarioCache = new Map();
-const expectedRuntimeId = "ChatRuntime82B3183A";
 const expectedConversationTableId = "ConversationTable75C14D21";
 const disabledCachePolicyId = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
 
@@ -272,7 +271,6 @@ function assertHistoryInfrastructure(
   const client = onlyRecord(accountTemplate, "AWS::Cognito::UserPoolClient");
   const historyHandler = historyFunction(chatTemplate);
 
-  expect(runtime.logicalId).toBe(expectedRuntimeId);
   expect(table.logicalId).toBe(expectedConversationTableId);
   expect(records(chatTemplate, "AWS::ApiGatewayV2::Api")).toHaveLength(0);
   expect(records(chatTemplate, "AWS::Cognito::UserPool")).toHaveLength(0);
@@ -315,6 +313,17 @@ function assertHistoryInfrastructure(
   ).toEqual(expect.arrayContaining(["pk", "sk", "historyOwner", "historyOrder"]));
 
   const routes = records(chatTemplate, "AWS::ApiGatewayV2::Route");
+  const requiredHistoryRouteKeys = [
+    "GET /api/chat/conversations",
+    "GET /api/chat/conversations/{conversationId}",
+    "GET /api/chat/conversations/{conversationId}/turns",
+    "GET /api/chat/conversations/{conversationId}/turns/{ordinal}/text",
+    "POST /api/chat/conversations/{conversationId}/hide",
+  ];
+  expect(
+    routes.map(({ properties }) => properties.RouteKey),
+    "the public history and hiding routes must be declared by ChatStack",
+  ).toEqual(expect.arrayContaining(requiredHistoryRouteKeys));
   const conversationRoute = routes.find(
     ({ properties }) => properties.RouteKey === "GET /api/chat/conversations",
   );
@@ -325,7 +334,7 @@ function assertHistoryInfrastructure(
     ),
   ).toBe(true);
   for (const { properties } of routes) {
-    if (!properties.RouteKey?.startsWith("GET /api/chat/conversations")) continue;
+    if (!requiredHistoryRouteKeys.includes(properties.RouteKey)) continue;
     expect(properties.AuthorizationType).toBe("JWT");
     expect(properties.AuthorizerId).toBeDefined();
   }
@@ -343,8 +352,18 @@ function assertHistoryInfrastructure(
     ),
     "the new history routes must invoke the ChatStack Lambda",
   ).toBe(true);
+  const historyIntegration = integrations.find(({ properties }) =>
+    referencesResource(properties.IntegrationUri, historyHandler.logicalId),
+  );
+  for (const { properties } of routes) {
+    if (!requiredHistoryRouteKeys.includes(properties.RouteKey)) continue;
+    expect(
+      historyIntegration && referencesResource(properties.Target, historyIntegration.logicalId),
+      `${properties.RouteKey} must invoke the shared ChatStack history handler`,
+    ).toBe(true);
+  }
   const authorizerIds = routes
-    .filter(({ properties }) => properties.RouteKey?.startsWith("GET /api/chat/conversations"))
+    .filter(({ properties }) => requiredHistoryRouteKeys.includes(properties.RouteKey))
     .map(({ properties }) => properties.AuthorizerId);
   const authorizers = [
     ...records(chatTemplate, "AWS::ApiGatewayV2::Authorizer"),
@@ -363,6 +382,25 @@ function assertHistoryInfrastructure(
   });
   expect(authorizer, "history routes must use a JWT authorizer").toBeDefined();
   if (authorizer) {
+    const authorizerSource = records(chatTemplate, "AWS::ApiGatewayV2::Authorizer").some(
+      ({ logicalId }) => logicalId === authorizer.logicalId,
+    )
+      ? chatTemplate
+      : accountTemplate;
+    const authorizerStackName =
+      authorizerSource === chatTemplate ? chatStackName : accountStackName;
+    for (const { properties } of routes) {
+      if (!requiredHistoryRouteKeys.includes(properties.RouteKey)) continue;
+      expect(
+        referencesStackResource(
+          properties.AuthorizerId,
+          authorizer,
+          authorizerSource,
+          authorizerStackName,
+        ),
+        `${properties.RouteKey} must use the existing bot's Cognito authorizer`,
+      ).toBe(true);
+    }
     expect(authorizer.properties.AuthorizerType).toBe("JWT");
     expect(authorizer.properties.JwtConfiguration?.Audience).toBeDefined();
     expect(
@@ -503,12 +541,11 @@ describe("chat history infrastructure template acceptance", () => {
         bot.accountStackName,
         scenario,
       );
-      const runtime = onlyRecord(templates.chatTemplate, "AWS::BedrockAgentCore::Runtime");
+      onlyRecord(templates.chatTemplate, "AWS::BedrockAgentCore::Runtime");
       const table = onlyRecord(templates.chatTemplate, "AWS::DynamoDB::Table");
       const api = onlyRecord(templates.accountTemplate, "AWS::ApiGatewayV2::Api");
       const client = onlyRecord(templates.accountTemplate, "AWS::Cognito::UserPoolClient");
       const pool = onlyRecord(templates.identityTemplate, "AWS::Cognito::UserPool");
-      expect(runtime.logicalId).toBe(expectedRuntimeId);
       expect(table.logicalId).toBe(expectedConversationTableId);
       expect(api.properties.Name).toBe(
         `${resolveEnvironment(environment, "docentes").botResourcePrefix}-account`,

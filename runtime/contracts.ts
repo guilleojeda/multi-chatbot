@@ -118,8 +118,8 @@ type TurnAdmissionInput = {
   resultDeadlineAt: number;
   text: string;
   profileSnapshot: ProfileSnapshot;
-  documentContext?: DocumentContext;
-  contextSnapshot?: ContextSnapshot;
+  documentContext: DocumentContext;
+  contextSnapshot: ContextSnapshot;
   summaryCandidate?: SummaryVersion;
   invocation: Invocation;
   quota: QuotaView;
@@ -127,19 +127,15 @@ type TurnAdmissionInput = {
 };
 
 export type StartTurnInput = TurnAdmissionInput & {
-  operation?: "start";
-  baseOrdinal?: 0;
+  operation: "start";
+  baseOrdinal: 0;
 };
 
-type ContinueTurnOrdinal =
-  | { baseOrdinal: number; expectedLastOrdinal?: number }
-  | { baseOrdinal?: number; expectedLastOrdinal: number };
-
-export type ContinueTurnInput = TurnAdmissionInput &
-  ContinueTurnOrdinal & {
-    operation?: "message";
-    contextReferences: ContextReference[];
-  };
+export type ContinueTurnInput = TurnAdmissionInput & {
+  operation: "message";
+  baseOrdinal: number;
+  contextReferences: ContextReference[];
+};
 
 export type SubmissionSnapshot = {
   sub: string;
@@ -155,7 +151,7 @@ export type SubmissionSnapshot = {
   question: string;
   questionManifest: TurnManifest;
   contextReferences: ContextReference[];
-  contextSnapshot?: ContextSnapshot;
+  contextSnapshot: ContextSnapshot;
   summary?: SummaryVersion;
   answer: string;
   answerManifest: TurnManifest;
@@ -163,7 +159,7 @@ export type SubmissionSnapshot = {
   canContinue: boolean;
   resultDeadlineAt: number;
   profileSnapshot: ProfileSnapshot;
-  documentContext?: DocumentContext;
+  documentContext: DocumentContext;
   invocation: Invocation;
   failure?: { code: string };
   ownerAttemptId?: string;
@@ -182,6 +178,7 @@ export type ConversationMeta = {
   activeQueryId?: string;
   activeOwnerAttemptId?: string;
   closed?: boolean;
+  hiddenAt?: unknown;
   historyOwner?: string;
   historyOrder?: string;
   historyLabel?: string;
@@ -192,6 +189,7 @@ export type ConversationStoreErrorCode =
   | "quota_period_changed"
   | "submission_exists"
   | "conversation_busy"
+  | "conversation_hidden"
   | "stale_base"
   | "conflict"
   | "storage_capacity_exceeded";

@@ -208,6 +208,17 @@ function uuidSequence() {
   return () => values[cursor++] || "d266b6c3-5c0d-4b45-a9da-77b675bed25b";
 }
 
+function confirmedHistoryMeta(conversationId, { label = originalQuestion, lastOrdinal = 1 } = {}) {
+  return {
+    conversationId,
+    ownerSub: defaultIdentity.sub,
+    botId: defaultIdentity.botId,
+    label,
+    lastOrdinal,
+    closed: false,
+  };
+}
+
 function createEnvironment({
   storage = new MemorySessionStorage(),
   identity = defaultIdentity,
@@ -219,6 +230,7 @@ function createEnvironment({
   requestPasswordReset = vi.fn(async () => undefined),
   confirmPasswordReset = vi.fn(async () => undefined),
   historySnapshot,
+  historyMeta,
   streamHandler = (request) =>
     sse([
       {
@@ -319,6 +331,28 @@ function createEnvironment({
                 },
               ]
             : [],
+        });
+      }
+      const metaMatch = /^\/api\/chat\/conversations\/([^/]+)$/.exec(parsed.pathname);
+      if (metaMatch && (!init.method || init.method === "GET")) {
+        const conversationId = decodeURIComponent(metaMatch[1]);
+        const headers = new Headers(init.headers);
+        if (
+          !historyMeta ||
+          conversationId !== historyMeta.conversationId ||
+          historyMeta.ownerSub !== identity.sub ||
+          historyMeta.botId !== identity.botId ||
+          identity.botId !== config.botId ||
+          headers.get("authorization") !== `Bearer ${session.accessToken()}`
+        ) {
+          return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 404);
+        }
+        return jsonResponse({
+          version: 1,
+          conversationId: historyMeta.conversationId,
+          label: historyMeta.label,
+          lastOrdinal: historyMeta.lastOrdinal,
+          closed: historyMeta.closed,
         });
       }
       if (!historySnapshot) return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 404);
@@ -423,8 +457,12 @@ async function seedAcceptedJournal(storage = new MemorySessionStorage()) {
   await acceptedStream.accepted;
   await app.flush();
   const request = startCalls(environment)[0].request;
+  const historyMeta = confirmedHistoryMeta(request.conversationId, {
+    label: originalQuestion,
+    lastOrdinal: request.baseOrdinal + 1,
+  });
   expect(findStoredRecord(storage, request.queryId)).not.toBeNull();
-  return { environment, app, request, acceptedStream, storage };
+  return { environment, app, request, acceptedStream, historyMeta, storage };
 }
 
 function recoverCalls(environment) {
@@ -472,6 +510,7 @@ describe("the chat recovery journal and restored submission", () => {
     const environment = createEnvironment({
       storage,
       session,
+      historyMeta: confirmedHistoryMeta(initialConversationId),
       recoverHandler: (request) =>
         jsonResponse(
           snapshot(request, {
@@ -695,6 +734,7 @@ describe("the chat recovery journal and restored submission", () => {
     seeded.app.dispose();
     const restored = createEnvironment({
       storage: seeded.storage,
+      historyMeta: seeded.historyMeta,
       recoverHandler: (request) =>
         jsonResponse(
           snapshot(request, {
@@ -735,12 +775,17 @@ describe("the chat recovery journal and restored submission", () => {
     await vi.waitFor(() => expect(startCalls(first)).toHaveLength(1));
     await initialStream.accepted;
     await firstApp.flush();
+    const admittedRequest = startCalls(first)[0].request;
     firstApp.dispose();
 
     const secondPoll = deferred();
     let pollCount = 0;
     const restored = createEnvironment({
       storage,
+      historyMeta: confirmedHistoryMeta(admittedRequest.conversationId, {
+        label: originalQuestion,
+        lastOrdinal: admittedRequest.baseOrdinal + 1,
+      }),
       recoverHandler: (request) => {
         pollCount += 1;
         if (pollCount === 1) {
@@ -811,6 +856,7 @@ describe("the chat recovery journal and restored submission", () => {
     const attemptedAt = [];
     const restored = createEnvironment({
       storage: seeded.storage,
+      historyMeta: seeded.historyMeta,
       recoverHandler: (request) => {
         attemptedAt.push(Date.now());
         return attemptedAt.length <= 2
@@ -848,6 +894,7 @@ describe("the chat recovery journal and restored submission", () => {
     const olderRecover = deferred();
     const restored = createEnvironment({
       storage: seeded.storage,
+      historyMeta: seeded.historyMeta,
       recoverHandler: (request) =>
         recoverCalls(restored).length === 1
           ? olderRecover.promise
@@ -1072,7 +1119,14 @@ describe("the chat recovery journal and restored submission", () => {
     initialApp.dispose();
 
     const pendingSnapshot = deferred();
-    const restored = createEnvironment({ storage, recoverHandler: () => pendingSnapshot.promise });
+    const restored = createEnvironment({
+      storage,
+      historyMeta: confirmedHistoryMeta(original.conversationId, {
+        label: originalQuestion,
+        lastOrdinal: original.baseOrdinal + 1,
+      }),
+      recoverHandler: () => pendingSnapshot.promise,
+    });
     const restoredApp = mount(restored);
     await initialize(restoredApp);
     await vi.waitFor(() => expect(recoverCalls(restored)).toHaveLength(1));

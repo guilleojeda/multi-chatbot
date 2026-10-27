@@ -28,6 +28,7 @@ function makeMeta(overrides = {}) {
 
 function makeTurn(ordinal, queryId, overrides = {}) {
   const status = overrides.status ?? "completed";
+  const answerManifest = overrides.answerManifest ?? { count: 1, complete: status === "completed" };
   return {
     pk: "CONV#" + conversationId,
     sk: "TURN#" + String(ordinal).padStart(8, "0"),
@@ -36,11 +37,20 @@ function makeTurn(ordinal, queryId, overrides = {}) {
     botId,
     ordinal,
     queryId,
+    requestFingerprint: `fingerprint-${ordinal}`,
+    operation: ordinal === 1 ? "start" : "message",
+    baseOrdinal: ordinal - 1,
+    ownerAttemptId: `attempt-${ordinal}`,
+    resultDeadlineAt: Date.parse("2026-10-24T13:00:00.000Z"),
     status,
-    phase: status === "completed" ? "complete" : "failed",
-    cursor: 1,
+    phase:
+      status === "completed" ? "complete" : status === "failed" ? "failed" : "invocation_claimed",
+    cursor: answerManifest.count,
     questionManifest: { count: 1, complete: true },
-    answerManifest: { count: 1, complete: status === "completed" },
+    answerManifest,
+    contextManifest: { count: 0, complete: true },
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContextManifest: { count: 1, complete: true },
     ...overrides,
   };
 }
@@ -66,23 +76,20 @@ function chunk(ordinal, queryId, role, index, text) {
   };
 }
 
-function makeLegacyFailedTurn(answerCount) {
+function makeFailedTurn(answerCount) {
   const turn = makeTurn(1, q1, {
     status: "failed",
     phase: "failed",
     cursor: answerCount,
     answerManifest: { count: answerCount, complete: false },
   });
-  delete turn.cursor;
   return turn;
 }
 
-function legacyAnswerChunks(count, extra = 0) {
-  return Array.from({ length: count + extra }, (_, index) => {
-    const legacyChunk = chunk(1, q1, "assistant", index, `answer-${index};`);
-    delete legacyChunk.ordinal;
-    return legacyChunk;
-  });
+function answerChunks(count, extra = 0) {
+  return Array.from({ length: count + extra }, (_, index) =>
+    chunk(1, q1, "assistant", index, `answer-${index};`),
+  );
 }
 
 function queryPrefixPage(command, rows) {
@@ -113,6 +120,45 @@ function createStore(send, now = () => Date.parse("2026-10-24T12:00:00.000Z")) {
 }
 
 describe("history reader regressions", () => {
+  it.each(["readConversationMeta", "readTurns", "readText"])(
+    "%s distinguishes a hidden owned META from a missing META before reading content",
+    async (method) => {
+      for (const [meta, expectedCode] of [
+        [makeMeta({ hiddenAt: null }), "conversation_hidden"],
+        [undefined, "conversation_unavailable"],
+      ]) {
+        const send = vi.fn(async (command) => {
+          if (command instanceof GetCommand && command.input.Key.sk === "META") {
+            return { Item: meta };
+          }
+          throw new Error("The public gate must reject before reading content.");
+        });
+        const store = createStore(send);
+        const request = {
+          sub,
+          botId,
+          conversationId,
+          ordinal: 1,
+          queryId: q1,
+          role: "user",
+          limit: 1,
+        };
+        const operation =
+          method === "readConversationMeta"
+            ? store.readConversationMeta({ sub, botId, conversationId })
+            : store[method](request);
+
+        await expect(operation).rejects.toMatchObject({ code: expectedCode });
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(send.mock.calls[0][0]).toBeInstanceOf(GetCommand);
+        expect(send.mock.calls[0][0].input.Key).toEqual({
+          pk: `CONV#${conversationId}`,
+          sk: "META",
+        });
+      }
+    },
+  );
+
   it("reads only known turn ordinals instead of evaluating earlier child rows", async () => {
     const meta = makeMeta({ lastOrdinal: 3 });
     const turns = new Map([
@@ -558,48 +604,37 @@ describe("history reader regressions", () => {
     }
   });
 
-  it("reports a legacy active turn without recovery identity as unconfirmable without mutation", async () => {
-    const oldActive = makeTurn(3, q2, {
+  it("rejects an active current turn missing its recovery identity", async () => {
+    const incompleteActive = makeTurn(3, q2, {
       status: "in_progress",
-      phase: undefined,
-      ownerAttemptId: undefined,
-      resultDeadlineAt: undefined,
+      phase: "invocation_claimed",
       cursor: 0,
       answerManifest: { count: 0, complete: false },
     });
+    delete incompleteActive.ownerAttemptId;
+    delete incompleteActive.resultDeadlineAt;
     const send = vi.fn(async (command) => {
       if (command instanceof GetCommand) {
-        return { Item: command.input.Key.sk === "META" ? makeMeta() : oldActive };
+        return { Item: command.input.Key.sk === "META" ? makeMeta() : incompleteActive };
       }
       throw new Error("Unexpected command " + command.constructor.name);
     });
-    const result = await createStore(send).readTurns({ sub, botId, conversationId, limit: 1 });
-    expect(result.turns.find(({ ordinal }) => ordinal === 3)).toMatchObject({
-      status: "in_progress",
-      failure: { code: "unconfirmable" },
-    });
-    expect(result.closed).toBe(false);
-    expect(result.canContinue).toBe(false);
+    await expect(
+      createStore(send).readTurns({ sub, botId, conversationId, limit: 1 }),
+    ).rejects.toMatchObject({ code: "conversation_unavailable" });
     expect(send.mock.calls.some(([command]) => command instanceof TransactWriteCommand)).toBe(
       false,
     );
   });
 
-  it("opens the known pre-quota generating phase as unconfirmable without recovery", async () => {
-    const legacyActive = makeTurn(1, q1, {
+  it("rejects a pre-quota generating phase instead of deriving a readable prefix", async () => {
+    const outdatedActive = makeTurn(1, q1, {
       status: "in_progress",
       phase: "generating",
       cursor: 0,
       answerManifest: { count: 0, complete: false },
     });
-    delete legacyActive.cursor;
-    delete legacyActive.resultDeadlineAt;
-    delete legacyActive.ownerAttemptId;
-    const legacyChunks = [
-      chunk(1, q1, "user", 0, "Pregunta histórica."),
-      chunk(1, q1, "assistant", 0, "Prefijo durable "),
-      chunk(1, q1, "assistant", 1, "sin confirmar."),
-    ];
+    const queries = [];
     const send = vi.fn(async (command) => {
       if (command instanceof GetCommand) {
         return {
@@ -610,66 +645,48 @@ describe("history reader regressions", () => {
                   activeQueryId: undefined,
                   activeOwnerAttemptId: undefined,
                 })
-              : legacyActive,
+              : outdatedActive,
         };
       }
       if (command instanceof QueryCommand) {
-        return queryPrefixPage(command, legacyChunks);
+        queries.push(command);
+        return queryPrefixPage(command, []);
       }
-      throw new Error("Legacy active turns must not be reconciled: " + command.constructor.name);
+      throw new Error("Outdated turn must not be reconciled: " + command.constructor.name);
     });
 
-    const store = createStore(send);
-    const result = await store.readTurns({ sub, botId, conversationId, limit: 1 });
-    const answer = await store.readText({
-      sub,
-      botId,
-      conversationId,
-      ordinal: 1,
-      queryId: q1,
-      role: "assistant",
-      throughCursor: result.turns[0].cursor,
-    });
-
-    expect(result).toMatchObject({
-      canContinue: false,
-      turns: [
-        {
-          status: "in_progress",
-          cursor: 2,
-          answerManifest: { count: 0, complete: false },
-          failure: { code: "unconfirmable" },
-        },
-      ],
-    });
-    expect(answer).toMatchObject({
-      chunks: [
-        { index: 0, text: "Prefijo durable " },
-        { index: 1, text: "sin confirmar." },
-      ],
-      complete: true,
-    });
+    await expect(
+      createStore(send).readTurns({ sub, botId, conversationId, limit: 1 }),
+    ).rejects.toMatchObject({ code: "conversation_unavailable" });
+    expect(queries).toHaveLength(0);
     expect(send.mock.calls.some(([command]) => command instanceof TransactWriteCommand)).toBe(
       false,
     );
   });
 
-  it("paginates a long legacy prefix and rejects gaps while reading it", async () => {
-    const legacyActive = makeTurn(1, q1, {
+  it("paginates a current long prefix and rejects gaps while reading it", async () => {
+    const active = makeTurn(1, q1, {
       status: "in_progress",
-      phase: "generating",
-      answerManifest: { count: 0, complete: false },
+      phase: "invocation_claimed",
+      ownerAttemptId: "attempt-current",
+      resultDeadlineAt: Date.parse("2026-10-24T13:00:00.000Z"),
+      cursor: 201,
+      answerManifest: { count: 201, complete: false },
     });
-    delete legacyActive.cursor;
-    delete legacyActive.resultDeadlineAt;
-    delete legacyActive.ownerAttemptId;
     const prefixChunks = Array.from({ length: 201 }, (_, index) =>
       chunk(1, q1, "assistant", index, `fragment-${index};`),
     );
     const send = vi.fn(async (command) => {
       if (command instanceof GetCommand) {
         return {
-          Item: command.input.Key.sk === "META" ? makeMeta({ lastOrdinal: 1 }) : legacyActive,
+          Item:
+            command.input.Key.sk === "META"
+              ? makeMeta({
+                  lastOrdinal: 1,
+                  activeQueryId: q1,
+                  activeOwnerAttemptId: "attempt-current",
+                })
+              : active,
         };
       }
       if (command instanceof QueryCommand) {
@@ -700,8 +717,7 @@ describe("history reader regressions", () => {
     expect(turns.turns[0]).toMatchObject({
       status: "in_progress",
       cursor: 201,
-      answerManifest: { count: 0, complete: false },
-      failure: { code: "unconfirmable" },
+      answerManifest: { count: 201, complete: false },
     });
     expect(loaded).toHaveLength(201);
     expect(loaded.map(({ index }) => index)).toEqual(
@@ -711,10 +727,10 @@ describe("history reader regressions", () => {
 
     const gappedTurn = makeTurn(1, q1, {
       status: "in_progress",
-      phase: "generating",
-      answerManifest: { count: 0, complete: false },
+      phase: "invocation_claimed",
+      cursor: 3,
+      answerManifest: { count: 3, complete: false },
     });
-    delete gappedTurn.cursor;
     const gappedChunks = [
       chunk(1, q1, "assistant", 0, "first"),
       chunk(1, q1, "assistant", 2, "third"),
@@ -743,7 +759,7 @@ describe("history reader regressions", () => {
     ).rejects.toMatchObject({ code: "conversation_unavailable" });
   });
 
-  it("does not admit arbitrary or incomplete-question legacy phases", async () => {
+  it("does not admit arbitrary or incomplete-question phases", async () => {
     const recordingQuestion = makeTurn(3, q2, {
       status: "in_progress",
       phase: "recording_question",
@@ -848,76 +864,61 @@ describe("history reader regressions", () => {
     });
   });
 
-  it("reads pre-quota turns by deriving a missing cursor and chunk ordinal from canonical data", async () => {
-    const legacy = makeTurn(1, q1);
-    delete legacy.cursor;
-    const legacyChunks = [
-      {
-        pk: legacy.pk,
-        sk: `TURN#00000001#${q1}#USER#00000000`,
-        conversationId,
-        queryId: q1,
-        role: "user",
-        index: 0,
-        text: "Pregunta histórica íntegra.",
-      },
-      {
-        pk: legacy.pk,
-        sk: `TURN#00000001#${q1}#ASSISTANT#00000000`,
-        conversationId,
-        queryId: q1,
-        role: "assistant",
-        index: 0,
-        text: "Respuesta histórica íntegra.",
-      },
-    ];
-    const send = vi.fn(async (command) => {
-      if (command instanceof GetCommand) {
-        return {
-          Item:
-            command.input.Key.sk === "META"
-              ? makeMeta({
-                  lastOrdinal: 1,
-                  activeQueryId: undefined,
-                  activeOwnerAttemptId: undefined,
-                })
-              : legacy,
-        };
-      }
-      if (command instanceof QueryCommand) {
-        if (command.input.FilterExpression) return { Items: [legacy] };
-        const prefix = command.input.ExpressionAttributeValues[":prefix"];
-        return { Items: legacyChunks.filter((chunk) => chunk.sk.startsWith(prefix)) };
-      }
-      throw new Error("Unexpected command " + command.constructor.name);
-    });
-    const store = createStore(send);
+  it.each(["missing turn cursor", "missing text chunk ordinal"])(
+    "rejects current-format history with a %s instead of deriving it from the key",
+    async (missingField) => {
+      const turn = makeTurn(1, q1);
+      const question = chunk(1, q1, "user", 0, "Pregunta completa.");
+      const answer = chunk(1, q1, "assistant", 0, "Respuesta completa.");
+      if (missingField === "missing turn cursor") delete turn.cursor;
+      else delete answer.ordinal;
+      const sends = [];
+      const send = vi.fn(async (command) => {
+        sends.push(command);
+        if (command instanceof GetCommand) {
+          return {
+            Item:
+              command.input.Key.sk === "META"
+                ? makeMeta({
+                    lastOrdinal: 1,
+                    activeQueryId: undefined,
+                    activeOwnerAttemptId: undefined,
+                  })
+                : turn,
+          };
+        }
+        if (command instanceof QueryCommand) {
+          const prefix = command.input.ExpressionAttributeValues?.[":prefix"];
+          return { Items: [question, answer].filter((row) => row.sk.startsWith(prefix)) };
+        }
+        throw new Error("Unexpected command " + command.constructor.name);
+      });
+      const store = createStore(send);
 
-    const turns = await store.readTurns({ sub, botId, conversationId, limit: 1 });
-    const answer = await store.readText({
-      sub,
-      botId,
-      conversationId,
-      ordinal: 1,
-      queryId: q1,
-      role: "assistant",
-    });
-
-    expect(turns.turns).toMatchObject([{ ordinal: 1, cursor: 1, status: "completed" }]);
-    expect(turns.canContinue).toBe(true);
-    expect(answer).toMatchObject({
-      chunks: [{ index: 0, text: "Respuesta histórica íntegra." }],
-      complete: true,
-    });
-    expect(legacy).not.toHaveProperty("cursor");
-    expect(legacyChunks.every((chunk) => !Object.hasOwn(chunk, "ordinal"))).toBe(true);
-  });
+      if (missingField === "missing turn cursor") {
+        await expect(
+          store.readTurns({ sub, botId, conversationId, limit: 1 }),
+        ).rejects.toMatchObject({ code: "conversation_unavailable" });
+      } else {
+        await expect(
+          store.readText({
+            sub,
+            botId,
+            conversationId,
+            ordinal: 1,
+            queryId: q1,
+            role: "assistant",
+          }),
+        ).rejects.toMatchObject({ code: "conversation_unavailable" });
+      }
+      expect(sends.some((command) => command instanceof TransactWriteCommand)).toBe(false);
+    },
+  );
 
   it("rejects an explicit chunk ordinal that disagrees with its canonical key", async () => {
-    const legacy = makeTurn(3, q2);
-    delete legacy.cursor;
+    const current = makeTurn(3, q2);
     const contradictoryChunk = {
-      pk: legacy.pk,
+      pk: current.pk,
       sk: `TURN#00000003#${q2}#ASSISTANT#00000000`,
       conversationId,
       ordinal: 2,
@@ -928,7 +929,7 @@ describe("history reader regressions", () => {
     };
     const send = vi.fn(async (command) => {
       if (command instanceof GetCommand) {
-        return { Item: command.input.Key.sk === "META" ? makeMeta() : legacy };
+        return { Item: command.input.Key.sk === "META" ? makeMeta() : current };
       }
       if (command instanceof QueryCommand) return { Items: [contradictoryChunk] };
       throw new Error("Unexpected command " + command.constructor.name);
@@ -1020,15 +1021,15 @@ describe("history reader regressions", () => {
     expect(assistantQueries[0].Limit).toBe(1);
   });
 
-  it("rejects an undercounted legacy failed answer after a committed Put with a lost acknowledgement", async () => {
-    const legacyFailed = makeLegacyFailedTurn(1);
-    const legacyChunks = [
+  it("rejects an undercounted current failed answer after a committed Put with a lost acknowledgement", async () => {
+    const failedTurn = makeFailedTurn(1);
+    const failedChunks = [
       {
-        ...legacyAnswerChunks(1)[0],
+        ...answerChunks(1)[0],
         text: "a first answer fragment that was acknowledged",
       },
       {
-        ...legacyAnswerChunks(1)[0],
+        ...answerChunks(1)[0],
         sk: `TURN#00000001#${q1}#ASSISTANT#00000001`,
         index: 1,
         text: "x".repeat(8192),
@@ -1045,12 +1046,12 @@ describe("history reader regressions", () => {
                   activeQueryId: undefined,
                   activeOwnerAttemptId: undefined,
                 })
-              : legacyFailed,
+              : failedTurn,
         };
       }
       if (command instanceof QueryCommand) {
         queries.push(command.input);
-        return queryPrefixPage(command, legacyChunks);
+        return queryPrefixPage(command, failedChunks);
       }
       throw new Error("History reads must not write or invoke generation.");
     });
@@ -1072,18 +1073,23 @@ describe("history reader regressions", () => {
       }),
     ).rejects.toMatchObject({ code: "conversation_unavailable" });
 
-    expect(legacyFailed).not.toHaveProperty("cursor");
-    expect(legacyChunks.every((row) => !Object.hasOwn(row, "ordinal"))).toBe(true);
-    expect(legacyChunks.map(({ index }) => index)).toEqual([0, 1]);
+    expect(failedTurn).toMatchObject({
+      phase: "failed",
+      cursor: 1,
+      contextSnapshot: { version: 1, recentReferences: [] },
+      documentContextManifest: { count: 1, complete: true },
+    });
+    expect(failedChunks.every((row) => row.ordinal === 1)).toBe(true);
+    expect(failedChunks.map(({ index }) => index)).toEqual([0, 1]);
     expect(queries.map(({ Limit }) => Limit)).toEqual([2]);
     expect(send.mock.calls.some(([command]) => command instanceof TransactWriteCommand)).toBe(
       false,
     );
   });
 
-  it("checks terminal assistant zero-count and page-size boundaries without rejecting an exact prefix", async () => {
+  it("checks current failed-answer zero-count and page-size boundaries without rejecting an exact prefix", async () => {
     async function readFailedAnswer({ count, chunks, terminalKey = false, cursor } = {}) {
-      const turn = makeLegacyFailedTurn(count);
+      const turn = makeFailedTurn(count);
       const queries = [];
       const store = createStore(async (command) => {
         if (command instanceof GetCommand) {
@@ -1128,7 +1134,7 @@ describe("history reader regressions", () => {
       return { text, queries, store };
     }
 
-    const emptyManifestWithExtra = makeLegacyFailedTurn(0);
+    const emptyManifestWithExtra = makeFailedTurn(0);
     const zeroCountQueries = [];
     const zeroCountStore = createStore(async (command) => {
       if (command instanceof GetCommand) {
@@ -1145,7 +1151,7 @@ describe("history reader regressions", () => {
       }
       if (command instanceof QueryCommand) {
         zeroCountQueries.push(command.input);
-        return queryPrefixPage(command, legacyAnswerChunks(0, 1));
+        return queryPrefixPage(command, answerChunks(0, 1));
       }
       throw new Error("Unexpected command " + command.constructor.name);
     });
@@ -1165,24 +1171,24 @@ describe("history reader regressions", () => {
     expect(emptyExact.text).toMatchObject({ chunks: [], complete: true });
     expect(emptyExact.queries.map(({ Limit }) => Limit)).toEqual([1]);
 
-    const exactSixteen = await readFailedAnswer({ count: 16, chunks: legacyAnswerChunks(16) });
+    const exactSixteen = await readFailedAnswer({ count: 16, chunks: answerChunks(16) });
     expect(exactSixteen.text.chunks).toHaveLength(16);
     expect(exactSixteen.text.complete).toBe(true);
     expect(exactSixteen.queries.map(({ Limit }) => Limit)).toEqual([17]);
 
     await expect(
-      readFailedAnswer({ count: 16, chunks: legacyAnswerChunks(16, 1) }),
+      readFailedAnswer({ count: 16, chunks: answerChunks(16, 1) }),
     ).rejects.toMatchObject({ code: "conversation_unavailable" });
 
     const terminalKeyOnly = await readFailedAnswer({
       count: 16,
-      chunks: legacyAnswerChunks(16),
+      chunks: answerChunks(16),
       terminalKey: true,
     });
     expect(terminalKeyOnly.text).toMatchObject({ complete: true, chunks: expect.any(Array) });
     expect(terminalKeyOnly.queries.map(({ Limit }) => Limit)).toEqual([17, 1]);
 
-    const seventeen = legacyAnswerChunks(17);
+    const seventeen = answerChunks(17);
     const firstPage = await readFailedAnswer({ count: 17, chunks: seventeen });
     expect(firstPage.text).toMatchObject({ complete: false, chunks: expect.any(Array) });
     expect(firstPage.text.chunks).toHaveLength(16);
@@ -1203,7 +1209,7 @@ describe("history reader regressions", () => {
     expect(firstPage.queries.map(({ Limit }) => Limit)).toEqual([16, 2]);
   });
 
-  it("keeps an older frozen assistant prefix readable when the terminal manifest has since grown", async () => {
+  it("keeps a current frozen assistant prefix readable when the terminal manifest has since grown", async () => {
     const active = makeTurn(1, q1, {
       status: "in_progress",
       phase: "invocation_claimed",
@@ -1212,9 +1218,9 @@ describe("history reader regressions", () => {
       cursor: 17,
       answerManifest: { count: 17, complete: false },
     });
-    const terminal = makeLegacyFailedTurn(18);
-    const activeChunks = legacyAnswerChunks(17);
-    const terminalChunks = legacyAnswerChunks(18);
+    const terminal = makeFailedTurn(18);
+    const activeChunks = answerChunks(17);
+    const terminalChunks = answerChunks(18);
     const queries = [];
     let readTerminal = false;
     const store = createStore(async (command) => {

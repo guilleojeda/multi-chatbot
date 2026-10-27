@@ -530,6 +530,62 @@ function belongsToSubmittingIdentity(
   );
 }
 
+function belongsToConversationMeta(
+  meta: unknown,
+  input: { sub: string; botId: string; conversationId: string },
+): meta is ConversationMeta {
+  return (
+    isRecord(meta) &&
+    meta.conversationId === input.conversationId &&
+    meta.sub === input.sub &&
+    meta.botId === input.botId
+  );
+}
+
+function hiddenConversationFailure(queryId?: string) {
+  return safeFailure("conversation_hidden", "unconfirmed", queryId, {
+    canContinue: false,
+    message: "Esta conversación ya no está disponible.",
+  });
+}
+
+function hiddenMetaFailure(
+  meta: unknown,
+  owner: { sub: string; botId: string },
+  conversationId: string,
+  queryId?: string,
+) {
+  if (
+    belongsToConversationMeta(meta, { ...owner, conversationId }) &&
+    Object.prototype.hasOwnProperty.call(meta, "hiddenAt")
+  ) {
+    return hiddenConversationFailure(queryId);
+  }
+  return undefined;
+}
+
+async function snapshotVisibilityFailure(
+  submission: SubmissionSnapshot,
+  owner: { sub: string; botId: string },
+  store: ConversationStore,
+): Promise<ReturnType<typeof safeFailure> | undefined> {
+  let meta: ConversationMeta | null;
+  try {
+    meta = await store.getMeta({ conversationId: submission.conversationId });
+  } catch {
+    return safeFailure("temporarily_unavailable", "unconfirmed", submission.queryId);
+  }
+  if (meta === null) {
+    return safeFailure("temporarily_unavailable", "unconfirmed", submission.queryId);
+  }
+  if (!belongsToConversationMeta(meta, { ...owner, conversationId: submission.conversationId })) {
+    return safeFailure("conversation_unavailable", "not_admitted", submission.queryId);
+  }
+  return Object.prototype.hasOwnProperty.call(meta, "hiddenAt")
+    ? hiddenConversationFailure(submission.queryId)
+    : undefined;
+}
+
 function failureResponse(payload: unknown, failure: ReturnType<typeof safeFailure>): ChatResponse {
   if (isRecord(payload) && payload.version === 2 && payload.operation === "recover") {
     return failure;
@@ -564,6 +620,8 @@ async function rejectAfterSubmissionLookup(
   if (!matchesRequest(persisted, request)) {
     return failureResponse(request, safeFailure("conflict", "not_admitted", request.queryId));
   }
+  const visibilityFailure = await snapshotVisibilityFailure(persisted, profileKey, store);
+  if (visibilityFailure) return failureResponse(request, visibilityFailure);
   return publicSnapshot(persisted);
 }
 
@@ -665,6 +723,8 @@ export function createChatHandler(dependencies: ChatDependencies) {
       if (!matchesRequest(existing, request)) {
         return failureResponse(request, safeFailure("conflict", "not_admitted", request.queryId));
       }
+      const visibilityFailure = await snapshotVisibilityFailure(existing, profileKey, store);
+      if (visibilityFailure) return failureResponse(request, visibilityFailure);
       return publicSnapshot(existing);
     }
     if (request.operation === "recover") {
@@ -702,9 +762,23 @@ export function createChatHandler(dependencies: ChatDependencies) {
 
     if (request.operation === "start") {
       if (meta !== null) {
+        const visibilityFailure = hiddenMetaFailure(
+          meta,
+          profileKey,
+          request.conversationId,
+          request.queryId,
+        );
+        if (visibilityFailure) return failureResponse(request, visibilityFailure);
         return reject(safeFailure("conversation_unavailable", "not_admitted", request.queryId));
       }
     } else {
+      const visibilityFailure = hiddenMetaFailure(
+        meta,
+        profileKey,
+        request.conversationId,
+        request.queryId,
+      );
+      if (visibilityFailure) return failureResponse(request, visibilityFailure);
       if (
         !isOwnedConversationMeta(meta, {
           conversationId: request.conversationId,
@@ -752,6 +826,13 @@ export function createChatHandler(dependencies: ChatDependencies) {
           } catch {
             return reject(safeFailure("temporarily_unavailable", "not_admitted"));
           }
+          const visibilityFailure = hiddenMetaFailure(
+            meta,
+            profileKey,
+            request.conversationId,
+            request.queryId,
+          );
+          if (visibilityFailure) return failureResponse(request, visibilityFailure);
           if (
             !isOwnedConversationMeta(meta, {
               conversationId: request.conversationId,
@@ -997,7 +1078,6 @@ export function createChatHandler(dependencies: ChatDependencies) {
         ...admission,
         operation: "message",
         baseOrdinal: request.baseOrdinal,
-        expectedLastOrdinal: request.baseOrdinal,
         contextReferences,
       };
       return store.continueTurn(continueInput);
@@ -1030,6 +1110,9 @@ export function createChatHandler(dependencies: ChatDependencies) {
       }
     } catch (error) {
       const code = errorCode(error);
+      if (code === "conversation_hidden") {
+        return failureResponse(request, hiddenConversationFailure(request.queryId));
+      }
       if (code === "quota_period_changed") {
         return reject(safeFailure("temporarily_unavailable", "not_admitted", request.queryId));
       }
@@ -1290,6 +1373,8 @@ async function recoverSnapshot(
   ) {
     return safeFailure("conversation_unavailable", "not_admitted", request.queryId);
   }
+  const initialVisibilityFailure = await snapshotVisibilityFailure(submission, owner, store);
+  if (initialVisibilityFailure) return initialVisibilityFailure;
   if (submission.status === "in_progress" && now() >= submission.resultDeadlineAt) {
     try {
       await store.reconcileTurn({
@@ -1313,6 +1398,8 @@ async function recoverSnapshot(
     } catch {
       return safeFailure("temporarily_unavailable", "not_admitted", request.queryId);
     }
+    const reconciledVisibilityFailure = await snapshotVisibilityFailure(submission, owner, store);
+    if (reconciledVisibilityFailure) return reconciledVisibilityFailure;
   }
   return publicSnapshot(submission);
 }

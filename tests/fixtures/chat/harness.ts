@@ -14,6 +14,10 @@ export const fixtureScenarios = [
   { id: "history-pending", label: "Historial: retener la primera lista" },
   { id: "history-snapshot-pending", label: "Historial: retener una lista ya capturada" },
   { id: "history-error", label: "Historial: error temporal al listar" },
+  { id: "history-meta-pending", label: "Historial: retener GET breve de META" },
+  { id: "history-meta-error", label: "Historial: error en GET breve de META" },
+  { id: "history-hide-pending", label: "Historial: retener POST para quitar" },
+  { id: "history-hide-ack-lost", label: "Historial: ocultar y perder la confirmación" },
   { id: "history-unavailable", label: "Historial: lista y apertura temporalmente indisponibles" },
   { id: "history-earlier-pending", label: "Historial: retener una página anterior" },
   { id: "history-reload-error", label: "Historial: META correcto y recarga 503" },
@@ -135,6 +139,7 @@ type FixtureConversation = {
   conversationId: string;
   ownerSub: string;
   botId: string;
+  hiddenAt?: string;
   createdAt?: string;
   updatedAt?: string;
   closed?: boolean;
@@ -261,6 +266,7 @@ function isFixtureConversation(value: unknown): value is FixtureConversation {
     value.conversationId.length > 0 &&
     typeof value.ownerSub === "string" &&
     typeof value.botId === "string" &&
+    (value.hiddenAt === undefined || typeof value.hiddenAt === "string") &&
     (value.createdAt === undefined || typeof value.createdAt === "string") &&
     (value.updatedAt === undefined || typeof value.updatedAt === "string") &&
     (value.closed === undefined || typeof value.closed === "boolean") &&
@@ -297,6 +303,7 @@ function cloneConversation(conversation: FixtureConversation): FixtureConversati
     conversationId: conversation.conversationId,
     ownerSub: conversation.ownerSub,
     botId: conversation.botId,
+    ...(isFixtureHidden(conversation) ? { hiddenAt: conversation.hiddenAt } : {}),
     ...(conversation.createdAt ? { createdAt: conversation.createdAt } : {}),
     ...(conversation.updatedAt ? { updatedAt: conversation.updatedAt } : {}),
     ...(conversation.closed === undefined ? {} : { closed: conversation.closed }),
@@ -333,6 +340,10 @@ function publicTurnStatus(turn: FixtureTurn): "in_progress" | "completed" | "fai
   if (turn.status === "completed") return "completed";
   if (turn.status === "failed") return "failed";
   return "in_progress";
+}
+
+function isFixtureHidden(conversation: FixtureConversation): boolean {
+  return Object.prototype.hasOwnProperty.call(conversation, "hiddenAt");
 }
 
 function productJournalScope(config: ChatBrowserFixture["publicConfig"]) {
@@ -528,6 +539,7 @@ export class ChatBrowserFixture {
   );
   private selectedScenario = initialScenario();
   private historyReloadReads = 0;
+  private hideAcknowledgementLost = false;
   private nextToken = 0;
   private nextRemoteQueryNumber = 0;
   private restoreCount = 0;
@@ -619,6 +631,7 @@ export class ChatBrowserFixture {
   selectScenario(scenario: FixtureScenario) {
     this.selectedScenario = scenario;
     this.historyReloadReads = 0;
+    this.hideAcknowledgementLost = false;
     this.clipboardFailure = scenario === "clipboard-fail";
     this.productStorage.setAdmissionWriteFailure(scenario === "journal-admission-write-failure");
     this.runtime401Used = false;
@@ -980,6 +993,131 @@ export class ChatBrowserFixture {
       this.finish(request, 503, "fallo temporal de las lecturas del historial");
       return this.historyJson({ code: "HISTORY_UNAVAILABLE" }, 503);
     }
+
+    const metaMatch = /^\/api\/chat\/conversations\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && metaMatch) {
+      let conversationId: string;
+      try {
+        conversationId = decodeURIComponent(metaMatch[1]);
+      } catch {
+        this.finish(request, 400, "ID de conversación mal codificado");
+        return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+      }
+      if (!fixtureUuidPattern.test(conversationId)) {
+        this.finish(request, 400, "ID de conversación inválido");
+        return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+      }
+      const conversation = this.conversations.get(conversationId);
+      if (
+        !conversation ||
+        conversation.ownerSub !== sub ||
+        conversation.botId !== this.publicConfig.botId
+      ) {
+        this.finish(request, 404, "META no disponible para esta identidad de fixture");
+        return this.historyJson({ code: "CONVERSATION_UNAVAILABLE" }, 404);
+      }
+      if (this.selectedScenario === "history-meta-error") {
+        this.finish(request, 503, "fallo temporal en la lectura breve de META");
+        return this.historyJson({ code: "HISTORY_UNAVAILABLE" }, 503);
+      }
+      if (this.selectedScenario === "history-meta-pending") {
+        request.status = "pending";
+        request.outcome = "GET breve de META espera el control Liberar historial";
+        this.changed();
+        await new Promise<void>((resolve) =>
+          this.pendingHistoryReads.push({ request, release: resolve }),
+        );
+        if (this.selectedScenario === "history-meta-pending") this.selectedScenario = "ready";
+        if (isFixtureHidden(conversation)) {
+          this.finish(request, 404, "META se ocultó mientras la lectura esperaba");
+          return this.historyJson({ code: "CONVERSATION_HIDDEN" }, 404);
+        }
+      }
+      if (isFixtureHidden(conversation)) {
+        this.finish(request, 404, "META oculto para el dueño; no se devuelve el resumen");
+        return this.historyJson({ code: "CONVERSATION_HIDDEN" }, 404);
+      }
+      const orderedTurns = [...conversation.turns].sort(
+        (left, right) => left.ordinal - right.ordinal,
+      );
+      const firstTurn = orderedTurns[0];
+      const latestTurn = orderedTurns[orderedTurns.length - 1];
+      if (!firstTurn || !latestTurn) {
+        this.finish(request, 404, "la conversación todavía no tiene un primer turno durable");
+        return this.historyJson({ code: "CONVERSATION_UNAVAILABLE" }, 404);
+      }
+      this.finish(request, 200, `META visible confirmada para ${sub}`);
+      return this.historyJson({
+        version: 1,
+        conversationId,
+        label: historyLabel(firstTurn.question),
+        ...(conversation.createdAt ? { createdAt: conversation.createdAt } : {}),
+        ...(conversation.updatedAt ? { updatedAt: conversation.updatedAt } : {}),
+        lastOrdinal: latestTurn.ordinal,
+        closed: conversation.closed === true,
+        ...(publicTurnStatus(latestTurn) === "in_progress"
+          ? { activeQueryId: latestTurn.queryId }
+          : {}),
+      });
+    }
+
+    const hideMatch = /^\/api\/chat\/conversations\/([^/]+)\/hide$/.exec(url.pathname);
+    if (request.method === "POST" && hideMatch) {
+      let conversationId: string;
+      try {
+        conversationId = decodeURIComponent(hideMatch[1]);
+      } catch {
+        this.finish(request, 400, "ID de conversación mal codificado");
+        return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+      }
+      if (!fixtureUuidPattern.test(conversationId) || request.body !== undefined) {
+        this.finish(request, 400, "solicitud para quitar inválida");
+        return this.historyJson({ code: "INVALID_REQUEST" }, 400);
+      }
+      const conversation = this.conversations.get(conversationId);
+      if (
+        !conversation ||
+        conversation.ownerSub !== sub ||
+        conversation.botId !== this.publicConfig.botId ||
+        conversation.turns.length === 0
+      ) {
+        this.finish(request, 404, "no se confirmó una conversación propia para quitar");
+        return this.historyJson({ code: "CONVERSATION_UNAVAILABLE" }, 404);
+      }
+      if (this.selectedScenario === "history-hide-pending") {
+        request.status = "pending";
+        request.outcome = "POST para quitar espera el control Liberar historial";
+        this.changed();
+        await new Promise<void>((resolve) =>
+          this.pendingHistoryReads.push({ request, release: resolve }),
+        );
+        if (this.selectedScenario === "history-hide-pending") this.selectedScenario = "ready";
+      }
+      const alreadyHidden = isFixtureHidden(conversation);
+      if (!alreadyHidden) {
+        conversation.hiddenAt = new Date().toISOString();
+        this.persistConversations();
+      }
+      const hiddenAt = conversation.hiddenAt;
+      if (this.selectedScenario === "history-hide-ack-lost" && !this.hideAcknowledgementLost) {
+        this.hideAcknowledgementLost = true;
+        this.finish(request, "network-error", "marca hiddenAt persistida; se perdió el ACK HTTP");
+        throw new TypeError("Failed to fetch");
+      }
+      if (typeof hiddenAt !== "string") {
+        this.finish(request, 503, "META oculto sin timestamp verificable");
+        return this.historyJson({ code: "HISTORY_UNAVAILABLE" }, 503);
+      }
+      this.finish(
+        request,
+        200,
+        alreadyHidden
+          ? "se confirmó idempotentemente la conversación ya oculta"
+          : "marca hiddenAt confirmada",
+      );
+      return this.historyJson({ version: 1, conversationId, hiddenAt });
+    }
+
     if (url.pathname === listPath && request.method === "GET") {
       if (this.selectedScenario === "history-error") {
         this.finish(request, 503, "fallo temporal al listar el historial");
@@ -1013,6 +1151,7 @@ export class ChatBrowserFixture {
         (conversation) =>
           conversation.ownerSub === sub &&
           conversation.botId === this.publicConfig.botId &&
+          !isFixtureHidden(conversation) &&
           conversation.turns.length > 0,
       );
       const conversations = scoped.sort((left, right) => {
@@ -1100,6 +1239,10 @@ export class ChatBrowserFixture {
     if (conversation.ownerSub !== sub || conversation.botId !== this.publicConfig.botId) {
       this.finish(request, 403, "el historial pertenece a otro sujeto o bot");
       return this.historyJson({ code: "FORBIDDEN" }, 403);
+    }
+    if (isFixtureHidden(conversation)) {
+      this.finish(request, 404, "conversación oculta; no se devuelven turnos ni texto");
+      return this.historyJson({ code: "CONVERSATION_HIDDEN" }, 404);
     }
 
     if (
@@ -1350,6 +1493,34 @@ export class ChatBrowserFixture {
     });
   }
 
+  private hiddenRuntimeResponse(
+    request: FixtureRequest,
+    operation: "start" | "message" | "recover",
+    conversationId: string,
+    queryId: string,
+    sub: string,
+  ): Response | null {
+    const conversation = this.conversations.get(conversationId);
+    if (
+      !conversation ||
+      conversation.ownerSub !== sub ||
+      conversation.botId !== this.publicConfig.botId ||
+      !isFixtureHidden(conversation)
+    ) {
+      return null;
+    }
+    const failure = {
+      type: "failed",
+      code: "conversation_hidden",
+      message: "Esta conversación ya no está disponible.",
+      recordStatus: "unconfirmed",
+      queryId,
+      canContinue: false,
+    };
+    this.finish(request, 200, `${operation} denegado por ocultación propia; sin leer ni admitir`);
+    return operation === "recover" ? json(failure) : sseResponse(failure);
+  }
+
   private async runtimeResponse(
     request: FixtureRequest,
     requestBody: unknown,
@@ -1378,6 +1549,15 @@ export class ChatBrowserFixture {
       this.finish(request, 400, "la solicitud no cumple el contrato v2");
       return json({ code: "INVALID_REQUEST" }, 400);
     }
+
+    const hiddenResponse = this.hiddenRuntimeResponse(
+      request,
+      operation,
+      conversationId,
+      queryId,
+      sub,
+    );
+    if (hiddenResponse) return hiddenResponse;
 
     if (this.selectedScenario === "runtime-401-pending" && !this.runtime401Used) {
       this.runtime401Used = true;
@@ -1697,7 +1877,9 @@ export class ChatBrowserFixture {
     this.pendingHistoryReads.shift()?.release();
     if (
       this.selectedScenario === "history-pending" ||
-      this.selectedScenario === "history-snapshot-pending"
+      this.selectedScenario === "history-snapshot-pending" ||
+      this.selectedScenario === "history-meta-pending" ||
+      this.selectedScenario === "history-hide-pending"
     )
       this.selectedScenario = "ready";
     this.changed();
@@ -1863,6 +2045,7 @@ export class ChatBrowserFixture {
       !conversation ||
       conversation.ownerSub !== sub ||
       conversation.botId !== this.publicConfig.botId ||
+      isFixtureHidden(conversation) ||
       !turn ||
       turn.status !== "streaming"
     ) {
@@ -2072,17 +2255,24 @@ export class ChatBrowserFixture {
     const sessionSub = accessToken ? (this.tokens.get(accessToken) ?? null) : null;
     const sessionIdentity = identities.find(({ sub }) => sub === sessionSub) || null;
     const restoredActiveCount = this.restoredActiveTurns().length;
-    const remoteAdvanceEntry = readProductJournal(this.publicConfig).entries.find(
-      (entry) =>
-        entry.sub === sessionSub &&
-        entry.botId === this.publicConfig.botId &&
-        entry.request !== null &&
-        this.conversations
-          .get(entry.request.conversationId)
-          ?.turns.some(
-            (turn) => turn.queryId === entry.request?.queryId && turn.status === "streaming",
-          ),
-    );
+    const remoteAdvanceEntry = readProductJournal(this.publicConfig).entries.find((entry) => {
+      if (
+        entry.sub !== sessionSub ||
+        entry.botId !== this.publicConfig.botId ||
+        entry.request === null
+      ) {
+        return false;
+      }
+      const request = entry.request;
+      const conversation = this.conversations.get(request.conversationId);
+      return (
+        conversation !== undefined &&
+        !isFixtureHidden(conversation) &&
+        conversation.turns.some(
+          (turn) => turn.queryId === request.queryId && turn.status === "streaming",
+        )
+      );
+    });
     return {
       fixture: "chat-browser-local",
       route,
@@ -2119,6 +2309,7 @@ export class ChatBrowserFixture {
         ownerSub: conversation.ownerSub,
         ...(conversation.createdAt ? { createdAt: conversation.createdAt } : {}),
         ...(conversation.updatedAt ? { updatedAt: conversation.updatedAt } : {}),
+        ...(isFixtureHidden(conversation) ? { hiddenAt: conversation.hiddenAt } : {}),
         closed: conversation.closed === true,
         turns: conversation.turns.map((turn) => ({ ...turn })),
       })),

@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import { GetCommand, QueryCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import {
+  GetCommand,
+  QueryCommand,
+  UpdateCommand,
+  type DynamoDBDocumentClient,
+} from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "./conversation-store.js";
 import type { ConversationMeta } from "./contracts.js";
 import { parseVerifiedHistoryTimestamp } from "./history-projection.js";
@@ -15,6 +20,7 @@ type Code =
   | "invalid_cursor"
   | "invalid_request"
   | "forbidden"
+  | "conversation_hidden"
   | "conversation_unavailable"
   | "history_unavailable";
 type Err = Error & { code: Code };
@@ -74,22 +80,6 @@ function presentationUpdatedAt(
     ? projectedAt.value
     : updatedAt.value;
 }
-function isLegacyGeneratingTurn(value: unknown): boolean {
-  if (!isRecord(value) || value.status !== "in_progress" || value.phase !== "generating") {
-    return false;
-  }
-  const question = value.questionManifest;
-  const answer = value.answerManifest;
-  return (
-    isRecord(question) &&
-    positive(question.count) &&
-    question.complete === true &&
-    isRecord(answer) &&
-    answer.count === 0 &&
-    answer.complete === false &&
-    (value.cursor === undefined || value.cursor === 0)
-  );
-}
 function hashScope(sub: string, botId: string): string {
   return createHash("sha256")
     .update(sub + "\0" + botId)
@@ -147,6 +137,7 @@ function asStorageError(error: unknown, fallback: Code): Err {
     "invalid_cursor",
     "invalid_request",
     "forbidden",
+    "conversation_hidden",
     "conversation_unavailable",
     "history_unavailable",
   ];
@@ -177,36 +168,46 @@ function validTurn(
   const answerCount =
     isRecord(value) && isRecord(value.answerManifest) ? value.answerManifest.count : undefined;
   const cursor = isRecord(value) ? value.cursor : undefined;
+  const phase = isRecord(value) ? value.phase : undefined;
+  const ordinal = isRecord(value) ? value.ordinal : undefined;
+  const operation = isRecord(value) ? value.operation : undefined;
+  const baseOrdinal = isRecord(value) ? value.baseOrdinal : undefined;
+  const status = isRecord(value) ? value.status : undefined;
+  const validPhase =
+    (status === "in_progress" && (phase === "admitted" || phase === "invocation_claimed")) ||
+    (status === "completed" && phase === "complete") ||
+    (status === "failed" && phase === "failed");
   return (
     isRecord(value) &&
     value.pk === "CONV#" + input.id &&
     value.conversationId === input.id &&
-    positive(value.ordinal) &&
-    (input.ordinal === undefined || value.ordinal === input.ordinal) &&
-    value.sk === turnKey(input.id, Number(value.ordinal)).sk &&
+    positive(ordinal) &&
+    (input.ordinal === undefined || ordinal === input.ordinal) &&
+    value.sk === turnKey(input.id, ordinal).sk &&
     value.sub === input.sub &&
     value.botId === input.botId &&
     typeof value.queryId === "string" &&
     uuid.test(value.queryId) &&
-    ["in_progress", "completed", "failed"].includes(String(value.status)) &&
-    (value.phase === undefined ||
-      (value.status === "in_progress"
-        ? ["admitted", "invocation_claimed"].includes(String(value.phase)) ||
-          isLegacyGeneratingTurn(value)
-        : value.status === "completed"
-          ? value.phase === "complete"
-          : value.phase === "failed")) &&
+    typeof value.requestFingerprint === "string" &&
+    value.requestFingerprint.length > 0 &&
+    operation === (ordinal === 1 ? "start" : "message") &&
+    baseOrdinal === ordinal - 1 &&
+    typeof value.ownerAttemptId === "string" &&
+    value.ownerAttemptId.length > 0 &&
+    nonNegative(value.resultDeadlineAt) &&
+    validPhase &&
     isRecord(value.questionManifest) &&
     positive(value.questionManifest.count) &&
     value.questionManifest.complete === true &&
     isRecord(value.answerManifest) &&
     nonNegative(value.answerManifest.count) &&
     typeof value.answerManifest.complete === "boolean" &&
-    (cursor === undefined || (nonNegative(cursor) && cursor === answerCount)) &&
-    (value.status !== "completed" || positive(value.answerManifest.count)) &&
-    (value.status !== "in_progress" || value.answerManifest.complete === false) &&
-    (value.status !== "completed" || value.answerManifest.complete === true) &&
-    (value.status !== "failed" || value.answerManifest.complete === false)
+    nonNegative(cursor) &&
+    cursor === answerCount &&
+    (status !== "completed" || positive(value.answerManifest.count)) &&
+    (status !== "in_progress" || value.answerManifest.complete === false) &&
+    (status !== "completed" || value.answerManifest.complete === true) &&
+    (status !== "failed" || value.answerManifest.complete === false)
   );
 }
 function validChunk(
@@ -220,7 +221,7 @@ function validChunk(
       textPrefix(input.id, input.ordinal, input.queryId, input.role) +
         String(value.index).padStart(8, "0") &&
     value.conversationId === input.id &&
-    (value.ordinal === undefined || value.ordinal === input.ordinal) &&
+    value.ordinal === input.ordinal &&
     value.queryId === input.queryId &&
     value.role === input.role &&
     nonNegative(value.index) &&
@@ -285,10 +286,113 @@ export function createHistoryStore(input: {
     if (!meta) throw fail("conversation_unavailable", "Conversation is unavailable.");
     if (meta.sub !== sub || meta.botId !== botId)
       throw fail("forbidden", "Conversation is unavailable.");
+    if (Object.hasOwn(meta, "hiddenAt")) {
+      throw fail("conversation_hidden", "Conversation is unavailable.");
+    }
     if (!validMeta(meta, id)) {
       throw fail("conversation_unavailable", "Conversation is unavailable.");
     }
     return meta;
+  }
+
+  function conversationSummaryFields(meta: Meta, conversationId: string) {
+    if (typeof meta.historyLabel !== "string" || !meta.historyLabel.trim()) {
+      throw fail("conversation_unavailable", "Conversation is unavailable.");
+    }
+    const updatedAt = presentationUpdatedAt(meta, conversationId, ownerKey(meta.sub));
+    return {
+      conversationId,
+      label: meta.historyLabel,
+      ...(isVerifiedTimestamp(meta.createdAt) ? { createdAt: meta.createdAt } : {}),
+      ...(updatedAt ? { updatedAt } : {}),
+      lastOrdinal: meta.lastOrdinal,
+      closed: meta.closed === true,
+      ...(typeof meta.activeQueryId === "string" ? { activeQueryId: meta.activeQueryId } : {}),
+    };
+  }
+
+  function conversationSummary(meta: Meta, conversationId: string) {
+    return { version: 1 as const, ...conversationSummaryFields(meta, conversationId) };
+  }
+
+  async function readConversationMeta(scope: {
+    sub: string;
+    botId: string;
+    conversationId: string;
+  }) {
+    scopeHash(scope);
+    if (typeof scope.conversationId !== "string" || !uuid.test(scope.conversationId)) {
+      throw fail("invalid_request", "Conversation ID is invalid.");
+    }
+    const meta = await ownedMeta(scope.sub, scope.conversationId);
+    return conversationSummary(meta, scope.conversationId);
+  }
+
+  async function hideConversation(scope: { sub: string; botId: string; conversationId: string }) {
+    scopeHash(scope);
+    if (typeof scope.conversationId !== "string" || !uuid.test(scope.conversationId)) {
+      throw fail("invalid_request", "Conversation ID is invalid.");
+    }
+    const timestamp = now();
+    if (!Number.isFinite(timestamp)) {
+      throw fail("history_unavailable", "Conversation history is temporarily unavailable.");
+    }
+    let hiddenAt: string;
+    try {
+      hiddenAt = new Date(timestamp).toISOString();
+    } catch {
+      throw fail("history_unavailable", "Conversation history is temporarily unavailable.");
+    }
+    let result: Record<string, unknown>;
+    try {
+      result = await documentClient.send(
+        new UpdateCommand({
+          TableName: tableName,
+          Key: { pk: "CONV#" + scope.conversationId, sk: "META" },
+          UpdateExpression:
+            "SET #hiddenAt = if_not_exists(#hiddenAt, :hiddenAt) REMOVE #historyOwner",
+          ConditionExpression:
+            "attribute_exists(#pk) AND #conversationId = :conversationId AND #sub = :sub AND #botId = :botId",
+          ExpressionAttributeNames: {
+            "#pk": "pk",
+            "#conversationId": "conversationId",
+            "#sub": "sub",
+            "#botId": "botId",
+            "#hiddenAt": "hiddenAt",
+            "#historyOwner": "historyOwner",
+          },
+          ExpressionAttributeValues: {
+            ":conversationId": scope.conversationId,
+            ":sub": scope.sub,
+            ":botId": scope.botId,
+            ":hiddenAt": hiddenAt,
+          },
+          ReturnValues: "UPDATED_NEW",
+        }),
+      );
+    } catch (error) {
+      if (
+        isRecord(error) &&
+        (error.name === "ConditionalCheckFailedException" ||
+          error.name === "TransactionCanceledException")
+      ) {
+        throw fail("conversation_unavailable", "Conversation is unavailable.");
+      }
+      const mapped = asStorageError(error, "history_unavailable");
+      if (error instanceof Error && mapped.code === "history_unavailable") {
+        mapped.message = error.message;
+      }
+      throw mapped;
+    }
+    const attributes = isRecord(result.Attributes) ? result.Attributes : undefined;
+    if (!attributes || !isVerifiedTimestamp(attributes.hiddenAt)) {
+      throw fail("history_unavailable", "Conversation history is temporarily unavailable.");
+    }
+    return {
+      version: 1 as const,
+      conversationId: scope.conversationId,
+      hiddenAt: attributes.hiddenAt,
+    };
   }
 
   async function listConversations(scope: {
@@ -377,21 +481,16 @@ export function createHistoryStore(input: {
         } catch (error) {
           throw asStorageError(error, "history_unavailable");
         }
-        // GSI updates are eventual; stale and now-foreign projections are skipped.
+        // GSI updates are eventual; stale, hidden, and now-foreign projections are skipped.
         if (!meta || meta.sub !== scope.sub || meta.botId !== botId) continue;
+        if (Object.hasOwn(meta, "hiddenAt")) continue;
+        if (!validMeta(meta, id)) {
+          throw fail("history_unavailable", "Conversation history projection is invalid.");
+        }
         if (typeof meta.historyLabel !== "string" || !meta.historyLabel.trim()) {
           throw fail("history_unavailable", "Conversation history projection is invalid.");
         }
-        const updatedAt = presentationUpdatedAt(meta, id, ownerKey(scope.sub));
-        const row: Record<string, unknown> = {
-          conversationId: id,
-          label: meta.historyLabel,
-          lastOrdinal: meta.lastOrdinal,
-          closed: meta.closed === true,
-          ...(isVerifiedTimestamp(meta.createdAt) ? { createdAt: meta.createdAt } : {}),
-          ...(updatedAt ? { updatedAt } : {}),
-          ...(typeof meta.activeQueryId === "string" ? { activeQueryId: meta.activeQueryId } : {}),
-        };
+        const row = conversationSummaryFields(meta, id);
         if (!fitsEnvelope({ version: 1, conversations: [...conversations, row] })) {
           throw fail(
             "history_unavailable",
@@ -440,10 +539,7 @@ export function createHistoryStore(input: {
     const ordinalMatch =
       typeof cursor.key.sk === "string" ? cursor.key.sk.match(/^TURN#(\d{8})/) : null;
     const keyOrdinal = ordinalMatch ? Number(ordinalMatch[1]) : -1;
-    const nextOrdinal =
-      cursor.nextOrdinal === undefined
-        ? keyOrdinal - (cursor.key.sk === turnKey(id, keyOrdinal).sk ? 1 : 0)
-        : Number(cursor.nextOrdinal);
+    const nextOrdinal = cursor.nextOrdinal;
     if (
       cursor.conversationId !== id ||
       !positive(cursor.throughOrdinal) ||
@@ -475,56 +571,6 @@ export function createHistoryStore(input: {
       nextOrdinal,
       key,
     });
-  }
-
-  async function readLegacyAnswerPrefixLength(
-    id: string,
-    turn: Record<string, unknown>,
-  ): Promise<number> {
-    if (!isLegacyGeneratingTurn(turn)) return answerCount(turn);
-    const prefix = textPrefix(id, Number(turn.ordinal), String(turn.queryId), "assistant");
-    let page: Record<string, unknown>;
-    try {
-      page = await documentClient.send(
-        new QueryCommand({
-          TableName: tableName,
-          KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
-          ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
-          ExpressionAttributeValues: { ":pk": turn.pk, ":prefix": prefix },
-          ConsistentRead: true,
-          ScanIndexForward: false,
-          Limit: 1,
-        }),
-      );
-    } catch (error) {
-      throw asStorageError(error, "conversation_unavailable");
-    }
-    const candidates = Array.isArray(page.Items) ? page.Items.filter(isRecord) : [];
-    if (candidates.length > 1) {
-      throw fail("conversation_unavailable", "Legacy answer prefix is invalid.");
-    }
-    const last = candidates[0];
-    if (!last) {
-      if (page.LastEvaluatedKey !== undefined) {
-        throw fail("conversation_unavailable", "Legacy answer prefix is invalid.");
-      }
-      return 0;
-    }
-    if (
-      !validChunk(last, {
-        id,
-        ordinal: Number(turn.ordinal),
-        queryId: String(turn.queryId),
-        role: "assistant",
-      }) ||
-      (page.LastEvaluatedKey !== undefined &&
-        (!isKey(page.LastEvaluatedKey) ||
-          page.LastEvaluatedKey.pk !== last.pk ||
-          page.LastEvaluatedKey.sk !== last.sk))
-    ) {
-      throw fail("conversation_unavailable", "Legacy answer prefix is invalid.");
-    }
-    return last.index + 1;
   }
 
   async function rejectExtraTextChunk(input: {
@@ -678,7 +724,7 @@ export function createHistoryStore(input: {
         }
       }
       const failure = failureCode(current.failure);
-      const cursor = await readLegacyAnswerPrefixLength(scope.conversationId, current);
+      const cursor = answerCount(current);
       descriptors.push({
         ordinal: current.ordinal,
         queryId: current.queryId,
@@ -823,11 +869,7 @@ export function createHistoryStore(input: {
       throw fail("conversation_unavailable", "Conversation text manifest is invalid.");
     }
     const manifestCount = manifest.count;
-    const legacyPrefixLength =
-      scope.role === "assistant" && isLegacyGeneratingTurn(turn)
-        ? await readLegacyAnswerPrefixLength(scope.conversationId, turn)
-        : undefined;
-    const available = legacyPrefixLength ?? manifestCount;
+    const available = manifestCount;
     const cursor = parseTextCursor(scope.cursor, digest, {
       conversationId: scope.conversationId,
       ordinal: scope.ordinal,
@@ -1000,5 +1042,5 @@ export function createHistoryStore(input: {
     return response;
   }
 
-  return { listConversations, readTurns, readText };
+  return { hideConversation, readConversationMeta, listConversations, readTurns, readText };
 }

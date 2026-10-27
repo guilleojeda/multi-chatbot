@@ -13,6 +13,14 @@ import {
   streamResponse,
 } from "../support/history-web-harness.mjs";
 import {
+  act,
+  buttonByText,
+  createPhase8Dom,
+  mountPhase8AccountApp,
+  React,
+  renderPhase8AccountApp,
+} from "../support/phase8-web-harness.mjs";
+import {
   clearChatJournal,
   markChatJournalAdmitted,
   readChatJournals,
@@ -22,19 +30,23 @@ import {
 import { ChatBrowserFixture } from "../fixtures/chat/harness.ts";
 
 let AccountApp;
+let ChatScreen;
 let disposeAccountAppModule;
 const apps = [];
+const domStates = [];
 
 beforeAll(async () => {
   ({ AccountApp, dispose: disposeAccountAppModule } = await loadHistoryAccountApp());
+  ChatScreen = globalThis.__accountScreens.ChatScreen;
 });
 
 afterAll(async () => {
   await disposeAccountAppModule?.();
 });
 
-afterEach(() => {
+afterEach(async () => {
   for (const app of apps.splice(0).reverse()) app.dispose();
+  for (const domState of domStates.splice(0).reverse()) await domState.dispose();
   vi.unstubAllGlobals();
   delete globalThis.__accountHooks;
   delete globalThis.__accountScreens;
@@ -171,6 +183,30 @@ function writePendingStart(environment, text) {
     queryId: firstQueryId,
     baseOrdinal: 0,
     text,
+  });
+}
+
+function registerConversationMeta(
+  environment,
+  {
+    conversationId = firstConversationId,
+    label,
+    lastOrdinal,
+    closed,
+    activeQueryId,
+    createdAt,
+    updatedAt,
+  },
+) {
+  environment.conversationMeta.set(conversationId, {
+    version: 1,
+    conversationId,
+    label,
+    lastOrdinal,
+    closed,
+    ...(activeQueryId ? { activeQueryId } : {}),
+    ...(createdAt ? { createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
   });
 }
 
@@ -462,6 +498,278 @@ describe("active recovery preserves authoritative activity", () => {
       updatedAt: olderUpdatedAt,
       lastOrdinal: 1,
       activeQueryId: firstQueryId,
+    });
+  });
+});
+
+describe("history removal state transitions", () => {
+  it("disables the composer only for the selected conversation being removed", async () => {
+    const pendingHide = deferred();
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+            {
+              conversationId: secondConversationId,
+              label: "Conversación B",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1, conversationId === firstConversationId ? firstQueryId : secondQueryId)],
+        }),
+      textHandler: turnText,
+      hideHandler: () => pendingHide.promise,
+    });
+    const domState = await createPhase8Dom();
+    domStates.push(domState);
+    const app = await mountPhase8AccountApp(environment, AccountApp, domState);
+    apps.push(app);
+    const render = () => renderPhase8AccountApp(app, domState);
+
+    await render();
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await render();
+    props(app).onDraftChange("seguimiento para A");
+    await render();
+
+    const hide = props(app).onHideConversation(firstConversationId);
+    await render();
+    expect(props(app).state.history.removal).toMatchObject({
+      conversationId: firstConversationId,
+      status: "hiding",
+    });
+    expect(buttonByText(domState.document, "Enviar").disabled).toBe(true);
+
+    pendingHide.reject(new TypeError("connection lost after the server may have committed"));
+    expect(await hide).toBe(false);
+    await render();
+    expect(props(app).state.history.removal).toMatchObject({
+      conversationId: firstConversationId,
+      status: "unconfirmed",
+    });
+    expect(buttonByText(domState.document, "Enviar").disabled).toBe(true);
+
+    expect(await props(app).onSelectConversation(secondConversationId)).toBe(true);
+    await render();
+    props(app).onDraftChange("seguimiento para B");
+    await render();
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: secondConversationId,
+      removal: { conversationId: firstConversationId, status: "unconfirmed" },
+    });
+    expect(buttonByText(domState.document, "Enviar").disabled).toBe(false);
+  });
+
+  it.each([
+    ["rejected", "hiding"],
+    ["rejected", "unconfirmed"],
+    ["unconfirmed", "hiding"],
+    ["unconfirmed", "unconfirmed"],
+  ])(
+    "disables same-thread retry for %s query while removal is %s",
+    async (queryStatus, removalStatus) => {
+      const domState = await createPhase8Dom();
+      domStates.push(domState);
+      const state = {
+        profileStatus: "complete",
+        queryStatus,
+        question: "Reintentar esta consulta",
+        draft: "Reintentar esta consulta",
+        ordinal: 1,
+        canContinue: true,
+        canRetry: true,
+        history: {
+          status: "ready",
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+          nextCursor: null,
+          loadingMore: false,
+          selectedConversationId: firstConversationId,
+          turnsStatus: "ready",
+          turns: [],
+          turnsNextCursor: null,
+          refreshRequired: false,
+          removal: { conversationId: firstConversationId, status: removalStatus },
+        },
+      };
+
+      await act(async () => {
+        domState.root.render(
+          React.createElement(ChatScreen, {
+            state,
+            onSubmit: vi.fn(() => false),
+            onSignOut: vi.fn(),
+            onRetryProfile: vi.fn(),
+            onReset: vi.fn(),
+            onCopy: vi.fn(),
+          }),
+        );
+      });
+
+      expect(buttonByText(domState.document, "Reintentar el mismo envío").disabled).toBe(true);
+    },
+  );
+
+  it("preserves the selected conversation's draft disclosure after a history refresh", async () => {
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1)],
+        }),
+      textHandler: turnText,
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    props(app).onDraftChange("borrador que se descartará");
+    await app.flush();
+    expect(
+      props(app).state.history.conversations.find(
+        (conversation) => conversation.conversationId === firstConversationId,
+      ).hasDraft,
+    ).toBe(true);
+
+    await props(app).onRefreshHistory();
+    await app.flush();
+
+    expect(
+      props(app).state.history.conversations.find(
+        (conversation) => conversation.conversationId === firstConversationId,
+      ),
+    ).toMatchObject({ conversationId: firstConversationId, hasDraft: true });
+  });
+
+  it("restores the current selection after hiding another conversation whose open is pending", async () => {
+    const lateOpen = deferred();
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+            {
+              conversationId: secondConversationId,
+              label: "Conversación B",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        conversationId === secondConversationId
+          ? lateOpen.promise
+          : jsonResponse({
+              version: 1,
+              conversationId,
+              label: "Conversación A",
+              throughOrdinal: 1,
+              closed: false,
+              canContinue: true,
+              turns: [turn(1)],
+              nextCursor: "older-A",
+            }),
+      textHandler: turnText,
+      hideHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          hiddenAt: "2026-10-27T13:45:00.000Z",
+        }),
+      runtimeHandler: (request) => streamResponse(request),
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    props(app).onDraftChange("seguir trabajando en A");
+    await app.flush();
+    const openingB = props(app).onSelectConversation(secondConversationId);
+    await app.flush();
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: firstConversationId,
+      openingConversationId: secondConversationId,
+      turnsStatus: "loading",
+    });
+
+    expect(await props(app).onHideConversation(secondConversationId)).toBe(true);
+    await app.flush();
+    lateOpen.resolve(
+      jsonResponse({
+        version: 1,
+        conversationId: secondConversationId,
+        throughOrdinal: 1,
+        closed: false,
+        canContinue: true,
+        turns: [turn(1, secondQueryId)],
+      }),
+    );
+    expect(await openingB).toBe(false);
+    await app.flush();
+
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: firstConversationId,
+      turnsStatus: "ready",
+      turnsNextCursor: "older-A",
+      turns: [{ ordinal: 1, question: "ORIGINAL_TEXT_1" }],
+    });
+    expect(props(app).state.history.openingConversationId).toBeUndefined();
+    expect(props(app).state.draft).toBe("seguir trabajando en A");
+    expect(
+      props(app).state.history.conversations.map((conversation) => conversation.conversationId),
+    ).toEqual([firstConversationId]);
+    expect(props(app).onSubmit("seguimiento en A")).toBe(true);
+    await app.flush();
+    expect(environment.runtimeRequests.at(-1).request).toMatchObject({
+      operation: "message",
+      conversationId: firstConversationId,
+      baseOrdinal: 1,
     });
   });
 });
@@ -1204,6 +1512,11 @@ describe("phase 7 frontend repair regressions", () => {
         });
       },
     });
+    registerConversationMeta(environment, {
+      label: "Conversación cerrada",
+      lastOrdinal: 1,
+      closed: true,
+    });
     const app = mount(environment);
     await app.flush();
 
@@ -1884,103 +2197,6 @@ describe("phase 7 frontend repair regressions", () => {
     expect(props(app).state.queryStatus).toBe("completed");
   });
 
-  it.each([false, true])(
-    "loads a durable legacy answer prefix without presenting it as terminal (closed=%s)",
-    async (closed) => {
-      const textReads = [];
-      const environment = createHistoryEnvironment({
-        listHandler: () =>
-          jsonResponse({
-            version: 1,
-            conversations: [
-              {
-                conversationId: firstConversationId,
-                label: "Generación no confirmable",
-                lastOrdinal: 1,
-                closed,
-              },
-            ],
-          }),
-        turnsHandler: ({ conversationId }) =>
-          jsonResponse({
-            version: 1,
-            conversationId,
-            throughOrdinal: 1,
-            closed,
-            canContinue: false,
-            turns: [
-              {
-                ordinal: 1,
-                queryId: firstQueryId,
-                status: "in_progress",
-                questionManifest: { count: 1, complete: true },
-                answerManifest: { count: 0, complete: false },
-                cursor: 2,
-                failure: { code: "unconfirmable" },
-              },
-            ],
-          }),
-        textHandler: ({ conversationId, ordinal, url }) => {
-          const role = url.searchParams.get("role");
-          const throughCursor = url.searchParams.get("throughCursor");
-          textReads.push({ role, throughCursor });
-          const chunks =
-            role === "assistant"
-              ? [
-                  { index: 0, text: "prefijo durable " },
-                  { index: 1, text: "sin cierre remoto" },
-                ]
-              : [{ index: 0, text: "Pregunta original" }];
-          return jsonResponse({
-            version: 1,
-            conversationId,
-            ordinal,
-            queryId: firstQueryId,
-            role,
-            chunks,
-            complete: true,
-          });
-        },
-      });
-      const app = mount(environment);
-      await app.flush();
-
-      expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
-      await app.flush();
-
-      expect(props(app).state.queryStatus).toBe("unconfirmed");
-      expect(props(app).state.canContinue).toBe(false);
-      expect(textReads).toContainEqual({ role: "assistant", throughCursor: "2" });
-      expect(props(app).state.history.turns).toMatchObject([
-        {
-          ordinal: 1,
-          queryId: firstQueryId,
-          status: "in_progress",
-          question: "Pregunta original",
-          questionComplete: true,
-          answer: "prefijo durable sin cierre remoto",
-          answerComplete: true,
-          failure: { code: "unconfirmable" },
-        },
-      ]);
-      const html = await app.html();
-      expect(html).toContain("El texto visible es un prefijo");
-      expect(html).not.toContain("· Abierta");
-      if (closed) {
-        expect(props(app).state.history.conversations[0].pending).toBeUndefined();
-        expect(html).toContain("· Cerrada");
-        expect(html).not.toContain("· Sin confirmar");
-      } else {
-        expect(props(app).state.history.conversations[0].pending).toBe(true);
-        expect(html).toContain("· Sin confirmar");
-      }
-      expect(html).not.toContain("<textarea");
-      expect(html).not.toContain("Copiar respuesta anterior");
-      expect(environment.runtimeRequests).toEqual([]);
-      expect(environment.apiRequests.some(({ method }) => method !== "GET")).toBe(false);
-    },
-  );
-
   it("shows a terminal empty-answer integrity error from the text API", async () => {
     const textReads = [];
     let turnsReads = 0;
@@ -2013,6 +2229,11 @@ describe("phase 7 frontend repair regressions", () => {
           complete: true,
         });
       },
+    });
+    registerConversationMeta(environment, {
+      label: "Pregunta con respuesta vacía",
+      lastOrdinal: 1,
+      closed: true,
     });
     const app = mount(environment);
     await app.flush();
@@ -2164,6 +2385,11 @@ describe("phase 7 frontend repair regressions", () => {
         });
       },
     });
+    registerConversationMeta(environment, {
+      label: "Pregunta fallida",
+      lastOrdinal: 1,
+      closed: true,
+    });
     const app = mount(environment);
     await app.flush();
 
@@ -2218,6 +2444,12 @@ describe("phase 7 frontend repair regressions", () => {
         });
       },
     });
+    registerConversationMeta(environment, {
+      label: "Consulta en curso",
+      lastOrdinal: 1,
+      closed: false,
+      activeQueryId: firstQueryId,
+    });
     const app = mount(environment);
     await app.flush();
 
@@ -2240,6 +2472,14 @@ describe("phase 7 frontend repair regressions", () => {
         ],
       },
     });
+    expect(props(app).state.history.conversations[0]).toMatchObject({
+      conversationId: firstConversationId,
+      pending: true,
+      durable: true,
+    });
+    expect(await app.html()).toContain("Quitar del historial");
+    expect(props(app).onSubmit("no continuar hasta confirmar")).toBe(false);
+    expect(environment.runtimeRequests).toEqual([]);
   });
 
   it.each([
@@ -2412,6 +2652,11 @@ describe("phase 7 frontend repair regressions", () => {
         });
       },
     });
+    registerConversationMeta(environment, {
+      label: "Respuesta completada",
+      lastOrdinal: 1,
+      closed: false,
+    });
     const app = mount(environment);
     await app.flush();
 
@@ -2475,6 +2720,12 @@ describe("phase 7 frontend repair regressions", () => {
         });
       },
     });
+    registerConversationMeta(environment, {
+      label: "Consulta en curso",
+      lastOrdinal: 1,
+      closed: false,
+      activeQueryId: firstQueryId,
+    });
     const app = mount(environment);
     await app.flush();
 
@@ -2533,6 +2784,11 @@ describe("phase 7 frontend repair regressions", () => {
           complete: true,
         });
       },
+    });
+    registerConversationMeta(environment, {
+      label: "Respuesta parcialmente fallida",
+      lastOrdinal: 1,
+      closed: true,
     });
     const app = mount(environment);
     await app.flush();
@@ -2731,6 +2987,12 @@ describe("phase 7 frontend repair regressions", () => {
           complete: true,
         }),
       runtimeHandler: (request) => streamResponse(request, { accepted: false }),
+    });
+    registerConversationMeta(environment, {
+      label: "Actividad antigua",
+      lastOrdinal: 1,
+      closed: false,
+      updatedAt: selectedUpdatedAt,
     });
     const app = mount(environment);
     await app.flush();
@@ -3344,6 +3606,13 @@ describe("phase 7 frontend repair regressions", () => {
             complete: true,
           }),
       });
+      if (listed.length === 0) {
+        registerConversationMeta(environment, {
+          label: "Conversación seleccionada",
+          lastOrdinal: 20,
+          closed: false,
+        });
+      }
       const app = mount(environment);
       await app.flush();
 
@@ -3650,6 +3919,7 @@ describe("phase 7 frontend repair regressions", () => {
     ]);
     expect(props(app).state.history.selectedConversationId).toBe(firstConversationId);
     expect(props(app).state.queryStatus).toBe("unconfirmed");
+    expect(await app.html()).not.toContain("Quitar del historial");
     expect(
       environment.runtimeRequests.filter(
         (item) => item.headers.get("accept") !== "application/json",
@@ -3729,6 +3999,11 @@ describe("phase 7 frontend repair regressions", () => {
           complete: true,
         }),
     });
+    registerConversationMeta(environment, {
+      label: "Conversación anterior",
+      lastOrdinal: 2,
+      closed: false,
+    });
     writeChatSelection(environment.config, environment.identity, firstConversationId);
     const app = mount(environment);
     await app.flush();
@@ -3773,6 +4048,13 @@ describe("phase 7 frontend repair regressions", () => {
           return listCalls === 1 ? firstList.promise : returnedList.promise;
         },
         runtimeHandler: (request) => acceptedOnlyStream(request),
+      });
+      registerConversationMeta(environment, {
+        conversationId: "33333333-3333-4333-8333-333333333333",
+        label: "Accepted request A",
+        lastOrdinal: 1,
+        closed: false,
+        activeQueryId: "44444444-4444-4444-8444-444444444444",
       });
       const app = mount(environment);
       await app.flush();

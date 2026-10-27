@@ -29,6 +29,17 @@ const turn = {
     policyRevision: "policy-r7",
   },
   text: "Adaptá la actividad para un grupo que todavía no trabajó decimales.",
+  operation: "message",
+  baseOrdinal: 3,
+  contextSnapshot: { version: 1, recentReferences: [] },
+  documentContext: {
+    knowledgeBaseId: "kb-docentes-dev",
+    query: "adaptación para no trabajar decimales",
+    revision: "documents-r1",
+    retrievedAt: Date.parse("2026-10-20T12:00:00.000Z"),
+    status: "empty",
+    results: [],
+  },
   profileSnapshot: {
     sub: "teacher-123",
     botId: "bot-aurora",
@@ -39,7 +50,6 @@ const turn = {
     configurationRevision: "revision-123",
   },
   invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "revision-123" },
-  expectedLastOrdinal: 3,
 };
 
 function conditionValue(command, attribute) {
@@ -84,7 +94,7 @@ describe("continuation store ownership guard", () => {
       conversationId: turn.conversationId,
       sub: turn.sub,
       botId: turn.botId,
-      lastOrdinal: turn.expectedLastOrdinal,
+      lastOrdinal: turn.baseOrdinal,
     };
     const documentClient = {
       send: vi.fn(async (command) =>
@@ -112,7 +122,7 @@ describe("continuation store ownership guard", () => {
     expect(conditionValue(update, "sub")).toBe(turn.sub);
     expect(conditionValue(update, "botId")).toBe(turn.botId);
     expect(conditionValue(update, "conversationId")).toBe(turn.conversationId);
-    expect(conditionValue(update, "lastOrdinal")).toBe(turn.expectedLastOrdinal);
+    expect(conditionValue(update, "lastOrdinal")).toBe(turn.baseOrdinal);
     expect(put.Item).toMatchObject({
       pk: `CONV#${turn.conversationId}`,
       sk: "TURN#00000004",
@@ -151,6 +161,8 @@ describe("continuation store ownership guard", () => {
       pk: `CONV#${turn.conversationId}`,
       sk: "TURN#00000004",
       conversationId: turn.conversationId,
+      sub: turn.sub,
+      botId: turn.botId,
       queryId: turn.queryId,
       ordinal: 4,
       requestFingerprint: turn.requestFingerprint,
@@ -164,6 +176,8 @@ describe("continuation store ownership guard", () => {
       questionManifest: { count: 1, complete: true },
       answerManifest: { count: 0, complete: false },
       contextManifest: { count: 0, complete: true },
+      contextSnapshot: { version: 1, recentReferences: [] },
+      documentContextManifest: { count: 1, complete: true },
       profileSnapshot: turn.profileSnapshot,
       invocation: turn.invocation,
     };
@@ -187,8 +201,20 @@ describe("continuation store ownership guard", () => {
       index: 0,
       text: turn.text,
     };
+    const documentContext = {
+      pk: `CONV#${turn.conversationId}`,
+      sk: "TURN#00000004#DOCUMENT#00000000",
+      conversationId: turn.conversationId,
+      queryId: turn.queryId,
+      ordinal: 4,
+      index: 0,
+      text: JSON.stringify(turn.documentContext),
+    };
     const records = new Map(
-      [marker, turnRecord, meta, question].map((item) => [item.pk + "\u0000" + item.sk, item]),
+      [marker, turnRecord, meta, question, documentContext].map((item) => [
+        item.pk + "\u0000" + item.sk,
+        item,
+      ]),
     );
     const keyOf = (key) => key.pk + "\u0000" + key.sk;
     let transactions = 0;
@@ -275,6 +301,87 @@ describe("continuation store ownership guard", () => {
       count: 1,
       complete: false,
     });
+  });
+
+  it("reports a winning hide before quota when admission loses both races", async () => {
+    const meta = {
+      pk: `CONV#${turn.conversationId}`,
+      sk: "META",
+      conversationId: turn.conversationId,
+      sub: turn.sub,
+      botId: turn.botId,
+      lastOrdinal: turn.baseOrdinal,
+    };
+    const dailyKey = {
+      pk: `USER#${turn.sub}#BOT#${turn.botId}`,
+      sk: `USAGE#DAY#${turn.quota.daily.period}`,
+    };
+    const monthlyKey = {
+      pk: `USER#${turn.sub}#BOT#${turn.botId}`,
+      sk: `USAGE#MONTH#${turn.quota.monthly.period}`,
+    };
+    const policyKey = { pk: `BOT#${turn.botId}`, sk: "QUOTA#POLICY" };
+    const records = new Map(
+      [
+        meta,
+        { ...dailyKey, used: 19 },
+        { ...monthlyKey, used: 1 },
+        { ...policyKey, dailyLimit: 20, monthlyLimit: 200, revision: "policy-r7" },
+      ].map((item) => [item.pk + "\u0000" + item.sk, item]),
+    );
+    const keyOf = (key) => key.pk + "\u0000" + key.sk;
+    let admissionAttempts = 0;
+    const documentClient = {
+      send: vi.fn(async (command) => {
+        if (command instanceof GetCommand) {
+          return { Item: records.get(keyOf(command.input.Key)) };
+        }
+        if (command instanceof TransactWriteCommand) {
+          admissionAttempts += 1;
+          const hiddenMeta = { ...meta, hiddenAt: "2026-10-20T12:00:01.000Z" };
+          records.set(keyOf(hiddenMeta), hiddenMeta);
+          records.set(keyOf(dailyKey), { ...dailyKey, used: 20 });
+          throw Object.assign(new Error("hide and quota won before admission"), {
+            name: "TransactionCanceledException",
+            CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+          });
+        }
+        throw new Error(`unexpected DynamoDB command ${command?.constructor?.name}`);
+      }),
+    };
+    const store = createConversationStoreAdapter({
+      documentClient,
+      tableName: "conversations-aurora-dev",
+      now: () => turn.now,
+    });
+
+    let rejection;
+    try {
+      await store.continueTurn({
+        ...turn,
+        quota: {
+          ...turn.quota,
+          daily: { ...turn.quota.daily, used: 19 },
+          monthly: { ...turn.quota.monthly, used: 1 },
+        },
+        contextReferences: [],
+      });
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toMatchObject({ code: "conversation_hidden" });
+    expect(rejection).not.toHaveProperty("quota");
+    expect(admissionAttempts).toBe(1);
+    expect(
+      documentClient.send.mock.calls.some(
+        ([command]) =>
+          command instanceof GetCommand && String(command.input.Key.sk).startsWith("USAGE#"),
+      ),
+    ).toBe(false);
+    expect(
+      records.has(keyOf({ pk: `USER#${turn.sub}#BOT#${turn.botId}`, sk: `SEND#${turn.queryId}` })),
+    ).toBe(false);
   });
 
   it.each([

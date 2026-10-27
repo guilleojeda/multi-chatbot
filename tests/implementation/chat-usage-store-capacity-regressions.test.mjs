@@ -9,7 +9,7 @@ import { createConversationStoreAdapter } from "../../runtime/conversation-store
 import { dynamoItemSize } from "../../runtime/context-storage.ts";
 
 const now = Date.parse("2026-10-24T15:00:00.000Z");
-const count = 6_936;
+const count = 6_935;
 const conversationId = "b2000000-0000-4000-8000-000000000001";
 const queryIdFor = (ordinal) => `b3000000-0000-4000-8000-${String(ordinal).padStart(12, "0")}`;
 const owner = { sub: "snapshot-teacher", botId: "bot-snapshot" };
@@ -67,7 +67,16 @@ it("externalizes a near-limit snapshot before claim, append, completion, failure
     now,
     ownerAttemptId: "attempt",
     resultDeadlineAt: now + 3_600_000,
+    operation: "message",
     text: "new question",
+    documentContext: {
+      knowledgeBaseId: "kb-snapshot-dev",
+      query: "new question",
+      revision: "documents-snapshot-r1",
+      retrievedAt: now,
+      status: "empty",
+      results: [],
+    },
     profileSnapshot: { fields: {} },
     invocation: { modelId: "model", revision: "r" },
     quota: {
@@ -322,7 +331,16 @@ it("rejects a near-capacity turn with no references before sending its quota tra
     now,
     ownerAttemptId: "attempt",
     resultDeadlineAt: now + 3_600_000,
+    operation: "message",
     text: "new question",
+    documentContext: {
+      knowledgeBaseId: "kb-snapshot-dev",
+      query: "new question",
+      revision: "documents-snapshot-r1",
+      retrievedAt: now,
+      status: "empty",
+      results: [],
+    },
     profileSnapshot: { fields: { payload: "x" } },
     invocation: { modelId: "model", revision: "r" },
     quota: {
@@ -335,6 +353,7 @@ it("rejects a near-capacity turn with no references before sending its quota tra
     requestFingerprint: "f",
     baseOrdinal: count,
     contextReferences: [],
+    contextSnapshot: { version: 1, recentReferences: [] },
   };
   const metaKey = { pk: previousMeta.pk, sk: previousMeta.sk };
   const baselineRecords = new Map([[keyId(metaKey), previousMeta]]);

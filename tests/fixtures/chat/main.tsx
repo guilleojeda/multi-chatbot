@@ -56,8 +56,9 @@ function FixtureControls() {
         <p>
           Esta página monta AccountApp, ChatScreen y createSession reales. Cognito, perfil y Runtime
           se simulan localmente; las conversaciones del Runtime se conservan en una clave propia de
-          sessionStorage de esta pestaña para probar recover. No se usan servicios AWS; el Runtime
-          simulado no escribe el journal productivo.
+          sessionStorage de esta pestaña para probar recover. Los GET breves de META y POST para
+          quitar usan esos mismos registros; no se usan servicios AWS y el Runtime simulado no
+          escribe el journal productivo.
         </p>
       </header>
 
@@ -80,6 +81,13 @@ function FixtureControls() {
           de contexto afecta solo seguimientos; el historial de peticiones conserva cuerpo e IDs
           para comprobar el reintento y el inicio nuevo. `journal-admission-write-failure` rechaza
           la escritura del journal después de la admisión.
+        </p>
+        <p className="profile-fixture-readout">
+          `history-hide-pending` retiene el POST hasta “Liberar historial”; `history-hide-ack-lost`
+          persiste la marca pero pierde el primer ACK para ejercitar el reintento explícito. Los
+          escenarios `history-meta-pending` y `history-meta-error` controlan solo el GET breve de
+          META. La marca oculta permanece en sessionStorage y el productor de un pedido admitido
+          puede terminar sin volver a hacer visible el hilo.
         </p>
         <button
           className="account-button account-button--secondary"
@@ -255,7 +263,7 @@ function FixtureControls() {
           </button>
         </div>
         <p className="profile-fixture-readout">
-          Perfiles pendientes: {state.pendingProfiles} · historial pendiente:{" "}
+          Perfiles pendientes: {state.pendingProfiles} · historial/META/quitar pendiente:{" "}
           {state.pendingHistoryReads} · logout pendiente: {state.pendingSignOuts} · confirmaciones
           de contraseña pendientes: {state.pendingPasswordResets} · admisiones pendientes:{" "}
           {state.pendingAdmissions} · respuestas admitidas: {state.admittedStreams}· 401 Runtime

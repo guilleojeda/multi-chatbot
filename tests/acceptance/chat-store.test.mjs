@@ -49,11 +49,22 @@ function startInput(overrides = {}) {
     ...owner,
     conversationId,
     queryId,
+    operation: "start",
+    baseOrdinal: 0,
     now,
     ownerAttemptId: "attempt-admitted",
     resultDeadlineAt: now + 60 * 60 * 1000,
     text: "Armá una actividad de porcentajes.",
     profileSnapshot,
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContext: {
+      knowledgeBaseId: "kb-docentes-dev",
+      query: "Porcentajes para segundo año",
+      revision: "documents-r14",
+      retrievedAt: now,
+      status: "empty",
+      results: [],
+    },
     invocation: {
       modelId: "global.anthropic.claude-sonnet-4-6",
       revision: "reviewed-revision-123",
@@ -152,15 +163,31 @@ function expectScopedKey(item) {
 }
 
 function turnRecord(ordinal, requestId, overrides = {}) {
+  const status = overrides.status ?? "completed";
+  const answerManifest = overrides.answerManifest ?? { count: 1, complete: status === "completed" };
   return {
     pk: `CONV#${conversationId}`,
     sk: `TURN#${String(ordinal).padStart(8, "0")}`,
     conversationId,
+    ...owner,
     queryId: requestId,
     ordinal,
-    status: "completed",
+    operation: ordinal === 1 ? "start" : "message",
+    baseOrdinal: ordinal - 1,
+    requestFingerprint: `fingerprint-${requestId}`,
+    status,
+    phase:
+      status === "completed" ? "complete" : status === "failed" ? "failed" : "invocation_claimed",
+    ownerAttemptId: `attempt-${ordinal}`,
+    resultDeadlineAt: Date.parse("2026-10-19T17:00:00.000Z"),
+    createdAt: "2026-10-19T16:00:00.000Z",
+    updatedAt: "2026-10-19T16:00:00.000Z",
+    cursor: answerManifest.count,
     questionManifest: { count: 1, complete: true },
-    answerManifest: { count: 1, complete: true },
+    answerManifest,
+    contextManifest: { count: 0, complete: true },
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContextManifest: { count: 1, complete: true },
     ...overrides,
   };
 }
@@ -255,6 +282,9 @@ describe("the DynamoDB conversation store adapter", () => {
           textChunk(2, secondId, "user", 0, "¿Cómo lo comprueban?"),
           turnRecord(3, thirdId, {
             status: "in_progress",
+            phase: "invocation_claimed",
+            ownerAttemptId: "attempt-third",
+            resultDeadlineAt: Date.parse("2026-10-19T17:00:00.000Z"),
             questionManifest: { count: 1, complete: true },
             answerManifest: { count: 1, complete: false },
           }),
@@ -272,6 +302,8 @@ describe("the DynamoDB conversation store adapter", () => {
       conversationId,
       ...owner,
       lastOrdinal: 4,
+      activeQueryId: thirdId,
+      activeOwnerAttemptId: "attempt-third",
     };
     const { documentClient, store } = makeStore(
       vi.fn(async (command) => {
@@ -334,6 +366,8 @@ describe("the DynamoDB conversation store adapter", () => {
               conversationId,
               ...owner,
               lastOrdinal: 2,
+              activeQueryId: pendingId,
+              activeOwnerAttemptId: "attempt-pending",
             },
           };
         }
@@ -342,6 +376,9 @@ describe("the DynamoDB conversation store adapter", () => {
             Items: [
               turnRecord(1, pendingId, {
                 status: "in_progress",
+                phase: "invocation_claimed",
+                ownerAttemptId: "attempt-pending",
+                resultDeadlineAt: Date.parse("2026-10-19T17:00:00.000Z"),
                 answerManifest: { count: 1, complete: false },
               }),
               textChunk(1, pendingId, "user", 0, "Consulta pendiente"),
@@ -499,7 +536,8 @@ describe("the DynamoDB conversation store adapter", () => {
 
     const result = await store.continueTurn({
       ...input,
-      expectedLastOrdinal: 1,
+      operation: "message",
+      baseOrdinal: 1,
       contextReferences: [],
     });
 
@@ -600,7 +638,12 @@ describe("the DynamoDB conversation store adapter", () => {
     const input = startInput({ queryId: "fcdd5a71-b6db-4ad9-a2c3-934cb56fe749" });
     const { documentClient, store } = makeStore();
 
-    await store.continueTurn({ ...input, expectedLastOrdinal, contextReferences: [] });
+    await store.continueTurn({
+      ...input,
+      operation: "message",
+      baseOrdinal: expectedLastOrdinal,
+      contextReferences: [],
+    });
 
     const transactions = transactionCommands(documentClient);
     expect(transactions).toHaveLength(1);
