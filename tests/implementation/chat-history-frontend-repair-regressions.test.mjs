@@ -1618,21 +1618,24 @@ describe("phase 7 frontend repair regressions", () => {
 
   it("shows a terminal empty-answer integrity error from the text API", async () => {
     const textReads = [];
+    let turnsReads = 0;
     const environment = createHistoryEnvironment({
-      turnsHandler: ({ conversationId }) =>
-        jsonResponse({
+      turnsHandler: ({ conversationId }) => {
+        turnsReads += 1;
+        return jsonResponse({
           version: 1,
           conversationId,
           throughOrdinal: 1,
-          closed: true,
-          canContinue: false,
+          closed: turnsReads === 1,
+          canContinue: turnsReads > 1,
           turns: [emptyFailedTurn()],
-        }),
+        });
+      },
       textHandler: ({ conversationId, ordinal, url }) => {
         const role = url.searchParams.get("role");
         const throughCursor = url.searchParams.get("throughCursor");
         textReads.push({ role, throughCursor });
-        if (role === "assistant") {
+        if (role === "assistant" && turnsReads === 1) {
           return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 500);
         }
         return jsonResponse({
@@ -1641,7 +1644,7 @@ describe("phase 7 frontend repair regressions", () => {
           ordinal,
           queryId: firstQueryId,
           role,
-          chunks: [{ index: 0, text: "Pregunta original" }],
+          chunks: role === "user" ? [{ index: 0, text: "Pregunta original" }] : [],
           complete: true,
         });
       },
@@ -1657,6 +1660,116 @@ describe("phase 7 frontend repair regressions", () => {
       turnsStatus: "error",
       turnsError: "Esta conversación ya no está disponible.",
     });
+    props(app).onDraftChange("Seguimiento pendiente de actualizar");
+    await app.flush();
+    let html = await app.html();
+    expect(props(app).state.draft).toBe("Seguimiento pendiente de actualizar");
+    expect(html).toContain("Seguimiento pendiente de actualizar");
+    const textarea = html.match(/<textarea\b[^>]*>/)?.[0];
+    expect(textarea).toContain('id="chat-query"');
+    expect(textarea).not.toContain("disabled");
+    const sendButton = html.match(/<button\b[^>]*type="submit"[^>]*>Enviar<\/button>/)?.[0];
+    expect(sendButton).toContain("disabled");
+    expect(props(app).onSubmit("Seguimiento pendiente de actualizar")).toBe(false);
+    expect(environment.runtimeRequests).toEqual([]);
+    expect(readChatJournals(environment.config, environment.identity).size).toBe(0);
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    expect(turnsReads).toBe(2);
+    expect(props(app).state).toMatchObject({
+      queryStatus: "failed",
+      ordinal: 1,
+      canContinue: true,
+      history: { throughOrdinal: 1, closed: false, turnsStatus: "ready" },
+    });
+    expect(props(app).onSubmit("Follow-up from loaded history")).toBe(true);
+    await app.flush();
+    expect(environment.runtimeRequests.at(-1).request).toMatchObject({
+      operation: "message",
+      conversationId: firstConversationId,
+      baseOrdinal: 1,
+      text: "Follow-up from loaded history",
+    });
+  });
+
+  it("allows the exact preparation retry after a history reopen error", async () => {
+    let turnsReads = 0;
+    let runtimeCalls = 0;
+    const body = "Retry this exact prepared follow-up";
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Hilo abierto",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) => {
+        turnsReads += 1;
+        if (turnsReads > 1) return jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503);
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1, firstQueryId)],
+        });
+      },
+      textHandler: ({ conversationId, ordinal, url }) => {
+        const role = url.searchParams.get("role");
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: firstQueryId,
+          role,
+          chunks: [{ index: 0, text: role === "user" ? "Pregunta original" : "Respuesta" }],
+          complete: true,
+        });
+      },
+      runtimeHandler: (request) => {
+        runtimeCalls += 1;
+        return runtimeCalls === 1
+          ? jsonResponse({
+              type: "failed",
+              code: "context_unavailable",
+              message: "No pudimos preparar el contexto.",
+              recordStatus: "not_admitted",
+              queryId: request.queryId,
+            })
+          : streamResponse(request);
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+
+    expect(props(app).onSubmit(body)).toBe(true);
+    await app.flush();
+    const originalRequest = environment.runtimeRequests.at(-1).request;
+    expect(props(app).state).toMatchObject({
+      queryStatus: "rejected",
+      canRetry: true,
+      queryErrorCode: "context_unavailable",
+    });
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(false);
+    await app.flush();
+    expect(turnsReads).toBe(2);
+    expect(props(app).state.history.turnsStatus).toBe("error");
+    expect(await app.html()).toContain("Reintentar el mismo envío");
+
+    expect(props(app).onSubmit(body)).toBe(true);
+    await app.flush();
+    expect(environment.runtimeRequests.at(-1).request).toEqual(originalRequest);
   });
 
   it("keeps a valid empty failed answer partial after checking its terminal boundary", async () => {
