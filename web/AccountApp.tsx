@@ -1314,7 +1314,31 @@ export function AccountApp({
   ) {
     const manifest = role === "user" ? turn.questionManifest : turn.answerManifest;
     const throughCursor = role === "user" ? manifest.count : turn.cursor;
-    if (throughCursor === 0) return { text: "", complete: manifest.complete };
+    if (throughCursor === 0) {
+      if (role !== "assistant" || turn.status === "in_progress" || manifest.count !== 0) {
+        return { text: "", complete: manifest.complete };
+      }
+      const page = await readConversationTextPage(
+        apiConfig!,
+        session!,
+        {
+          conversationId,
+          ordinal: turn.ordinal,
+          queryId: turn.queryId,
+          role,
+          throughCursor,
+          cursor: null,
+        },
+        isActive,
+      );
+      if (page.chunks.length !== 0 || page.nextCursor !== null) {
+        throw Object.assign(new Error("History text exceeds the requested empty prefix"), {
+          code: "INVALID_RESPONSE",
+          status: 502,
+        });
+      }
+      return { text: "", complete: isActive() && manifest.complete && page.complete };
+    }
     const chunks: { index: number; text: string }[] = [];
     let cursor: string | null = null;
     let finished = false;
@@ -1661,6 +1685,65 @@ export function AccountApp({
       setChatRecoveryRevision((revision) => revision + 1);
       return false;
     }
+  }
+
+  async function reconcileTerminalSnapshot(
+    snapshot: Extract<Awaited<ReturnType<typeof recoverChat>>, { version: 2 }>,
+    request: Pick<ChatRequest, "conversationId" | "queryId">,
+    config: PublicConfig,
+    session: Session,
+    isCurrentSelection: () => boolean,
+  ) {
+    if (!isCurrentSelection()) return { kind: "inactive" as const };
+    const isTerminal = snapshot.status === "completed" || snapshot.status === "failed";
+    if (!isTerminal || snapshot.canContinue) {
+      return {
+        kind: "current" as const,
+        canContinue: snapshot.canContinue,
+        history: undefined,
+        historyError: undefined,
+      };
+    }
+
+    let history: Awaited<ReturnType<typeof readConversationTurns>> | undefined;
+    try {
+      history = await readConversationTurns(
+        config,
+        session,
+        request.conversationId,
+        null,
+        isCurrentSelection,
+      );
+    } catch (error) {
+      if (!isCurrentSelection()) return { kind: "inactive" as const };
+      const apiError = asApiError(error);
+      if (apiError.status === 401 || apiError.status === 403) {
+        return { kind: "unauthorized" as const, status: apiError.status };
+      }
+      return {
+        kind: "current" as const,
+        canContinue: snapshot.canContinue,
+        history: undefined,
+        historyError:
+          "No pudimos confirmar si el hilo sigue abierto. Volvé a seleccionarlo en el historial para actualizarlo.",
+      };
+    }
+    if (!isCurrentSelection()) return { kind: "inactive" as const };
+
+    const latestTurn = history.turns.at(-1);
+    if (
+      history.throughOrdinal !== snapshot.ordinal ||
+      latestTurn?.queryId !== snapshot.queryId ||
+      latestTurn?.status !== snapshot.status
+    ) {
+      return { kind: "needs-reload" as const, canContinue: false, history };
+    }
+    return {
+      kind: "current" as const,
+      canContinue: history.canContinue,
+      history,
+      historyError: undefined,
+    };
   }
 
   async function loadMoreHistory(reload = false) {
@@ -2124,9 +2207,9 @@ export function AccountApp({
     ) => {
       const isCurrentSelection = () =>
         isActive() &&
-        chatScreenStateRef.current.history?.selectedConversationId === request.conversationId;
-      if (!isCurrentSelection() || chatJournalRef.current?.request.queryId !== request.queryId)
-        return;
+        chatScreenStateRef.current.history?.selectedConversationId === request.conversationId &&
+        chatJournalRef.current?.request.queryId === request.queryId;
+      if (!isCurrentSelection()) return;
       const isTerminal = snapshot.status === "completed" || snapshot.status === "failed";
       const reference = {
         version: 2 as const,
@@ -2149,54 +2232,23 @@ export function AccountApp({
       chatJournalRef.current = admittedJournal;
       chatConversationIdRef.current = snapshot.conversationId;
 
-      let terminalHistory: Awaited<ReturnType<typeof readConversationTurns>> | undefined;
-      let terminalHistoryError: string | undefined;
-      if (isTerminal && !snapshot.canContinue) {
-        try {
-          terminalHistory = await readConversationTurns(
-            recoveryConfig,
-            recoverySession,
-            request.conversationId,
-            null,
-            isCurrentSelection,
-          );
-        } catch (error) {
-          if (!isCurrentSelection()) return;
-          const apiError = asApiError(error);
-          if (apiError.status === 401) {
-            invalidateChat(recoveryConfig);
-            profileUnauthorized();
-            return;
-          }
-          if (apiError.status === 403) {
-            invalidateChat(recoveryConfig);
-            profileForbidden();
-            return;
-          }
-          terminalHistoryError =
-            "No pudimos confirmar si el hilo sigue abierto. Volvé a seleccionarlo en el historial para actualizarlo.";
-        }
-        if (!isCurrentSelection() || chatJournalRef.current?.request.queryId !== request.queryId) {
-          return;
-        }
-        if (terminalHistory) {
-          const latestTurn = terminalHistory.turns.at(-1);
-          if (terminalHistory.throughOrdinal > snapshot.ordinal) {
-            await selectConversation(request.conversationId);
-            return;
-          }
-          if (
-            terminalHistory.throughOrdinal !== snapshot.ordinal ||
-            latestTurn?.queryId !== snapshot.queryId ||
-            latestTurn?.status !== snapshot.status
-          ) {
-            await selectConversation(request.conversationId);
-            return;
-          }
-        }
-      }
-      if (!isCurrentSelection() || chatJournalRef.current?.request.queryId !== request.queryId)
+      const reconciliation = await reconcileTerminalSnapshot(
+        snapshot,
+        request,
+        recoveryConfig,
+        recoverySession,
+        isCurrentSelection,
+      );
+      if (reconciliation.kind === "inactive") return;
+      if (reconciliation.kind === "unauthorized") {
+        invalidateChat(recoveryConfig);
+        if (reconciliation.status === 401) profileUnauthorized();
+        else profileForbidden();
         return;
+      }
+      const terminalHistory = reconciliation.history;
+      const terminalHistoryError = reconciliation.historyError;
+      if (!isCurrentSelection()) return;
       const before = chatScreenStateRef.current;
       if (isTerminal) {
         clearChatJournalEntry(recoveryConfig, identity, request.conversationId);
@@ -2211,7 +2263,7 @@ export function AccountApp({
         return;
       }
       chatDisplayedQueryIdRef.current = snapshot.queryId;
-      const canContinue = terminalHistory?.canContinue ?? snapshot.canContinue;
+      const canContinue = reconciliation.canContinue;
       const nextState: ChatScreenState = {
         ...before,
         queryId: snapshot.queryId,
@@ -2261,7 +2313,7 @@ export function AccountApp({
         if (terminalHistory) {
           markLocalConversationTerminal(
             request.conversationId,
-            snapshot.ordinal,
+            terminalHistory.throughOrdinal,
             terminalHistory.closed,
           );
         } else if (snapshot.canContinue) {
@@ -2287,6 +2339,9 @@ export function AccountApp({
           snapshot.ordinal,
           snapshot.queryId,
         );
+      }
+      if (reconciliation.kind === "needs-reload") {
+        if (!(await selectConversation(request.conversationId))) return;
       }
     };
 
@@ -2871,7 +2926,7 @@ export function AccountApp({
         }
       },
     })
-      .then((result) => {
+      .then(async (result) => {
         if (!isActive()) return;
         const before = chatScreenStateRef.current;
         if ("version" in result) {
@@ -2900,16 +2955,66 @@ export function AccountApp({
             chatJournalsRef.current.delete(conversationId);
             chatJournalRef.current = null;
           }
+
+          const isCurrentSelection = () =>
+            isActive() &&
+            chatScreenStateRef.current.history?.selectedConversationId === conversationId &&
+            chatDisplayedQueryIdRef.current === queryId;
+          const reconciliation = await reconcileTerminalSnapshot(
+            result,
+            admittedRequest,
+            apiConfig,
+            session,
+            isCurrentSelection,
+          );
+          if (reconciliation.kind === "inactive") return;
+          if (reconciliation.kind === "unauthorized") {
+            invalidateChat(apiConfig);
+            if (reconciliation.status === 401) profileUnauthorized();
+            else profileForbidden();
+            return;
+          }
+          if (!isCurrentSelection()) return;
+
+          const current = chatScreenStateRef.current;
+          const canContinue = reconciliation.canContinue;
+          const history = current.history ?? emptyHistoryState();
+          const reconciledHistory = reconciliation.history
+            ? {
+                ...history,
+                closed: reconciliation.history.closed,
+                canContinue: reconciliation.history.canContinue,
+                throughOrdinal: reconciliation.history.throughOrdinal,
+                turnsError: undefined,
+              }
+            : reconciliation.historyError
+              ? {
+                  ...history,
+                  throughOrdinal: Math.max(history.throughOrdinal ?? 0, result.ordinal),
+                  turnsError: reconciliation.historyError,
+                }
+              : terminal
+                ? {
+                    ...history,
+                    closed: false,
+                    canContinue: true,
+                    throughOrdinal: Math.max(history.throughOrdinal ?? 0, result.ordinal),
+                    turnsError: undefined,
+                  }
+                : {
+                    ...history,
+                    throughOrdinal: Math.max(history.throughOrdinal ?? 0, result.ordinal),
+                  };
           chatDraftsRef.current.set(conversationId, "");
           const nextState: ChatScreenState = {
-            ...before,
+            ...current,
             queryId,
             question: result.question,
             answer: result.answer,
             draft: "",
             answerComplete: true,
             ordinal: result.ordinal,
-            canContinue: result.canContinue,
+            canContinue,
             quota: result.quota,
             quotaReceivedAt: result.quota ? performance.now() : undefined,
             queryStatus: result.status === "in_progress" ? "streaming" : result.status,
@@ -2919,9 +3024,8 @@ export function AccountApp({
             recoveryLoading: false,
             canRetry: false,
             history: {
-              ...(before.history ?? emptyHistoryState()),
+              ...reconciledHistory,
               selectedConversationId: conversationId,
-              throughOrdinal: result.ordinal,
             },
           };
           setChat(
@@ -2932,17 +3036,36 @@ export function AccountApp({
               answer: result.answer,
               questionComplete: true,
               answerComplete: result.status !== "in_progress",
-              canContinue: result.canContinue,
+              canContinue,
               failure: undefined,
             }),
           );
-          updateLocalConversation(
-            conversationId,
-            text,
-            result.ordinal,
-            result.status === "in_progress" ? result.queryId : null,
-            terminal && !result.canContinue,
-          );
+          if (terminal && reconciliation.history) {
+            markLocalConversationTerminal(
+              conversationId,
+              reconciliation.history.throughOrdinal,
+              reconciliation.history.closed,
+            );
+          } else if (terminal && result.canContinue) {
+            markLocalConversationTerminal(conversationId, result.ordinal, false);
+          } else if (terminal && reconciliation.historyError) {
+            const existing =
+              localConversationsRef.current.get(conversationId) ??
+              current.history?.conversations.find(
+                (conversation) => conversation.conversationId === conversationId,
+              );
+            updateLocalConversation(conversationId, text, result.ordinal, null, existing?.closed);
+          } else {
+            updateLocalConversation(
+              conversationId,
+              text,
+              result.ordinal,
+              result.status === "in_progress" ? result.queryId : null,
+            );
+          }
+          if (reconciliation.kind === "needs-reload") {
+            if (!(await selectConversation(conversationId))) return;
+          }
           return;
         }
         if (result.status === "completed") {

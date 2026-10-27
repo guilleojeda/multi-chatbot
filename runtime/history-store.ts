@@ -517,6 +517,61 @@ export function createHistoryStore(input: {
     return last.index + 1;
   }
 
+  async function rejectExtraTextChunk(input: {
+    id: string;
+    ordinal: number;
+    queryId: string;
+    role: "user" | "assistant";
+    afterKey?: Key;
+  }): Promise<void> {
+    let remainder: Record<string, unknown>;
+    try {
+      remainder = await documentClient.send(
+        new QueryCommand({
+          TableName: tableName,
+          KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+          ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
+          ExpressionAttributeValues: {
+            ":pk": "CONV#" + input.id,
+            ":prefix": textPrefix(input.id, input.ordinal, input.queryId, input.role),
+          },
+          ConsistentRead: true,
+          ScanIndexForward: true,
+          Limit: 1,
+          ...(input.afterKey ? { ExclusiveStartKey: input.afterKey } : {}),
+        }),
+      );
+    } catch (error) {
+      throw asStorageError(error, "conversation_unavailable");
+    }
+    const candidates = Array.isArray(remainder.Items) ? remainder.Items.filter(isRecord) : [];
+    if (candidates.length > 1) {
+      throw fail("conversation_unavailable", "Conversation text prefix is invalid.");
+    }
+    const extra = candidates[0];
+    if (extra) {
+      if (
+        !validChunk(extra, {
+          id: input.id,
+          ordinal: input.ordinal,
+          queryId: input.queryId,
+          role: input.role,
+        })
+      ) {
+        throw fail("conversation_unavailable", "Conversation text chunk is invalid.");
+      }
+      throw fail(
+        "conversation_unavailable",
+        input.role === "user"
+          ? "Conversation question has data beyond its manifest."
+          : "Conversation answer has data beyond its manifest.",
+      );
+    }
+    if (remainder.LastEvaluatedKey) {
+      throw fail("conversation_unavailable", "Conversation text prefix is invalid.");
+    }
+  }
+
   async function readTurns(scope: {
     sub: string;
     botId: string;
@@ -779,6 +834,10 @@ export function createHistoryStore(input: {
     ) {
       throw fail(cursor ? "invalid_cursor" : "invalid_request", "Text prefix cursor is invalid.");
     }
+    const immutableAnswerBoundary =
+      scope.role === "assistant" &&
+      turn.status !== "in_progress" &&
+      throughCursor === manifestCount;
     const startIndex = cursor ? Number(cursor.nextIndex) : 0;
     if (startIndex > throughCursor)
       throw fail("invalid_cursor", "Text cursor is outside the frozen prefix.");
@@ -803,7 +862,9 @@ export function createHistoryStore(input: {
                 ? remaining <= MAX_CHUNKS
                   ? remaining + 1
                   : MAX_CHUNKS
-                : Math.min(MAX_CHUNKS, remaining),
+                : immutableAnswerBoundary && remaining <= MAX_CHUNKS
+                  ? remaining + 1
+                  : Math.min(MAX_CHUNKS, remaining),
             ...(cursor && isKey(cursor.key) ? { ExclusiveStartKey: cursor.key } : {}),
           }),
         );
@@ -829,7 +890,13 @@ export function createHistoryStore(input: {
       }
       // Chunks appended after this descriptor's frozen cursor belong to a later read.
       if (candidate.index >= throughCursor) {
-        if (scope.role === "assistant") continue;
+        if (scope.role === "assistant" && !immutableAnswerBoundary) continue;
+        if (scope.role === "assistant") {
+          throw fail(
+            "conversation_unavailable",
+            "Conversation answer has data beyond its manifest.",
+          );
+        }
         throw fail(
           "conversation_unavailable",
           "Conversation question has data beyond its manifest.",
@@ -856,50 +923,25 @@ export function createHistoryStore(input: {
       throw fail("history_unavailable", "A history text chunk exceeds the response limit.");
     }
     const complete = expectedIndex === throughCursor;
-    if (scope.role === "user" && complete && page.LastEvaluatedKey) {
+    if (complete && page.LastEvaluatedKey && (scope.role === "user" || immutableAnswerBoundary)) {
       if (!lastIncludedKey) {
-        throw fail("conversation_unavailable", "Conversation question manifest is invalid.");
+        throw fail("conversation_unavailable", "Conversation text manifest is invalid.");
       }
-      let remainder: Record<string, unknown>;
-      try {
-        remainder = await documentClient.send(
-          new QueryCommand({
-            TableName: tableName,
-            KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
-            ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" },
-            ExpressionAttributeValues: {
-              ":pk": "CONV#" + scope.conversationId,
-              ":prefix": textPrefix(scope.conversationId, scope.ordinal, scope.queryId, "user"),
-            },
-            ConsistentRead: true,
-            ScanIndexForward: true,
-            Limit: 1,
-            ExclusiveStartKey: lastIncludedKey,
-          }),
-        );
-      } catch (error) {
-        throw asStorageError(error, "conversation_unavailable");
-      }
-      const extra = Array.isArray(remainder.Items) ? remainder.Items.find(isRecord) : undefined;
-      if (extra) {
-        if (
-          !validChunk(extra, {
-            id: scope.conversationId,
-            ordinal: scope.ordinal,
-            queryId: scope.queryId,
-            role: "user",
-          })
-        ) {
-          throw fail("conversation_unavailable", "Conversation text chunk is invalid.");
-        }
-        throw fail(
-          "conversation_unavailable",
-          "Conversation question has data beyond its manifest.",
-        );
-      }
-      if (remainder.LastEvaluatedKey) {
-        throw fail("conversation_unavailable", "Conversation question prefix is invalid.");
-      }
+      await rejectExtraTextChunk({
+        id: scope.conversationId,
+        ordinal: scope.ordinal,
+        queryId: scope.queryId,
+        role: scope.role,
+        afterKey: lastIncludedKey,
+      });
+    }
+    if (scope.role === "assistant" && immutableAnswerBoundary && complete && throughCursor === 0) {
+      await rejectExtraTextChunk({
+        id: scope.conversationId,
+        ordinal: scope.ordinal,
+        queryId: scope.queryId,
+        role: scope.role,
+      });
     }
     if (!complete && expectedIndex === startIndex && candidates.length === 0) {
       throw fail("conversation_unavailable", "Conversation text prefix is incomplete.");
