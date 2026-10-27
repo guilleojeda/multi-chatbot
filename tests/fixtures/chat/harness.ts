@@ -6,12 +6,14 @@ import {
 import { siteConfig } from "../../../config/site";
 import type { QuotaView } from "../../../runtime/contracts";
 import { createSession, type Session, type SessionTokens } from "../../../web/session";
+import { clearChatJournal } from "../../../web/chat-journal";
 
 export const fixtureScenarios = [
   { id: "ready", label: "Perfil completo; Runtime controlado" },
   { id: "incomplete", label: "Perfil docente incompleto" },
   { id: "history-pending", label: "Historial: retener la primera lista" },
   { id: "history-error", label: "Historial: error temporal al listar" },
+  { id: "history-earlier-pending", label: "Historial: retener una página anterior" },
   { id: "history-reload-error", label: "Historial: META correcto y recarga 503" },
   { id: "profile-error", label: "GET del perfil: error recuperable" },
   { id: "profile-pending", label: "GET del perfil: mantener pendiente" },
@@ -674,6 +676,52 @@ export class ChatBrowserFixture {
     this.changed();
   }
 
+  seedHistorySelectionDemo() {
+    const ownerSub = this.activeSessionSub() || identities[0].sub;
+    const now = Date.now();
+    this.conversations.clear();
+    try {
+      clearChatJournal(this.publicConfig, { sub: ownerSub, botId: this.publicConfig.botId });
+    } catch {
+      // The seeded server history remains useful if fixture storage is unavailable.
+    }
+    for (const [conversationNumber, offset, active] of [
+      [1, 120_000, true],
+      [2, 60_000, false],
+    ] as const) {
+      const conversationId = fixtureUuid("71000000", conversationNumber);
+      const turns: FixtureTurn[] = Array.from({ length: 22 }, (_, index) => {
+        const ordinal = index + 1;
+        const isActive = active && ordinal === 22;
+        return {
+          ordinal,
+          queryId: fixtureUuid("81000000", conversationNumber * 100 + ordinal),
+          question:
+            ordinal === 1
+              ? `Hilo ${active ? "A antiguo y activo" : "B reciente"}: primera consulta.`
+              : `Consulta ${ordinal} del hilo ${active ? "A" : "B"}.`,
+          answer: isActive
+            ? "Prefijo durable de la respuesta activa del hilo A."
+            : `Respuesta completa ${ordinal} del hilo ${active ? "A" : "B"}.`,
+          status: isActive ? "streaming" : "completed",
+          canContinue: !isActive,
+        };
+      });
+      this.conversations.set(conversationId, {
+        conversationId,
+        ownerSub,
+        botId: this.publicConfig.botId,
+        createdAt: new Date(now - offset - 60_000).toISOString(),
+        updatedAt: new Date(now - offset).toISOString(),
+        closed: false,
+        nextOrdinal: turns.length + 1,
+        turns,
+      });
+    }
+    this.persistConversations();
+    this.changed();
+  }
+
   get scenario() {
     return this.selectedScenario;
   }
@@ -1036,6 +1084,20 @@ export class ChatBrowserFixture {
     if (conversation.ownerSub !== sub || conversation.botId !== this.publicConfig.botId) {
       this.finish(request, 403, "el historial pertenece a otro sujeto o bot");
       return this.historyJson({ code: "FORBIDDEN" }, 403);
+    }
+
+    if (
+      turnsMatch &&
+      url.searchParams.has("cursor") &&
+      this.selectedScenario === "history-earlier-pending"
+    ) {
+      this.selectedScenario = "ready";
+      request.status = "pending";
+      request.outcome = "la primera página anterior espera el control Liberar historial";
+      this.changed();
+      await new Promise<void>((resolve) =>
+        this.pendingHistoryReads.push({ request, release: resolve }),
+      );
     }
 
     if (turnsMatch && this.selectedScenario === "history-reload-error") {

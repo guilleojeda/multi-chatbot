@@ -9,6 +9,7 @@ import {
   mountHistoryAccountApp,
   secondConversationId,
   secondQueryId,
+  thirdQueryId,
   streamResponse,
 } from "../support/history-web-harness.mjs";
 import {
@@ -213,6 +214,257 @@ const turnText = ({ conversationId, ordinal, url }) =>
     chunks: [{ index: 0, text: `ORIGINAL_TEXT_${ordinal}` }],
     complete: true,
   });
+
+describe("earlier history pages follow the current selection", () => {
+  const fourthQueryId = "9ed06c25-b5c8-40d0-9b04-f93c2f7e8900";
+  const queryIds = new Map([
+    [`${firstConversationId}:1`, firstQueryId],
+    [`${firstConversationId}:2`, secondQueryId],
+    [`${secondConversationId}:1`, thirdQueryId],
+    [`${secondConversationId}:2`, fourthQueryId],
+  ]);
+  const page = (conversationId, turns, nextCursor) =>
+    jsonResponse({
+      version: 1,
+      conversationId,
+      throughOrdinal: 2,
+      closed: false,
+      canContinue: true,
+      turns,
+      ...(nextCursor ? { nextCursor } : {}),
+    });
+
+  it("clears A's pending-page state before B can load its own history and ignores A's late result", async () => {
+    const pendingA = deferred();
+    let aEarlierReads = 0;
+    let failFirstBOpen = true;
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            { conversationId: firstConversationId, label: "A", lastOrdinal: 2, closed: false },
+            { conversationId: secondConversationId, label: "B", lastOrdinal: 2, closed: false },
+          ],
+        }),
+      turnsHandler: ({ conversationId, url }) => {
+        const cursor = url.searchParams.get("cursor");
+        if (!cursor) {
+          if (conversationId === secondConversationId && failFirstBOpen) {
+            failFirstBOpen = false;
+            return jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503);
+          }
+          return page(
+            conversationId,
+            [turn(2, queryIds.get(`${conversationId}:2`))],
+            `${conversationId}-older`,
+          );
+        }
+        if (conversationId === firstConversationId && aEarlierReads++ === 0)
+          return pendingA.promise;
+        return page(conversationId, [turn(1, queryIds.get(`${conversationId}:1`))]);
+      },
+      textHandler: ({ conversationId, ordinal, url }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: queryIds.get(`${conversationId}:${ordinal}`),
+          role: url.searchParams.get("role"),
+          chunks: [{ index: 0, text: `original-${conversationId}-${ordinal}` }],
+          complete: true,
+        }),
+    });
+    const app = mount(environment);
+    await app.flush();
+    const current = () => props(app).state.history;
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    const pendingPage = props(app).onLoadEarlierTurns();
+    await app.flush();
+    expect(current()).toMatchObject({
+      selectedConversationId: firstConversationId,
+      loadingEarlier: true,
+    });
+
+    expect(await props(app).onSelectConversation(secondConversationId)).toBe(false);
+    await app.flush();
+    expect(current()).toMatchObject({
+      selectedConversationId: firstConversationId,
+      turnsStatus: "error",
+      loadingEarlier: false,
+    });
+    const openingError = current().turnsError;
+
+    expect(await props(app).onSelectConversation(secondConversationId)).toBe(true);
+    await app.flush();
+    expect(current()).toMatchObject({
+      selectedConversationId: secondConversationId,
+      turnsStatus: "ready",
+      turnsNextCursor: `${secondConversationId}-older`,
+      loadingEarlier: false,
+    });
+    await props(app).onLoadEarlierTurns();
+    await app.flush();
+    expect(current().turns.map(({ queryId }) => queryId)).toEqual([thirdQueryId, fourthQueryId]);
+
+    pendingA.resolve(page(firstConversationId, [turn(1, firstQueryId)]));
+    await pendingPage;
+    await app.flush();
+    expect(current()).toMatchObject({
+      selectedConversationId: secondConversationId,
+      turnsStatus: "ready",
+      loadingEarlier: false,
+      turnsError: undefined,
+    });
+    expect(current().turns.map(({ queryId }) => queryId)).toEqual([thirdQueryId, fourthQueryId]);
+    expect(openingError).toContain("No pudimos abrir");
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    expect(current()).toMatchObject({
+      selectedConversationId: firstConversationId,
+      turnsNextCursor: `${firstConversationId}-older`,
+      loadingEarlier: false,
+    });
+    await props(app).onLoadEarlierTurns();
+    await app.flush();
+    expect(current().turns.map(({ queryId }) => queryId)).toEqual([firstQueryId, secondQueryId]);
+  });
+
+  it("keeps a same-thread page load through list refresh and clears it when starting a new chat", async () => {
+    const pendingA = deferred();
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            { conversationId: firstConversationId, label: "A", lastOrdinal: 2, closed: false },
+          ],
+        }),
+      turnsHandler: ({ conversationId, url }) =>
+        url.searchParams.has("cursor")
+          ? pendingA.promise
+          : page(conversationId, [turn(2, secondQueryId)], `${conversationId}-older`),
+      textHandler: turnText,
+    });
+    const app = mount(environment);
+    await app.flush();
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    const pendingPage = props(app).onLoadEarlierTurns();
+    await app.flush();
+    expect(props(app).state.history.loadingEarlier).toBe(true);
+
+    await props(app).onRefreshHistory();
+    await app.flush();
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: firstConversationId,
+      loadingEarlier: true,
+    });
+
+    props(app).onReset();
+    await app.flush();
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: null,
+      loadingEarlier: false,
+      turnsNextCursor: null,
+    });
+    pendingA.resolve(page(firstConversationId, [turn(1, firstQueryId)]));
+    await pendingPage;
+    await app.flush();
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: null,
+      loadingEarlier: false,
+      turns: [],
+    });
+  });
+});
+
+describe("active recovery preserves authoritative activity", () => {
+  it("keeps an older in-progress conversation behind a newer conversation after recover", async () => {
+    const olderUpdatedAt = new Date(Date.now() - 120_000).toISOString();
+    const newerUpdatedAt = new Date(Date.now() - 60_000).toISOString();
+    const activeTurn = {
+      ...turn(1, firstQueryId),
+      status: "in_progress",
+      answerManifest: { count: 1, complete: false },
+    };
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: secondConversationId,
+              label: "B reciente",
+              updatedAt: newerUpdatedAt,
+              lastOrdinal: 1,
+              closed: false,
+            },
+            {
+              conversationId: firstConversationId,
+              label: "A antiguo y activo",
+              updatedAt: olderUpdatedAt,
+              lastOrdinal: 1,
+              closed: false,
+              activeQueryId: firstQueryId,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          label: "A antiguo y activo",
+          updatedAt: olderUpdatedAt,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: false,
+          turns: [activeTurn],
+        }),
+      textHandler: turnText,
+      recoverHandler: (request) =>
+        jsonResponse({
+          version: 2,
+          conversationId: request.conversationId,
+          queryId: request.queryId,
+          ordinal: 1,
+          status: "in_progress",
+          question: "Consulta activa A",
+          answer: "Prefijo durable",
+          canContinue: false,
+        }),
+    });
+    const app = mount(environment);
+    await app.flush();
+    expect(
+      props(app).state.history.conversations.map(({ conversationId }) => conversationId),
+    ).toEqual([secondConversationId, firstConversationId]);
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+
+    expect(environment.runtimeRequests.map(({ request }) => request.operation)).toEqual([
+      "recover",
+    ]);
+    expect(props(app).state).toMatchObject({ queryId: firstQueryId, queryStatus: "streaming" });
+    expect(
+      props(app).state.history.conversations.map(({ conversationId }) => conversationId),
+    ).toEqual([secondConversationId, firstConversationId]);
+    expect(props(app).state.history.conversations[0]).toMatchObject({
+      conversationId: secondConversationId,
+      updatedAt: newerUpdatedAt,
+    });
+    expect(props(app).state.history.conversations[1]).toMatchObject({
+      conversationId: firstConversationId,
+      updatedAt: olderUpdatedAt,
+      lastOrdinal: 1,
+      activeQueryId: firstQueryId,
+    });
+  });
+});
 
 function createFixtureStorage() {
   const values = new Map();

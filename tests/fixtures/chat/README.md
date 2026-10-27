@@ -89,6 +89,24 @@ fallida explícitamente parcial; como su prefijo remoto está cargado por comple
 `runtime-stale-base` y envía un seguimiento: el borrador debe permanecer y la interfaz debe pedir
 una actualización explícita, sin reenviar.
 
+Para comprobar el cambio entre dos páginas de historial pendientes, pulsa “Preparar hilos A→B y
+recargar”. La preparación reemplaza los registros simulados por dos conversaciones de 22 turnos y
+borra el journal y la selección locales de la identidad de fixture actual. El estado inicial es B
+primero por actividad reciente y A después, con su último turno en curso. En el selector elige
+`history-earlier-pending`, abre A y pulsa “Ver mensajes anteriores”; espera a que el contador indique
+una lectura de historial pendiente. El escenario retiene solo esa primera página anterior y vuelve
+a `ready`. Abre B y confirma que su acción “Ver mensajes anteriores” está disponible; cárgala y
+comprueba que sus dos turnos más antiguos aparecen junto a los veinte recientes. Libera la lectura
+pendiente y confirma que B y sus turnos no cambian. Al volver a A, su estado de carga debe estar
+libre y su página anterior se puede cargar normalmente. El control “Liberar historial” suelta la
+respuesta retenida; la respuesta tardía de A no se aplica a la selección B.
+
+La misma preparación permite verificar recuperación sin actividad nueva: vuelve a pulsar “Preparar
+hilos A→B y recargar”, abre A y observa “Resumen” y “Peticiones”. A debe seguir detrás de B
+con su `updatedAt` anterior, aunque el Runtime responda a `recover` con `in_progress`. La operación
+debe ser `recover`, sin un `start` o `message`; B conserva su fecha más reciente. La preparación
+usa IDs de consulta distintos por ordinal para que cada registro simulado represente un hilo real.
+
 La paginación, los manifiestos, los controles de membresía y los textos del historial son dobles de
 HTTP apoyados en registros de Runtime sintéticos en `sessionStorage`. No prueban DynamoDB, el GSI,
 Bedrock, IAM, API Gateway, Cognito, ni supervivencia de trabajos AWS.
@@ -355,7 +373,7 @@ path. The fixture does not write to the operating-system clipboard.
 
 Append `?scenario=<name>` before the hash to select an initial scenario, for example
 `/?scenario=profile-pending#/chat`. Supported names are `ready`, `incomplete`, `history-pending`,
-`history-error`, `profile-error`,
+`history-error`, `history-earlier-pending`, `profile-error`,
 `profile-pending`, `profile-save-error`, `membership-denied`, `membership-unauthorized`,
 `membership-temporary`, `membership-network`, `config-temporary`, `runtime-admission-pending`,
 `runtime-unconfirmed`, `runtime-temporary`, `runtime-recover-network`, `runtime-quota-daily`,

@@ -95,6 +95,22 @@ function FixtureControls() {
           Carga 22 conversaciones y un hilo con 22 turnos en los registros simulados del Runtime.
           Incluye un hilo activo con texto en varias páginas y otro cerrado. No escribe datos AWS.
         </p>
+        <button
+          className="account-button account-button--secondary"
+          type="button"
+          onClick={() => {
+            fixture.seedHistorySelectionDemo();
+            window.history.replaceState(null, "", "/#/chat");
+            window.location.reload();
+          }}
+        >
+          Preparar hilos A→B y recargar
+        </button>
+        <p className="profile-fixture-readout">
+          Carga dos hilos paginados: A tiene una consulta activa y actividad más antigua; B tiene
+          actividad más reciente. Sirve para comprobar el cambio de selección y el orden tras
+          recuperar A.
+        </p>
         <nav className="profile-fixture-links" aria-label="Rutas locales">
           <a href="#/chat">Abrir chat</a>
           <a href="#/profile">Abrir perfil</a>
