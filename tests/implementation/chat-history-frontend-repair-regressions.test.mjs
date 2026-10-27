@@ -195,6 +195,14 @@ const turn = (ordinal = 2, queryId = firstQueryId) => ({
   cursor: 1,
 });
 
+const emptyFailedTurn = () => ({
+  ...turn(1, firstQueryId),
+  status: "failed",
+  answerManifest: { count: 0, complete: false },
+  cursor: 0,
+  failure: { code: "runtime_failed" },
+});
+
 const turnText = ({ conversationId, ordinal, url }) =>
   jsonResponse({
     version: 1,
@@ -450,6 +458,519 @@ describe("phase 7 frontend repair regressions", () => {
         (item) => item.headers.get("accept") !== "application/json",
       ),
     ).toHaveLength(0);
+  });
+
+  it("reopens authoritative history after replaying an older terminal snapshot", async () => {
+    const body = "Original uncertain start";
+    let environment;
+    let originalRequest;
+    let remoteAdvanced = false;
+    let turnsReads = 0;
+    const recoveredQueries = [];
+    const journalAtMetaRead = [];
+    environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: remoteAdvanced
+            ? [
+                {
+                  conversationId: originalRequest?.conversationId ?? firstConversationId,
+                  label: body,
+                  lastOrdinal: 2,
+                  closed: false,
+                },
+              ]
+            : [],
+        }),
+      turnsHandler: ({ conversationId }) => {
+        turnsReads += 1;
+        journalAtMetaRead.push(
+          readChatJournals(environment.config, environment.identity).get(
+            originalRequest.conversationId,
+          ),
+        );
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          label: body,
+          throughOrdinal: 2,
+          closed: false,
+          canContinue: true,
+          turns: [turn(2, secondQueryId)],
+        });
+      },
+      textHandler: ({ conversationId, ordinal, url }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: secondQueryId,
+          role: url.searchParams.get("role"),
+          chunks: [{ index: 0, text: `latest-${url.searchParams.get("role")}` }],
+          complete: true,
+        }),
+      recoverHandler: (request) => {
+        recoveredQueries.push(request.queryId);
+        return jsonResponse({
+          type: "failed",
+          code: "conversation_unavailable",
+          message: "No se encontró el envío.",
+          recordStatus: "not_admitted",
+          queryId: request.queryId,
+        });
+      },
+      runtimeHandler: (request) => {
+        if (!originalRequest) {
+          originalRequest = request;
+          return streamResponse(request, { accepted: false });
+        }
+        return request.queryId === originalRequest.queryId
+          ? jsonResponse({
+              version: 2,
+              conversationId: request.conversationId,
+              queryId: request.queryId,
+              ordinal: 1,
+              status: "completed",
+              question: body,
+              answer: "Older completed result",
+              canContinue: false,
+            })
+          : streamResponse(request);
+      },
+    });
+
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).onSubmit(body)).toBe(true);
+    await app.flush();
+    expect(originalRequest).toMatchObject({ operation: "start", baseOrdinal: 0, text: body });
+    expect(props(app).state).toMatchObject({
+      queryStatus: "unconfirmed",
+      question: body,
+      canRetry: true,
+    });
+    expect(recoveredQueries).toContain(originalRequest.queryId);
+    expect(
+      readChatJournals(environment.config, environment.identity).get(
+        originalRequest.conversationId,
+      ),
+    ).toMatchObject({
+      admitted: false,
+      request: { queryId: originalRequest.queryId, text: body },
+    });
+    expect(environment.apiRequests.filter((item) => item.path.endsWith("/turns"))).toHaveLength(0);
+
+    // The uncertain admission and a follow-up finish in another session.
+    remoteAdvanced = true;
+    expect(props(app).onSubmit(body)).toBe(true);
+    await app.flush();
+
+    expect(turnsReads).toBeGreaterThan(0);
+    expect(journalAtMetaRead[0]).toBeUndefined();
+    expect(
+      readChatJournals(environment.config, environment.identity).has(
+        originalRequest.conversationId,
+      ),
+    ).toBe(false);
+    expect(props(app).state).toMatchObject({
+      ordinal: 2,
+      queryStatus: "completed",
+      canContinue: true,
+      history: {
+        selectedConversationId: originalRequest.conversationId,
+        throughOrdinal: 2,
+        closed: false,
+        canContinue: true,
+        turns: [{ ordinal: 2, queryId: secondQueryId, answer: "latest-assistant" }],
+      },
+    });
+    expect(props(app).state.history.conversations[0]).toMatchObject({
+      conversationId: originalRequest.conversationId,
+      lastOrdinal: 2,
+      closed: false,
+    });
+    expect(props(app).onSubmit("New follow-up")).toBe(true);
+    await app.flush();
+    expect(environment.runtimeRequests.at(-1).request).toMatchObject({
+      operation: "message",
+      conversationId: originalRequest.conversationId,
+      baseOrdinal: 2,
+      text: "New follow-up",
+    });
+  });
+
+  it("keeps a confirmed replay result when reopening newer history fails", async () => {
+    let turnsReads = 0;
+    const body = "Confirmed completed result";
+    const environment = createHistoryEnvironment({
+      turnsHandler: ({ conversationId }) => {
+        turnsReads += 1;
+        if (turnsReads > 1) return jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503);
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 2,
+          closed: false,
+          canContinue: true,
+          turns: [turn(2, secondQueryId)],
+        });
+      },
+      recoverHandler: (request) =>
+        jsonResponse({
+          type: "failed",
+          code: "conversation_unavailable",
+          message: "No se encontró el envío.",
+          recordStatus: "not_admitted",
+          queryId: request.queryId,
+        }),
+      runtimeHandler: (request) =>
+        jsonResponse({
+          version: 2,
+          conversationId: request.conversationId,
+          queryId: request.queryId,
+          ordinal: 1,
+          status: "completed",
+          question: "Original uncertain start",
+          answer: body,
+          canContinue: false,
+        }),
+    });
+    writePendingStart(environment, "Original uncertain start");
+
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).state.queryStatus).toBe("unconfirmed");
+    expect(props(app).onSubmit("Original uncertain start")).toBe(true);
+    await app.flush();
+
+    expect(turnsReads).toBe(2);
+    expect(props(app).state).toMatchObject({
+      ordinal: 1,
+      queryStatus: "completed",
+      answer: body,
+      canContinue: false,
+      history: {
+        throughOrdinal: 2,
+        closed: false,
+        canContinue: true,
+        turnsStatus: "error",
+        turnsError: "No pudimos abrir la conversación. Podés volver a intentarlo.",
+      },
+    });
+    expect(
+      readChatJournals(environment.config, environment.identity).has(firstConversationId),
+    ).toBe(false);
+    let html = await app.html();
+    expect(html).toContain("Recuperamos este envío. No pudimos actualizar la conversación.");
+    expect(html).toContain(
+      "La respuesta está completa. No pudimos confirmar si podés continuar este hilo.",
+    );
+    expect(html).not.toContain("Recuperamos el último envío de esta conversación");
+    expect(html).not.toContain("La respuesta está completa. Podés continuar este hilo.");
+    expect(html).toContain("Copiar respuesta");
+
+    props(app).onDraftChange("Seguimiento pendiente de actualizar");
+    await app.flush();
+    html = await app.html();
+    expect(props(app).state.draft).toBe("Seguimiento pendiente de actualizar");
+    expect(html).toContain("Seguimiento pendiente de actualizar");
+    const textarea = html.match(/<textarea\b[^>]*>/)?.[0];
+    expect(textarea).toContain('id="chat-query"');
+    expect(textarea).not.toContain("disabled");
+    const sendButton = html.match(/<button\b[^>]*type="submit"[^>]*>Enviar<\/button>/)?.[0];
+    expect(sendButton).toContain("disabled");
+    expect(props(app).onSubmit("Next follow-up")).toBe(false);
+  });
+
+  it("uses current META closure for an explicitly replayed failed terminal", async () => {
+    const body = "Retry an uncertain request that failed durably";
+    let turnsReads = 0;
+    const environment = createHistoryEnvironment({
+      turnsHandler: ({ conversationId }) => {
+        turnsReads += 1;
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: true,
+          canContinue: false,
+          turns: [
+            {
+              ...turn(1, firstQueryId),
+              status: "failed",
+              answerManifest: { count: 0, complete: false },
+              cursor: 0,
+              failure: { code: "runtime_failed" },
+            },
+          ],
+        });
+      },
+      recoverHandler: (request) =>
+        jsonResponse({
+          type: "failed",
+          code: "conversation_unavailable",
+          message: "No se encontró el envío.",
+          recordStatus: "not_admitted",
+          queryId: request.queryId,
+        }),
+      runtimeHandler: (request) =>
+        jsonResponse({
+          version: 2,
+          conversationId: request.conversationId,
+          queryId: request.queryId,
+          ordinal: 1,
+          status: "failed",
+          question: body,
+          answer: "Durable partial result",
+          canContinue: false,
+        }),
+    });
+    writePendingStart(environment, body);
+
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).state.queryStatus).toBe("unconfirmed");
+    expect(props(app).onSubmit(body)).toBe(true);
+    await app.flush();
+
+    expect(turnsReads).toBe(1);
+    expect(props(app).state).toMatchObject({
+      queryStatus: "failed",
+      answer: "Durable partial result",
+      canContinue: false,
+      history: { throughOrdinal: 1, closed: true, canContinue: false },
+    });
+    expect(props(app).state.history.conversations[0]).toMatchObject({
+      lastOrdinal: 1,
+      closed: true,
+    });
+  });
+
+  it("keeps a replayed terminal result and reports META failure without closing the thread", async () => {
+    const body = "Keep the confirmed answer if current history is unavailable";
+    let turnsReads = 0;
+    const environment = createHistoryEnvironment({
+      turnsHandler: () => {
+        turnsReads += 1;
+        return jsonResponse({ code: "TEMPORARY" }, 503);
+      },
+      recoverHandler: (request) =>
+        jsonResponse({
+          type: "failed",
+          code: "conversation_unavailable",
+          message: "No se encontró el envío.",
+          recordStatus: "not_admitted",
+          queryId: request.queryId,
+        }),
+      runtimeHandler: (request) =>
+        jsonResponse({
+          version: 2,
+          conversationId: request.conversationId,
+          queryId: request.queryId,
+          ordinal: 1,
+          status: "completed",
+          question: body,
+          answer: "Confirmed result remains visible",
+          canContinue: false,
+        }),
+    });
+    writePendingStart(environment, body);
+
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).state.queryStatus).toBe("unconfirmed");
+    expect(props(app).onSubmit(body)).toBe(true);
+    await app.flush();
+
+    expect(turnsReads).toBe(1);
+    expect(props(app).state).toMatchObject({
+      queryStatus: "completed",
+      answer: "Confirmed result remains visible",
+      canContinue: false,
+      history: {
+        selectedConversationId: firstConversationId,
+        turnsError:
+          "No pudimos confirmar si el hilo sigue abierto. Volvé a seleccionarlo en el historial para actualizarlo.",
+      },
+    });
+    expect(props(app).state.history.conversations[0]).toMatchObject({
+      conversationId: firstConversationId,
+      lastOrdinal: 1,
+      closed: false,
+    });
+    const html = await app.html();
+    expect(html).toContain("Recuperamos este envío. No pudimos actualizar la conversación.");
+    expect(html).toContain(
+      "La respuesta está completa. No pudimos confirmar si podés continuar este hilo.",
+    );
+    expect(html).not.toContain("Recuperamos el último envío de esta conversación");
+    expect(html).not.toContain("La respuesta está completa. Podés continuar este hilo.");
+  });
+
+  it("describes a confirmed closed completed thread without inviting a follow-up", async () => {
+    const environment = createHistoryEnvironment({
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: true,
+          canContinue: false,
+          turns: [
+            {
+              ...turn(1, firstQueryId),
+              status: "completed",
+              answerManifest: { count: 1, complete: true },
+              cursor: 1,
+            },
+          ],
+        }),
+      textHandler: ({ conversationId, ordinal, url }) => {
+        const role = url.searchParams.get("role");
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: firstQueryId,
+          role,
+          chunks: [{ index: 0, text: role === "user" ? "Pregunta" : "Respuesta" }],
+          complete: true,
+        });
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+
+    expect(props(app).state).toMatchObject({
+      queryStatus: "completed",
+      canContinue: false,
+      history: { closed: true, turnsStatus: "ready" },
+    });
+    const html = await app.html();
+    expect(html).toContain("La respuesta está completa. Este hilo está cerrado.");
+    expect(html).not.toContain("La respuesta está completa. Podés continuar este hilo.");
+  });
+
+  it("ignores a newer-history reload after explicit selection changes", async () => {
+    const terminalMeta = deferred();
+    let firstConversationReads = 0;
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Pendiente",
+              lastOrdinal: 0,
+              closed: false,
+            },
+            {
+              conversationId: secondConversationId,
+              label: "Otra conversación",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) => {
+        if (conversationId === secondConversationId) {
+          return jsonResponse({
+            version: 1,
+            conversationId,
+            throughOrdinal: 1,
+            closed: false,
+            canContinue: true,
+            turns: [turn(1, secondQueryId)],
+          });
+        }
+        firstConversationReads += 1;
+        if (firstConversationReads === 1) {
+          return jsonResponse({
+            version: 1,
+            conversationId,
+            throughOrdinal: 2,
+            closed: false,
+            canContinue: true,
+            turns: [turn(2, secondQueryId)],
+          });
+        }
+        return terminalMeta.promise;
+      },
+      textHandler: ({ conversationId, ordinal, url }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: url.searchParams.get("queryId"),
+          role: url.searchParams.get("role"),
+          chunks: [{ index: 0, text: `text-${conversationId}` }],
+          complete: true,
+        }),
+      recoverHandler: (request) =>
+        jsonResponse({
+          type: "failed",
+          code: "conversation_unavailable",
+          message: "No se encontró el envío.",
+          recordStatus: "not_admitted",
+          queryId: request.queryId,
+        }),
+      runtimeHandler: (request) =>
+        jsonResponse({
+          version: 2,
+          conversationId: request.conversationId,
+          queryId: request.queryId,
+          ordinal: 1,
+          status: "completed",
+          question: "Older request",
+          answer: "Older result",
+          canContinue: false,
+        }),
+    });
+    writePendingStart(environment, "Older request");
+
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).state.queryStatus).toBe("unconfirmed");
+    expect(props(app).onSubmit("Older request")).toBe(true);
+    await vi.waitFor(() => expect(firstConversationReads).toBe(2));
+
+    expect(await props(app).onSelectConversation(secondConversationId)).toBe(true);
+    await app.flush();
+    terminalMeta.resolve(
+      jsonResponse({
+        version: 1,
+        conversationId: firstConversationId,
+        throughOrdinal: 2,
+        closed: true,
+        canContinue: false,
+        turns: [
+          {
+            ...turn(2, secondQueryId),
+            status: "failed",
+            answerManifest: { count: 0, complete: false },
+            cursor: 0,
+            failure: { code: "runtime_failed" },
+          },
+        ],
+      }),
+    );
+    await app.flush();
+
+    expect(props(app).state.history.selectedConversationId).toBe(secondConversationId);
+    expect(props(app).state).toMatchObject({
+      queryStatus: "completed",
+      history: { throughOrdinal: 1, closed: false, canContinue: true },
+    });
+    expect(props(app).state.history.turns.at(-1)).toMatchObject({
+      ordinal: 1,
+      queryId: secondQueryId,
+      question: `text-${secondConversationId}`,
+    });
   });
 
   it("minimizes a pending start when recover confirms its active turn", async () => {
@@ -1094,6 +1615,154 @@ describe("phase 7 frontend repair regressions", () => {
       expect(environment.apiRequests.some(({ method }) => method !== "GET")).toBe(false);
     },
   );
+
+  it("shows a terminal empty-answer integrity error from the text API", async () => {
+    const textReads = [];
+    const environment = createHistoryEnvironment({
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: true,
+          canContinue: false,
+          turns: [emptyFailedTurn()],
+        }),
+      textHandler: ({ conversationId, ordinal, url }) => {
+        const role = url.searchParams.get("role");
+        const throughCursor = url.searchParams.get("throughCursor");
+        textReads.push({ role, throughCursor });
+        if (role === "assistant") {
+          return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 500);
+        }
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: firstQueryId,
+          role,
+          chunks: [{ index: 0, text: "Pregunta original" }],
+          complete: true,
+        });
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(false);
+    await app.flush();
+
+    expect(textReads).toContainEqual({ role: "assistant", throughCursor: "0" });
+    expect(props(app).state.history).toMatchObject({
+      turnsStatus: "error",
+      turnsError: "Esta conversación ya no está disponible.",
+    });
+  });
+
+  it("keeps a valid empty failed answer partial after checking its terminal boundary", async () => {
+    const textReads = [];
+    const environment = createHistoryEnvironment({
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: true,
+          canContinue: false,
+          turns: [emptyFailedTurn()],
+        }),
+      textHandler: ({ conversationId, ordinal, url }) => {
+        const role = url.searchParams.get("role");
+        const throughCursor = url.searchParams.get("throughCursor");
+        textReads.push({ role, throughCursor });
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: firstQueryId,
+          role,
+          chunks: role === "user" ? [{ index: 0, text: "Pregunta original" }] : [],
+          complete: true,
+        });
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+
+    expect(textReads).toContainEqual({ role: "assistant", throughCursor: "0" });
+    expect(props(app).state.queryStatus).toBe("failed");
+    expect(props(app).state.history).toMatchObject({
+      turnsStatus: "ready",
+      turns: [
+        {
+          status: "failed",
+          question: "Pregunta original",
+          answer: "",
+          answerComplete: false,
+        },
+      ],
+    });
+  });
+
+  it("keeps an active empty answer prefix partial without treating it as terminal text", async () => {
+    const textReads = [];
+    const environment = createHistoryEnvironment({
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: false,
+          turns: [
+            {
+              ...emptyFailedTurn(),
+              status: "in_progress",
+              failure: { code: "unconfirmable" },
+            },
+          ],
+        }),
+      textHandler: ({ conversationId, ordinal, url }) => {
+        const role = url.searchParams.get("role");
+        const throughCursor = url.searchParams.get("throughCursor");
+        textReads.push({ role, throughCursor });
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          ordinal,
+          queryId: firstQueryId,
+          role,
+          chunks: [{ index: 0, text: "Pregunta original" }],
+          complete: true,
+        });
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+
+    expect(textReads).not.toContainEqual({ role: "assistant", throughCursor: "0" });
+    expect(props(app).state).toMatchObject({
+      queryStatus: "unconfirmed",
+      canContinue: false,
+      history: {
+        turnsStatus: "ready",
+        turns: [
+          {
+            status: "in_progress",
+            answer: "",
+            answerComplete: false,
+            failure: { code: "unconfirmable" },
+          },
+        ],
+      },
+    });
+  });
 
   it("keeps a selected old conversation visible behind newer activity after refresh", async () => {
     const recentUpdatedAt = new Date(Date.now() - 60_000).toISOString();

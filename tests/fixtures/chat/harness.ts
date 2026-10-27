@@ -12,6 +12,7 @@ export const fixtureScenarios = [
   { id: "incomplete", label: "Perfil docente incompleto" },
   { id: "history-pending", label: "Historial: retener la primera lista" },
   { id: "history-error", label: "Historial: error temporal al listar" },
+  { id: "history-reload-error", label: "Historial: META correcto y recarga 503" },
   { id: "profile-error", label: "GET del perfil: error recuperable" },
   { id: "profile-pending", label: "GET del perfil: mantener pendiente" },
   { id: "profile-save-error", label: "PUT del perfil: 503 sin aplicar el cambio" },
@@ -522,6 +523,7 @@ export class ChatBrowserFixture {
     fixtureProfiles.map((profile) => [profile.sub, cloneProfile(profile)]),
   );
   private selectedScenario = initialScenario();
+  private historyReloadReads = 0;
   private nextToken = 0;
   private nextRemoteQueryNumber = 0;
   private restoreCount = 0;
@@ -612,6 +614,7 @@ export class ChatBrowserFixture {
 
   selectScenario(scenario: FixtureScenario) {
     this.selectedScenario = scenario;
+    this.historyReloadReads = 0;
     this.clipboardFailure = scenario === "clipboard-fail";
     this.productStorage.setAdmissionWriteFailure(scenario === "journal-admission-write-failure");
     this.runtime401Used = false;
@@ -1035,6 +1038,14 @@ export class ChatBrowserFixture {
       return this.historyJson({ code: "FORBIDDEN" }, 403);
     }
 
+    if (turnsMatch && this.selectedScenario === "history-reload-error") {
+      this.historyReloadReads += 1;
+      if (this.historyReloadReads > 1) {
+        this.finish(request, 503, "META respondió; la recarga posterior del hilo falla");
+        return this.historyJson({ code: "HISTORY_UNAVAILABLE" }, 503);
+      }
+    }
+
     const limitValue = url.searchParams.get("limit");
     const limit =
       limitValue === null || limitValue === ""
@@ -1334,6 +1345,18 @@ export class ChatBrowserFixture {
     }
 
     if (operation === "recover") return this.recoverResponse(request, conversationId, queryId, sub);
+
+    const knownTurn = this.conversations
+      .get(conversationId)
+      ?.turns.find((turn) => turn.queryId === queryId);
+    if (
+      knownTurn &&
+      knownTurn.question === body.text &&
+      knownTurn.ordinal === Number(body.baseOrdinal) + 1 &&
+      operation === (knownTurn.ordinal === 1 ? "start" : "message")
+    ) {
+      return this.recoverResponse(request, conversationId, queryId, sub);
+    }
 
     if (this.selectedScenario === "runtime-unconfirmed") {
       this.finish(request, 200, "lookup temporal sin admisión; conserva el mismo query ID");

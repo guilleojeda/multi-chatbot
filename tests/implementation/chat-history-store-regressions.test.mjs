@@ -66,6 +66,25 @@ function chunk(ordinal, queryId, role, index, text) {
   };
 }
 
+function makeLegacyFailedTurn(answerCount) {
+  const turn = makeTurn(1, q1, {
+    status: "failed",
+    phase: "failed",
+    cursor: answerCount,
+    answerManifest: { count: answerCount, complete: false },
+  });
+  delete turn.cursor;
+  return turn;
+}
+
+function legacyAnswerChunks(count, extra = 0) {
+  return Array.from({ length: count + extra }, (_, index) => {
+    const legacyChunk = chunk(1, q1, "assistant", index, `answer-${index};`);
+    delete legacyChunk.ordinal;
+    return legacyChunk;
+  });
+}
+
 function queryPrefixPage(command, rows) {
   const input = command.input;
   const prefix = input.ExpressionAttributeValues[":prefix"];
@@ -869,6 +888,253 @@ describe("history reader regressions", () => {
     });
     expect(assistantQueries).toHaveLength(1);
     expect(assistantQueries[0].Limit).toBe(1);
+  });
+
+  it("rejects an undercounted legacy failed answer after a committed Put with a lost acknowledgement", async () => {
+    const legacyFailed = makeLegacyFailedTurn(1);
+    const legacyChunks = [
+      {
+        ...legacyAnswerChunks(1)[0],
+        text: "a first answer fragment that was acknowledged",
+      },
+      {
+        ...legacyAnswerChunks(1)[0],
+        sk: `TURN#00000001#${q1}#ASSISTANT#00000001`,
+        index: 1,
+        text: "x".repeat(8192),
+      },
+    ];
+    const queries = [];
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) {
+        return {
+          Item:
+            command.input.Key.sk === "META"
+              ? makeMeta({
+                  lastOrdinal: 1,
+                  activeQueryId: undefined,
+                  activeOwnerAttemptId: undefined,
+                })
+              : legacyFailed,
+        };
+      }
+      if (command instanceof QueryCommand) {
+        queries.push(command.input);
+        return queryPrefixPage(command, legacyChunks);
+      }
+      throw new Error("History reads must not write or invoke generation.");
+    });
+    const store = createStore(send);
+
+    const descriptor = await store.readTurns({ sub, botId, conversationId, limit: 1 });
+    expect(descriptor.turns).toMatchObject([
+      { ordinal: 1, status: "failed", answerManifest: { count: 1, complete: false }, cursor: 1 },
+    ]);
+    await expect(
+      store.readText({
+        sub,
+        botId,
+        conversationId,
+        ordinal: 1,
+        queryId: q1,
+        role: "assistant",
+        throughCursor: descriptor.turns[0].cursor,
+      }),
+    ).rejects.toMatchObject({ code: "conversation_unavailable" });
+
+    expect(legacyFailed).not.toHaveProperty("cursor");
+    expect(legacyChunks.every((row) => !Object.hasOwn(row, "ordinal"))).toBe(true);
+    expect(legacyChunks.map(({ index }) => index)).toEqual([0, 1]);
+    expect(queries.map(({ Limit }) => Limit)).toEqual([2]);
+    expect(send.mock.calls.some(([command]) => command instanceof TransactWriteCommand)).toBe(
+      false,
+    );
+  });
+
+  it("checks terminal assistant zero-count and page-size boundaries without rejecting an exact prefix", async () => {
+    async function readFailedAnswer({ count, chunks, terminalKey = false, cursor } = {}) {
+      const turn = makeLegacyFailedTurn(count);
+      const queries = [];
+      const store = createStore(async (command) => {
+        if (command instanceof GetCommand) {
+          return {
+            Item:
+              command.input.Key.sk === "META"
+                ? makeMeta({
+                    lastOrdinal: 1,
+                    activeQueryId: undefined,
+                    activeOwnerAttemptId: undefined,
+                  })
+                : turn,
+          };
+        }
+        if (command instanceof QueryCommand) {
+          queries.push(command.input);
+          const result = queryPrefixPage(command, chunks);
+          if (
+            terminalKey &&
+            !command.input.ExclusiveStartKey &&
+            result.Items.length === count &&
+            result.LastEvaluatedKey === undefined
+          ) {
+            result.LastEvaluatedKey = {
+              pk: result.Items.at(-1).pk,
+              sk: result.Items.at(-1).sk,
+            };
+          }
+          return result;
+        }
+        throw new Error("Unexpected command " + command.constructor.name);
+      });
+      const text = await store.readText({
+        sub,
+        botId,
+        conversationId,
+        ordinal: 1,
+        queryId: q1,
+        role: "assistant",
+        ...(cursor ? { cursor } : {}),
+      });
+      return { text, queries, store };
+    }
+
+    const emptyManifestWithExtra = makeLegacyFailedTurn(0);
+    const zeroCountQueries = [];
+    const zeroCountStore = createStore(async (command) => {
+      if (command instanceof GetCommand) {
+        return {
+          Item:
+            command.input.Key.sk === "META"
+              ? makeMeta({
+                  lastOrdinal: 1,
+                  activeQueryId: undefined,
+                  activeOwnerAttemptId: undefined,
+                })
+              : emptyManifestWithExtra,
+        };
+      }
+      if (command instanceof QueryCommand) {
+        zeroCountQueries.push(command.input);
+        return queryPrefixPage(command, legacyAnswerChunks(0, 1));
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+    await expect(
+      zeroCountStore.readText({
+        sub,
+        botId,
+        conversationId,
+        ordinal: 1,
+        queryId: q1,
+        role: "assistant",
+      }),
+    ).rejects.toMatchObject({ code: "conversation_unavailable" });
+    expect(zeroCountQueries.map(({ Limit }) => Limit)).toEqual([1]);
+
+    const emptyExact = await readFailedAnswer({ count: 0, chunks: [] });
+    expect(emptyExact.text).toMatchObject({ chunks: [], complete: true });
+    expect(emptyExact.queries.map(({ Limit }) => Limit)).toEqual([1]);
+
+    const exactSixteen = await readFailedAnswer({ count: 16, chunks: legacyAnswerChunks(16) });
+    expect(exactSixteen.text.chunks).toHaveLength(16);
+    expect(exactSixteen.text.complete).toBe(true);
+    expect(exactSixteen.queries.map(({ Limit }) => Limit)).toEqual([17]);
+
+    await expect(
+      readFailedAnswer({ count: 16, chunks: legacyAnswerChunks(16, 1) }),
+    ).rejects.toMatchObject({ code: "conversation_unavailable" });
+
+    const terminalKeyOnly = await readFailedAnswer({
+      count: 16,
+      chunks: legacyAnswerChunks(16),
+      terminalKey: true,
+    });
+    expect(terminalKeyOnly.text).toMatchObject({ complete: true, chunks: expect.any(Array) });
+    expect(terminalKeyOnly.queries.map(({ Limit }) => Limit)).toEqual([17, 1]);
+
+    const seventeen = legacyAnswerChunks(17);
+    const firstPage = await readFailedAnswer({ count: 17, chunks: seventeen });
+    expect(firstPage.text).toMatchObject({ complete: false, chunks: expect.any(Array) });
+    expect(firstPage.text.chunks).toHaveLength(16);
+    expect(firstPage.queries.map(({ Limit }) => Limit)).toEqual([16]);
+    const finalPage = await firstPage.store.readText({
+      sub,
+      botId,
+      conversationId,
+      ordinal: 1,
+      queryId: q1,
+      role: "assistant",
+      cursor: firstPage.text.nextCursor,
+    });
+    expect(finalPage).toMatchObject({
+      chunks: [{ index: 16, text: "answer-16;" }],
+      complete: true,
+    });
+    expect(firstPage.queries.map(({ Limit }) => Limit)).toEqual([16, 2]);
+  });
+
+  it("keeps an older frozen assistant prefix readable when the terminal manifest has since grown", async () => {
+    const active = makeTurn(1, q1, {
+      status: "in_progress",
+      phase: "invocation_claimed",
+      ownerAttemptId: "turn-attempt",
+      resultDeadlineAt: Date.parse("2026-10-24T13:00:00.000Z"),
+      cursor: 17,
+      answerManifest: { count: 17, complete: false },
+    });
+    const terminal = makeLegacyFailedTurn(18);
+    const activeChunks = legacyAnswerChunks(17);
+    const terminalChunks = legacyAnswerChunks(18);
+    const queries = [];
+    let readTerminal = false;
+    const store = createStore(async (command) => {
+      if (command instanceof GetCommand) {
+        return {
+          Item:
+            command.input.Key.sk === "META"
+              ? makeMeta({
+                  lastOrdinal: 1,
+                  activeQueryId: undefined,
+                  activeOwnerAttemptId: undefined,
+                })
+              : readTerminal
+                ? terminal
+                : active,
+        };
+      }
+      if (command instanceof QueryCommand) {
+        queries.push(command.input);
+        return queryPrefixPage(command, readTerminal ? terminalChunks : activeChunks);
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    const first = await store.readText({
+      sub,
+      botId,
+      conversationId,
+      ordinal: 1,
+      queryId: q1,
+      role: "assistant",
+    });
+    expect(first.complete).toBe(false);
+    expect(first.chunks).toHaveLength(16);
+    readTerminal = true;
+    const frozenFinalPage = await store.readText({
+      sub,
+      botId,
+      conversationId,
+      ordinal: 1,
+      queryId: q1,
+      role: "assistant",
+      cursor: first.nextCursor,
+    });
+
+    expect(frozenFinalPage).toMatchObject({
+      chunks: [{ index: 16, text: "answer-16;" }],
+      complete: true,
+    });
+    expect(queries.map(({ Limit }) => Limit)).toEqual([16, 1]);
   });
 
   it("checks the end of a paginated question manifest without mistaking a terminal key for extra data", async () => {

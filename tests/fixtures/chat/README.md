@@ -9,7 +9,9 @@ reload. The product journal and the fake Runtime's conversation records use the 
 separate from the product recovery journal and contain only the simulated conversation, question,
 answer prefix, and status.
 The mock Runtime accepts `start` once per new conversation ID and `message` for later turns with
-that same ID. The history GET routes read those same simulated conversation and turn records,
+that same ID. Replaying an admitted query with its original operation, base and text returns its
+existing JSON snapshot, like `recover`, without creating another turn. The history GET routes read
+those same simulated conversation and turn records,
 derive labels, manifests, and cursors from their question/answer text, and check the fixture subject
 and bot before returning text. They do not use separate canned API responses. The sanitized request
 list and state JSON show the Runtime operation, ID, ordinal, and mock turns. The profile route saves
@@ -49,6 +51,14 @@ terminal controls update that durable fixture record even though the prior SSE o
 exists; the next `recover` poll observes the new prefix or terminal state. This control bridge is a
 local fixture aid, not survival of JavaScript or an AWS process. A follow-up after a completed
 snapshot uses the recovered ordinal and a new query ID.
+To inspect an explicit replay after another session advances the thread, submit with
+`runtime-admission-pending`, close SSE before admission, and wait for the uncertain-send retry.
+Use “Admitir consulta,” “Simular en otra sesión: terminar y admitir seguimiento,” then “Completar.”
+With `ready`, retrying the original send must open the latest completed follow-up. With
+`membership-temporary`, META confirmation fails and the confirmed original answer remains visible.
+With `history-reload-error`, the first turns read returns current META and the second returns 503;
+the confirmed answer must remain visible with a history error and no enabled follow-up. Selecting
+a scenario resets this read counter. Return to `ready` and reselect the thread to restore it.
 If the fake Runtime has no conversation or turn for the same IDs, it returns JSON
 `conversation_unavailable` with `recordStatus: "not_admitted"` and HTTP 200, so the product keeps
 the reference for an explicit retry. A record belonging to the other fixture identity remains a

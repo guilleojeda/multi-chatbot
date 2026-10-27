@@ -155,6 +155,11 @@ export function ChatScreen({
     historyTurns.length > 0 ||
     Boolean(state.question || state.answer) ||
     state.queryStatus !== "idle";
+  const history = state.history;
+  const terminalCurrentnessUnconfirmed =
+    (state.queryStatus === "completed" || state.queryStatus === "failed") &&
+    state.canContinue === false &&
+    Boolean(history?.turnsError);
 
   if (!hasConversation && sawConversationRef.current) {
     copyEpochRef.current += 1;
@@ -232,7 +237,11 @@ export function ChatScreen({
             ? "Escribí un seguimiento para continuar este hilo."
             : "Escribí una consulta para empezar."
           : state.queryStatus === "completed"
-            ? "La respuesta está completa. Podés continuar este hilo."
+            ? state.canContinue === true
+              ? "La respuesta está completa. Podés continuar este hilo."
+              : history?.closed === true
+                ? "La respuesta está completa. Este hilo está cerrado."
+                : "La respuesta está completa. No pudimos confirmar si podés continuar este hilo."
             : "";
 
   useEffect(() => {
@@ -316,7 +325,6 @@ export function ChatScreen({
     }
   }
 
-  const history = state.history;
   const staleBaseRefreshRequired =
     state.queryErrorCode === "stale_base" && history?.refreshRequired === true;
 
@@ -508,7 +516,9 @@ export function ChatScreen({
               <div className="chat-conversation">
                 {state.recovered ? (
                   <p className="chat-context-note" role="status">
-                    Recuperamos el último envío de esta conversación
+                    {terminalCurrentnessUnconfirmed
+                      ? "Recuperamos este envío. No pudimos actualizar la conversación."
+                      : "Recuperamos el último envío de esta conversación"}
                   </p>
                 ) : null}
                 {sending ? (
