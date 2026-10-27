@@ -94,6 +94,8 @@ Los rechazos de capacidad o almacenamiento conservan el borrador; `token_count_u
 
 Una tabla DynamoDB propia por bot y ambiente conserva propietarios, consumos, consultas, estados, originales y contexto profesional para prestar el servicio y permitir revisión/análisis por el equipo. Reiniciar o abandonar la pantalla no elimina datos. No hay TTL conversacional, plazo de retención ni función de eliminación acordados.
 
+Una lista demorada no revierte un terminal o cierre ya confirmado para el mismo ordinal; un terminal autoritativo o un ordinal posterior sí actualiza la proyección local, sin comparar el reloj del navegador con el servidor. Si solo se conserva un seguimiento incierto y no se puede leer el historial, se muestra «Conversación pendiente» hasta recuperar la primera pregunta; el cuerpo del seguimiento no sustituye esa etiqueta. Recuperar o repetir un envío rechaza combinaciones contradictorias de estado y fase, sin presentarlas como resultados completos.
+
 ## Recursos y operación
 
 Runtime, tabla, índice y Lambda de historial pertenecen al stack de chat del bot/ambiente. Se conservan ARN de Runtime, tabla, Cognito y API existentes. El rol de Runtime lee puntualmente cuenta/perfil, consulta/escribe su tabla y usa `ConditionCheckItem` para la revisión de política; Bedrock queda restringido a la ruta aprobada. La Lambda de historial lee membresía, tabla/índice propios y comparte la transición terminal condicionada de vencidos con Runtime; no admite, reclama invocaciones ni modifica cupos. No tiene Scan, Bedrock ni lectura de fuentes S3. La Lambda de cuenta mantiene sus responsabilidades.

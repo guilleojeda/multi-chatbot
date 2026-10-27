@@ -33,6 +33,7 @@ afterAll(async () => {
 
 afterEach(() => {
   for (const app of apps.splice(0).reverse()) app.dispose();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   delete globalThis.__accountHooks;
   delete globalThis.__accountScreens;
@@ -771,5 +772,427 @@ describe("AccountApp history text cursor regressions", () => {
     expect(
       readChatJournals(environment.config, environment.identity).has(secondConversationId),
     ).toBe(false);
+  });
+});
+
+function createControlledHistoryStreamEnvironment({ listHandler }) {
+  let controller;
+  let request;
+  const encoder = new TextEncoder();
+  const emit = (event) =>
+    controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+  const environment = createHistoryEnvironment({
+    listHandler,
+    runtimeHandler: (nextRequest) => {
+      request = nextRequest;
+      return new Response(
+        new ReadableStream({
+          start(nextController) {
+            controller = nextController;
+            emit({
+              type: "accepted",
+              conversationId: nextRequest.conversationId,
+              queryId: nextRequest.queryId,
+              ordinal: 1,
+            });
+            emit({ type: "text", queryId: nextRequest.queryId, index: 0, text: "Respuesta." });
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    environment,
+    request: () => request,
+    emit,
+    close: () => controller.close(),
+  };
+}
+
+describe("AccountApp history transition and pending-label regressions", () => {
+  it("keeps a local completion over a delayed active page, then accepts same-ordinal terminal catch-up", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const base = Date.parse("2026-10-27T12:00:00.000Z");
+    vi.setSystemTime(base);
+    const delayedActivePage = deferred();
+    const pages = [];
+    let listCalls = 0;
+    const stream = createControlledHistoryStreamEnvironment({
+      listHandler: () => {
+        listCalls += 1;
+        if (listCalls === 1) return jsonResponse({ version: 1, conversations: [] });
+        return pages.shift();
+      },
+    });
+    const app = mountHistoryAccountApp(stream.environment, AccountApp);
+    apps.push(app);
+    await app.flush();
+
+    expect(app.current()?.props?.onSubmit("FIRST QUESTION")).toBe(true);
+    await app.flush();
+    const conversationId = stream.request().conversationId;
+    vi.setSystemTime(base + 30_000);
+    pages.push(delayedActivePage.promise);
+    const refresh = app.current()?.props?.onRefreshHistory?.();
+    await app.flush();
+
+    vi.setSystemTime(base + 60_000);
+    stream.emit({ type: "completed", queryId: stream.request().queryId });
+    stream.close();
+    await app.flush();
+    expect(app.current()?.props?.state?.queryStatus).toBe("completed");
+
+    delayedActivePage.resolve(
+      jsonResponse({
+        version: 1,
+        conversations: [
+          {
+            conversationId,
+            label: "STALE SERVER LABEL",
+            updatedAt: new Date(base).toISOString(),
+            lastOrdinal: 1,
+            closed: false,
+            activeQueryId: stream.request().queryId,
+          },
+          {
+            conversationId: secondConversationId,
+            label: "OTHER CONVERSATION",
+            updatedAt: new Date(base + 15_000).toISOString(),
+            lastOrdinal: 1,
+            closed: false,
+          },
+        ],
+      }),
+    );
+    await refresh;
+    await app.flush();
+
+    let history = app.current()?.props?.state?.history;
+    expect(history?.conversations.map(({ conversationId: id }) => id)).toEqual([
+      conversationId,
+      secondConversationId,
+    ]);
+    expect(history?.conversations[0]?.label).toBe("FIRST QUESTION");
+    expect(history?.conversations[0]).not.toHaveProperty("activeQueryId");
+    expect(history?.conversations[0]?.updatedAt).toBe(new Date(base + 60_000).toISOString());
+    expect(await app.html()).toContain("La respuesta está completa");
+    expect(await app.html()).not.toContain("· En curso");
+
+    pages.push(
+      jsonResponse({
+        version: 1,
+        conversations: [
+          {
+            conversationId: secondConversationId,
+            label: "OTHER CONVERSATION",
+            updatedAt: new Date(base + 55_000).toISOString(),
+            lastOrdinal: 1,
+            closed: false,
+          },
+          {
+            conversationId,
+            label: "FIRST QUESTION FROM SERVER",
+            updatedAt: new Date(base + 45_000).toISOString(),
+            lastOrdinal: 1,
+            closed: false,
+          },
+        ],
+      }),
+    );
+    await app.current()?.props?.onRefreshHistory?.();
+    await app.flush();
+
+    history = app.current()?.props?.state?.history;
+    expect(history?.conversations.map(({ conversationId: id }) => id)).toEqual([
+      secondConversationId,
+      conversationId,
+    ]);
+    expect(history?.conversations[1]).toMatchObject({
+      label: "FIRST QUESTION FROM SERVER",
+      updatedAt: new Date(base + 45_000).toISOString(),
+      lastOrdinal: 1,
+      closed: false,
+    });
+    expect(history?.conversations[1]).not.toHaveProperty("activeQueryId");
+  });
+
+  it("keeps a local closed failure over a delayed open page and accepts closed server catch-up", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const base = Date.parse("2026-10-27T13:00:00.000Z");
+    vi.setSystemTime(base);
+    const delayedOpenPage = deferred();
+    const pages = [];
+    let listCalls = 0;
+    const stream = createControlledHistoryStreamEnvironment({
+      listHandler: () => {
+        listCalls += 1;
+        if (listCalls === 1) return jsonResponse({ version: 1, conversations: [] });
+        return pages.shift();
+      },
+    });
+    const app = mountHistoryAccountApp(stream.environment, AccountApp);
+    apps.push(app);
+    await app.flush();
+
+    expect(app.current()?.props?.onSubmit("FAILED QUESTION")).toBe(true);
+    await app.flush();
+    const conversationId = stream.request().conversationId;
+    vi.setSystemTime(base + 30_000);
+    pages.push(delayedOpenPage.promise);
+    const refresh = app.current()?.props?.onRefreshHistory?.();
+    await app.flush();
+
+    vi.setSystemTime(base + 60_000);
+    stream.emit({
+      type: "failed",
+      queryId: stream.request().queryId,
+      code: "PROVIDER_FAILURE",
+      message: "No se pudo completar.",
+      recordStatus: "failed",
+      canContinue: false,
+    });
+    stream.close();
+    await app.flush();
+    expect(app.current()?.props?.state?.queryStatus).toBe("failed");
+
+    delayedOpenPage.resolve(
+      jsonResponse({
+        version: 1,
+        conversations: [
+          {
+            conversationId,
+            label: "STALE SERVER LABEL",
+            updatedAt: new Date(base).toISOString(),
+            lastOrdinal: 1,
+            closed: false,
+            activeQueryId: stream.request().queryId,
+          },
+        ],
+      }),
+    );
+    await refresh;
+    await app.flush();
+
+    let history = app.current()?.props?.state?.history;
+    expect(history?.conversations[0]).toMatchObject({
+      label: "FAILED QUESTION",
+      lastOrdinal: 1,
+      closed: true,
+    });
+    expect(history?.conversations[0]).not.toHaveProperty("activeQueryId");
+    expect(await app.html()).toContain("· Cerrada");
+
+    pages.push(
+      jsonResponse({
+        version: 1,
+        conversations: [
+          {
+            conversationId,
+            label: "FAILED QUESTION FROM SERVER",
+            updatedAt: new Date(base + 45_000).toISOString(),
+            lastOrdinal: 1,
+            closed: true,
+          },
+        ],
+      }),
+    );
+    await app.current()?.props?.onRefreshHistory?.();
+    await app.flush();
+
+    history = app.current()?.props?.state?.history;
+    expect(history?.conversations[0]).toMatchObject({
+      label: "FAILED QUESTION FROM SERVER",
+      updatedAt: new Date(base + 45_000).toISOString(),
+      lastOrdinal: 1,
+      closed: true,
+    });
+  });
+
+  it("lets a higher server ordinal supersede local terminal state even with an earlier timestamp", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const base = Date.parse("2026-10-27T14:00:00.000Z");
+    vi.setSystemTime(base);
+    const delayedProgressPage = deferred();
+    const pages = [];
+    let listCalls = 0;
+    const stream = createControlledHistoryStreamEnvironment({
+      listHandler: () => {
+        listCalls += 1;
+        if (listCalls === 1) return jsonResponse({ version: 1, conversations: [] });
+        return pages.shift();
+      },
+    });
+    const app = mountHistoryAccountApp(stream.environment, AccountApp);
+    apps.push(app);
+    await app.flush();
+
+    expect(app.current()?.props?.onSubmit("FIRST QUESTION")).toBe(true);
+    await app.flush();
+    const conversationId = stream.request().conversationId;
+    vi.setSystemTime(base + 30_000);
+    pages.push(delayedProgressPage.promise);
+    const refresh = app.current()?.props?.onRefreshHistory?.();
+    await app.flush();
+    vi.setSystemTime(base + 60_000);
+    stream.emit({ type: "completed", queryId: stream.request().queryId });
+    stream.close();
+    await app.flush();
+
+    delayedProgressPage.resolve(
+      jsonResponse({
+        version: 1,
+        conversations: [
+          {
+            conversationId,
+            label: "SECOND QUESTION FROM SERVER",
+            updatedAt: new Date(base + 45_000).toISOString(),
+            lastOrdinal: 2,
+            closed: false,
+            activeQueryId: secondQueryId,
+          },
+        ],
+      }),
+    );
+    await refresh;
+    await app.flush();
+
+    const conversation = app
+      .current()
+      ?.props?.state?.history?.conversations.find((item) => item.conversationId === conversationId);
+    expect(conversation).toMatchObject({
+      label: "SECOND QUESTION FROM SERVER",
+      updatedAt: new Date(base + 45_000).toISOString(),
+      lastOrdinal: 2,
+      closed: false,
+      activeQueryId: secondQueryId,
+    });
+  });
+
+  it("uses a provisional label for a cold pending follow-up while list and open return 503", async () => {
+    const text = "REPLACE THE LAST THREE CRITERIA WITH ONLY TWO";
+    const environment = createHistoryEnvironment({
+      listHandler: () => jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503),
+      turnsHandler: () => jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503),
+    });
+    writePendingChatJournal(environment.config, environment.identity, {
+      version: 2,
+      operation: "message",
+      conversationId: firstConversationId,
+      queryId: firstQueryId,
+      baseOrdinal: 12,
+      text,
+    });
+
+    const app = mountHistoryAccountApp(environment, AccountApp);
+    apps.push(app);
+    await app.flush();
+
+    const history = app.current()?.props?.state?.history;
+    expect(history?.status).toBe("error");
+    expect(history?.turnsStatus).toBe("error");
+    expect(history?.conversations[0]).toMatchObject({
+      conversationId: firstConversationId,
+      label: "Conversación pendiente",
+      lastOrdinal: 12,
+      pending: true,
+    });
+    expect(await app.html()).toContain("Conversación pendiente");
+    expect(await app.html()).not.toContain(`chat-history__label">${text}`);
+  });
+
+  it("keeps the first text as the label for a cold pending start", async () => {
+    const text = "FIRST QUESTION FOR A NEW THREAD";
+    const environment = createHistoryEnvironment({
+      listHandler: () => jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503),
+      turnsHandler: () => jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503),
+    });
+    writePendingChatJournal(environment.config, environment.identity, {
+      version: 2,
+      operation: "start",
+      conversationId: firstConversationId,
+      queryId: firstQueryId,
+      baseOrdinal: 0,
+      text,
+    });
+
+    const app = mountHistoryAccountApp(environment, AccountApp);
+    apps.push(app);
+    await app.flush();
+
+    expect(app.current()?.props?.state?.history?.conversations[0]).toMatchObject({
+      label: text,
+      lastOrdinal: 0,
+      pending: true,
+    });
+    expect(await app.html()).toContain(text);
+  });
+
+  it("replaces a provisional follow-up label after authoritative history reads recover", async () => {
+    const text = "CHANGE THE LAST STEP";
+    let listCalls = 0;
+    let turnCalls = 0;
+    const environment = createHistoryEnvironment({
+      listHandler: () => {
+        listCalls += 1;
+        if (listCalls === 1) return jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503);
+        return jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "FIRST QUESTION",
+              updatedAt: "2026-10-27T11:00:00.000Z",
+              lastOrdinal: 12,
+              closed: false,
+            },
+          ],
+        });
+      },
+      turnsHandler: ({ conversationId }) => {
+        turnCalls += 1;
+        if (turnCalls === 1) return jsonResponse({ code: "TEMPORARY_UNAVAILABLE" }, 503);
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          label: "FIRST QUESTION",
+          updatedAt: "2026-10-27T11:00:00.000Z",
+          throughOrdinal: 12,
+          closed: false,
+          canContinue: true,
+          turns: [],
+        });
+      },
+    });
+    writePendingChatJournal(environment.config, environment.identity, {
+      version: 2,
+      operation: "message",
+      conversationId: firstConversationId,
+      queryId: firstQueryId,
+      baseOrdinal: 12,
+      text,
+    });
+
+    const app = mountHistoryAccountApp(environment, AccountApp);
+    apps.push(app);
+    await app.flush();
+    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe(
+      "Conversación pendiente",
+    );
+    expect(turnCalls).toBe(1);
+
+    await app.current()?.props?.onRefreshHistory?.();
+    await app.flush();
+    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe("FIRST QUESTION");
+
+    expect(await app.current()?.props?.onSelectConversation?.(firstConversationId)).toBe(true);
+    await app.flush();
+    expect(app.current()?.props?.state?.history?.turnsStatus).toBe("ready");
+    expect(app.current()?.props?.state?.history?.conversations[0]?.label).toBe("FIRST QUESTION");
+    expect(await app.html()).toContain("FIRST QUESTION");
+    expect(await app.html()).not.toContain(`chat-history__label">${text}`);
+    expect(
+      environment.runtimeRequests.every(({ request }) => request.operation === "recover"),
+    ).toBe(true);
   });
 });
