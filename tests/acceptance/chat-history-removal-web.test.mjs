@@ -355,10 +355,13 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
       conversationId: firstConversationId,
       status: "hiding",
     });
-    const pendingConfirm = buttonByText(domState.document, "Quitando…");
-    expect(pendingConfirm).toBeDefined();
-    expect(pendingConfirm.disabled).toBe(true);
-    await clickPhase8(pendingConfirm, app, domState);
+    const pendingStatus = statusText(domState.document, "Quitando…");
+    const pendingTrigger = hideButtonFor(domState.document, firstLabel);
+    expect(pendingStatus).toBeDefined();
+    expect(domState.document.activeElement).toBe(pendingStatus);
+    expect(pendingTrigger).toBeDefined();
+    expect(pendingTrigger.disabled).toBe(true);
+    await clickPhase8(pendingTrigger, app, domState);
     expect(attempts).toBe(1);
     expect(
       componentProps(app).onSubmit("No enviar"),

@@ -151,6 +151,7 @@ export function ChatScreen({
   const focusQueryAfterResetRef = useRef(false);
   const hideTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
   const openConversationRefs = useRef(new Map<string, HTMLButtonElement>());
+  const removalStatusRefs = useRef(new Map<string, HTMLParagraphElement>());
   const cancelRemovalRefs = useRef(new Map<string, HTMLButtonElement>());
   const newConversationRef = useRef<HTMLButtonElement>(null);
   const focusAfterCancelRef = useRef<string | null>(null);
@@ -295,6 +296,11 @@ export function ChatScreen({
   }, [confirmingRemovalId, history?.conversations]);
 
   useEffect(() => {
+    if (removal?.status !== "hiding") return;
+    removalStatusRefs.current.get(removal.conversationId)?.focus();
+  }, [removal?.conversationId, removal?.status]);
+
+  useEffect(() => {
     const candidates = focusAfterRemovalRef.current;
     if (!candidates) return;
     const removedConversationId = candidates.at(-1);
@@ -427,15 +433,17 @@ export function ChatScreen({
     setRemovalAnnouncement("");
     let confirmed = false;
     try {
-      confirmed = await onHideConversation(conversationId);
+      const hiding = onHideConversation(conversationId);
+      setConfirmingRemovalId(null);
+      confirmed = await hiding;
     } catch {
       confirmed = false;
     }
     if (!confirmed) {
       focusAfterRemovalRef.current = null;
+      setConfirmingRemovalId(conversationId);
       return;
     }
-    setConfirmingRemovalId(null);
     setRemovalAnnouncement("Conversación quitada del historial.");
   }
 
@@ -573,6 +581,12 @@ export function ChatScreen({
                           className="chat-history__removal-status"
                           role="status"
                           aria-live="polite"
+                          tabIndex={-1}
+                          ref={(element) => {
+                            if (element)
+                              removalStatusRefs.current.set(conversation.conversationId, element);
+                            else removalStatusRefs.current.delete(conversation.conversationId);
+                          }}
                         >
                           Quitando…
                         </p>

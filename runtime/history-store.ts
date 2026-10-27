@@ -26,7 +26,6 @@ type Code =
 type Err = Error & { code: Code };
 type Key = Record<string, unknown>;
 type Meta = ConversationMeta;
-type VerifiedTimestamp = { value: string; milliseconds: number };
 
 function fail(code: Code, message: string): Err {
   const error = new Error(message) as Err;
@@ -45,40 +44,10 @@ function nonNegative(value: unknown): value is number {
 function isVerifiedTimestamp(value: unknown): value is string {
   return verifiedTimestamp(value) !== undefined;
 }
-function verifiedTimestamp(value: unknown): VerifiedTimestamp | undefined {
-  const milliseconds = parseVerifiedHistoryTimestamp(value);
-  return typeof value === "string" && milliseconds !== undefined
-    ? { value, milliseconds }
+function verifiedTimestamp(value: unknown): string | undefined {
+  return typeof value === "string" && parseVerifiedHistoryTimestamp(value) !== undefined
+    ? value
     : undefined;
-}
-function canonicalHistoryOrderTimestamp(
-  value: unknown,
-  conversationId: string,
-): VerifiedTimestamp | undefined {
-  if (typeof value !== "string") return undefined;
-  const suffix = "#" + conversationId;
-  if (!value.endsWith(suffix)) return undefined;
-  const timestamp = value.slice(0, -suffix.length);
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(timestamp)) {
-    return undefined;
-  }
-  const verified = verifiedTimestamp(timestamp);
-  return verified && new Date(verified.milliseconds).toISOString() === timestamp
-    ? verified
-    : undefined;
-}
-function presentationUpdatedAt(
-  meta: Meta,
-  conversationId: string,
-  expectedHistoryOwner: string,
-): string | undefined {
-  const updatedAt = verifiedTimestamp(meta.updatedAt);
-  if (meta.historyOwner !== expectedHistoryOwner) return updatedAt?.value;
-  const projectedAt = canonicalHistoryOrderTimestamp(meta.historyOrder, conversationId);
-  if (!projectedAt) return updatedAt?.value;
-  return !updatedAt || projectedAt.milliseconds > updatedAt.milliseconds
-    ? projectedAt.value
-    : updatedAt.value;
 }
 function hashScope(sub: string, botId: string): string {
   return createHash("sha256")
@@ -299,7 +268,7 @@ export function createHistoryStore(input: {
     if (typeof meta.historyLabel !== "string" || !meta.historyLabel.trim()) {
       throw fail("conversation_unavailable", "Conversation is unavailable.");
     }
-    const updatedAt = presentationUpdatedAt(meta, conversationId, ownerKey(meta.sub));
+    const updatedAt = verifiedTimestamp(meta.updatedAt);
     return {
       conversationId,
       label: meta.historyLabel,
@@ -739,7 +708,7 @@ export function createHistoryStore(input: {
       });
     }
     descriptors.sort((left, right) => Number(left.ordinal) - Number(right.ordinal));
-    const updatedAt = presentationUpdatedAt(currentMeta, scope.conversationId, ownerKey(scope.sub));
+    const updatedAt = verifiedTimestamp(currentMeta.updatedAt);
     const response: Record<string, unknown> = {
       version: 1,
       conversationId: scope.conversationId,
