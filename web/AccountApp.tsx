@@ -147,6 +147,19 @@ function sortHistoryConversations(conversations: ChatHistoryState["conversations
   );
 }
 
+function serverConversationSupersedesLocal(
+  local: ChatHistoryState["conversations"][number],
+  server: ChatHistoryState["conversations"][number],
+) {
+  if (server.lastOrdinal !== local.lastOrdinal) return server.lastOrdinal > local.lastOrdinal;
+  if (local.closed && !server.closed) return false;
+  if (server.closed && !local.closed) return true;
+  if (local.pending) return true;
+
+  // Ordinals advance at admission; terminal state can advance at the same ordinal.
+  return !server.activeQueryId || Boolean(local.activeQueryId);
+}
+
 function mergeHistoryConversations(
   local: Map<string, ChatHistoryState["conversations"][number]>,
   serverPage: ChatHistoryState["conversations"],
@@ -165,28 +178,30 @@ function mergeHistoryConversations(
   );
   for (const [conversationId, server] of serverById) {
     const localConversation = local.get(conversationId);
-    if (localConversation && server.lastOrdinal >= localConversation.lastOrdinal) {
+    if (localConversation && serverConversationSupersedesLocal(localConversation, server)) {
       local.delete(conversationId);
     }
   }
   const localById = new Map(local);
-  const localAhead = [...localById.values()].filter((conversation) => {
+  const localPreserved = [...localById.values()].filter((conversation) => {
     const server = serverById.get(conversation.conversationId);
-    return !server || conversation.lastOrdinal > server.lastOrdinal;
+    return !server || !serverConversationSupersedesLocal(conversation, server);
   });
-  const localAheadIds = new Set(localAhead.map((conversation) => conversation.conversationId));
+  const localPreservedIds = new Set(
+    localPreserved.map((conversation) => conversation.conversationId),
+  );
   const serverIds = new Set(serverById.keys());
   const preserved = existing.filter(
     (conversation) =>
       !serverIds.has(conversation.conversationId) &&
-      !localAheadIds.has(conversation.conversationId),
+      !localPreservedIds.has(conversation.conversationId),
   );
   const authoritativeServerPage = authoritativePage.filter((conversation) => {
     const localConversation = localById.get(conversation.conversationId);
-    return !localConversation || localConversation.lastOrdinal <= conversation.lastOrdinal;
+    return !localConversation || serverConversationSupersedesLocal(localConversation, conversation);
   });
   const merged = new Map<string, ChatHistoryState["conversations"][number]>();
-  for (const conversation of [...localAhead, ...preserved, ...authoritativeServerPage]) {
+  for (const conversation of [...localPreserved, ...preserved, ...authoritativeServerPage]) {
     const previous = merged.get(conversation.conversationId);
     if (!previous || conversation.lastOrdinal >= previous.lastOrdinal) {
       merged.set(conversation.conversationId, conversation);
@@ -247,6 +262,11 @@ function submissionHistoryTurn(
     ...existing,
     ...overrides,
   };
+}
+
+function pendingConversationLabel(request: Pick<ChatRequest, "operation" | "text">) {
+  if (request.operation !== "start") return "Conversación pendiente";
+  return request.text.trim().replace(/\s+/g, " ").slice(0, 120) || "Nueva conversación";
 }
 
 function isRecoveryIdentityError(code: string) {
@@ -2618,7 +2638,7 @@ export function AccountApp({
             }
           : {
               conversationId,
-              label: entry.request.text.trim().replace(/\s+/g, " ").slice(0, 120),
+              label: pendingConversationLabel(entry.request),
               lastOrdinal: entry.request.baseOrdinal,
               closed: false,
               pending: true,
@@ -2638,7 +2658,7 @@ export function AccountApp({
       localConversationsRef.current.set(request.conversationId, prior);
       return;
     }
-    const label = request.text.trim().replace(/\s+/g, " ").slice(0, 120) || "Nueva conversación";
+    const label = pendingConversationLabel(request);
     const summary = {
       createdAt: new Date().toISOString(),
       conversationId: request.conversationId,

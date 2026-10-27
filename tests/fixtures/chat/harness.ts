@@ -12,7 +12,9 @@ export const fixtureScenarios = [
   { id: "ready", label: "Perfil completo; Runtime controlado" },
   { id: "incomplete", label: "Perfil docente incompleto" },
   { id: "history-pending", label: "Historial: retener la primera lista" },
+  { id: "history-snapshot-pending", label: "Historial: retener una lista ya capturada" },
   { id: "history-error", label: "Historial: error temporal al listar" },
+  { id: "history-unavailable", label: "Historial: lista y apertura temporalmente indisponibles" },
   { id: "history-earlier-pending", label: "Historial: retener una página anterior" },
   { id: "history-reload-error", label: "Historial: META correcto y recarga 503" },
   { id: "profile-error", label: "GET del perfil: error recuperable" },
@@ -974,6 +976,10 @@ export class ChatBrowserFixture {
     }
 
     const listPath = "/api/chat/conversations";
+    if (this.selectedScenario === "history-unavailable") {
+      this.finish(request, 503, "fallo temporal de las lecturas del historial");
+      return this.historyJson({ code: "HISTORY_UNAVAILABLE" }, 503);
+    }
     if (url.pathname === listPath && request.method === "GET") {
       if (this.selectedScenario === "history-error") {
         this.finish(request, 503, "fallo temporal al listar el historial");
@@ -1034,8 +1040,7 @@ export class ChatBrowserFixture {
         nextOffset < conversations.length
           ? `list:v1:${sub}:${this.publicConfig.botId}:${nextOffset}`
           : undefined;
-      this.finish(request, 200, `lista de ${page.length} originales del productor para ${sub}`);
-      return this.historyJson({
+      const payload = {
         version: 1,
         conversations: page.map((conversation) => {
           const firstTurn = [...conversation.turns].sort((a, b) => a.ordinal - b.ordinal)[0];
@@ -1053,7 +1058,18 @@ export class ChatBrowserFixture {
           };
         }),
         ...(nextCursor ? { nextCursor } : {}),
-      });
+      };
+      if (this.selectedScenario === "history-snapshot-pending") {
+        request.status = "pending";
+        request.outcome = "lista capturada; esperar Liberar historial aunque el productor avance";
+        this.changed();
+        await new Promise<void>((resolve) =>
+          this.pendingHistoryReads.push({ request, release: resolve }),
+        );
+        if (this.selectedScenario === "history-snapshot-pending") this.selectedScenario = "ready";
+      }
+      this.finish(request, 200, `lista de ${page.length} originales del productor para ${sub}`);
+      return this.historyJson(payload);
     }
 
     const textMatch = /^\/api\/chat\/conversations\/([^/]+)\/turns\/(\d+)\/text$/.exec(
@@ -1679,7 +1695,11 @@ export class ChatBrowserFixture {
 
   releaseHistory() {
     this.pendingHistoryReads.shift()?.release();
-    if (this.selectedScenario === "history-pending") this.selectedScenario = "ready";
+    if (
+      this.selectedScenario === "history-pending" ||
+      this.selectedScenario === "history-snapshot-pending"
+    )
+      this.selectedScenario = "ready";
     this.changed();
   }
 

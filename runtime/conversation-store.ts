@@ -1715,6 +1715,11 @@ export function createConversationStoreAdapter(input: {
     const questionCount = contextManifestCount(turn.questionManifest);
     const answerCount = partialManifestCount(turn.answerManifest);
     const cursor = turn.cursor;
+    const validStatusPhasePair =
+      (turn.status === "in_progress" &&
+        (turn.phase === "admitted" || turn.phase === "invocation_claimed")) ||
+      (turn.status === "completed" && turn.phase === "complete") ||
+      (turn.status === "failed" && turn.phase === "failed");
     if (
       questionCount === null ||
       !isRecord(turn.questionManifest) ||
@@ -1724,8 +1729,7 @@ export function createConversationStoreAdapter(input: {
       !Number.isSafeInteger(cursor) ||
       Number(cursor) < 0 ||
       Number(cursor) > answerCount ||
-      !["in_progress", "completed", "failed"].includes(String(turn.status)) ||
-      !["admitted", "invocation_claimed", "complete", "failed"].includes(String(turn.phase))
+      !validStatusPhasePair
     )
       throw new Error("Submission turn is malformed.");
     if (

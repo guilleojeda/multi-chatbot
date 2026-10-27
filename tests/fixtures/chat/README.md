@@ -89,6 +89,13 @@ fallida explícitamente parcial; como su prefijo remoto está cargado por comple
 `runtime-stale-base` y envía un seguimiento: el borrador debe permanecer y la interfaz debe pedir
 una actualización explícita, sin reenviar.
 
+`history-snapshot-pending` captura la lista al recibir el GET y retiene esa respuesta hasta
+“Liberar historial”. Permite completar el envío antes de liberar su lista antigua y comprobar que
+la interfaz conserva el terminal y la actividad observados. `history-unavailable` devuelve 503 en
+lista y apertura: abrir `/?scenario=history-unavailable#/chat` en la misma pestaña con un
+seguimiento aún incierto permite comprobar que su cuerpo no se convierte en
+el título de primera pregunta del hilo. Volver a `ready` permite recuperar los originales y su etiqueta.
+
 Para comprobar el cambio entre dos páginas de historial pendientes, pulsa “Preparar hilos A→B y
 recargar”. La preparación reemplaza los registros simulados por dos conversaciones de 22 turnos y
 borra el journal y la selección locales de la identidad de fixture actual. El estado inicial es B

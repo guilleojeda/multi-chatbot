@@ -181,7 +181,7 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
       "x-amzn-bedrock-agentcore-runtime-session-id": conversationId,
     },
   };
-  return { handler, context, sentCommands, auxiliary };
+  return { handler, context, sentCommands, auxiliary, store };
 }
 
 async function publicValue(result) {
@@ -201,7 +201,7 @@ const repeatedMessageRequest = {
   text,
 };
 
-describe("public recovery rejects empty completed answers", () => {
+describe("public Runtime submission recovery integrity", () => {
   it.each([
     { kind: "empty", answer: "", answerCount: 0 },
     { kind: "whitespace-only", answer: " \n\t ", answerCount: 1 },
@@ -243,12 +243,26 @@ describe("public recovery rejects empty completed answers", () => {
   });
 
   it.each([
+    {
+      status: "completed",
+      phase: "complete",
+      answer: "Saved answer.",
+      answerCount: 1,
+      answerComplete: true,
+    },
     { status: "in_progress", phase: "admitted", answerComplete: false },
+    {
+      status: "in_progress",
+      phase: "invocation_claimed",
+      answer: "Saved prefix.",
+      answerCount: 1,
+      answerComplete: false,
+    },
     { status: "failed", phase: "failed", answerComplete: false },
   ])(
-    "preserves an empty $status answer during recovery",
-    async ({ status, phase, answerComplete }) => {
-      const harness = createHarness({ status, phase, answerComplete });
+    "preserves a valid $status/$phase submission during recovery",
+    async ({ status, phase, answer, answerCount, answerComplete }) => {
+      const harness = createHarness({ status, phase, answer, answerCount, answerComplete });
 
       const recovered = await harness.handler(recoverRequest, harness.context);
 
@@ -259,7 +273,7 @@ describe("public recovery rejects empty completed answers", () => {
         ordinal: 8,
         status,
         question: text,
-        answer: "",
+        answer: answer ?? "",
       });
       expect(harness.auxiliary).not.toHaveBeenCalled();
       expect(
@@ -267,6 +281,108 @@ describe("public recovery rejects empty completed answers", () => {
           (command) => command instanceof GetCommand || command instanceof QueryCommand,
         ),
       ).toBe(true);
+    },
+  );
+
+  it.each([
+    ["in_progress", "complete"],
+    ["in_progress", "failed"],
+    ["completed", "admitted"],
+    ["completed", "invocation_claimed"],
+    ["completed", "failed"],
+    ["failed", "admitted"],
+    ["failed", "invocation_claimed"],
+    ["failed", "complete"],
+  ])(
+    "does not publish a %s/%s submission and preserves safe caller errors",
+    async (status, phase) => {
+      const completed = status === "completed";
+      const harness = createHarness({
+        status,
+        phase,
+        answer: completed ? "Saved answer." : "",
+        answerCount: completed ? 1 : 0,
+        answerComplete: completed,
+      });
+
+      const recovered = await publicValue(await harness.handler(recoverRequest, harness.context));
+      const repeated = await publicValue(
+        await harness.handler(repeatedMessageRequest, harness.context),
+      );
+
+      for (const result of [recovered, ...(Array.isArray(repeated) ? repeated : [repeated])]) {
+        expect(result).toMatchObject({
+          type: "failed",
+          code: "temporarily_unavailable",
+          recordStatus: "unconfirmed",
+          queryId,
+        });
+        expect(JSON.stringify(result)).not.toContain('"status":"completed"');
+      }
+      expect(repeated).toHaveLength(1);
+      expect(harness.auxiliary).not.toHaveBeenCalled();
+      expect(
+        harness.sentCommands.every(
+          (command) => command instanceof GetCommand || command instanceof QueryCommand,
+        ),
+      ).toBe(true);
+    },
+  );
+});
+
+describe("submission storage validates status and phase together", () => {
+  it.each([
+    ["in_progress", "complete"],
+    ["in_progress", "failed"],
+    ["completed", "admitted"],
+    ["completed", "invocation_claimed"],
+    ["completed", "failed"],
+    ["failed", "admitted"],
+    ["failed", "invocation_claimed"],
+    ["failed", "complete"],
+  ])("rejects the contradictory %s/%s enum pair", async (status, phase) => {
+    const completed = status === "completed";
+    const harness = createHarness({
+      status,
+      phase,
+      answer: completed ? "Saved answer." : "",
+      answerCount: completed ? 1 : 0,
+      answerComplete: completed,
+    });
+
+    await expect(harness.store.getSubmission({ sub, botId, queryId })).rejects.toThrow(
+      /Submission turn is malformed/,
+    );
+  });
+
+  it.each([
+    {
+      status: "completed",
+      phase: "complete",
+      answer: "Saved answer.",
+      answerCount: 1,
+      answerComplete: true,
+    },
+    { status: "in_progress", phase: "admitted", answerComplete: false },
+    {
+      status: "in_progress",
+      phase: "invocation_claimed",
+      answer: "Saved prefix.",
+      answerCount: 1,
+      answerComplete: false,
+    },
+    { status: "failed", phase: "failed", answerComplete: false },
+  ])(
+    "accepts the valid $status/$phase enum pair",
+    async ({ status, phase, answer, answerCount, answerComplete }) => {
+      const harness = createHarness({ status, phase, answer, answerCount, answerComplete });
+
+      await expect(harness.store.getSubmission({ sub, botId, queryId })).resolves.toMatchObject({
+        status,
+        stage: phase,
+        answer: answer ?? "",
+        canContinue: status !== "in_progress",
+      });
     },
   );
 });
