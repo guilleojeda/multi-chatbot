@@ -100,6 +100,83 @@ describe("history backfill regressions", () => {
   });
 
   it.each([
+    ["closed is not a boolean", { closed: "false" }],
+    ["lastQueryId is empty", { lastQueryId: "" }],
+    ["activeQueryId is empty", { activeQueryId: "" }],
+  ])("reports invalid META as incompatible even when projected (%s)", async (_name, overrides) => {
+    const updatedAt = "2026-10-18T12:00:00.000Z";
+    const questionText = "Pregunta histórica.";
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub,
+      botId,
+      lastOrdinal: 1,
+      updatedAt,
+      historyOwner: `USER#${sub}#BOT#${botId}`,
+      historyOrder: `${updatedAt}#${conversationId}`,
+      historyLabel: questionText,
+      ...overrides,
+    };
+    const turn = firstTurnRecord(conversationId, queryId, { createdAt: updatedAt });
+    const question = firstQuestionChunk(conversationId, queryId, questionText);
+    const { send } = mockDocumentClient({
+      scans: [{ Items: [meta] }],
+      chunks: new Map([[conversationId, { 1: { record: turn, chunks: [question] } }]]),
+    });
+
+    const result = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+
+    expect(result).toMatchObject({ scanned: 1, updated: 0, skipped: 0, incompatible: 1 });
+    expect(send.mock.calls.some(([command]) => command instanceof UpdateCommand)).toBe(false);
+  });
+
+  it("accepts well-formed present META fields and legacy META without optional fields", async () => {
+    const cases = [
+      {
+        meta: { closed: true, lastQueryId: queryId },
+        turn: firstTurnRecord(conversationId, queryId),
+      },
+      {
+        meta: { closed: false, lastQueryId: queryId, activeQueryId: queryId },
+        turn: firstTurnRecord(conversationId, queryId, {
+          status: "in_progress",
+          phase: "invocation_claimed",
+          answerManifest: { count: 1, complete: false },
+          cursor: 1,
+        }),
+      },
+      {
+        meta: {},
+        turn: firstTurnRecord(conversationId, queryId),
+      },
+    ];
+
+    for (const { meta: optionalFields, turn } of cases) {
+      const meta = {
+        pk: `CONV#${conversationId}`,
+        sk: "META",
+        conversationId,
+        sub,
+        botId,
+        lastOrdinal: 1,
+        ...optionalFields,
+      };
+      const question = firstQuestionChunk(conversationId, queryId, "Pregunta histórica.");
+      const { send } = mockDocumentClient({
+        scans: [{ Items: [meta] }],
+        chunks: new Map([[conversationId, { 1: { record: turn, chunks: [question] } }]]),
+      });
+
+      const result = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+
+      expect(result).toMatchObject({ scanned: 1, updated: 1, skipped: 0, incompatible: 0 });
+      expect(send.mock.calls.some(([command]) => command instanceof UpdateCommand)).toBe(true);
+    }
+  });
+
+  it.each([
     ["cursor disagrees with answer manifest", { cursor: 0 }, undefined],
     ["chunk ordinal disagrees with canonical key", {}, 2],
   ])(

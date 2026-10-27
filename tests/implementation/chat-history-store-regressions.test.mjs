@@ -1137,6 +1137,175 @@ describe("history reader regressions", () => {
     expect(queries.map(({ Limit }) => Limit)).toEqual([16, 1]);
   });
 
+  it("rejects only a fully read empty completed assistant answer", async () => {
+    async function readCompletedAnswer(texts) {
+      const turn = makeTurn(1, q1, {
+        answerManifest: { count: texts.length, complete: true },
+        cursor: texts.length,
+      });
+      const chunks = texts.map((text, index) => chunk(1, q1, "assistant", index, text));
+      const store = createStore(async (command) => {
+        if (command instanceof GetCommand) {
+          return { Item: command.input.Key.sk === "META" ? makeMeta({ lastOrdinal: 1 }) : turn };
+        }
+        if (command instanceof QueryCommand) return queryPrefixPage(command, chunks);
+        throw new Error("Unexpected command " + command.constructor.name);
+      });
+      return store.readText({
+        sub,
+        botId,
+        conversationId,
+        ordinal: 1,
+        queryId: q1,
+        role: "assistant",
+      });
+    }
+
+    for (const emptyAnswer of ["", "   \t\n", "\u2003"]) {
+      await expect(readCompletedAnswer([emptyAnswer])).rejects.toMatchObject({
+        code: "conversation_unavailable",
+      });
+    }
+
+    const samePage = await readCompletedAnswer(["  \n", "Respuesta válida."]);
+    expect(samePage).toMatchObject({
+      chunks: [
+        { index: 0, text: "  \n" },
+        { index: 1, text: "Respuesta válida." },
+      ],
+      complete: true,
+    });
+
+    const laterPageTexts = Array.from({ length: 17 }, (_, index) =>
+      index === 16 ? "Respuesta posterior." : "   ",
+    );
+    const laterPageTurn = makeTurn(1, q1, {
+      answerManifest: { count: laterPageTexts.length, complete: true },
+      cursor: laterPageTexts.length,
+    });
+    const laterPageChunks = laterPageTexts.map((text, index) =>
+      chunk(1, q1, "assistant", index, text),
+    );
+    const laterPageStore = createStore(async (command) => {
+      if (command instanceof GetCommand) {
+        return {
+          Item: command.input.Key.sk === "META" ? makeMeta({ lastOrdinal: 1 }) : laterPageTurn,
+        };
+      }
+      if (command instanceof QueryCommand) return queryPrefixPage(command, laterPageChunks);
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+    const firstPage = await laterPageStore.readText({
+      sub,
+      botId,
+      conversationId,
+      ordinal: 1,
+      queryId: q1,
+      role: "assistant",
+    });
+    const finalPage = await laterPageStore.readText({
+      sub,
+      botId,
+      conversationId,
+      ordinal: 1,
+      queryId: q1,
+      role: "assistant",
+      cursor: firstPage.nextCursor,
+    });
+    expect(firstPage.complete).toBe(false);
+    expect(firstPage.chunks).toHaveLength(16);
+    expect(firstPage.chunks[0]).toEqual({ index: 0, text: "   " });
+    expect(finalPage).toMatchObject({
+      complete: true,
+      chunks: [{ index: 16, text: "Respuesta posterior." }],
+    });
+    expect([...firstPage.chunks, ...finalPage.chunks].map(({ text }) => text).join("")).toBe(
+      laterPageTexts.join(""),
+    );
+
+    for (const status of ["in_progress", "failed"]) {
+      const turn = makeTurn(1, q1, {
+        status,
+        phase: status === "in_progress" ? "admitted" : "failed",
+        answerManifest: { count: 0, complete: false },
+        cursor: 0,
+      });
+      const store = createStore(async (command) => {
+        if (command instanceof GetCommand) {
+          return { Item: command.input.Key.sk === "META" ? makeMeta({ lastOrdinal: 1 }) : turn };
+        }
+        if (command instanceof QueryCommand) return { Items: [] };
+        throw new Error("Unexpected command " + command.constructor.name);
+      });
+      await expect(
+        store.readText({ sub, botId, conversationId, ordinal: 1, queryId: q1, role: "assistant" }),
+      ).resolves.toMatchObject({ chunks: [], complete: true });
+    }
+  });
+
+  it("allows a whitespace-only frozen prefix after a completed turn grows", async () => {
+    const active = makeTurn(1, q1, {
+      status: "in_progress",
+      phase: "invocation_claimed",
+      ownerAttemptId: "turn-attempt",
+      resultDeadlineAt: Date.parse("2026-10-24T13:00:00.000Z"),
+      cursor: 17,
+      answerManifest: { count: 17, complete: false },
+    });
+    const terminal = makeTurn(1, q1, {
+      cursor: 18,
+      answerManifest: { count: 18, complete: true },
+    });
+    const activeChunks = Array.from({ length: 17 }, (_, index) =>
+      chunk(1, q1, "assistant", index, "   "),
+    );
+    const terminalChunks = [...activeChunks, chunk(1, q1, "assistant", 17, "   ")];
+    let completed = false;
+    const store = createStore(async (command) => {
+      if (command instanceof GetCommand) {
+        return {
+          Item:
+            command.input.Key.sk === "META"
+              ? makeMeta({ lastOrdinal: 1 })
+              : completed
+                ? terminal
+                : active,
+        };
+      }
+      if (command instanceof QueryCommand) {
+        return queryPrefixPage(command, completed ? terminalChunks : activeChunks);
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    const firstPage = await store.readText({
+      sub,
+      botId,
+      conversationId,
+      ordinal: 1,
+      queryId: q1,
+      role: "assistant",
+    });
+    completed = true;
+    const frozenFinalPage = await store.readText({
+      sub,
+      botId,
+      conversationId,
+      ordinal: 1,
+      queryId: q1,
+      role: "assistant",
+      cursor: firstPage.nextCursor,
+    });
+
+    expect(firstPage.complete).toBe(false);
+    expect(firstPage.chunks).toHaveLength(16);
+    expect(firstPage.chunks[0]).toEqual({ index: 0, text: "   " });
+    expect(frozenFinalPage).toMatchObject({
+      complete: true,
+      chunks: [{ index: 16, text: "   " }],
+    });
+  });
+
   it("checks the end of a paginated question manifest without mistaking a terminal key for extra data", async () => {
     function questionReader({ count, extra = false, terminalKey = false }) {
       const turn = makeTurn(1, q1, {
