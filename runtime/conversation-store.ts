@@ -473,6 +473,7 @@ function reconstructMessages(
         String(index).padStart(8, "0") !== keyMatch[4] ||
         chunk.pk !== partition ||
         chunk.conversationId !== conversationId ||
+        (chunk.ordinal !== undefined && chunk.ordinal !== turn.ordinal) ||
         chunk.queryId !== turn.queryId ||
         chunk.role !== role ||
         chunk.index !== index ||
@@ -1179,6 +1180,20 @@ export function createConversationStoreAdapter(input: {
     const partition = conversationKey(turn.conversationId);
     const metaKey = { ...partition, sk: "META" };
     const previousMeta = operation === "message" ? await getItem(metaKey) : undefined;
+    if (operation === "message" && previousMeta) {
+      if (
+        previousMeta.sub !== turn.sub ||
+        previousMeta.botId !== turn.botId ||
+        previousMeta.conversationId !== turn.conversationId
+      ) {
+        throw storeError("conflict", "Conversation does not belong to this user and chatbot.");
+      }
+      if (previousMeta.activeQueryId || previousMeta.closed === true) {
+        throw storeError("conversation_busy", "Conversation already has an active or closed turn.");
+      }
+      if (previousMeta.lastOrdinal !== baseOrdinal)
+        throw storeError("stale_base", "Conversation base ordinal is stale.");
+    }
     const currentSummary = readSummaryPointer(previousMeta);
     const contextSnapshot =
       turn.contextSnapshot === undefined
@@ -1450,19 +1465,6 @@ export function createConversationStoreAdapter(input: {
       );
       affectedItems.push(meta, record);
     } else {
-      if (
-        previousMeta &&
-        (previousMeta.sub !== turn.sub ||
-          previousMeta.botId !== turn.botId ||
-          previousMeta.conversationId !== turn.conversationId)
-      ) {
-        throw storeError("conflict", "Conversation does not belong to this user and chatbot.");
-      }
-      if (previousMeta?.activeQueryId || previousMeta?.closed === true) {
-        throw storeError("conversation_busy", "Conversation already has an active or closed turn.");
-      }
-      if (previousMeta && previousMeta.lastOrdinal !== baseOrdinal)
-        throw storeError("stale_base", "Conversation base ordinal is stale.");
       const historyProjection = await historyProjectionFor(
         previousMeta,
         turn.conversationId,

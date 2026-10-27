@@ -45,17 +45,36 @@ function validMeta(item, botId) {
   );
 }
 
-function validTurn(item, meta) {
+function validTurn(item, meta, ordinal = 1) {
+  const key = "TURN#" + String(ordinal).padStart(8, "0");
+  const legacyGenerating =
+    item?.status === "in_progress" &&
+    item.phase === "generating" &&
+    isRecord(item.questionManifest) &&
+    Number.isSafeInteger(item.questionManifest.count) &&
+    item.questionManifest.count > 0 &&
+    item.questionManifest.complete === true &&
+    isRecord(item.answerManifest) &&
+    item.answerManifest.count === 0 &&
+    item.answerManifest.complete === false &&
+    (item.cursor === undefined || item.cursor === 0);
   return (
     isRecord(item) &&
     item.pk === meta.pk &&
-    item.sk === "TURN#00000001" &&
+    item.sk === key &&
     item.conversationId === meta.conversationId &&
     item.sub === meta.sub &&
     item.botId === meta.botId &&
-    item.ordinal === 1 &&
+    item.ordinal === ordinal &&
     typeof item.queryId === "string" &&
     uuidPattern.test(item.queryId) &&
+    ["in_progress", "completed", "failed"].includes(String(item.status)) &&
+    (item.phase === undefined ||
+      (item.status === "in_progress"
+        ? ["admitted", "invocation_claimed"].includes(String(item.phase)) || legacyGenerating
+        : item.status === "completed"
+          ? item.phase === "complete"
+          : item.phase === "failed")) &&
     isRecord(item.questionManifest) &&
     Number.isSafeInteger(item.questionManifest.count) &&
     item.questionManifest.count > 0 &&
@@ -67,7 +86,11 @@ function validTurn(item, meta) {
     (item.cursor === undefined ||
       (Number.isSafeInteger(item.cursor) &&
         item.cursor >= 0 &&
-        item.cursor === item.answerManifest.count))
+        item.cursor === item.answerManifest.count)) &&
+    (item.status !== "completed" || item.answerManifest.count > 0) &&
+    (item.status !== "in_progress" || item.answerManifest.complete === false) &&
+    (item.status !== "completed" || item.answerManifest.complete === true) &&
+    (item.status !== "failed" || item.answerManifest.complete === false)
   );
 }
 
@@ -203,36 +226,27 @@ async function readLatestTurn(documentClient, tableName, meta) {
     }),
   );
   const turn = response.Item;
-  if (
-    !isRecord(turn) ||
-    turn.pk !== meta.pk ||
-    turn.conversationId !== meta.conversationId ||
-    turn.sk !== "TURN#" + String(meta.lastOrdinal).padStart(8, "0") ||
-    turn.ordinal !== meta.lastOrdinal ||
-    turn.sub !== meta.sub ||
-    turn.botId !== meta.botId
-  ) {
-    return undefined;
-  }
+  if (!validTurn(turn, meta, meta.lastOrdinal)) return null;
   const admittedAt = turn.createdAt;
   if (turn.status === "completed") {
-    return latestTimestamp([admittedAt, turn.completedAt, turn.updatedAt]);
+    return { activityAt: latestTimestamp([admittedAt, turn.completedAt, turn.updatedAt]) };
   }
   if (turn.status === "failed") {
-    return latestTimestamp([admittedAt, turn.failedAt, turn.updatedAt]);
+    return { activityAt: latestTimestamp([admittedAt, turn.failedAt, turn.updatedAt]) };
   }
   // An active writer updates TURN while streaming. That is not conversation activity.
-  return normalizedTimestamp(admittedAt);
+  return { activityAt: normalizedTimestamp(admittedAt) };
 }
 
 async function projectionFor(documentClient, tableName, botId, meta, pageSize) {
   if (!validMeta(meta, botId)) return null;
   const original = await readFirstQuestion(documentClient, tableName, meta, pageSize);
   if (!original) return null;
-  const latestTurnActivity = await readLatestTurn(documentClient, tableName, meta);
+  const latestTurn = await readLatestTurn(documentClient, tableName, meta);
+  if (!latestTurn) return null;
   const activityAt = latestTimestamp([
     meta.updatedAt,
-    latestTurnActivity,
+    latestTurn.activityAt,
     meta.createdAt,
     original.firstTurn.createdAt,
   ]);

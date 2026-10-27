@@ -1,7 +1,7 @@
 import { prepareUnchangedContext } from "../support/context-preparation.mjs";
 import { describe, expect, it, vi } from "vitest";
 import { createChatHandler, createChatInvocationHandler } from "../../runtime/chat.ts";
-import { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
 import { extractOriginalRequestText } from "../acceptance/helpers/model-input-text.mjs";
 
@@ -287,6 +287,89 @@ async function collect(stream) {
 }
 
 describe("chat Runtime implementation regressions", () => {
+  it("reports stale_base when another tab completes after the handler's initial base read", async () => {
+    const references = [1, 2].map((ordinal) => ({
+      ordinal,
+      queryId: `a4bfbc9f-3699-4e93-b120-${String(ordinal).padStart(12, "0")}`,
+    }));
+    const currentMeta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub: "teacher-123",
+      botId: "bot-aurora",
+      lastOrdinal: 2,
+      lastQueryId: references[1].queryId,
+    };
+    const storageCalls = [];
+    const durableStore = createConversationStoreAdapter({
+      documentClient: {
+        async send(command) {
+          storageCalls.push(command.constructor.name);
+          if (command instanceof GetCommand) {
+            return command.input.Key.sk === "META" ? { Item: currentMeta } : {};
+          }
+          throw new Error(`Unexpected command ${command.constructor.name}`);
+        },
+      },
+      tableName: "chat-race-regression",
+      now: () => Date.parse("2026-10-19T16:00:00.000Z"),
+    });
+    const context = {
+      messages: references.flatMap(({ ordinal }) => [
+        { role: "user", content: [{ text: `Pregunta ${ordinal}` }] },
+        { role: "assistant", content: [{ text: `Respuesta ${ordinal}` }] },
+      ]),
+      references,
+    };
+    const harness = makeHarness({
+      meta: { conversationId, sub: "teacher-123", botId: "bot-aurora", lastOrdinal: 1 },
+      context,
+      storeOverrides: (state) => ({
+        async continueTurn(input) {
+          state.admissionCalls += 1;
+          state.continued.push(input);
+          return durableStore.continueTurn(input);
+        },
+      }),
+    });
+
+    const events = await collect(
+      harness.handler(
+        {
+          version: 2,
+          operation: "message",
+          conversationId,
+          queryId,
+          baseOrdinal: 1,
+          text: "Continuar desde la base observada.",
+        },
+        {
+          sessionId: conversationId,
+          headers: {
+            authorization: bearer(),
+            "x-amzn-bedrock-agentcore-runtime-session-id": conversationId,
+          },
+        },
+      ),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "failed",
+      code: "stale_base",
+      recordStatus: "not_admitted",
+      queryId,
+    });
+    expect(storageCalls).toEqual(["GetCommand", "GetCommand"]);
+    expect(harness.state.continued[0]).toMatchObject({
+      baseOrdinal: 1,
+      contextReferences: references,
+      contextSnapshot: { version: 1, recentReferences: references },
+    });
+    expect(harness.state.providerCalls).toBe(0);
+  });
+
   it("async disposal detaches only the observer while the registered producer finishes", async () => {
     const releaseProducer = deferred();
     const producerPaused = deferred();

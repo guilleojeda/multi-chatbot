@@ -383,6 +383,171 @@ describe("conversation context integrity", () => {
       ]);
     },
   );
+
+  it.each(
+    ["without a summary", "after a summary"].flatMap((mode) =>
+      ["user", "assistant"].flatMap((role) => {
+        const ordinal = mode === "without a summary" ? 1 : 2;
+        return [
+          [mode, role, "matching explicit ordinal", ordinal, false],
+          [mode, role, "legacy absent ordinal", undefined, false],
+          [mode, role, "contradictory explicit ordinal", ordinal + 1, true],
+        ];
+      }),
+    ),
+  )(
+    "%s validates a consumed %s chunk with a %s",
+    async (mode, role, _label, chunkOrdinal, shouldReject) => {
+      const ordinal = mode === "without a summary" ? 1 : 2;
+      const textChunk = (targetOrdinal, targetRole) => {
+        const chunk = turnText(
+          targetOrdinal,
+          targetRole,
+          targetRole === "user" ? `question-${targetOrdinal}` : `answer-${targetOrdinal}`,
+        );
+        if (targetRole === role) {
+          if (chunkOrdinal === undefined) delete chunk.ordinal;
+          else chunk.ordinal = chunkOrdinal;
+        }
+        return chunk;
+      };
+      let items;
+      if (mode === "without a summary") {
+        items = [meta(1), turnRecord(1), textChunk(1, "user"), textChunk(1, "assistant")];
+      } else {
+        const summary = summaryVersion([reference(1)], "ordinal-validation-summary");
+        const persistedSummary = createContextStorage({
+          documentClient: { send: async () => ({}) },
+          tableName,
+        }).createSummaryItems({ conversationId, ...owner, summary });
+        const coveredQuestion = turnText(1, "user", "covered-question");
+        const coveredAnswer = turnText(1, "assistant", "covered-answer");
+        coveredQuestion.ordinal = 99;
+        coveredAnswer.ordinal = 99;
+        items = [
+          meta(2, { summaryId: summary.summaryId, throughOrdinal: 1 }),
+          turnRecord(1),
+          coveredQuestion,
+          coveredAnswer,
+          ...persistedSummary.sourceReferenceItems,
+          ...persistedSummary.textItems,
+          persistedSummary.descriptor,
+          turnRecord(2),
+          textChunk(2, "user"),
+          textChunk(2, "assistant"),
+        ];
+      }
+      const db = makeDatabase(items);
+
+      if (shouldReject) {
+        await expect(makeStore(db.documentClient).readContext({ conversationId })).rejects.toThrow(
+          /malformed text chunk/i,
+        );
+      } else {
+        const context = await makeStore(db.documentClient).readContext({ conversationId });
+        expect(context.messages).toEqual([
+          { role: "user", content: [{ text: `question-${ordinal}` }] },
+          { role: "assistant", content: [{ text: `answer-${ordinal}` }] },
+        ]);
+        if (mode === "after a summary") {
+          expect(context.summary?.text).toBe("Resumen de referencias fragmentadas.");
+          expect(
+            db.queries.some((query) =>
+              String(query.ExpressionAttributeValues?.[":prefix"]).startsWith("TURN#00000001#"),
+            ),
+          ).toBe(false);
+        }
+      }
+    },
+  );
+});
+
+describe("continuation base races", () => {
+  it("rejects a context prepared through a newer ordinal before validating its snapshot", async () => {
+    const db = makeDatabase([meta(2), turnRecord(1), turnRecord(2)]);
+    const references = [reference(1), reference(2)];
+    const input = continuationInput({
+      baseOrdinal: 1,
+      contextSnapshot: { version: 1, recentReferences: references },
+      contextReferences: references,
+    });
+
+    await expect(makeStore(db.documentClient).continueTurn(input)).rejects.toMatchObject({
+      code: "stale_base",
+    });
+    expect(db.transactions).toHaveLength(0);
+  });
+
+  it.each([
+    ["another owner", { ...meta(2), sub: "another-teacher" }, "conflict"],
+    ["an active turn", { ...meta(2), activeQueryId: queryId(2) }, "conversation_busy"],
+    ["a closed conversation", { ...meta(2), closed: true }, "conversation_busy"],
+  ])(
+    "checks %s before validating context from a newer ordinal",
+    async (_state, currentMeta, code) => {
+      const db = makeDatabase([currentMeta, turnRecord(1), turnRecord(2)]);
+      const references = [reference(1), reference(2)];
+      const input = continuationInput({
+        baseOrdinal: 1,
+        contextSnapshot: { version: 1, recentReferences: references },
+        contextReferences: references,
+      });
+
+      await expect(makeStore(db.documentClient).continueTurn(input)).rejects.toMatchObject({
+        code,
+      });
+      expect(db.transactions).toHaveLength(0);
+    },
+  );
+
+  it("preserves a compatible durable SEND winner after an admission condition loses", async () => {
+    const input = continuationInput({
+      baseOrdinal: 1,
+      contextSnapshot: { version: 1, recentReferences: [reference(1)] },
+      contextReferences: [reference(1)],
+    });
+    const records = new Map([[recordKey(meta(1)), meta(1)]]);
+    let winner;
+    let transactions = 0;
+    const documentClient = {
+      async send(command) {
+        if (command instanceof GetCommand) {
+          const key = recordKey(command.input.Key);
+          return {
+            Item:
+              key === `USER#${owner.sub}#BOT#${owner.botId}\u0000SEND#${input.queryId}`
+                ? winner
+                : records.get(key),
+          };
+        }
+        if (command instanceof TransactWriteCommand) {
+          transactions += 1;
+          winner = {
+            pk: `USER#${owner.sub}#BOT#${owner.botId}`,
+            sk: `SEND#${input.queryId}`,
+            sub: owner.sub,
+            botId: owner.botId,
+            queryId: input.queryId,
+            requestFingerprint: input.requestFingerprint,
+            operation: "message",
+            baseOrdinal: 1,
+            conversationId,
+            ordinal: 2,
+          };
+          throw Object.assign(new Error("Conditional write lost to the matching request."), {
+            name: "ConditionalCheckFailedException",
+          });
+        }
+        throw new Error(`Unexpected command ${command.constructor.name}`);
+      },
+    };
+
+    await expect(makeStore(documentClient).continueTurn(input)).rejects.toMatchObject({
+      code: "submission_exists",
+    });
+    expect(transactions).toBe(1);
+    expect(winner).toMatchObject({ queryId: input.queryId, ordinal: 2 });
+  });
 });
 
 describe("summarized history with snapshots created before coverage", () => {

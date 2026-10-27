@@ -97,6 +97,44 @@ function firstTurnData(conversationId, queryId, text, overrides = {}) {
   };
 }
 
+function messageTurnData(conversationId, queryId, ordinal, baseOrdinal, question, answer, times) {
+  const turnKey = `TURN#${String(ordinal).padStart(8, "0")}`;
+  const textPrefix = `${turnKey}#${queryId}`;
+  return {
+    record: firstTurnRecord(conversationId, queryId, {
+      sk: turnKey,
+      operation: "message",
+      baseOrdinal,
+      ordinal,
+      createdAt: times.createdAt,
+      completedAt: times.completedAt,
+      updatedAt: times.completedAt,
+    }),
+    chunks: [
+      {
+        pk: `CONV#${conversationId}`,
+        sk: `${textPrefix}#USER#00000000`,
+        conversationId,
+        queryId,
+        ordinal,
+        index: 0,
+        role: "user",
+        text: question,
+      },
+      {
+        pk: `CONV#${conversationId}`,
+        sk: `${textPrefix}#ASSISTANT#00000000`,
+        conversationId,
+        queryId,
+        ordinal,
+        index: 0,
+        role: "assistant",
+        text: answer,
+      },
+    ],
+  };
+}
+
 function queryText(command) {
   const values = command.input.ExpressionAttributeValues || {};
   return (
@@ -261,8 +299,31 @@ describe("chat history backfill acceptance", () => {
       LastEvaluatedKey: { pk: `CONV#${legacyId}`, sk: "META" },
     };
     const pageTwo = { Items: [legacyMeta, brokenMeta] };
+    const firstIdTurns = firstTurnData(
+      firstId,
+      "11111111-1111-4111-8111-111111111111",
+      firstQuestion,
+    );
+    firstIdTurns[2] = messageTurnData(
+      firstId,
+      "22222222-2222-4222-8222-222222222223",
+      2,
+      1,
+      "Revisá la actividad.",
+      "Versión revisada de la actividad.",
+      { createdAt: "2026-10-20T10:01:00.000Z", completedAt: "2026-10-20T10:05:00.000Z" },
+    );
+    firstIdTurns[3] = messageTurnData(
+      firstId,
+      "33333333-3333-4333-8333-333333333333",
+      3,
+      2,
+      "Agregá una pregunta de cierre.",
+      "Pregunta de cierre agregada.",
+      { createdAt: "2026-10-20T10:08:00.000Z", completedAt: "2026-10-20T10:12:00.000Z" },
+    );
     const chunks = new Map([
-      [firstId, firstTurnData(firstId, "11111111-1111-4111-8111-111111111111", firstQuestion)],
+      [firstId, firstIdTurns],
       [legacyId, firstTurnData(legacyId, "22222222-2222-4222-8222-222222222222", legacyQuestion)],
     ]);
     const { documentClient, send } = mockDocumentClient({ scans: [pageOne, pageTwo], chunks });

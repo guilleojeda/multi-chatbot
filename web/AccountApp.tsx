@@ -643,6 +643,7 @@ export function AccountApp({
             openingConversationId: undefined,
             turns: [],
             turnsNextCursor: null,
+            loadingEarlier: false,
             refreshRequired: false,
             turnsError: undefined,
           }
@@ -1491,6 +1492,7 @@ export function AccountApp({
       ...history,
       turnsStatus: "loading",
       openingConversationId: conversationId,
+      loadingEarlier: false,
       turnsError: undefined,
     }));
 
@@ -2338,6 +2340,8 @@ export function AccountApp({
           snapshot.question,
           snapshot.ordinal,
           snapshot.queryId,
+          false,
+          { recordActivity: false },
         );
       }
       if (reconciliation.kind === "needs-reload") {
@@ -2542,6 +2546,7 @@ export function AccountApp({
     ordinal: number,
     activeQueryId: string | null,
     closed = false,
+    { recordActivity = true }: { recordActivity?: boolean } = {},
   ) {
     const current = chatScreenStateRef.current.history ?? emptyHistoryState();
     const prior =
@@ -2549,13 +2554,20 @@ export function AccountApp({
       current.conversations.find((conversation) => conversation.conversationId === conversationId);
     const label =
       prior?.label || question.trim().replace(/\s+/g, " ").slice(0, 120) || "Nueva conversación";
+    const activityAt = recordActivity ? new Date().toISOString() : undefined;
     const summary = {
       ...(prior?.createdAt
         ? { createdAt: prior.createdAt }
-        : { createdAt: new Date().toISOString() }),
+        : activityAt
+          ? { createdAt: activityAt }
+          : {}),
       conversationId,
       label,
-      updatedAt: new Date().toISOString(),
+      ...(activityAt
+        ? { updatedAt: activityAt }
+        : prior?.updatedAt
+          ? { updatedAt: prior.updatedAt }
+          : {}),
       lastOrdinal: Math.max(prior?.lastOrdinal ?? 0, ordinal),
       closed,
       ...(activeQueryId ? { activeQueryId } : {}),
@@ -2567,7 +2579,9 @@ export function AccountApp({
     setHistory((history) => ({
       ...history,
       status: "ready",
-      conversations: [summary, ...remaining],
+      conversations: recordActivity
+        ? [summary, ...remaining]
+        : mergeHistoryConversations(localConversationsRef.current, [], history.conversations),
       error: undefined,
     }));
   }

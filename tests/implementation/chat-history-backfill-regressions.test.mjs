@@ -242,10 +242,11 @@ describe("history backfill regressions", () => {
     };
     const activeTurn = firstTurnRecord(conversationId, queryId, {
       status: "in_progress",
-      phase: "generating",
+      phase: "invocation_claimed",
       createdAt: admittedAt,
       updatedAt: chunkAt,
       answerManifest: { count: 1, complete: false },
+      cursor: 1,
     });
     const question = firstQuestionChunk(conversationId, queryId, "Primera pregunta histórica.");
     const updates = [];
@@ -267,6 +268,101 @@ describe("history backfill regressions", () => {
     );
   });
 
+  it.each([
+    {
+      name: "completed first turn with an empty answer",
+      lastOrdinal: 1,
+      firstTurn: { answerManifest: { count: 0, complete: true } },
+    },
+    {
+      name: "unknown first-turn phase",
+      lastOrdinal: 1,
+      firstTurn: { phase: "unknown" },
+    },
+    {
+      name: "completed latest turn with an empty answer",
+      lastOrdinal: 2,
+      latestTurn: {
+        status: "completed",
+        phase: "complete",
+        answerManifest: { count: 0, complete: true },
+      },
+    },
+    {
+      name: "unknown latest-turn phase",
+      lastOrdinal: 2,
+      latestTurn: { phase: "unknown" },
+    },
+    { name: "missing latest turn", lastOrdinal: 2 },
+    { name: "missing META last ordinal" },
+    { name: "invalid META last ordinal", lastOrdinal: 0 },
+  ])("reports $name without writing a projection or changing originals", async (scenario) => {
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub,
+      botId,
+      lastOrdinal: scenario.lastOrdinal,
+    };
+    if (scenario.lastOrdinal === undefined) delete meta.lastOrdinal;
+
+    const firstTurn = firstTurnRecord(conversationId, queryId, scenario.firstTurn);
+    const question = firstQuestionChunk(conversationId, queryId, "Primera pregunta histórica.");
+    const turns = { 1: { record: firstTurn, chunks: [question] } };
+    let latestTurn;
+    if (scenario.latestTurn) {
+      const latestOrdinal = scenario.lastOrdinal;
+      const latestQueryId = "a4bfbc9f-3699-4a93-b120-a03c0204bc68";
+      latestTurn = firstTurnRecord(conversationId, latestQueryId, {
+        ordinal: latestOrdinal,
+        sk: `TURN#${String(latestOrdinal).padStart(8, "0")}`,
+        ...scenario.latestTurn,
+      });
+      turns[latestOrdinal] = { record: latestTurn, chunks: [] };
+    }
+    const originals = structuredClone({ meta, turns });
+    const { send } = mockDocumentClient({
+      scans: [{ Items: [meta] }],
+      chunks: new Map([[conversationId, turns]]),
+    });
+
+    const result = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+
+    expect(result).toMatchObject({ scanned: 1, updated: 0, skipped: 0, incompatible: 1 });
+    expect(send.mock.calls.some(([command]) => command instanceof UpdateCommand)).toBe(false);
+    expect({ meta, turns }).toEqual(originals);
+  });
+
+  it("keeps a valid legacy terminal turn without dates at the unavailable-date position", async () => {
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub,
+      botId,
+      lastOrdinal: 1,
+    };
+    const legacyTurn = firstTurnRecord(conversationId, queryId);
+    delete legacyTurn.phase;
+    delete legacyTurn.createdAt;
+    const question = firstQuestionChunk(conversationId, queryId, "Primera pregunta histórica.");
+    const originals = structuredClone({ meta, legacyTurn, question });
+    const { send } = mockDocumentClient({
+      scans: [{ Items: [meta] }],
+      chunks: new Map([[conversationId, { 1: { record: legacyTurn, chunks: [question] } }]]),
+    });
+
+    const result = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+    const update = send.mock.calls
+      .map(([command]) => command)
+      .find((command) => command instanceof UpdateCommand);
+
+    expect(result).toMatchObject({ scanned: 1, updated: 1, incompatible: 0 });
+    expect(update.input.ExpressionAttributeValues[":historyOrder"]).toBe(`0000#${conversationId}`);
+    expect({ meta, legacyTurn, question }).toEqual(originals);
+  });
+
   it("reads only the first question when a turn has many assistant and private chunks", async () => {
     const meta = {
       pk: "CONV#" + conversationId,
@@ -284,6 +380,8 @@ describe("history backfill regressions", () => {
       botId,
       queryId,
       ordinal: 1,
+      status: "completed",
+      phase: "complete",
       questionManifest: { count: 1, complete: true },
       answerManifest: { count: 12, complete: true },
       cursor: 12,
@@ -396,6 +494,8 @@ describe("history backfill regressions", () => {
       botId,
       queryId,
       ordinal: 1,
+      status: "completed",
+      phase: "complete",
       questionManifest: { count: chunkCount, complete: true },
       answerManifest: { count: 12, complete: true },
       cursor: 12,
