@@ -542,7 +542,7 @@ export function ChatScreen({
                         (turn.status === "completed" && turn.answerComplete !== false) ||
                         (turn.status === "failed" && turn.answerComplete === true);
                       return (
-                        <li className="chat-previous-turn" key={`${index}-${turn.status}`}>
+                        <li className="chat-previous-turn" key={turn.queryId}>
                           <p className="chat-question">
                             <span className="chat-message-label">
                               {isCurrentTurn ? "Tu consulta" : `Tu consulta anterior ${index + 1}`}

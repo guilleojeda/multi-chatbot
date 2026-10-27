@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { GetCommand, QueryCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "./conversation-store.js";
 import type { ConversationMeta } from "./contracts.js";
+import { parseVerifiedHistoryTimestamp } from "./history-projection.js";
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_PAGE = 50;
@@ -19,6 +20,7 @@ type Code =
 type Err = Error & { code: Code };
 type Key = Record<string, unknown>;
 type Meta = ConversationMeta;
+type VerifiedTimestamp = { value: string; milliseconds: number };
 
 function fail(code: Code, message: string): Err {
   const error = new Error(message) as Err;
@@ -35,12 +37,18 @@ function nonNegative(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 function isVerifiedTimestamp(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0 && Number.isFinite(Date.parse(value));
+  return verifiedTimestamp(value) !== undefined;
+}
+function verifiedTimestamp(value: unknown): VerifiedTimestamp | undefined {
+  const milliseconds = parseVerifiedHistoryTimestamp(value);
+  return typeof value === "string" && milliseconds !== undefined
+    ? { value, milliseconds }
+    : undefined;
 }
 function canonicalHistoryOrderTimestamp(
   value: unknown,
   conversationId: string,
-): string | undefined {
+): VerifiedTimestamp | undefined {
   if (typeof value !== "string") return undefined;
   const suffix = "#" + conversationId;
   if (!value.endsWith(suffix)) return undefined;
@@ -48,9 +56,9 @@ function canonicalHistoryOrderTimestamp(
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(timestamp)) {
     return undefined;
   }
-  const milliseconds = Date.parse(timestamp);
-  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === timestamp
-    ? timestamp
+  const verified = verifiedTimestamp(timestamp);
+  return verified && new Date(verified.milliseconds).toISOString() === timestamp
+    ? verified
     : undefined;
 }
 function presentationUpdatedAt(
@@ -58,11 +66,13 @@ function presentationUpdatedAt(
   conversationId: string,
   expectedHistoryOwner: string,
 ): string | undefined {
-  const updatedAt = isVerifiedTimestamp(meta.updatedAt) ? meta.updatedAt : undefined;
-  if (meta.historyOwner !== expectedHistoryOwner) return updatedAt;
+  const updatedAt = verifiedTimestamp(meta.updatedAt);
+  if (meta.historyOwner !== expectedHistoryOwner) return updatedAt?.value;
   const projectedAt = canonicalHistoryOrderTimestamp(meta.historyOrder, conversationId);
-  if (!projectedAt) return updatedAt;
-  return !updatedAt || Date.parse(projectedAt) > Date.parse(updatedAt) ? projectedAt : updatedAt;
+  if (!projectedAt) return updatedAt?.value;
+  return !updatedAt || projectedAt.milliseconds > updatedAt.milliseconds
+    ? projectedAt.value
+    : updatedAt.value;
 }
 function isLegacyGeneratingTurn(value: unknown): boolean {
   if (!isRecord(value) || value.status !== "in_progress" || value.phase !== "generating") {
