@@ -127,11 +127,22 @@ function admissionInput(overrides = {}) {
     ...owner,
     conversationId,
     queryId,
+    operation: "start",
+    baseOrdinal: 0,
     now,
     ownerAttemptId: "attempt-admitted",
     resultDeadlineAt: now + 60 * 60 * 1000,
     text: "Armá una actividad de porcentajes.",
     profileSnapshot,
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContext: {
+      knowledgeBaseId: "kb-aurora-dev",
+      query: "porcentajes para secundaria",
+      revision: "documents-r7",
+      retrievedAt: now,
+      status: "empty",
+      results: [],
+    },
     invocation: {
       modelId: "global.anthropic.claude-sonnet-4-6",
       revision: "profile-r7",
@@ -294,6 +305,7 @@ function conditionalFailure() {
 
 function turnRecord(overrides = {}) {
   return {
+    ...owner,
     pk: "CONV#" + conversationId,
     sk: "TURN#00000002",
     conversationId,
@@ -307,6 +319,8 @@ function turnRecord(overrides = {}) {
     questionManifest: { count: 1, complete: true },
     answerManifest: { count: 0, complete: false },
     contextManifest: { count: 0, complete: true },
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContextManifest: { count: 1, complete: true },
     profileSnapshot,
     invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "profile-r7" },
     operation: "message",
@@ -380,12 +394,22 @@ function lifecycleRecords(turnOverrides = {}, metaOverrides = {}) {
   });
   const meta = metaRecord(metaOverrides);
   const question = submissionChunk(turn.ordinal, turn.queryId, "user", 0, "Pregunta fixture.");
+  const document = documentChunk(turn.ordinal, turn.queryId);
   return new Map([
     [keyId({ pk: submission.pk, sk: submission.sk }), submission],
     [keyId({ pk: turn.pk, sk: turn.sk }), turn],
     [keyId({ pk: meta.pk, sk: meta.sk }), meta],
     [keyId({ pk: question.pk, sk: question.sk }), question],
+    [keyId({ pk: document.pk, sk: document.sk }), document],
   ]);
+}
+
+function documentChunk(ordinal, requestId) {
+  return {
+    ...submissionChunk(ordinal, requestId, "document", 0, ""),
+    sk: "TURN#" + String(ordinal).padStart(8, "0") + "#DOCUMENT#00000000",
+    text: JSON.stringify(admissionInput().documentContext),
+  };
 }
 
 describe("the DynamoDB usage and submission store adapter", () => {
@@ -667,6 +691,9 @@ describe("the DynamoDB usage and submission store adapter", () => {
       queryId: "fcdd5a71-b6db-4ad9-a2c3-934cb56fe749",
       text: largeQuestion,
       contextReferences: references,
+      contextSnapshot: { version: 1, recentReferences: references },
+      operation: "message",
+      baseOrdinal: 4,
       expectedLastOrdinal: 4,
     });
     const { documentClient, store } = makeStore();
@@ -799,7 +826,12 @@ describe("the DynamoDB usage and submission store adapter", () => {
   it("guards the stable query marker and active conversation ordinal in the same admission", async () => {
     const { documentClient, store } = makeStore();
     const continueTurn = requireMethod(store, "continueTurn");
-    const input = admissionInput({ expectedLastOrdinal: 4, contextReferences: [] });
+    const input = admissionInput({
+      operation: "message",
+      baseOrdinal: 4,
+      expectedLastOrdinal: 4,
+      contextReferences: [],
+    });
 
     await continueTurn(input);
 
@@ -840,10 +872,15 @@ describe("the DynamoDB usage and submission store adapter", () => {
     const secondAnswer = submissionChunk(2, queryId, "assistant", 1, "respuesta.");
     const beyondCursor = submissionChunk(2, queryId, "assistant", 2, "respuesta zombi");
     const records = new Map(
-      [record, turn, question, firstAnswer, secondAnswer, beyondCursor].map((item) => [
-        keyId({ pk: item.pk, sk: item.sk }),
-        item,
-      ]),
+      [
+        record,
+        turn,
+        question,
+        firstAnswer,
+        secondAnswer,
+        beyondCursor,
+        documentChunk(2, queryId),
+      ].map((item) => [keyId({ pk: item.pk, sk: item.sk }), item]),
     );
     const { documentClient, store } = makeStore(mapReadRecords(records));
     const getSubmission = requireMethod(store, "getSubmission");

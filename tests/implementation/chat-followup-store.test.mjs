@@ -29,6 +29,17 @@ const turn = {
     policyRevision: "policy-r7",
   },
   text: "Adaptá la actividad para un grupo que todavía no trabajó decimales.",
+  operation: "message",
+  baseOrdinal: 3,
+  contextSnapshot: { version: 1, recentReferences: [] },
+  documentContext: {
+    knowledgeBaseId: "kb-docentes-dev",
+    query: "adaptación para no trabajar decimales",
+    revision: "documents-r1",
+    retrievedAt: Date.parse("2026-10-20T12:00:00.000Z"),
+    status: "empty",
+    results: [],
+  },
   profileSnapshot: {
     sub: "teacher-123",
     botId: "bot-aurora",

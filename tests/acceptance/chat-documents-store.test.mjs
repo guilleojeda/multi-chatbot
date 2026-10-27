@@ -70,6 +70,15 @@ function startInput(overrides = {}) {
     resultDeadlineAt: now + 60 * 60 * 1000,
     text: "Armá una actividad de porcentajes.",
     profileSnapshot,
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContext: {
+      knowledgeBaseId: "kb-docentes-dev",
+      query: "Porcentajes para segundo año",
+      revision: "documents-r14",
+      retrievedAt: now,
+      status: "empty",
+      results: [],
+    },
     invocation: {
       modelId: "global.anthropic.claude-sonnet-4-6",
       revision: "reviewed-revision-123",
@@ -180,18 +189,19 @@ describe("document context in the DynamoDB conversation store", () => {
     expect(records.size).toBeGreaterThan(4);
   });
 
-  it("captures an empty successful retrieval distinctly from a legacy turn with no document manifest", async () => {
+  it("captures an empty successful retrieval and rejects a turn without the current manifest", async () => {
     const emptyStore = makeStore();
     const emptyCapture = documentContext({ status: "empty", results: [] });
     await emptyStore.store.startTurn(startInput({ documentContext: emptyCapture }));
     const emptySnapshot = await emptyStore.store.getSubmission({ ...owner, queryId });
     expect(emptySnapshot?.documentContext).toEqual(emptyCapture);
 
-    const legacyStore = makeStore();
-    await legacyStore.store.startTurn(startInput());
-    const legacySnapshot = await legacyStore.store.getSubmission({ ...owner, queryId });
-    expect(legacySnapshot).not.toHaveProperty("documentContext");
-    expect(turnRecord(legacyStore.records, 1)).not.toHaveProperty("documentContextManifest");
+    const malformedStore = makeStore();
+    await malformedStore.store.startTurn(startInput({ documentContext: emptyCapture }));
+    delete turnRecord(malformedStore.records, 1).documentContextManifest;
+    await expect(malformedStore.store.getSubmission({ ...owner, queryId })).rejects.toThrow(
+      /document|manifest/i,
+    );
   });
 
   it("stores each continuation's own document capture with its exact context references", async () => {
@@ -218,6 +228,8 @@ describe("document context in the DynamoDB conversation store", () => {
       answerManifest: { count: 1, complete: true },
       contextManifest: { count: 0, complete: true },
       cursor: 1,
+      contextSnapshot: { version: 1, recentReferences: [] },
+      documentContextManifest: { count: 1, complete: true },
     });
     const capture = documentContext({
       query: "Qué plantea la segunda explicación sobre porcentajes",
@@ -242,11 +254,14 @@ describe("document context in the DynamoDB conversation store", () => {
       startInput({
         queryId: continuationId,
         text: "¿Qué plantea la segunda explicación?",
+        operation: "message",
+        baseOrdinal: 1,
         documentContext: capture,
         requestFingerprint: "sha256:continuation-fingerprint",
         ownerAttemptId: "attempt-continuation",
         expectedLastOrdinal: 1,
         contextReferences: [{ ordinal: 1, queryId }],
+        contextSnapshot: { version: 1, recentReferences: [{ ordinal: 1, queryId }] },
       }),
     );
 

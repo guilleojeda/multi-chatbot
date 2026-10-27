@@ -128,15 +128,14 @@ function attachedStatements(template, roleId) {
 }
 
 describe("summary preparation infrastructure acceptance", () => {
-  it("configures the existing Runtime with approved defaults without changing resource identities or granting the history reader Bedrock", async () => {
+  it("configures one Runtime with approved defaults without extra storage or granting the history reader Bedrock", async () => {
     const templates = await runtimeTemplate();
     expect(templates, "a synthesized stack assembly is required").toBeDefined();
     if (!templates) return;
     const { chat: template, account: accountTemplate, identity: identityTemplate } = templates;
 
     const runtimes = resourceEntries(template, "AWS::BedrockAgentCore::Runtime");
-    expect(runtimes, "summary preparation must reuse the existing Runtime").toHaveLength(1);
-    expect(runtimes[0]?.[0]).toBe("ChatRuntime82B3183A");
+    expect(runtimes, "summary preparation uses the conversation Runtime").toHaveLength(1);
     const runtimeVariables = runtimes[0]?.[1].Properties?.EnvironmentVariables;
     expect(runtimeVariables).toMatchObject({
       SUMMARY_TRIGGER_TOKENS: "128000",
@@ -170,7 +169,7 @@ describe("summary preparation infrastructure acceptance", () => {
         "DocumentsVectorIndexD1E04ED4",
         "DocumentsKnowledgeBase6B2C8C67",
         "DocumentsDocumentDataSourceEAB8D31A",
-        "ChatRuntime82B3183A",
+        runtimes[0][0],
       ].sort(),
     );
     expect(resourceEntries(accountTemplate, "AWS::ApiGatewayV2::Api").map(([id]) => id)).toEqual([

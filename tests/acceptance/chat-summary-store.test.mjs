@@ -148,6 +148,8 @@ function continuationInput({
     },
     quota,
     requestFingerprint: `fingerprint-${ordinal}`,
+    operation: "message",
+    baseOrdinal,
     expectedLastOrdinal: baseOrdinal,
     contextReferences: refs,
     contextSnapshot: snapshot,
@@ -194,6 +196,7 @@ function completedPair(ordinal, { contextReferences = [] } = {}) {
   const question = `question-${ordinal}`;
   const answer = `answer-${ordinal}`;
   const pk = `CONV#${conversationId}`;
+  const documentCapture = documentContext();
   const items = [
     {
       pk,
@@ -211,6 +214,8 @@ function completedPair(ordinal, { contextReferences = [] } = {}) {
         count: contextReferences.length > 0 ? 1 : 0,
         complete: true,
       },
+      contextSnapshot: { version: 1, recentReferences: contextReferences },
+      documentContextManifest: { count: 1, complete: true },
     },
     {
       pk,
@@ -231,6 +236,14 @@ function completedPair(ordinal, { contextReferences = [] } = {}) {
       role: "assistant",
       index: 0,
       text: answer,
+    },
+    {
+      pk,
+      sk: `TURN#${String(ordinal).padStart(8, "0")}#DOCUMENT#00000000`,
+      conversationId,
+      ordinal,
+      index: 0,
+      text: JSON.stringify(documentCapture),
     },
   ];
   if (contextReferences.length > 0) {
@@ -667,9 +680,10 @@ describe("versioned conversation summary storage acceptance", () => {
     });
   });
 
-  it("keeps legacy turns readable when they do not declare a versioned context", async () => {
+  it("rejects a completed turn that omits its current versioned context", async () => {
     const q2 = queryId(2);
-    const legacy = completedPair(2, { contextReferences: [reference(1)] });
+    const missingSnapshot = completedPair(2, { contextReferences: [reference(1)] });
+    delete missingSnapshot[0].contextSnapshot;
     const marker = {
       pk: `USER#${owner.sub}#BOT#${owner.botId}`,
       sk: `SEND#${q2}`,
@@ -687,20 +701,14 @@ describe("versioned conversation summary storage acceptance", () => {
     const db = makeDatabase([
       ownerMeta(2, { lastQueryId: q2 }),
       ...completedPair(1),
-      ...legacy,
+      ...missingSnapshot,
       marker,
     ]);
     const store = makeStore(db.documentClient);
 
-    const context = await store.readContext({ conversationId });
-    expect(JSON.stringify(context.messages)).toContain("question-1");
-    expect(JSON.stringify(context.messages)).toContain("answer-2");
-    expect(context.references).toEqual([reference(1), reference(2)]);
-    expect(context.summary).toBeUndefined();
-    const submission = await store.getSubmission({ ...owner, queryId: q2 });
-    expect(submission.contextReferences).toEqual([reference(1)]);
-    expect(submission.contextSnapshot).toBeUndefined();
-    expect(submission.summary).toBeUndefined();
+    await expect(store.readContext({ conversationId })).rejects.toThrow(
+      /context snapshot|context references/i,
+    );
   });
 
   it.each([

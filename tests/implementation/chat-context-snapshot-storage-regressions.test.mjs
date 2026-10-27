@@ -27,7 +27,7 @@ function recordKey(item) {
   return `${item.pk}\u0000${item.sk}`;
 }
 
-function meta(lastOrdinal, summary) {
+function meta(lastOrdinal, summary, overrides = {}) {
   return {
     pk: `CONV#${conversationId}`,
     sk: "META",
@@ -36,12 +36,15 @@ function meta(lastOrdinal, summary) {
     lastOrdinal,
     lastQueryId: queryId(lastOrdinal),
     ...(summary ? { summary } : {}),
+    ...overrides,
   };
 }
 
 function turnRecord(ordinal, overrides = {}) {
   const id = queryId(ordinal);
   const padded = String(ordinal).padStart(8, "0");
+  const status = overrides.status ?? "completed";
+  const answerManifest = overrides.answerManifest ?? { count: 1, complete: status === "completed" };
   return {
     pk: `CONV#${conversationId}`,
     sk: `TURN#${padded}`,
@@ -49,12 +52,15 @@ function turnRecord(ordinal, overrides = {}) {
     ...owner,
     ordinal,
     queryId: id,
-    status: "completed",
-    phase: "complete",
-    cursor: 1,
+    status,
+    phase:
+      status === "completed" ? "complete" : status === "failed" ? "failed" : "invocation_claimed",
+    cursor: answerManifest.count,
     questionManifest: { count: 1, complete: true },
-    answerManifest: { count: 1, complete: true },
+    answerManifest,
     contextManifest: { count: 0, complete: true },
+    contextSnapshot: { version: 1, recentReferences: [] },
+    documentContextManifest: { count: 1, complete: true },
     ...overrides,
   };
 }
@@ -169,7 +175,17 @@ function continuationInput({ baseOrdinal, contextSnapshot, contextReferences, su
     ownerAttemptId: `snapshot-attempt-${ordinal}`,
     resultDeadlineAt: now + 60 * 60 * 1000,
     text: `new question ${ordinal}`,
+    operation: "message",
+    baseOrdinal,
     profileSnapshot: { sub: owner.sub, botId: owner.botId },
+    documentContext: {
+      knowledgeBaseId: "kb-snapshot-dev",
+      query: "context snapshot storage",
+      revision: "documents-snapshot-r1",
+      retrievedAt: now,
+      status: "empty",
+      results: [],
+    },
     invocation: {
       modelId: "global.anthropic.claude-sonnet-4-6",
       revision: "context-snapshot-test-r1",
@@ -260,7 +276,10 @@ describe("conversation context integrity", () => {
 
   it("checks coverage across failed and active turns without requiring SEND rows", async () => {
     const items = [
-      meta(3),
+      meta(3, undefined, {
+        activeQueryId: queryId(3),
+        activeOwnerAttemptId: "attempt-3",
+      }),
       turnRecord(1),
       turnText(1, "user", "question-1"),
       turnText(1, "assistant", "answer-1"),
@@ -274,6 +293,8 @@ describe("conversation context integrity", () => {
       turnRecord(3, {
         status: "in_progress",
         phase: "admitted",
+        ownerAttemptId: "attempt-3",
+        resultDeadlineAt: now + 60 * 60 * 1000,
         cursor: 0,
         answerManifest: { count: 0, complete: false },
       }),
@@ -339,7 +360,7 @@ describe("conversation context integrity", () => {
   );
 
   it.each(["without a summary", "after a summary"])(
-    "preserves legacy completed turns whose optional cursor, phase, and owner are absent %s",
+    "rejects a completed turn missing its current owner or lifecycle fields %s",
     async (mode) => {
       const ordinal = mode === "without a summary" ? 1 : 2;
       const legacyTurn = turnRecord(ordinal);
@@ -374,13 +395,9 @@ describe("conversation context integrity", () => {
       }
       const db = makeDatabase(items);
 
-      const context = await makeStore(db.documentClient).readContext({ conversationId });
-
-      expect(context.references).toEqual([reference(ordinal)]);
-      expect(context.messages).toEqual([
-        { role: "user", content: [{ text: "legacy-question" }] },
-        { role: "assistant", content: [{ text: "legacy-answer" }] },
-      ]);
+      await expect(makeStore(db.documentClient).readContext({ conversationId })).rejects.toThrow(
+        /turn|owner|context/i,
+      );
     },
   );
 
@@ -390,7 +407,7 @@ describe("conversation context integrity", () => {
         const ordinal = mode === "without a summary" ? 1 : 2;
         return [
           [mode, role, "matching explicit ordinal", ordinal, false],
-          [mode, role, "legacy absent ordinal", undefined, false],
+          [mode, role, "missing current ordinal", undefined, true],
           [mode, role, "contradictory explicit ordinal", ordinal + 1, true],
         ];
       }),
