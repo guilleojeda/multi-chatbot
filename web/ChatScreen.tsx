@@ -193,9 +193,15 @@ export function ChatScreen({
     (state.queryStatus === "failed" && state.canContinue !== false) ||
     (state.queryStatus === "rejected" && Boolean(state.quota)) ||
     (state.queryStatus === "rejected" && state.queryErrorCode === "storage_capacity_exceeded");
+  const hasUsableContinuationBase =
+    state.canContinue === true &&
+    typeof state.ordinal === "number" &&
+    Number.isSafeInteger(state.ordinal) &&
+    state.ordinal > 0;
   const canSubmit =
     state.profileStatus === "complete" &&
     state.history?.turnsStatus !== "loading" &&
+    (state.history?.turnsStatus !== "error" || hasUsableContinuationBase) &&
     !state.history?.openingConversationId &&
     canSubmitForState &&
     draft.trim().length > 0;

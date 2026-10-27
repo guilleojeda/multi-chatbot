@@ -2721,6 +2721,11 @@ export function AccountApp({
       (current.queryStatus === "rejected" && Boolean(current.quota)) ||
       (current.queryStatus === "rejected" &&
         current.queryErrorCode === "storage_capacity_exceeded");
+    const hasUsableContinuationBase =
+      current.canContinue === true &&
+      typeof current.ordinal === "number" &&
+      Number.isSafeInteger(current.ordinal) &&
+      current.ordinal > 0;
     if (
       !identity ||
       !ownerKey ||
@@ -2729,6 +2734,7 @@ export function AccountApp({
       chatOwnerKeyRef.current !== ownerKey ||
       (current.profileStatus !== "complete" && !retrying) ||
       current.history?.turnsStatus === "loading" ||
+      (current.history?.turnsStatus === "error" && !retrying && !hasUsableContinuationBase) ||
       Boolean(current.history?.openingConversationId) ||
       (!retrying && !canStartNewRequest) ||
       (previousJournal && !previousJournal.admitted && !retrying) ||
