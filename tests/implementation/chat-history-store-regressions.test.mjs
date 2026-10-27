@@ -297,18 +297,18 @@ describe("history reader regressions", () => {
     });
   });
 
-  it("uses verified terminal activity for list and turn presentation when META retains admission time", async () => {
-    const admittedAt = "2026-10-23T10:00:00.000Z";
-    const completedAt = "2026-10-25T10:00:00.000Z";
-    const historyOrder = `${completedAt}#${conversationId}`;
+  it("uses only META.updatedAt for list, brief, and turn activity", async () => {
+    const metaActivityAt = "2026-10-23T10:00:00.000Z";
+    const indexOrderAt = "2026-10-25T10:00:00.000Z";
+    const historyOrder = `${indexOrderAt}#${conversationId}`;
     const meta = makeMeta({
       lastOrdinal: 1,
       activeQueryId: undefined,
       activeOwnerAttemptId: undefined,
       createdAt: "2026-10-20T10:00:00.000Z",
-      updatedAt: admittedAt,
+      updatedAt: metaActivityAt,
       historyOrder,
-      historyLabel: "Legacy completed answer",
+      historyLabel: "Current-format answer",
     });
     const send = vi.fn(async (command) => {
       if (command instanceof QueryCommand) {
@@ -331,13 +331,15 @@ describe("history reader regressions", () => {
     const store = createStore(send);
 
     const listed = await store.listConversations({ sub, botId, limit: 1 });
+    const brief = await store.readConversationMeta({ sub, botId, conversationId });
     const turns = await store.readTurns({ sub, botId, conversationId, limit: 1 });
 
     expect(listed.conversations[0]).toMatchObject({
-      updatedAt: completedAt,
-      label: "Legacy completed answer",
+      updatedAt: metaActivityAt,
+      label: "Current-format answer",
     });
-    expect(turns).toMatchObject({ updatedAt: completedAt, turns: [{ ordinal: 1 }] });
+    expect(brief.updatedAt).toBe(metaActivityAt);
+    expect(turns).toMatchObject({ updatedAt: metaActivityAt, turns: [{ ordinal: 1 }] });
   });
 
   it.each([
@@ -361,7 +363,7 @@ describe("history reader regressions", () => {
       undefined,
     ],
   ])(
-    "does not present an unowned or invalid history order (%s)",
+    "presents verified META activity without deriving it from history order (%s)",
     async (_label, overrides, expected) => {
       const meta = makeMeta({
         lastOrdinal: 1,
@@ -512,8 +514,8 @@ describe("history reader regressions", () => {
     expect(unverifiedDateMeta).toEqual(originals);
   });
 
-  it("uses another valid activity date and preserves valid ISO offsets, fractions, and leap days", async () => {
-    const projectedAt = "2026-03-01T10:00:00.000Z";
+  it("omits invalid META activity and preserves valid ISO offsets, fractions, and leap days", async () => {
+    const indexOrderAt = "2026-03-01T10:00:00.000Z";
     const offsetFraction = "2024-02-29T10:15:30.123456789+02:30";
     const meta = makeMeta({
       lastOrdinal: 1,
@@ -521,7 +523,7 @@ describe("history reader regressions", () => {
       activeOwnerAttemptId: undefined,
       createdAt: "2024-02-29T08:00:00.123+02:30",
       updatedAt: "2026-02-30T10:00:00.000Z",
-      historyOrder: `${projectedAt}#${conversationId}`,
+      historyOrder: `${indexOrderAt}#${conversationId}`,
     });
     const validMeta = makeMeta({
       lastOrdinal: 1,
@@ -553,7 +555,7 @@ describe("history reader regressions", () => {
     const store = createStore(send);
 
     const projected = await store.listConversations({ sub, botId, limit: 1 });
-    expect(projected.conversations[0].updatedAt).toBe(projectedAt);
+    expect(projected.conversations[0]).not.toHaveProperty("updatedAt");
     expect(projected.conversations[0].createdAt).toBe(meta.createdAt);
 
     currentMeta = validMeta;

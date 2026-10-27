@@ -15,10 +15,14 @@ import {
 import {
   act,
   buttonByText,
+  clickPhase8,
   createPhase8Dom,
+  conversationRow,
+  hideButtonFor,
   mountPhase8AccountApp,
   React,
   renderPhase8AccountApp,
+  statusText,
 } from "../support/phase8-web-harness.mjs";
 import {
   clearChatJournal,
@@ -503,6 +507,163 @@ describe("active recovery preserves authoritative activity", () => {
 });
 
 describe("history removal state transitions", () => {
+  async function mountRemovalDom(hideHandler) {
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+            {
+              conversationId: secondConversationId,
+              label: "Conversación B",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1, conversationId === firstConversationId ? firstQueryId : secondQueryId)],
+        }),
+      textHandler: turnText,
+      hideHandler,
+    });
+    const domState = await createPhase8Dom();
+    domStates.push(domState);
+    const app = await mountPhase8AccountApp(environment, AccountApp, domState);
+    apps.push(app);
+    const render = () => renderPhase8AccountApp(app, domState);
+    return { app, domState, environment, render };
+  }
+
+  it.each(["button", "Escape"])(
+    "cancels before the POST with %s and restores focus to the enabled trigger",
+    async (method) => {
+      const hideHandler = vi.fn(() => jsonResponse({ version: 1 }));
+      const { app, domState, environment, render } = await mountRemovalDom(hideHandler);
+      const trigger = hideButtonFor(domState.document, "Conversación A");
+
+      await clickPhase8(trigger, app, domState);
+      const row = conversationRow(domState.document, "Conversación A");
+      if (method === "button") {
+        await clickPhase8(buttonByText(domState.document, "Cancelar"), app, domState);
+      } else {
+        const confirmation = row.querySelector(".chat-history__remove-confirmation");
+        await act(async () => {
+          confirmation.dispatchEvent(
+            new domState.dom.window.KeyboardEvent("keydown", {
+              key: "Escape",
+              bubbles: true,
+            }),
+          );
+        });
+        await render();
+      }
+
+      expect(hideHandler).not.toHaveBeenCalled();
+      expect(
+        environment.apiRequests.filter(({ method: requestMethod }) => requestMethod === "POST"),
+      ).toHaveLength(0);
+      expect(trigger.disabled).toBe(false);
+      expect(domState.document.activeElement).toBe(trigger);
+      expect(
+        conversationRow(domState.document, "Conversación A").querySelector(
+          ".chat-history__remove-confirmation",
+        ),
+      ).toBeNull();
+    },
+  );
+
+  it("keeps the pending hide visible and focused while Escape cannot dismiss it or block another thread", async () => {
+    const pendingHide = deferred();
+    const hideHandler = vi.fn(() => pendingHide.promise);
+    const { app, domState, render } = await mountRemovalDom(hideHandler);
+
+    await clickPhase8(hideButtonFor(domState.document, "Conversación A"), app, domState);
+    const rowA = conversationRow(domState.document, "Conversación A");
+    await clickPhase8(rowA.querySelector(".chat-history__remove-confirm"), app, domState);
+
+    const pendingStatus = statusText(domState.document, "Quitando…");
+    expect(pendingStatus).not.toBeNull();
+    expect(domState.document.activeElement).toBe(pendingStatus);
+    expect(buttonByText(domState.document, "Cancelar")).toBeUndefined();
+    expect(hideButtonFor(domState.document, "Conversación A").disabled).toBe(true);
+    expect(props(app).state.history.removal).toMatchObject({
+      conversationId: firstConversationId,
+      status: "hiding",
+    });
+
+    await act(async () => {
+      pendingStatus.dispatchEvent(
+        new domState.dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      );
+    });
+    await render();
+    expect(statusText(domState.document, "Quitando…")).toBe(pendingStatus);
+    expect(domState.document.activeElement).toBe(pendingStatus);
+    expect(props(app).state.history.removal.status).toBe("hiding");
+    expect(hideHandler).toHaveBeenCalledTimes(1);
+
+    const rowB = conversationRow(domState.document, "Conversación B");
+    await clickPhase8(rowB.querySelector(".chat-history__item"), app, domState);
+    expect(props(app).state.history.selectedConversationId).toBe(secondConversationId);
+    expect(statusText(domState.document, "Quitando…")).not.toBeNull();
+
+    pendingHide.resolve(
+      jsonResponse({
+        version: 1,
+        conversationId: firstConversationId,
+        hiddenAt: "2026-10-27T14:00:00.000Z",
+      }),
+    );
+    await render();
+    expect(props(app).state.history.removal).toBeUndefined();
+  });
+
+  it("reopens an uncertain removal for retry and focuses the next row after confirmation", async () => {
+    let attempts = 0;
+    const { app, domState, render } = await mountRemovalDom(() => {
+      attempts += 1;
+      return attempts === 1
+        ? jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503)
+        : jsonResponse({
+            version: 1,
+            conversationId: firstConversationId,
+            hiddenAt: "2026-10-27T14:00:00.000Z",
+          });
+    });
+
+    await clickPhase8(hideButtonFor(domState.document, "Conversación A"), app, domState);
+    let rowA = conversationRow(domState.document, "Conversación A");
+    await clickPhase8(rowA.querySelector(".chat-history__remove-confirm"), app, domState);
+
+    rowA = conversationRow(domState.document, "Conversación A");
+    expect(props(app).state.history.removal).toMatchObject({
+      conversationId: firstConversationId,
+      status: "unconfirmed",
+    });
+    expect(rowA.querySelector('[role="alert"]')?.textContent).toContain("No pudimos confirmar");
+    expect(domState.document.activeElement).toBe(buttonByText(domState.document, "Cancelar"));
+
+    await clickPhase8(rowA.querySelector(".chat-history__remove-confirm"), app, domState);
+    await render();
+    expect(attempts).toBe(2);
+    expect(conversationRow(domState.document, "Conversación A")).toBeUndefined();
+    const rowB = conversationRow(domState.document, "Conversación B");
+    expect(domState.document.activeElement).toBe(rowB.querySelector(".chat-history__item"));
+  });
+
   it("disables the composer only for the selected conversation being removed", async () => {
     const pendingHide = deferred();
     const environment = createHistoryEnvironment({
