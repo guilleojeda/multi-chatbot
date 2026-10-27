@@ -386,6 +386,136 @@ describe("history reader regressions", () => {
     expect(invalidDateMeta.updatedAt).toBe("");
   });
 
+  it("omits impossible calendar dates from list and turn presentation without changing META", async () => {
+    const invalidDateMeta = makeMeta({
+      lastOrdinal: 1,
+      activeQueryId: undefined,
+      activeOwnerAttemptId: undefined,
+      createdAt: "2023-02-29T10:00:00.000Z",
+      updatedAt: "2026-02-30T10:00:00.000Z",
+      historyOrder: `2026-02-30T10:00:00.000Z#${conversationId}`,
+    });
+    const originals = structuredClone(invalidDateMeta);
+    const send = vi.fn(async (command) => {
+      if (command instanceof QueryCommand) {
+        return {
+          Items: [
+            {
+              pk: invalidDateMeta.pk,
+              sk: "META",
+              historyOwner: invalidDateMeta.historyOwner,
+              historyOrder: invalidDateMeta.historyOrder,
+            },
+          ],
+        };
+      }
+      if (command instanceof GetCommand) {
+        return {
+          Item: command.input.Key.sk === "META" ? invalidDateMeta : makeTurn(1, q1),
+        };
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+    const store = createStore(send);
+
+    const listed = await store.listConversations({ sub, botId, limit: 1 });
+    const turns = await store.readTurns({ sub, botId, conversationId, limit: 1 });
+
+    expect(listed.conversations[0]).not.toHaveProperty("createdAt");
+    expect(listed.conversations[0]).not.toHaveProperty("updatedAt");
+    expect(turns).not.toHaveProperty("createdAt");
+    expect(turns).not.toHaveProperty("updatedAt");
+    expect(invalidDateMeta).toEqual(originals);
+  });
+
+  it("omits unsupported non-ISO dates from presentation without changing META", async () => {
+    const unverifiedDateMeta = makeMeta({
+      lastOrdinal: 1,
+      activeQueryId: undefined,
+      activeOwnerAttemptId: undefined,
+      createdAt: "2024/02/29",
+      updatedAt: "Mon, 30 Feb 2026 10:00:00 GMT",
+      historyOrder: `0000#${conversationId}`,
+    });
+    const originals = structuredClone(unverifiedDateMeta);
+    const send = vi.fn(async (command) => {
+      if (command instanceof QueryCommand) {
+        return {
+          Items: [
+            {
+              pk: unverifiedDateMeta.pk,
+              sk: "META",
+              historyOwner: unverifiedDateMeta.historyOwner,
+              historyOrder: unverifiedDateMeta.historyOrder,
+            },
+          ],
+        };
+      }
+      if (command instanceof GetCommand) {
+        return {
+          Item: command.input.Key.sk === "META" ? unverifiedDateMeta : makeTurn(1, q1),
+        };
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+
+    const result = await createStore(send).listConversations({ sub, botId, limit: 1 });
+
+    expect(result.conversations[0]).not.toHaveProperty("createdAt");
+    expect(result.conversations[0]).not.toHaveProperty("updatedAt");
+    expect(unverifiedDateMeta).toEqual(originals);
+  });
+
+  it("uses another valid activity date and preserves valid ISO offsets, fractions, and leap days", async () => {
+    const projectedAt = "2026-03-01T10:00:00.000Z";
+    const offsetFraction = "2024-02-29T10:15:30.123456789+02:30";
+    const meta = makeMeta({
+      lastOrdinal: 1,
+      activeQueryId: undefined,
+      activeOwnerAttemptId: undefined,
+      createdAt: "2024-02-29T08:00:00.123+02:30",
+      updatedAt: "2026-02-30T10:00:00.000Z",
+      historyOrder: `${projectedAt}#${conversationId}`,
+    });
+    const validMeta = makeMeta({
+      lastOrdinal: 1,
+      activeQueryId: undefined,
+      activeOwnerAttemptId: undefined,
+      createdAt: "2024-02-29T08:00:00.123+02:30",
+      updatedAt: offsetFraction,
+      historyOrder: `0000#${conversationId}`,
+    });
+    let currentMeta = meta;
+    const send = vi.fn(async (command) => {
+      if (command instanceof QueryCommand) {
+        return {
+          Items: [
+            {
+              pk: currentMeta.pk,
+              sk: "META",
+              historyOwner: currentMeta.historyOwner,
+              historyOrder: currentMeta.historyOrder,
+            },
+          ],
+        };
+      }
+      if (command instanceof GetCommand) {
+        return { Item: command.input.Key.sk === "META" ? currentMeta : makeTurn(1, q1) };
+      }
+      throw new Error("Unexpected command " + command.constructor.name);
+    });
+    const store = createStore(send);
+
+    const projected = await store.listConversations({ sub, botId, limit: 1 });
+    expect(projected.conversations[0].updatedAt).toBe(projectedAt);
+    expect(projected.conversations[0].createdAt).toBe(meta.createdAt);
+
+    currentMeta = validMeta;
+    const valid = await store.listConversations({ sub, botId, limit: 1 });
+    expect(valid.conversations[0].updatedAt).toBe(offsetFraction);
+    expect(valid.conversations[0].createdAt).toBe(validMeta.createdAt);
+  });
+
   it("allows continuation after an open confirmed failure, but not after an uncertain claimed failure", async () => {
     const cases = [
       {

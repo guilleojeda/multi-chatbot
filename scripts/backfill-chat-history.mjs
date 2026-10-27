@@ -1,22 +1,19 @@
 import { GetCommand, QueryCommand, ScanCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
-import { createHistoryLabel, createHistoryOrder } from "../runtime/history-projection.ts";
+import {
+  createHistoryLabel,
+  createHistoryOrder,
+  normalizeVerifiedHistoryTimestamp,
+} from "../runtime/history-projection.ts";
 import { pathToFileURL } from "node:url";
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validTimestamp(value) {
-  return (
-    typeof value === "string" && timestampPattern.test(value) && Number.isFinite(Date.parse(value))
-  );
-}
-
 function normalizedTimestamp(value) {
-  return validTimestamp(value) ? new Date(Date.parse(value)).toISOString() : undefined;
+  return normalizeVerifiedHistoryTimestamp(value);
 }
 
 function latestTimestamp(values) {
@@ -405,7 +402,11 @@ export async function backfillChatHistory(input) {
       for (const meta of page.Items) {
         if (!isRecord(meta) || meta.sk !== "META") continue;
         result.scanned += 1;
-        if (meta.botId !== input.botId) {
+        if (
+          typeof meta.botId === "string" &&
+          meta.botId.trim().length > 0 &&
+          meta.botId !== input.botId
+        ) {
           result.skipped += 1;
           continue;
         }

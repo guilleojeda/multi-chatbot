@@ -65,6 +65,55 @@ function mockDocumentClient({ scans, chunks }) {
 }
 
 describe("history backfill regressions", () => {
+  it.each([
+    ["missing botId", undefined],
+    ["non-string botId", 42],
+    ["blank botId", "  "],
+  ])(
+    "reports META with %s as incompatible without reading originals",
+    async (_name, invalidBotId) => {
+      const meta = {
+        pk: `CONV#${conversationId}`,
+        sk: "META",
+        conversationId,
+        sub,
+        lastOrdinal: 1,
+      };
+      if (invalidBotId !== undefined) meta.botId = invalidBotId;
+      const originals = structuredClone(meta);
+      const send = vi.fn(async (command) => {
+        if (command instanceof ScanCommand) return { Items: [meta] };
+        throw new Error("Invalid bot identity must not read original records.");
+      });
+
+      const result = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+
+      expect(result).toMatchObject({ scanned: 1, updated: 0, skipped: 0, incompatible: 1 });
+      expect(send.mock.calls.map(([command]) => command.constructor.name)).toEqual(["ScanCommand"]);
+      expect(meta).toEqual(originals);
+    },
+  );
+
+  it("skips an explicitly foreign bot without reading its original records", async () => {
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub,
+      botId: "another-valid-bot",
+      lastOrdinal: 1,
+    };
+    const send = vi.fn(async (command) => {
+      if (command instanceof ScanCommand) return { Items: [meta] };
+      throw new Error("Foreign bot data must not be read or changed.");
+    });
+
+    const result = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+
+    expect(result).toMatchObject({ scanned: 1, updated: 0, skipped: 1, incompatible: 0 });
+    expect(send.mock.calls.map(([command]) => command.constructor.name)).toEqual(["ScanCommand"]);
+  });
+
   it("indexes valid pre-quota turns with cursor and chunk ordinal derived from durable data", async () => {
     const legacyTurn = firstTurnRecord(conversationId, queryId);
     delete legacyTurn.cursor;
@@ -438,6 +487,85 @@ describe("history backfill regressions", () => {
     expect(result).toMatchObject({ scanned: 1, updated: 1, incompatible: 0 });
     expect(update.input.ExpressionAttributeValues[":historyOrder"]).toBe(`0000#${conversationId}`);
     expect({ meta, legacyTurn, question }).toEqual(originals);
+  });
+
+  it.each([
+    ["impossible February 30", "2026-02-30T10:00:00.000Z"],
+    ["non-leap February 29", "2023-02-29T10:00:00.000Z"],
+    ["unverified RFC date", "Mon, 30 Feb 2026 10:00:00 GMT"],
+  ])("does not turn %s into activity and preserves the source date", async (_name, invalidAt) => {
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub,
+      botId,
+      lastOrdinal: 1,
+      updatedAt: invalidAt,
+    };
+    const turn = firstTurnRecord(conversationId, queryId);
+    delete turn.createdAt;
+    const question = firstQuestionChunk(conversationId, queryId, "Pregunta histórica.");
+    const originals = structuredClone({ meta, turn, question });
+    const { send } = mockDocumentClient({
+      scans: [{ Items: [meta] }],
+      chunks: new Map([[conversationId, { 1: { record: turn, chunks: [question] } }]]),
+    });
+
+    const result = await backfillChatHistory({ documentClient: { send }, tableName, botId });
+    const update = send.mock.calls
+      .map(([command]) => command)
+      .find((command) => command instanceof UpdateCommand);
+
+    expect(result).toMatchObject({ scanned: 1, updated: 1, incompatible: 0 });
+    expect(update.input.ExpressionAttributeValues[":historyOrder"]).toBe(`0000#${conversationId}`);
+    expect({ meta, turn, question }).toEqual(originals);
+  });
+
+  it("falls back to another verifiable source date and keeps valid offset, fraction, and leap dates", async () => {
+    const cases = [
+      {
+        meta: {
+          updatedAt: "2026-02-30T10:00:00.000Z",
+          createdAt: "2026-02-28T08:00:00.000Z",
+        },
+        turn: {},
+        expected: "2026-02-28T08:00:00.000Z",
+      },
+      {
+        meta: { updatedAt: "2024-02-29T10:15:30.123456789+02:30" },
+        turn: {},
+        expected: "2024-02-29T07:45:30.123Z",
+      },
+    ];
+
+    for (const { meta: dates, turn: turnDates, expected } of cases) {
+      const meta = {
+        pk: `CONV#${conversationId}`,
+        sk: "META",
+        conversationId,
+        sub,
+        botId,
+        lastOrdinal: 1,
+        ...dates,
+      };
+      const turn = firstTurnRecord(conversationId, queryId, turnDates);
+      delete turn.createdAt;
+      const question = firstQuestionChunk(conversationId, queryId, "Pregunta histórica.");
+      const { send } = mockDocumentClient({
+        scans: [{ Items: [meta] }],
+        chunks: new Map([[conversationId, { 1: { record: turn, chunks: [question] } }]]),
+      });
+
+      await backfillChatHistory({ documentClient: { send }, tableName, botId });
+      const update = send.mock.calls
+        .map(([command]) => command)
+        .find((command) => command instanceof UpdateCommand);
+
+      expect(update.input.ExpressionAttributeValues[":historyOrder"]).toBe(
+        `${expected}#${conversationId}`,
+      );
+    }
   });
 
   it("reads only the first question when a turn has many assistant and private chunks", async () => {
