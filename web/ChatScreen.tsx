@@ -218,11 +218,17 @@ export function ChatScreen({
     typeof state.ordinal === "number" &&
     Number.isSafeInteger(state.ordinal) &&
     state.ordinal > 0;
+  const removalBlocksSelectedConversation = Boolean(
+    history?.selectedConversationId &&
+    removal?.conversationId === history.selectedConversationId &&
+    (removal.status === "hiding" || removal.status === "unconfirmed"),
+  );
   const canSubmit =
     state.profileStatus === "complete" &&
     state.history?.turnsStatus !== "loading" &&
     (state.history?.turnsStatus !== "error" || hasUsableContinuationBase) &&
     !state.history?.openingConversationId &&
+    !removalBlocksSelectedConversation &&
     canSubmitForState &&
     draft.trim().length > 0;
   const showConversation =
@@ -919,6 +925,7 @@ export function ChatScreen({
                         <button
                           className="account-button account-button--secondary chat-restart-button"
                           type="button"
+                          disabled={removalBlocksSelectedConversation}
                           onClick={() => {
                             if (onSubmit(state.question || "") !== false) onDraftChange?.("");
                           }}
@@ -938,6 +945,7 @@ export function ChatScreen({
                       <button
                         className="account-button account-button--secondary chat-restart-button"
                         type="button"
+                        disabled={removalBlocksSelectedConversation}
                         onClick={() => {
                           if (onSubmit(state.question || "") !== false) onDraftChange?.("");
                         }}

@@ -13,6 +13,14 @@ import {
   streamResponse,
 } from "../support/history-web-harness.mjs";
 import {
+  act,
+  buttonByText,
+  createPhase8Dom,
+  mountPhase8AccountApp,
+  React,
+  renderPhase8AccountApp,
+} from "../support/phase8-web-harness.mjs";
+import {
   clearChatJournal,
   markChatJournalAdmitted,
   readChatJournals,
@@ -22,19 +30,23 @@ import {
 import { ChatBrowserFixture } from "../fixtures/chat/harness.ts";
 
 let AccountApp;
+let ChatScreen;
 let disposeAccountAppModule;
 const apps = [];
+const domStates = [];
 
 beforeAll(async () => {
   ({ AccountApp, dispose: disposeAccountAppModule } = await loadHistoryAccountApp());
+  ChatScreen = globalThis.__accountScreens.ChatScreen;
 });
 
 afterAll(async () => {
   await disposeAccountAppModule?.();
 });
 
-afterEach(() => {
+afterEach(async () => {
   for (const app of apps.splice(0).reverse()) app.dispose();
+  for (const domState of domStates.splice(0).reverse()) await domState.dispose();
   vi.unstubAllGlobals();
   delete globalThis.__accountHooks;
   delete globalThis.__accountScreens;
@@ -491,6 +503,135 @@ describe("active recovery preserves authoritative activity", () => {
 });
 
 describe("history removal state transitions", () => {
+  it("disables the composer only for the selected conversation being removed", async () => {
+    const pendingHide = deferred();
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+            {
+              conversationId: secondConversationId,
+              label: "Conversación B",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1, conversationId === firstConversationId ? firstQueryId : secondQueryId)],
+        }),
+      textHandler: turnText,
+      hideHandler: () => pendingHide.promise,
+    });
+    const domState = await createPhase8Dom();
+    domStates.push(domState);
+    const app = await mountPhase8AccountApp(environment, AccountApp, domState);
+    apps.push(app);
+    const render = () => renderPhase8AccountApp(app, domState);
+
+    await render();
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await render();
+    props(app).onDraftChange("seguimiento para A");
+    await render();
+
+    const hide = props(app).onHideConversation(firstConversationId);
+    await render();
+    expect(props(app).state.history.removal).toMatchObject({
+      conversationId: firstConversationId,
+      status: "hiding",
+    });
+    expect(buttonByText(domState.document, "Enviar").disabled).toBe(true);
+
+    pendingHide.reject(new TypeError("connection lost after the server may have committed"));
+    expect(await hide).toBe(false);
+    await render();
+    expect(props(app).state.history.removal).toMatchObject({
+      conversationId: firstConversationId,
+      status: "unconfirmed",
+    });
+    expect(buttonByText(domState.document, "Enviar").disabled).toBe(true);
+
+    expect(await props(app).onSelectConversation(secondConversationId)).toBe(true);
+    await render();
+    props(app).onDraftChange("seguimiento para B");
+    await render();
+    expect(props(app).state.history).toMatchObject({
+      selectedConversationId: secondConversationId,
+      removal: { conversationId: firstConversationId, status: "unconfirmed" },
+    });
+    expect(buttonByText(domState.document, "Enviar").disabled).toBe(false);
+  });
+
+  it.each([
+    ["rejected", "hiding"],
+    ["rejected", "unconfirmed"],
+    ["unconfirmed", "hiding"],
+    ["unconfirmed", "unconfirmed"],
+  ])(
+    "disables same-thread retry for %s query while removal is %s",
+    async (queryStatus, removalStatus) => {
+      const domState = await createPhase8Dom();
+      domStates.push(domState);
+      const state = {
+        profileStatus: "complete",
+        queryStatus,
+        question: "Reintentar esta consulta",
+        draft: "Reintentar esta consulta",
+        ordinal: 1,
+        canContinue: true,
+        canRetry: true,
+        history: {
+          status: "ready",
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+          nextCursor: null,
+          loadingMore: false,
+          selectedConversationId: firstConversationId,
+          turnsStatus: "ready",
+          turns: [],
+          turnsNextCursor: null,
+          refreshRequired: false,
+          removal: { conversationId: firstConversationId, status: removalStatus },
+        },
+      };
+
+      await act(async () => {
+        domState.root.render(
+          React.createElement(ChatScreen, {
+            state,
+            onSubmit: vi.fn(() => false),
+            onSignOut: vi.fn(),
+            onRetryProfile: vi.fn(),
+            onReset: vi.fn(),
+            onCopy: vi.fn(),
+          }),
+        );
+      });
+
+      expect(buttonByText(domState.document, "Reintentar el mismo envío").disabled).toBe(true);
+    },
+  );
+
   it("preserves the selected conversation's draft disclosure after a history refresh", async () => {
     const environment = createHistoryEnvironment({
       listHandler: () =>
