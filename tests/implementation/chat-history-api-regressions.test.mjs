@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { createChatHistoryHandler } from "../../api/chat-history.ts";
+import { createHistoryStore } from "../../runtime/history-store.ts";
 
 const botId = "bot-history-api";
 const sub = "history-api-owner";
@@ -24,6 +26,17 @@ function makeHandler(turnsResult) {
 function turnsEvent() {
   return {
     rawPath: `/api/chat/conversations/${conversationId}/turns`,
+    requestContext: {
+      http: { method: "GET" },
+      authorizer: { jwt: { claims: { sub, token_use: "access" } } },
+    },
+  };
+}
+
+function textEvent() {
+  return {
+    rawPath: `/api/chat/conversations/${conversationId}/turns/1/text`,
+    queryStringParameters: { role: "assistant", queryId },
     requestContext: {
       http: { method: "GET" },
       authorizer: { jwt: { claims: { sub, token_use: "access" } } },
@@ -113,6 +126,86 @@ describe("chat history API presentation metadata regressions", () => {
     expect(JSON.parse(response.body)).toEqual({
       code: "INTERNAL_ERROR",
       message: "No pudimos completar la solicitud.",
+    });
+  });
+});
+
+describe("completed assistant text integrity regressions", () => {
+  function apiForAnswer(answer) {
+    const pk = "CONV#" + conversationId;
+    const meta = { pk, sk: "META", conversationId, sub, botId, lastOrdinal: 1, closed: false };
+    const turn = {
+      pk,
+      sk: "TURN#00000001",
+      conversationId,
+      sub,
+      botId,
+      ordinal: 1,
+      queryId,
+      status: "completed",
+      phase: "complete",
+      cursor: 1,
+      questionManifest: { count: 1, complete: true },
+      answerManifest: { count: 1, complete: true },
+    };
+    const rows = [
+      {
+        pk,
+        sk: `TURN#00000001#${queryId}#ASSISTANT#00000000`,
+        conversationId,
+        ordinal: 1,
+        queryId,
+        role: "assistant",
+        index: 0,
+        text: answer,
+      },
+    ];
+    const documentClient = {
+      send: vi.fn(async (command) => {
+        if (command instanceof GetCommand) {
+          return { Item: command.input.Key.sk === "META" ? meta : turn };
+        }
+        if (command instanceof QueryCommand) {
+          const prefix = command.input.ExpressionAttributeValues[":prefix"];
+          return { Items: rows.filter((row) => row.sk.startsWith(prefix)) };
+        }
+        throw new Error("Unexpected command " + command.constructor.name);
+      }),
+    };
+    const handler = createChatHistoryHandler({
+      botId,
+      store: createHistoryStore({ documentClient, tableName: "history-test", botId }),
+      getMembership: async () => true,
+      now: Date.now,
+    });
+    return { handler, documentClient };
+  }
+
+  it.each(["", "   \t\n"])(
+    "returns 404 for a completed assistant answer containing only %j",
+    async (answer) => {
+      const { handler } = apiForAnswer(answer);
+
+      const response = await handler(textEvent());
+
+      expect(response.statusCode).toBe(404);
+      expect(JSON.parse(response.body)).toEqual({
+        code: "NOT_FOUND",
+        message: "No encontramos esa conversación.",
+      });
+    },
+  );
+
+  it("returns a completed assistant answer that contains text after leading whitespace", async () => {
+    const { handler } = apiForAnswer(" \nRespuesta válida.");
+
+    const response = await handler(textEvent());
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({
+      role: "assistant",
+      chunks: [{ index: 0, text: " \nRespuesta válida." }],
+      complete: true,
     });
   });
 });

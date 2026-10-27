@@ -40,8 +40,11 @@ function validMeta(item, botId) {
     item.botId === botId &&
     Number.isSafeInteger(item.lastOrdinal) &&
     item.lastOrdinal > 0 &&
-    (item.lastQueryId === undefined || typeof item.lastQueryId === "string") &&
-    (item.activeQueryId === undefined || typeof item.activeQueryId === "string")
+    (item.lastQueryId === undefined ||
+      (typeof item.lastQueryId === "string" && item.lastQueryId.length > 0)) &&
+    (item.activeQueryId === undefined ||
+      (typeof item.activeQueryId === "string" && item.activeQueryId.length > 0)) &&
+    (item.closed === undefined || typeof item.closed === "boolean")
   );
 }
 

@@ -1442,6 +1442,12 @@ export function AccountApp({
             readCompleteTurnText(conversationId, turn, "user", isActive),
             readCompleteTurnText(conversationId, turn, "assistant", isActive),
           ]);
+          if (turn.status === "completed" && answer.complete && !answer.text.trim()) {
+            throw Object.assign(new Error("Completed history turn has an empty answer"), {
+              code: "INVALID_RESPONSE",
+              status: 502,
+            });
+          }
           return {
             ordinal: turn.ordinal,
             queryId: turn.queryId,
@@ -1776,7 +1782,18 @@ export function AccountApp({
     try {
       const page = await listChatConversations(config, session, cursor, isActive);
       if (!isActive()) return;
-      const existing = retryFromStart ? [] : before.conversations;
+      const currentHistory = chatScreenStateRef.current.history ?? before;
+      const selectedConversationId = currentHistory.selectedConversationId;
+      const selectedConversation = selectedConversationId
+        ? currentHistory.conversations.find(
+            (conversation) => conversation.conversationId === selectedConversationId,
+          )
+        : undefined;
+      const existing = retryFromStart
+        ? selectedConversation
+          ? [selectedConversation]
+          : []
+        : currentHistory.conversations;
       const conversations = mergeHistoryConversations(
         localConversationsRef.current,
         page.conversations,
@@ -2617,22 +2634,17 @@ export function AccountApp({
       current.conversations.find(
         (conversation) => conversation.conversationId === request.conversationId,
       );
-    if (request.operation === "message" && prior) {
+    if (prior) {
       localConversationsRef.current.set(request.conversationId, prior);
       return;
     }
-    const label =
-      prior?.label ||
-      request.text.trim().replace(/\s+/g, " ").slice(0, 120) ||
-      "Nueva conversación";
+    const label = request.text.trim().replace(/\s+/g, " ").slice(0, 120) || "Nueva conversación";
     const summary = {
-      ...(prior?.createdAt
-        ? { createdAt: prior.createdAt }
-        : { createdAt: new Date().toISOString() }),
+      createdAt: new Date().toISOString(),
       conversationId: request.conversationId,
       label,
       updatedAt: new Date().toISOString(),
-      lastOrdinal: Math.max(prior?.lastOrdinal ?? 0, request.baseOrdinal),
+      lastOrdinal: request.baseOrdinal,
       closed: false,
       pending: true,
     };
@@ -3081,6 +3093,8 @@ export function AccountApp({
               text,
               result.ordinal,
               result.status === "in_progress" ? result.queryId : null,
+              false,
+              { recordActivity: false },
             );
           }
           if (reconciliation.kind === "needs-reload") {

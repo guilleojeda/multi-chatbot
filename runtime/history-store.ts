@@ -923,6 +923,18 @@ export function createHistoryStore(input: {
       throw fail("history_unavailable", "A history text chunk exceeds the response limit.");
     }
     const complete = expectedIndex === throughCursor;
+    // `complete` means this frozen prefix was loaded. Reject an empty answer only
+    // when this request started at zero and read the current completed manifest.
+    if (
+      scope.role === "assistant" &&
+      turn.status === "completed" &&
+      startIndex === 0 &&
+      throughCursor === manifestCount &&
+      complete &&
+      !chunks.some(({ text }) => text.trim().length > 0)
+    ) {
+      throw fail("conversation_unavailable", "Completed conversation answer is empty.");
+    }
     if (complete && page.LastEvaluatedKey && (scope.role === "user" || immutableAnswerBoundary)) {
       if (!lastIncludedKey) {
         throw fail("conversation_unavailable", "Conversation text manifest is invalid.");
