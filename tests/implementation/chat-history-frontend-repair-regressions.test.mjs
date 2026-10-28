@@ -937,10 +937,10 @@ describe("delayed active recovery snapshots preserve the current transcript", ()
           ...turn(ordinal, queryId),
           status,
           answerManifest: {
-            count: status === "in_progress" ? 0 : 1,
+            count: 1,
             complete: status === "completed",
           },
-          cursor: status === "in_progress" ? 0 : 1,
+          cursor: 1,
           ...(status === "failed" ? { failure: { code: "runtime_failed" } } : {}),
         };
       };
@@ -1098,6 +1098,108 @@ describe("delayed active recovery snapshots preserve the current transcript", ()
       }
     },
   );
+
+  it("keeps a superseded active poll closed to submission when the transcript reload fails", async () => {
+    let currentSummary = {
+      conversationId: firstConversationId,
+      label: "Q1 activa",
+      lastOrdinal: 1,
+      closed: false,
+      activeQueryId: firstQueryId,
+    };
+    const recovery = deferred();
+    let turnsReads = 0;
+    let recoveryReads = 0;
+    const environment = createHistoryEnvironment({
+      listHandler: () => jsonResponse({ version: 1, conversations: [currentSummary] }),
+      turnsHandler: ({ conversationId }) => {
+        turnsReads += 1;
+        if (turnsReads > 1) return jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503);
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          label: currentSummary.label,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: false,
+          turns: [
+            {
+              ...turn(1, firstQueryId),
+              status: "in_progress",
+              answerManifest: { count: 1, complete: false },
+              cursor: 1,
+            },
+          ],
+        });
+      },
+      textHandler: turnText,
+      recoverHandler: () => {
+        recoveryReads += 1;
+        return recovery.promise;
+      },
+    });
+    markChatJournalAdmitted(
+      environment.config,
+      environment.identity,
+      {
+        version: 2,
+        operation: "start",
+        conversationId: firstConversationId,
+        queryId: firstQueryId,
+        baseOrdinal: 0,
+      },
+      1,
+    );
+    writeChatSelection(environment.config, environment.identity, firstConversationId);
+
+    const app = mount(environment);
+    await app.flush();
+    expect(recoveryReads).toBe(1);
+
+    currentSummary = {
+      conversationId: firstConversationId,
+      label: "Q2 cerrada",
+      lastOrdinal: 2,
+      closed: true,
+    };
+    await props(app).onRefreshHistory();
+    await app.flush();
+
+    recovery.resolve(
+      jsonResponse({
+        version: 2,
+        conversationId: firstConversationId,
+        queryId: firstQueryId,
+        ordinal: 1,
+        status: "in_progress",
+        question: "Pregunta recuperada Q1",
+        answer: "Prefijo recuperado Q1",
+        canContinue: false,
+      }),
+    );
+    await app.flush();
+
+    expect(recoveryReads).toBe(1);
+    expect(turnsReads).toBe(2);
+    expect(
+      readChatJournals(environment.config, environment.identity).has(firstConversationId),
+    ).toBe(false);
+    expect(props(app).state.history).toMatchObject({
+      turnsStatus: "error",
+      turnsError: "No pudimos abrir la conversación. Podés volver a intentarlo.",
+    });
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ),
+    ).toMatchObject({ lastOrdinal: 2, closed: true });
+    expect(props(app).onSubmit("No continuar")).toBe(false);
+    const html = await app.html();
+    expect(html).toContain(" · Cerrada");
+    expect(html).not.toContain("Prefijo recuperado Q1");
+    const sendButton = html.match(/<button\b[^>]*type="submit"[^>]*>/)?.[0];
+    expect(sendButton).toContain("disabled");
+  });
 });
 
 describe("delayed SSE terminals preserve newer conversation state", () => {
@@ -2864,6 +2966,112 @@ describe("phase 7 frontend repair regressions", () => {
     const sendButton = html.match(/<button\b[^>]*type="submit"[^>]*>Enviar<\/button>/)?.[0];
     expect(sendButton).toContain("disabled");
     expect(props(app).onSubmit("Next follow-up")).toBe(false);
+  });
+
+  it("reloads a closed newer transcript before applying an explicitly replayed active snapshot", async () => {
+    const replay = deferred();
+    const body = "Original uncertain start";
+    let currentSummary;
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: currentSummary ? [currentSummary] : [],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          label: "Hilo cerrado",
+          throughOrdinal: 2,
+          closed: true,
+          canContinue: false,
+          turns: [
+            turn(1, firstQueryId),
+            {
+              ...turn(2, secondQueryId),
+              status: "failed",
+              failure: { code: "runtime_failed" },
+            },
+          ],
+        }),
+      textHandler: turnText,
+      recoverHandler: (request) =>
+        jsonResponse({
+          type: "failed",
+          code: "conversation_unavailable",
+          message: "No se encontró el envío.",
+          recordStatus: "not_admitted",
+          queryId: request.queryId,
+        }),
+      runtimeHandler: () => replay.promise,
+    });
+    writePendingStart(environment, body);
+
+    const app = mount(environment);
+    await app.flush();
+    expect(props(app).state).toMatchObject({ queryStatus: "unconfirmed", canRetry: true });
+    expect(props(app).onSubmit(body)).toBe(true);
+    await app.flush();
+    expect(environment.runtimeRequests.at(-1).request).toMatchObject({
+      operation: "start",
+      queryId: firstQueryId,
+      text: body,
+    });
+
+    currentSummary = {
+      conversationId: firstConversationId,
+      label: "Hilo cerrado",
+      lastOrdinal: 2,
+      closed: true,
+    };
+    await props(app).onRefreshHistory();
+    await app.flush();
+    expect(props(app).state.history.conversations[0]).toMatchObject(currentSummary);
+
+    replay.resolve(
+      jsonResponse({
+        version: 2,
+        conversationId: firstConversationId,
+        queryId: firstQueryId,
+        ordinal: 1,
+        status: "in_progress",
+        question: body,
+        answer: "Prefijo replayado Q1",
+        canContinue: false,
+      }),
+    );
+    await app.flush();
+
+    expect(props(app).state).toMatchObject({
+      ordinal: 2,
+      queryStatus: "failed",
+      canContinue: false,
+      history: {
+        selectedConversationId: firstConversationId,
+        throughOrdinal: 2,
+        closed: true,
+      },
+    });
+    expect(props(app).state.history.turns.at(-1)).toMatchObject({
+      ordinal: 2,
+      queryId: secondQueryId,
+      status: "failed",
+    });
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ),
+    ).toMatchObject({ lastOrdinal: 2, closed: true });
+    expect(
+      readChatJournals(environment.config, environment.identity).has(firstConversationId),
+    ).toBe(false);
+    const html = await app.html();
+    expect(html).toContain("ORIGINAL_TEXT_2");
+    expect(html).toContain(" · Cerrada");
+    expect(html).not.toContain("Prefijo replayado Q1");
+    expect(html).not.toContain('class="chat-form"');
+    expect(props(app).onSubmit("No continuar")).toBe(false);
   });
 
   it("uses current META closure for an explicitly replayed failed terminal", async () => {
