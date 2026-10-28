@@ -448,7 +448,7 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
     });
     expect(conversationRow(domState.document, firstLabel)).toBeDefined();
     expect(conversationRow(domState.document, secondLabel)).toBeDefined();
-    expect(domState.document.body.textContent).toContain("sigue en tu historial");
+    expect(domState.document.body.textContent).toContain("Sigue en tu historial");
     expect(hideButtonFor(domState.document, firstLabel)).toMatchObject({ disabled: false });
     expect(hideButtonFor(domState.document, secondLabel)).toMatchObject({ disabled: true });
     expect(
@@ -458,11 +458,28 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
     ).toHaveLength(1);
   });
 
+  it("keeps the retry route when opening an uncertain row cannot verify META", async () => {
+    const { app, metadataReads } = await beginUnconfirmedRemovalAfterRefresh();
+
+    await selectConversation(app, firstLabel);
+
+    expect(
+      metadataReads.filter((conversationId) => conversationId === firstConversationId),
+    ).toHaveLength(2);
+    expect(visibleHistoryState(app).removal).toMatchObject({
+      conversationId: firstConversationId,
+      status: "unconfirmed",
+    });
+    expect(conversationRow(domState.document, firstLabel)).toBeDefined();
+    expect(hideButtonFor(domState.document, firstLabel)).toBeDefined();
+  });
+
   it("retries the same unconfirmed removal and then allows removing another row", async () => {
     const { app, env, hideAttempts } = await beginUnconfirmedRemovalAfterRefresh();
 
     expect(hideAttempts).toBe(1);
-    await clickHideFor(app, env, firstLabel);
+    await clickPhase8(actionButton(domState.document, firstLabel), app, domState);
+    expect(hideCalls(env)).toHaveLength(1);
     await confirmHide(app);
 
     expect(hideCalls(env).map(({ conversationId }) => conversationId)).toEqual([
@@ -472,7 +489,8 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
     expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
     expect(hideButtonFor(domState.document, secondLabel).disabled).toBe(false);
 
-    await clickHideFor(app, env, secondLabel);
+    await clickPhase8(actionButton(domState.document, secondLabel), app, domState);
+    expect(hideCalls(env)).toHaveLength(2);
     await confirmHide(app);
 
     expect(hideCalls(env).map(({ conversationId }) => conversationId)).toEqual([
@@ -485,7 +503,7 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
   });
 
   it("confirms an uncertain removal when a later refresh sees hidden META and blocks stale resurrection", async () => {
-    const { app, env, server, metadataReads } = await beginUnconfirmedRemovalAfterRefresh();
+    const { app, server, metadataReads } = await beginUnconfirmedRemovalAfterRefresh();
     server.metaAHidden = true;
 
     await clickText(app, "Actualizar historial");

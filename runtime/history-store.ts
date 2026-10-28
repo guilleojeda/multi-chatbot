@@ -506,18 +506,19 @@ export function createHistoryStore(input: {
       throw fail("invalid_cursor", "History cursor does not match this conversation.");
     }
     const ordinalMatch =
-      typeof cursor.key.sk === "string" ? cursor.key.sk.match(/^TURN#(\d{8})/) : null;
+      typeof cursor.key.sk === "string" ? cursor.key.sk.match(/^TURN#(\d{8})$/) : null;
     const keyOrdinal = ordinalMatch ? Number(ordinalMatch[1]) : -1;
     const nextOrdinal = cursor.nextOrdinal;
     if (
       cursor.conversationId !== id ||
       !positive(cursor.throughOrdinal) ||
       cursor.key.pk !== "CONV#" + id ||
-      !/^TURN#\d{8}(?:#.*)?$/.test(String(cursor.key.sk)) ||
+      !ordinalMatch ||
+      cursor.key.sk !== turnKey(id, keyOrdinal).sk ||
       Number(cursor.throughOrdinal) > Number.MAX_SAFE_INTEGER ||
-      !nonNegative(nextOrdinal) ||
+      !positive(nextOrdinal) ||
       keyOrdinal > Number(cursor.throughOrdinal) ||
-      (nextOrdinal !== keyOrdinal && nextOrdinal !== keyOrdinal - 1)
+      nextOrdinal !== keyOrdinal - 1
     ) {
       throw fail("invalid_cursor", "History cursor does not match this conversation.");
     }
