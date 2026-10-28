@@ -719,13 +719,13 @@ describe("active recovery preserves authoritative activity", () => {
       name: "a later closed META snapshot",
       newerSummary: { lastOrdinal: 2, closed: true },
       expectedSummary: { lastOrdinal: 2, closed: true },
-      expectedHistory: { closed: true, canContinue: false },
+      expectedHistory: { closed: true, canContinue: false, throughOrdinal: 2 },
     },
     {
       name: "a later active META snapshot",
       newerSummary: { lastOrdinal: 2, closed: false, activeQueryId: secondQueryId },
       expectedSummary: { lastOrdinal: 2, closed: false, activeQueryId: secondQueryId },
-      expectedHistory: { closed: false, canContinue: false },
+      expectedHistory: { closed: false, canContinue: false, throughOrdinal: 2 },
     },
   ])(
     "does not let an older terminal recover overwrite $name",
@@ -738,27 +738,53 @@ describe("active recovery preserves authoritative activity", () => {
         activeQueryId: firstQueryId,
       };
       const recovery = deferred();
+      const latestTurns = deferred();
+      let holdLatestTurns = false;
+      const currentTurnsPage = () => {
+        const ordinal = currentSummary.lastOrdinal;
+        const queryId = ordinal === 1 ? firstQueryId : secondQueryId;
+        const active = Boolean(currentSummary.activeQueryId);
+        return {
+          version: 1,
+          conversationId: firstConversationId,
+          label: "Hilo",
+          throughOrdinal: ordinal,
+          closed: currentSummary.closed,
+          canContinue: !currentSummary.closed && !active,
+          turns: [
+            {
+              ...turn(ordinal, queryId),
+              ...(active
+                ? {
+                    status: "in_progress",
+                    answerManifest: { count: 0, complete: false },
+                    cursor: 0,
+                  }
+                : {}),
+            },
+          ],
+        };
+      };
       const environment = createHistoryEnvironment({
         listHandler: () => jsonResponse({ version: 1, conversations: [currentSummary] }),
         turnsHandler: () =>
-          jsonResponse({
-            version: 1,
-            conversationId: firstConversationId,
-            label: "Hilo",
-            throughOrdinal: 1,
-            closed: false,
-            canContinue: false,
-            turns: [
-              {
-                ...turn(1, firstQueryId),
-                status: "in_progress",
-                answerManifest: { count: 0, complete: false },
-                cursor: 0,
-              },
-            ],
-          }),
+          holdLatestTurns && currentSummary.lastOrdinal > 1
+            ? latestTurns.promise
+            : jsonResponse(currentTurnsPage()),
         textHandler: turnText,
-        recoverHandler: () => recovery.promise,
+        recoverHandler: (recoverRequest) =>
+          recoverRequest.queryId === firstQueryId
+            ? recovery.promise
+            : jsonResponse({
+                version: 2,
+                conversationId: firstConversationId,
+                queryId: secondQueryId,
+                ordinal: 2,
+                status: "in_progress",
+                question: "Seguimiento",
+                answer: "",
+                canContinue: false,
+              }),
       });
       const request = {
         version: 2,
@@ -791,6 +817,12 @@ describe("active recovery preserves authoritative activity", () => {
         ),
       ).toMatchObject(expectedSummary);
 
+      const turnsReadCount = () =>
+        environment.apiRequests.filter(
+          ({ path }) => path === `/chat/conversations/${firstConversationId}/turns`,
+        ).length;
+      const turnsBeforeRecovery = turnsReadCount();
+      holdLatestTurns = true;
       recovery.resolve(
         jsonResponse({
           version: 2,
@@ -805,11 +837,20 @@ describe("active recovery preserves authoritative activity", () => {
       );
       await app.flush();
 
+      expect(turnsReadCount()).toBeGreaterThan(turnsBeforeRecovery);
       const summary = props(app).state.history.conversations.find(
         ({ conversationId }) => conversationId === firstConversationId,
       );
       expect(summary).toMatchObject(expectedSummary);
       expect(props(app).state.canContinue).toBe(false);
+      latestTurns.resolve(jsonResponse(currentTurnsPage()));
+      await app.flush();
+
+      const refreshedSummary = props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      );
+      expect(refreshedSummary).toMatchObject(expectedSummary);
+      expect(props(app).state.ordinal).toBe(2);
       expect(props(app).state.history).toMatchObject(expectedHistory);
       const html = await app.html();
       if (expectedSummary.closed) {
@@ -2070,7 +2111,7 @@ describe("phase 7 frontend repair regressions", () => {
               status: "completed",
               question: body,
               answer: "Older completed result",
-              canContinue: false,
+              canContinue: true,
             })
           : streamResponse(request);
       },
@@ -2099,6 +2140,14 @@ describe("phase 7 frontend repair regressions", () => {
 
     // The uncertain admission and a follow-up finish in another session.
     remoteAdvanced = true;
+    await props(app).onRefreshHistory();
+    await app.flush();
+    expect(props(app).state.history.conversations[0]).toMatchObject({
+      conversationId: originalRequest.conversationId,
+      lastOrdinal: 2,
+      closed: false,
+    });
+
     expect(props(app).onSubmit(body)).toBe(true);
     await app.flush();
 

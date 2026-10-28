@@ -2276,7 +2276,12 @@ export function AccountApp({
       });
       ensureConversationVisibleFromHistory(view);
       if (last?.status === "completed" || last?.status === "failed") {
-        markLocalConversationTerminal(conversationId, view.throughOrdinal, view.closed);
+        markLocalConversationTerminal(
+          conversationId,
+          view.throughOrdinal,
+          view.closed,
+          last.queryId,
+        );
       }
       setChatRecoveryRevision((revision) => revision + 1);
       return true;
@@ -2320,6 +2325,23 @@ export function AccountApp({
   ) {
     if (!isCurrentSelection()) return { kind: "inactive" as const };
     const isTerminal = snapshot.status === "completed" || snapshot.status === "failed";
+    const observedConversation = getObservedConversationSummary(request.conversationId);
+    if (
+      isTerminal &&
+      observedConversation &&
+      (observedConversation.lastOrdinal > snapshot.ordinal ||
+        (observedConversation.lastOrdinal === snapshot.ordinal &&
+          observedConversation.activeQueryId &&
+          observedConversation.activeQueryId !== snapshot.queryId) ||
+        (observedConversation.closed && snapshot.canContinue))
+    ) {
+      return {
+        kind: "needs-reload" as const,
+        canContinue: false as const,
+        history: undefined,
+        historyError: undefined,
+      };
+    }
     if (!isTerminal || snapshot.canContinue) {
       return {
         kind: "current" as const,
@@ -2373,6 +2395,16 @@ export function AccountApp({
       history,
       historyError: undefined,
     };
+  }
+
+  function getObservedConversationSummary(conversationId: string) {
+    const local = localConversationsRef.current.get(conversationId);
+    const visible = chatScreenStateRef.current.history?.conversations.find(
+      (conversation) => conversation.conversationId === conversationId,
+    );
+    if (!local) return visible;
+    if (!visible) return local;
+    return serverConversationSupersedesLocal(local, visible) ? visible : local;
   }
 
   async function loadMoreHistory(reload = false) {
@@ -3008,9 +3040,15 @@ export function AccountApp({
             request.conversationId,
             terminalHistory.throughOrdinal,
             terminalHistory.closed,
+            terminalHistory.turns.at(-1)?.queryId,
           );
         } else if (snapshot.canContinue) {
-          markLocalConversationTerminal(request.conversationId, snapshot.ordinal, false);
+          markLocalConversationTerminal(
+            request.conversationId,
+            snapshot.ordinal,
+            false,
+            snapshot.queryId,
+          );
         } else if (terminalHistoryError) {
           const existing =
             localConversationsRef.current.get(request.conversationId) ??
@@ -3022,6 +3060,7 @@ export function AccountApp({
               request.conversationId,
               snapshot.ordinal,
               existing.closed,
+              snapshot.queryId,
             );
           }
         }
@@ -3159,6 +3198,7 @@ export function AccountApp({
             request.conversationId,
             request.baseOrdinal + 1,
             result.canContinue === false,
+            request.queryId,
           );
           stopCycle();
           return;
@@ -3394,13 +3434,24 @@ export function AccountApp({
     }));
   }
 
-  function markLocalConversationTerminal(conversationId: string, ordinal: number, closed: boolean) {
+  function markLocalConversationTerminal(
+    conversationId: string,
+    ordinal: number,
+    closed: boolean,
+    queryId?: string,
+  ) {
     if (hiddenConversationIdsRef.current.has(conversationId)) return;
-    const history = chatScreenStateRef.current.history ?? emptyHistoryState();
-    const existing =
-      localConversationsRef.current.get(conversationId) ??
-      history.conversations.find((conversation) => conversation.conversationId === conversationId);
+    const existing = getObservedConversationSummary(conversationId);
     if (!existing) return;
+    if (
+      existing.lastOrdinal > ordinal ||
+      (existing.closed && !closed) ||
+      (existing.lastOrdinal >= ordinal &&
+        existing.activeQueryId &&
+        existing.activeQueryId !== queryId)
+    ) {
+      return;
+    }
     const summary = {
       ...existing,
       lastOrdinal: Math.max(existing.lastOrdinal, ordinal),
@@ -3745,7 +3796,7 @@ export function AccountApp({
               failure: undefined,
             }),
           );
-          markLocalConversationTerminal(conversationId, baseOrdinal + 1, false);
+          markLocalConversationTerminal(conversationId, baseOrdinal + 1, false, queryId);
         }
       },
     })
@@ -3878,9 +3929,10 @@ export function AccountApp({
               conversationId,
               reconciliation.history.throughOrdinal,
               reconciliation.history.closed,
+              result.queryId,
             );
           } else if (terminal && result.canContinue) {
-            markLocalConversationTerminal(conversationId, result.ordinal, false);
+            markLocalConversationTerminal(conversationId, result.ordinal, false, result.queryId);
           } else if (terminal && reconciliation.historyError) {
             const existing =
               localConversationsRef.current.get(conversationId) ??
