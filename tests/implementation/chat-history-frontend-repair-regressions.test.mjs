@@ -2901,6 +2901,7 @@ describe("phase 7 frontend repair regressions", () => {
           turns: [turn(2, secondQueryId)],
         });
       },
+      textHandler: turnText,
       recoverHandler: (request) =>
         jsonResponse({
           type: "failed",
@@ -2943,6 +2944,12 @@ describe("phase 7 frontend repair regressions", () => {
         turnsError: "No pudimos abrir la conversación. Podés volver a intentarlo.",
       },
     });
+    expect(props(app).state.history.turns.at(-1)).toMatchObject({
+      ordinal: 2,
+      queryId: secondQueryId,
+      question: "ORIGINAL_TEXT_2",
+      answer: "ORIGINAL_TEXT_2",
+    });
     expect(
       readChatJournals(environment.config, environment.identity).has(firstConversationId),
     ).toBe(false);
@@ -2953,6 +2960,7 @@ describe("phase 7 frontend repair regressions", () => {
     );
     expect(html).not.toContain("Recuperamos el último envío de esta conversación");
     expect(html).not.toContain("La respuesta está completa. Podés continuar este hilo.");
+    expect(html).toContain("ORIGINAL_TEXT_2");
     expect(html).toContain("Copiar respuesta");
 
     props(app).onDraftChange("Seguimiento pendiente de actualizar");
@@ -3090,13 +3098,14 @@ describe("phase 7 frontend repair regressions", () => {
             {
               ...turn(1, firstQueryId),
               status: "failed",
-              answerManifest: { count: 0, complete: false },
-              cursor: 0,
+              answerManifest: { count: 1, complete: false },
+              cursor: 1,
               failure: { code: "runtime_failed" },
             },
           ],
         });
       },
+      textHandler: turnText,
       recoverHandler: (request) =>
         jsonResponse({
           type: "failed",
@@ -3545,8 +3554,8 @@ describe("phase 7 frontend repair regressions", () => {
               queryId: secondQueryId,
               status: failed ? "failed" : "in_progress",
               questionManifest: { count: 1, complete: true },
-              answerManifest: { count: 0, complete: false },
-              cursor: 0,
+              answerManifest: { count: failed ? 1 : 0, complete: false },
+              cursor: failed ? 1 : 0,
               ...(failed ? { failure: { code: "runtime_failed" } } : {}),
             },
           ],
@@ -3641,8 +3650,8 @@ describe("phase 7 frontend repair regressions", () => {
               queryId: secondQueryId,
               status: turnsReads > 1 ? "failed" : "in_progress",
               questionManifest: { count: 1, complete: true },
-              answerManifest: { count: 0, complete: false },
-              cursor: 0,
+              answerManifest: { count: turnsReads > 1 ? 1 : 0, complete: false },
+              cursor: turnsReads > 1 ? 1 : 0,
               ...(turnsReads > 1 ? { failure: { code: "runtime_failed" } } : {}),
             },
           ],

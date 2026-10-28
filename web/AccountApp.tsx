@@ -2320,7 +2320,6 @@ export function AccountApp({
     snapshot: Extract<Awaited<ReturnType<typeof recoverChat>>, { version: 2 }>,
     request: Pick<ChatRequest, "conversationId" | "queryId">,
     config: PublicConfig,
-    session: Session,
     isCurrentSelection: () => boolean,
   ) {
     if (!isCurrentSelection()) return { kind: "inactive" as const };
@@ -2350,15 +2349,9 @@ export function AccountApp({
       };
     }
 
-    let history: Awaited<ReturnType<typeof readConversationTurns>> | undefined;
+    let history: Awaited<ReturnType<typeof readConversationView>> | undefined;
     try {
-      history = await readConversationTurns(
-        config,
-        session,
-        request.conversationId,
-        null,
-        isCurrentSelection,
-      );
+      history = await readConversationView(request.conversationId, null, isCurrentSelection);
     } catch (error) {
       if (!isCurrentSelection()) return { kind: "inactive" as const };
       const apiError = asApiError(error);
@@ -2993,7 +2986,6 @@ export function AccountApp({
         snapshot,
         request,
         recoveryConfig,
-        recoverySession,
         isCurrentSelection,
       );
       if (reconciliation.kind === "inactive") return;
@@ -3953,7 +3945,6 @@ export function AccountApp({
             result,
             admittedRequest,
             apiConfig,
-            session,
             isCurrentSelection,
           );
           if (reconciliation.kind === "inactive") return;
