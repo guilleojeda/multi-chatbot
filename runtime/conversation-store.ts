@@ -38,7 +38,7 @@ type TextChunk = { index: number; text: string };
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const turnRecordPattern = /^TURN#(\d+)$/;
 const chunkPrefixPattern = /^TURN#(\d+)#/;
-const chunkRecordPattern = /^TURN#(\d+)#([0-9a-f-]{36})#(USER|ASSISTANT)#(\d+)$/i;
+const chunkRecordPattern = /^TURN#(\d+)#([0-9A-Fa-f-]{36})#(USER|ASSISTANT)#(\d+)$/;
 const contextChunkRecordPattern = /^TURN#(\d+)#CONTEXT#(\d+)$/;
 const documentContextChunkRecordPattern = /^TURN#(\d+)#DOCUMENT#(\d+)$/;
 
@@ -65,7 +65,7 @@ function isConversationMeta(value: unknown, conversationId: string): value is Co
       (typeof value.lastQueryId === "string" && value.lastQueryId.length > 0)) &&
     (value.activeQueryId === undefined ||
       (typeof value.activeQueryId === "string" && value.activeQueryId.length > 0)) &&
-    (value.closed === undefined || typeof value.closed === "boolean")
+    typeof value.closed === "boolean"
   );
 }
 
@@ -356,6 +356,13 @@ function reconstructMessages(
       if (item.status === "failed" || item.status === "in_progress") continue;
       throw new Error("Conversation context contains an unrecognized record.");
     }
+    if (
+      !item.sk.includes("#CONTEXT#") &&
+      !item.sk.includes("#DOCUMENT#") &&
+      !chunkRecordPattern.test(item.sk)
+    ) {
+      throw new Error("Conversation context contains a malformed text chunk.");
+    }
     const turnChunks = chunks.get(chunkPrefixMatch[1]) ?? [];
     turnChunks.push(item);
     chunks.set(chunkPrefixMatch[1], turnChunks);
@@ -479,11 +486,7 @@ function reconstructMessages(
       const keyMatch = chunkRecordPattern.exec(String(chunk.sk));
       const index = keyMatch ? Number(keyMatch[4]) : Number.NaN;
       const role: ChunkRole | null =
-        keyMatch?.[3].toUpperCase() === "USER"
-          ? "user"
-          : keyMatch?.[3].toUpperCase() === "ASSISTANT"
-            ? "assistant"
-            : null;
+        keyMatch?.[3] === "USER" ? "user" : keyMatch?.[3] === "ASSISTANT" ? "assistant" : null;
       if (
         !keyMatch ||
         keyMatch[1] !== turn.ordinalKey ||
@@ -1372,7 +1375,7 @@ export function createConversationStoreAdapter(input: {
           Key: metaKey,
           UpdateExpression: `SET #lastOrdinal = :nextOrdinal, #lastQueryId = :queryId, #activeQueryId = :queryId, #activeOwnerAttemptId = :ownerAttemptId, #updatedAt = :updatedAt${historyUpdate.assignments.length ? ", " + historyUpdate.assignments.join(", ") : ""}${summaryUpdate}`,
           ConditionExpression:
-            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND attribute_not_exists(#hiddenAt) AND (attribute_not_exists(#closed) OR #closed = :false)" +
+            "#sub = :sub AND #botId = :botId AND #conversationId = :conversationId AND #lastOrdinal = :expectedLastOrdinal AND attribute_not_exists(#activeQueryId) AND attribute_not_exists(#hiddenAt) AND #closed = :false" +
             summaryCondition,
           ExpressionAttributeNames: {
             "#sub": "sub",
@@ -1652,11 +1655,16 @@ export function createConversationStoreAdapter(input: {
     const questionPieces: TextChunk[] = [];
     const answerPieces: TextChunk[] = [];
     for (const item of chunks) {
-      const match = chunkRecordPattern.exec(String(item.sk));
-      if (!match) continue;
+      const itemKey = String(item.sk);
+      const match = chunkRecordPattern.exec(itemKey);
+      if (!match) {
+        if (itemKey.includes("#CONTEXT#") || itemKey.includes("#DOCUMENT#")) continue;
+        throw new Error("Submission contains a malformed text chunk.");
+      }
       const chunkOrdinal = Number(match[1]);
       const chunkIndex = Number(match[4]);
-      const role = match[3].toLowerCase();
+      const role: ChunkRole | null =
+        match[3] === "USER" ? "user" : match[3] === "ASSISTANT" ? "assistant" : null;
       if (
         chunkOrdinal !== ordinal ||
         String(chunkOrdinal).padStart(8, "0") !== match[1] ||
@@ -1696,39 +1704,16 @@ export function createConversationStoreAdapter(input: {
       throw new Error("Submission context manifest is malformed.");
     }
     if (rawContextCount > 0) {
-      const contextParts = chunks.filter((item) => String(item.sk).includes("#CONTEXT#"));
-      const serialized = assembleText(
-        contextParts.flatMap((item) => {
-          const match = contextChunkRecordPattern.exec(String(item.sk));
-          if (!match) throw new Error("Submission context record is malformed.");
-          const index = Number(match[2]);
-          if (
-            Number(match[1]) !== ordinal ||
-            item.pk !== turn.pk ||
-            item.conversationId !== marker.conversationId ||
-            item.ordinal !== ordinal ||
-            item.index !== index ||
-            typeof item.text !== "string"
-          )
-            throw new Error("Submission context record is malformed.");
-          return [{ index, text: item.text }];
-        }),
-        rawContextCount,
-        "context",
-        input.queryId,
-      );
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(serialized);
-      } catch {
-        throw new Error("Submission context references are malformed.");
-      }
-      if (!Array.isArray(parsed)) throw new Error("Submission context references are malformed.");
-      if (!Array.isArray(parsed) || parsed.length === 0) {
-        throw new Error("Submission context references are malformed.");
-      }
-      encodeContextReferences(parsed as ContextReference[], ordinal);
-      contextReferences = parsed as ContextReference[];
+      contextReferences = parseContextReferences({
+        ordinal,
+        queryId: input.queryId,
+        count: rawContextCount,
+        chunks,
+        partition: String(turn.pk),
+        conversationId: marker.conversationId,
+        turns: new Map(),
+        verifyTargets: false,
+      });
     } else {
       parseContextReferences({
         ordinal,

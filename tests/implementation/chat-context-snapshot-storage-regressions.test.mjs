@@ -34,6 +34,7 @@ function meta(lastOrdinal, summary, overrides = {}) {
     conversationId,
     ...owner,
     lastOrdinal,
+    closed: false,
     lastQueryId: queryId(lastOrdinal),
     ...(summary ? { summary } : {}),
     ...overrides,
@@ -70,8 +71,7 @@ function turnRecord(ordinal, overrides = {}) {
   };
 }
 
-function turnText(ordinal, role, text) {
-  const id = queryId(ordinal);
+function turnText(ordinal, role, text, id = queryId(ordinal)) {
   const upperRole = role.toUpperCase();
   return {
     pk: `CONV#${conversationId}`,
@@ -82,6 +82,58 @@ function turnText(ordinal, role, text) {
     role,
     index: 0,
     text,
+  };
+}
+
+function uppercaseUuidCompletedTurnFixture(id) {
+  const record = turnRecord(1, {
+    queryId: id,
+    profileSnapshot: { sub: owner.sub, botId: owner.botId },
+    invocation: {
+      modelId: "global.anthropic.claude-sonnet-4-6",
+      revision: "context-snapshot-test-r1",
+    },
+  });
+  const answer = turnText(1, "assistant", "answer-1", id);
+  const marker = {
+    pk: `USER#${owner.sub}#BOT#${owner.botId}`,
+    sk: `SEND#${id}`,
+    ...owner,
+    conversationId,
+    queryId: id,
+    requestFingerprint: record.requestFingerprint,
+    operation: "start",
+    baseOrdinal: 0,
+    ordinal: 1,
+    resultDeadlineAt: record.resultDeadlineAt,
+  };
+  const documentContext = {
+    knowledgeBaseId: "kb-snapshot-test",
+    query: "context snapshot recovery test",
+    revision: "documents-r1",
+    retrievedAt: now,
+    status: "empty",
+    results: [],
+  };
+  const documentChunk = {
+    pk: `CONV#${conversationId}`,
+    sk: "TURN#00000001#DOCUMENT#00000000",
+    conversationId,
+    queryId: id,
+    ordinal: 1,
+    index: 0,
+    text: JSON.stringify(documentContext),
+  };
+  return {
+    answer,
+    records: [
+      meta(1, undefined, { lastQueryId: id }),
+      record,
+      marker,
+      turnText(1, "user", "question-1", id),
+      answer,
+      documentChunk,
+    ],
   };
 }
 
@@ -218,6 +270,28 @@ function assertTransactionLimits(transaction) {
   expect(Buffer.byteLength(JSON.stringify(transaction.input), "utf8")).toBeLessThan(
     4 * 1024 * 1024,
   );
+}
+
+async function admitLargeContextContinuation() {
+  const references = Array.from({ length: 7000 }, (_, index) => reference(index + 1));
+  const initialTurns = references.map(({ ordinal }) => turnRecord(ordinal));
+  const db = makeDatabase([meta(references.length), ...initialTurns]);
+  const snapshot = { version: 1, recentReferences: references };
+  const input = continuationInput({
+    baseOrdinal: references.length,
+    contextSnapshot: snapshot,
+    contextReferences: references,
+  });
+  const store = makeStore(db.documentClient);
+
+  await store.continueTurn(input);
+
+  const transaction = db.transactions.at(-1);
+  const turn = putItems(transaction).find(
+    (item) => item.sk === `TURN#${String(references.length + 1).padStart(8, "0")}`,
+  );
+  const contextItems = putItems(transaction).filter((item) => item.sk.includes("#CONTEXT#"));
+  return { references, snapshot, db, input, store, transaction, turn, contextItems };
 }
 
 describe("stored context snapshot read validation", () => {
@@ -571,6 +645,64 @@ describe("continuation base races", () => {
   });
 });
 
+describe("canonical conversation text chunk keys", () => {
+  const uppercaseId = queryId(1).toUpperCase();
+
+  it("accepts uppercase UUIDs during context reconstruction", async () => {
+    const fixture = uppercaseUuidCompletedTurnFixture(uppercaseId);
+    const db = makeDatabase(fixture.records);
+    const store = makeStore(db.documentClient);
+
+    await expect(store.readContext({ conversationId })).resolves.toMatchObject({
+      messages: [
+        { role: "user", content: [{ text: "question-1" }] },
+        { role: "assistant", content: [{ text: "answer-1" }] },
+      ],
+    });
+  });
+
+  it("rejects a noncanonical role token during context reconstruction", async () => {
+    const fixture = uppercaseUuidCompletedTurnFixture(uppercaseId);
+    const db = makeDatabase(fixture.records);
+    const store = makeStore(db.documentClient);
+    db.records.delete(recordKey(fixture.answer));
+    const malformedAnswer = {
+      ...fixture.answer,
+      sk: fixture.answer.sk.replace("#ASSISTANT#", "#assistant#"),
+    };
+    db.records.set(recordKey(malformedAnswer), malformedAnswer);
+
+    await expect(store.readContext({ conversationId })).rejects.toThrow(/malformed text chunk/i);
+  });
+
+  it("accepts uppercase UUIDs during submission recovery", async () => {
+    const fixture = uppercaseUuidCompletedTurnFixture(uppercaseId);
+    const db = makeDatabase(fixture.records);
+    const store = makeStore(db.documentClient);
+
+    await expect(store.getSubmission({ ...owner, queryId: uppercaseId })).resolves.toMatchObject({
+      question: "question-1",
+      answer: "answer-1",
+    });
+  });
+
+  it("rejects a noncanonical role token during submission recovery", async () => {
+    const fixture = uppercaseUuidCompletedTurnFixture(uppercaseId);
+    const db = makeDatabase(fixture.records);
+    const store = makeStore(db.documentClient);
+    db.records.delete(recordKey(fixture.answer));
+    const malformedAnswer = {
+      ...fixture.answer,
+      sk: fixture.answer.sk.replace("#ASSISTANT#", "#assistant#"),
+    };
+    db.records.set(recordKey(malformedAnswer), malformedAnswer);
+
+    await expect(store.getSubmission({ ...owner, queryId: uppercaseId })).rejects.toThrow(
+      /malformed text chunk/i,
+    );
+  });
+});
+
 describe("summarized history with snapshots created before coverage", () => {
   it.each(["inline", "fragmented"])(
     "keeps a historical recent reference to covered turn data when stored %s",
@@ -639,25 +771,9 @@ describe("summarized history with snapshots created before coverage", () => {
 
 describe("fragmented large context references", () => {
   it("admits and restores 7,000 recent references without putting the list in a turn item", async () => {
-    const references = Array.from({ length: 7000 }, (_, index) => reference(index + 1));
-    const initialTurns = references.map(({ ordinal }) => turnRecord(ordinal));
-    const db = makeDatabase([meta(references.length), ...initialTurns]);
-    const snapshot = { version: 1, recentReferences: references };
-    const input = continuationInput({
-      baseOrdinal: references.length,
-      contextSnapshot: snapshot,
-      contextReferences: references,
-    });
-    const store = makeStore(db.documentClient);
-
-    await store.continueTurn(input);
-
-    const transaction = db.transactions.at(-1);
+    const { references, snapshot, db, input, store, transaction, turn, contextItems } =
+      await admitLargeContextContinuation();
     assertTransactionLimits(transaction);
-    const turn = putItems(transaction).find(
-      (item) => item.sk === `TURN#${String(references.length + 1).padStart(8, "0")}`,
-    );
-    const contextItems = putItems(transaction).filter((item) => item.sk.includes("#CONTEXT#"));
     expect(turn.contextSnapshot).toEqual({ version: 1, recentReferencesStorage: "context_chunks" });
     expect(turn.contextSnapshot).not.toHaveProperty("recentReferences");
     expect(turn.contextManifest).toEqual({ count: contextItems.length, complete: true });
@@ -673,6 +789,30 @@ describe("fragmented large context references", () => {
     storedTurn.contextManifest = { count: contextItems.length, complete: true };
     db.records.delete(recordKey(contextItems.at(-1)));
     await expect(store.getSubmission({ ...owner, queryId: input.queryId })).rejects.toThrow();
+  });
+
+  it("rejects noncanonical fragment padding during submission recovery", async () => {
+    const { references, db, input, store, contextItems } = await admitLargeContextContinuation();
+    const submission = await store.getSubmission({ ...owner, queryId: input.queryId });
+    expect(submission.contextReferences).toEqual(references);
+
+    const firstContextItem = contextItems.find((item) => item.index === 0);
+    expect(firstContextItem.sk).toMatch(/#CONTEXT#00000000$/);
+    const firstContextKey = recordKey(firstContextItem);
+    const malformedContextItem = {
+      ...db.records.get(firstContextKey),
+      sk: firstContextItem.sk.replace(/#CONTEXT#\d+$/, "#CONTEXT#0"),
+    };
+    db.records.delete(firstContextKey);
+    db.records.set(recordKey(malformedContextItem), malformedContextItem);
+
+    let rejectedMalformedContextKey = false;
+    try {
+      await store.getSubmission({ ...owner, queryId: input.queryId });
+    } catch {
+      rejectedMalformedContextKey = true;
+    }
+    expect(rejectedMalformedContextKey).toBe(true);
   });
 });
 

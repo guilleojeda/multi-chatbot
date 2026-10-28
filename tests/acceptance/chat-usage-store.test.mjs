@@ -337,6 +337,7 @@ function metaRecord(overrides = {}) {
     conversationId,
     ...owner,
     lastOrdinal: 2,
+    closed: false,
     activeQueryId: queryId,
     activeOwnerAttemptId: "attempt-a",
     ...overrides,

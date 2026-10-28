@@ -48,6 +48,7 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
     sub,
     botId,
     lastOrdinal: 8,
+    closed: false,
     lastQueryId: queryId,
     ...(status === "in_progress" ? { activeQueryId: queryId } : {}),
   };

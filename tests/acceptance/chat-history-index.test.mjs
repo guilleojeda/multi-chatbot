@@ -27,6 +27,7 @@ function makeMeta(overrides = {}) {
     createdAt: "2026-10-19T16:00:00.000Z",
     updatedAt: "2026-10-19T16:00:00.000Z",
     lastOrdinal: 1,
+    closed: false,
     lastQueryId: queryId,
     historyOwner: `USER#${sub}#BOT#${botId}`,
     historyOrder: `2026-10-19T16:00:00.000Z#${conversationId}`,

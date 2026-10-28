@@ -473,6 +473,7 @@ export function AccountApp({
   const localConversationsRef = useRef(
     new Map<string, ChatHistoryState["conversations"][number]>(),
   );
+  const pendingHistoryReferenceChecksRef = useRef(new Set<string>());
   const hiddenConversationIdsRef = useRef(new Set<string>());
   const serverConfirmedConversationIdsRef = useRef(new Set<string>());
   const metadataChecksRef = useRef(new Map<string, Promise<ConversationMetaCheck>>());
@@ -647,6 +648,7 @@ export function AccountApp({
     chatJournalsRef.current.clear();
     chatDraftsRef.current.clear();
     localConversationsRef.current.clear();
+    pendingHistoryReferenceChecksRef.current.clear();
     historyListInitializedOwnerRef.current = null;
     chatJournalBootstrapOwnerRef.current = null;
     chatPendingConversationOpenRef.current = null;
@@ -1613,6 +1615,7 @@ export function AccountApp({
   ) {
     hiddenConversationIdsRef.current.add(conversationId);
     serverConfirmedConversationIdsRef.current.delete(conversationId);
+    pendingHistoryReferenceChecksRef.current.delete(conversationId);
     localConversationsRef.current.delete(conversationId);
     chatDraftsRef.current.delete(conversationId);
     chatJournalsRef.current.delete(conversationId);
@@ -1765,6 +1768,7 @@ export function AccountApp({
     conversation: Awaited<ReturnType<typeof readChatConversationMeta>>,
   ) {
     if (hiddenConversationIdsRef.current.has(conversation.conversationId)) return;
+    pendingHistoryReferenceChecksRef.current.delete(conversation.conversationId);
     serverConfirmedConversationIdsRef.current.add(conversation.conversationId);
     const existing =
       localConversationsRef.current.get(conversation.conversationId) ??
@@ -1793,6 +1797,7 @@ export function AccountApp({
 
   function showReferenceVerificationError(conversationId: string, message: string) {
     if (hiddenConversationIdsRef.current.has(conversationId)) return;
+    pendingHistoryReferenceChecksRef.current.add(conversationId);
     localConversationsRef.current.delete(conversationId);
     if (chatPendingConversationOpenRef.current?.conversationId === conversationId) {
       chatPendingConversationOpenRef.current = null;
@@ -1873,6 +1878,7 @@ export function AccountApp({
     const pageIds = new Set(page.conversations.map((conversation) => conversation.conversationId));
     for (const conversationId of pageIds) {
       serverConfirmedConversationIdsRef.current.add(conversationId);
+      pendingHistoryReferenceChecksRef.current.delete(conversationId);
     }
 
     const references = new Set<string>([
@@ -1885,6 +1891,7 @@ export function AccountApp({
         ? [chatScreenStateRef.current.history.selectedConversationId]
         : []),
       ...[...chatDraftsRef.current.keys()].filter((conversationId) => conversationId !== "__new__"),
+      ...pendingHistoryReferenceChecksRef.current,
     ]);
     if (fromStart) {
       for (const conversationId of references) {
@@ -1917,12 +1924,14 @@ export function AccountApp({
       if (check.kind === "missing") {
         const journal = chatJournalsRef.current.get(conversationId);
         if (journal && !journal.admitted && journal.request.operation === "start") {
+          pendingHistoryReferenceChecksRef.current.delete(conversationId);
           rememberJournalConversations(new Map([[conversationId, journal]]));
           const local = localConversationsRef.current.get(conversationId);
           if (local) additions.push(local);
           continue;
         }
         localConversationsRef.current.delete(conversationId);
+        pendingHistoryReferenceChecksRef.current.add(conversationId);
         errors.push(
           "No pudimos confirmar una referencia de conversación guardada. Actualizá el historial para reintentarlo.",
         );
@@ -1930,6 +1939,7 @@ export function AccountApp({
       }
       if (check.error.status === 401 || check.error.status === 403) throw check.error;
       localConversationsRef.current.delete(conversationId);
+      pendingHistoryReferenceChecksRef.current.add(conversationId);
       errors.push(
         "No pudimos verificar una referencia de conversación guardada. Actualizá el historial para reintentarlo.",
       );

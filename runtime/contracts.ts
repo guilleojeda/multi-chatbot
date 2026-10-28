@@ -177,7 +177,7 @@ export type ConversationMeta = {
   lastQueryId?: string;
   activeQueryId?: string;
   activeOwnerAttemptId?: string;
-  closed?: boolean;
+  closed: boolean;
   hiddenAt?: unknown;
   historyOwner?: string;
   historyOrder?: string;
