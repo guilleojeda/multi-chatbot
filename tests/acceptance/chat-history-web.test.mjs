@@ -698,6 +698,7 @@ describe("the conversation history in AccountApp", () => {
 
   it("reconciles after switching away and back without showing late text on the other conversation", async () => {
     let continueStream;
+    let activeRequest;
     const environment = createHistoryEnvironment({
       listHandler: async () =>
         jsonResponse({
@@ -712,15 +713,30 @@ describe("the conversation history in AccountApp", () => {
             { conversationId: secondConversationId, label: "Otro", lastOrdinal: 1, closed: false },
           ],
         }),
-      turnsHandler: async ({ conversationId }) =>
-        jsonResponse({
+      turnsHandler: async ({ conversationId }) => {
+        const active = conversationId === firstConversationId ? activeRequest : undefined;
+        const activeOrdinal = active ? active.baseOrdinal + 1 : undefined;
+        const priorQueryId = conversationId === firstConversationId ? firstQueryId : secondQueryId;
+        return jsonResponse({
           version: 1,
           conversationId,
-          throughOrdinal: 1,
+          throughOrdinal: activeOrdinal ?? 1,
           closed: false,
-          canContinue: true,
-          turns: [turn(1, firstQueryId)],
-        }),
+          canContinue: !active,
+          turns: [
+            turn(1, priorQueryId),
+            ...(active && activeOrdinal !== undefined
+              ? [
+                  turn(activeOrdinal, active.queryId, {
+                    status: "in_progress",
+                    answerManifest: { count: 1, complete: false },
+                    cursor: 1,
+                  }),
+                ]
+              : []),
+          ],
+        });
+      },
       textHandler: async ({ conversationId, ordinal, url }) =>
         jsonResponse({
           version: 1,
@@ -740,6 +756,7 @@ describe("the conversation history in AccountApp", () => {
           complete: true,
         }),
       runtimeHandler: async (request) => {
+        activeRequest = request;
         let controller;
         const response = new Response(
           new ReadableStream({
@@ -789,9 +806,9 @@ describe("the conversation history in AccountApp", () => {
           version: 2,
           conversationId: request.conversationId,
           queryId: request.queryId,
-          ordinal: 2,
+          ordinal: (activeRequest?.baseOrdinal ?? 1) + 1,
           status: "completed",
-          question: "Pedido que ya se admitió.",
+          question: activeRequest?.text ?? "Pedido que ya se admitió.",
           answer: "Resultado durable recuperado.",
           canContinue: true,
         }),

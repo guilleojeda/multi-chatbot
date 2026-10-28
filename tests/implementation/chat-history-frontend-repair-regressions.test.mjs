@@ -5710,7 +5710,18 @@ describe("phase 7 frontend repair regressions", () => {
       ],
     });
     const environment = createHistoryEnvironment({
-      listHandler: historyList,
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación anterior",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
       turnsHandler: () => {
         turnsCalls += 1;
         return turnsCalls === 1 ? firstOpen.promise : jsonResponse(page(1));
@@ -5728,7 +5739,7 @@ describe("phase 7 frontend repair regressions", () => {
     });
     registerConversationMeta(environment, {
       label: "Conversación anterior",
-      lastOrdinal: 2,
+      lastOrdinal: 1,
       closed: false,
     });
     writeChatSelection(environment.config, environment.identity, firstConversationId);

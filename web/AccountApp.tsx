@@ -1969,7 +1969,10 @@ export function AccountApp({
     return { inactive: false, additions, errors };
   }
 
-  async function selectConversation(conversationId: string): Promise<boolean> {
+  async function selectConversation(
+    conversationId: string,
+    retrySupersededView = true,
+  ): Promise<boolean> {
     const identity = state.view === "ready" ? state.identity : undefined;
     const config = configRef.current;
     const current = chatScreenStateRef.current;
@@ -2161,8 +2164,17 @@ export function AccountApp({
         return true;
       }
 
+      const observedBeforeView = getObservedConversationSummary(conversationId);
       const view = await readConversationView(conversationId, null, isActive);
       if (!isActive()) return false;
+      if (conversationViewIsSuperseded(view, observedBeforeView)) {
+        retainObservedConversationControl(conversationId);
+        if (retrySupersededView) return await selectConversation(conversationId, false);
+        throw Object.assign(new Error("Conversation history changed while opening"), {
+          code: "HISTORY_UNAVAILABLE",
+          status: 503,
+        });
+      }
       const last = view.turns.at(-1);
       let journal = chatJournalsRef.current.get(conversationId) ?? null;
       const journalIsOlderThanHistory =
@@ -2302,6 +2314,7 @@ export function AccountApp({
         retireHiddenConversation(conversationId, config, identity);
         return false;
       }
+      retainObservedConversationControl(conversationId);
       if (historyOpeningContextRef.current?.conversationId === conversationId) {
         historyOpeningContextRef.current = null;
       }
@@ -2350,6 +2363,7 @@ export function AccountApp({
     }
 
     let history: Awaited<ReturnType<typeof readConversationView>> | undefined;
+    const observedBeforeView = getObservedConversationSummary(request.conversationId);
     try {
       history = await readConversationView(request.conversationId, null, isCurrentSelection);
     } catch (error) {
@@ -2363,6 +2377,22 @@ export function AccountApp({
         if (identity) retireHiddenConversation(request.conversationId, config, identity);
         return { kind: "inactive" as const };
       }
+      if (
+        conversationSnapshotIsSuperseded(
+          request.conversationId,
+          snapshot.queryId,
+          snapshot.ordinal,
+          snapshot.status,
+          snapshot.canContinue,
+        )
+      ) {
+        return {
+          kind: "needs-reload" as const,
+          canContinue: false as const,
+          history: undefined,
+          historyError: undefined,
+        };
+      }
       return {
         kind: "current" as const,
         canContinue: snapshot.canContinue,
@@ -2373,19 +2403,43 @@ export function AccountApp({
     }
     if (!isCurrentSelection()) return { kind: "inactive" as const };
 
+    if (
+      conversationSnapshotIsSuperseded(
+        request.conversationId,
+        snapshot.queryId,
+        snapshot.ordinal,
+        snapshot.status,
+        snapshot.canContinue,
+      ) ||
+      conversationViewIsSuperseded(history, observedBeforeView)
+    ) {
+      return {
+        kind: "needs-reload" as const,
+        canContinue: false as const,
+        history: undefined,
+        historyError: undefined,
+      };
+    }
+
     const latestTurn = history.turns.at(-1);
     if (
       history.throughOrdinal !== snapshot.ordinal ||
       latestTurn?.queryId !== snapshot.queryId ||
       latestTurn?.status !== snapshot.status
     ) {
-      return { kind: "needs-reload" as const, canContinue: false, history };
+      return {
+        kind: "needs-reload" as const,
+        canContinue: false as const,
+        history,
+        observedBeforeView,
+      };
     }
     return {
       kind: "current" as const,
       canContinue: history.canContinue,
       history,
       historyError: undefined,
+      observedBeforeView,
     };
   }
 
@@ -2417,6 +2471,68 @@ export function AccountApp({
           observed.closed &&
           (status === "in_progress" || canContinue))),
     );
+  }
+
+  function conversationViewIsSuperseded(
+    view: Awaited<ReturnType<typeof readConversationView>>,
+    observedBefore: ReturnType<typeof getObservedConversationSummary>,
+  ) {
+    const observed = getObservedConversationSummary(view.conversationId);
+    if (!observed) return false;
+    if (observed.lastOrdinal > view.throughOrdinal) return true;
+    if (observed.lastOrdinal < view.throughOrdinal) return false;
+
+    const summaryChangedDuringRead =
+      !observedBefore ||
+      observedBefore.lastOrdinal !== observed.lastOrdinal ||
+      observedBefore.closed !== observed.closed ||
+      observedBefore.activeQueryId !== observed.activeQueryId;
+    if (!summaryChangedDuringRead) return false;
+    if (observed.lastOrdinal !== view.throughOrdinal) return false;
+    if (observed.closed && !view.closed) return true;
+
+    const last = view.turns.at(-1);
+    return last
+      ? conversationSnapshotIsSuperseded(
+          view.conversationId,
+          last.queryId,
+          view.throughOrdinal,
+          last.status,
+          view.canContinue,
+        )
+      : observed.activeQueryId !== undefined;
+  }
+
+  function retainObservedConversationControl(conversationId: string) {
+    const observed = getObservedConversationSummary(conversationId);
+    if (!observed) return;
+    const current = chatScreenStateRef.current;
+    const history = current.history ?? emptyHistoryState();
+    if (
+      (history.selectedConversationId !== null &&
+        history.selectedConversationId !== conversationId) ||
+      (history.selectedConversationId === null && history.openingConversationId !== conversationId)
+    ) {
+      return;
+    }
+    const displayedOrdinal = history.throughOrdinal ?? current.ordinal;
+    const staleControl =
+      displayedOrdinal === undefined ||
+      observed.lastOrdinal > displayedOrdinal ||
+      (observed.lastOrdinal === displayedOrdinal &&
+        ((observed.closed && !history.closed) ||
+          (observed.activeQueryId !== undefined &&
+            history.turns.at(-1)?.queryId !== observed.activeQueryId)));
+    if (!staleControl) return;
+    setChat({
+      ...current,
+      canContinue: false,
+      history: {
+        ...history,
+        closed: history.closed === true || observed.closed,
+        canContinue: false,
+      },
+    });
   }
 
   function clearSupersededJournal(
@@ -2995,9 +3111,32 @@ export function AccountApp({
         else profileForbidden();
         return;
       }
-      if (reconciliation.kind === "needs-reload" && !reconciliation.history) {
+      const observedHistoryView =
+        reconciliation.kind === "current" || reconciliation.kind === "needs-reload"
+          ? reconciliation.history
+          : undefined;
+      const historyViewBecameSuperseded = Boolean(
+        observedHistoryView &&
+        conversationViewIsSuperseded(
+          observedHistoryView,
+          "observedBeforeView" in reconciliation ? reconciliation.observedBeforeView : undefined,
+        ),
+      );
+      if (
+        (reconciliation.kind === "needs-reload" && !reconciliation.history) ||
+        historyViewBecameSuperseded
+      ) {
         stopCycle();
+        retainObservedConversationControl(request.conversationId);
         clearSupersededJournal(request.conversationId, snapshot.queryId, recoveryConfig, identity);
+        setChat({
+          ...chatScreenStateRef.current,
+          canContinue: false,
+          quota: snapshot.quota,
+          quotaReceivedAt: snapshot.quota ? performance.now() : undefined,
+          recoveryLoading: false,
+          recovered: false,
+        });
         await selectConversation(request.conversationId);
         return;
       }
@@ -3058,22 +3197,18 @@ export function AccountApp({
           : {}),
       };
       setChat(
-        reconciliation.kind === "needs-reload"
-          ? nextState
-          : withHistoryTurn(nextState, request.conversationId, {
-              ordinal: snapshot.ordinal,
-              queryId: snapshot.queryId,
-              status: snapshot.status,
-              question: snapshot.question,
-              answer: snapshot.answer,
-              questionComplete: true,
-              answerComplete: snapshot.status !== "in_progress",
-              canContinue,
-            }),
+        withHistoryTurn(nextState, request.conversationId, {
+          ordinal: snapshot.ordinal,
+          queryId: snapshot.queryId,
+          status: snapshot.status,
+          question: snapshot.question,
+          answer: snapshot.answer,
+          questionComplete: true,
+          answerComplete: snapshot.status !== "in_progress",
+          canContinue,
+        }),
       );
-      if (reconciliation.kind === "needs-reload" && terminalHistory) {
-        ensureConversationVisibleFromHistory(terminalHistory);
-      } else if (isTerminal) {
+      if (isTerminal) {
         if (terminalHistory) {
           markLocalConversationTerminal(
             request.conversationId,
@@ -3446,8 +3581,15 @@ export function AccountApp({
 
   function ensureConversationVisibleFromHistory(
     view: Awaited<ReturnType<typeof readConversationView>>,
+    observedBefore: ReturnType<
+      typeof getObservedConversationSummary
+    > = getObservedConversationSummary(view.conversationId),
   ) {
     if (hiddenConversationIdsRef.current.has(view.conversationId)) return;
+    if (conversationViewIsSuperseded(view, observedBefore)) {
+      retainObservedConversationControl(view.conversationId);
+      return;
+    }
     const current = chatScreenStateRef.current.history ?? emptyHistoryState();
     const existing =
       localConversationsRef.current.get(view.conversationId) ??
@@ -3800,6 +3942,21 @@ export function AccountApp({
           } catch {
             // Selection is page-local while the current session remains open.
           }
+          if (
+            conversationSnapshotIsSuperseded(
+              conversationId,
+              queryId,
+              event.ordinal,
+              "in_progress",
+              false,
+            )
+          ) {
+            retainObservedConversationControl(conversationId);
+            chatDraftsRef.current.set(conversationId, "");
+            setChat({ ...chatScreenStateRef.current, draft: "" });
+            void selectConversation(conversationId);
+            return;
+          }
           const nextState: ChatScreenState = {
             ...before,
             queryId,
@@ -3828,6 +3985,19 @@ export function AccountApp({
           );
           updateLocalConversation(conversationId, text, event.ordinal, queryId);
         } else if (event.type === "text") {
+          if (
+            conversationSnapshotIsSuperseded(
+              conversationId,
+              queryId,
+              baseOrdinal + 1,
+              "in_progress",
+              false,
+            )
+          ) {
+            retainObservedConversationControl(conversationId);
+            void selectConversation(conversationId);
+            return;
+          }
           const answer = (before.answer || "") + event.text;
           const nextState: ChatScreenState = {
             ...before,
@@ -3954,8 +4124,36 @@ export function AccountApp({
             else profileForbidden();
             return;
           }
-          if (reconciliation.kind === "needs-reload" && !reconciliation.history) {
+          const observedHistoryView =
+            reconciliation.kind === "current" || reconciliation.kind === "needs-reload"
+              ? reconciliation.history
+              : undefined;
+          const historyViewBecameSuperseded = Boolean(
+            observedHistoryView &&
+            conversationViewIsSuperseded(
+              observedHistoryView,
+              "observedBeforeView" in reconciliation
+                ? reconciliation.observedBeforeView
+                : undefined,
+            ),
+          );
+          if (
+            (reconciliation.kind === "needs-reload" && !reconciliation.history) ||
+            historyViewBecameSuperseded
+          ) {
+            retainObservedConversationControl(conversationId);
             clearSupersededJournal(conversationId, result.queryId, apiConfig, identity);
+            setChat({
+              ...chatScreenStateRef.current,
+              canContinue: false,
+              quota: result.quota,
+              quotaReceivedAt: result.quota ? performance.now() : undefined,
+              queryError: undefined,
+              queryErrorCode: undefined,
+              recovered: false,
+              recoveryLoading: false,
+              canRetry: false,
+            });
             await selectConversation(conversationId);
             return;
           }
