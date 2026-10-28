@@ -1320,7 +1320,11 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     submission.status = "in_progress";
     submission.answer = "Prefijo durable.";
     submission.canContinue = false;
+    harness.state.metaByConversation.get(conversationId).activeQueryId = queryId;
     harness.state.now = submission.resultDeadlineAt;
+    const auxiliaryReadsBefore = harness.state.calls.filter(([name]) =>
+      ["getProfile", "readContext"].includes(name),
+    ).length;
     harness.store.reconcileTurn.mockImplementationOnce(async () => {
       throw new Error("reconciliation timed out before applying");
     });
@@ -1363,8 +1367,12 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     });
     expect(harness.store.reconcileTurn).toHaveBeenCalledTimes(2);
     expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.continueTurn).not.toHaveBeenCalled();
     expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
     expect(harness.store.readQuota).toHaveBeenCalledTimes(1);
+    expect(
+      harness.state.calls.filter(([name]) => ["getProfile", "readContext"].includes(name)),
+    ).toHaveLength(auxiliaryReadsBefore);
     expect(harness.state.providerCalls).toBe(1);
   });
 
@@ -1375,7 +1383,11 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     submission.status = "in_progress";
     submission.answer = "Prefijo durable.";
     submission.canContinue = false;
+    harness.state.metaByConversation.get(conversationId).activeQueryId = queryId;
     harness.state.now = submission.resultDeadlineAt;
+    const auxiliaryReadsBefore = harness.state.calls.filter(([name]) =>
+      ["getProfile", "readContext"].includes(name),
+    ).length;
     const reconcile = harness.store.reconcileTurn.getMockImplementation();
     harness.store.reconcileTurn.mockImplementationOnce(async (input) => {
       await reconcile(input);
@@ -1421,8 +1433,12 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     });
     expect(harness.store.reconcileTurn).toHaveBeenCalledTimes(1);
     expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.continueTurn).not.toHaveBeenCalled();
     expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
     expect(harness.store.readQuota).toHaveBeenCalledTimes(1);
+    expect(
+      harness.state.calls.filter(([name]) => ["getProfile", "readContext"].includes(name)),
+    ).toHaveLength(auxiliaryReadsBefore);
     expect(harness.state.providerCalls).toBe(1);
   });
 
@@ -1433,7 +1449,11 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     submission.status = "in_progress";
     submission.answer = "Prefijo durable.";
     submission.canContinue = false;
+    harness.state.metaByConversation.get(conversationId).activeQueryId = queryId;
     harness.state.now = submission.resultDeadlineAt;
+    const auxiliaryReadsBefore = harness.state.calls.filter(([name]) =>
+      ["getProfile", "readContext"].includes(name),
+    ).length;
     const getSubmission = harness.store.getSubmission.getMockImplementation();
     let failedPostReconcileLookup = false;
     harness.store.getSubmission.mockImplementation(async (input) => {
@@ -1484,8 +1504,12 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     });
     expect(harness.store.reconcileTurn).toHaveBeenCalledTimes(1);
     expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.continueTurn).not.toHaveBeenCalled();
     expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
     expect(harness.store.readQuota).toHaveBeenCalledTimes(1);
+    expect(
+      harness.state.calls.filter(([name]) => ["getProfile", "readContext"].includes(name)),
+    ).toHaveLength(auxiliaryReadsBefore);
     expect(harness.state.providerCalls).toBe(1);
   });
 
