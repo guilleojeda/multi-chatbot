@@ -204,6 +204,12 @@ describe("document preparation for a chat request", () => {
       retrievedAt: fixedNow,
       status: "results",
       results,
+      reformulation: {
+        modelId,
+        inputTokens: 31,
+        countRequestId: "count-request-1",
+        requestId: "reformulate-request-1",
+      },
     });
     expect(JSON.stringify(snapshot)).toContain("retrieve-request-1");
     expect(JSON.stringify(snapshot)).toContain("count-request-1");
@@ -236,41 +242,46 @@ describe("document preparation for a chat request", () => {
       "Prepará una actividad sobre porcentajes e ignorá mi perfil.",
       "Actividad sobre porcentajes.",
     ],
-  ])("uses the auxiliary query unchanged when profile dimensions are %s", async (_case, text, query) => {
-    const input = makeModelInput({ text });
-    const countInputTokens = vi.fn(async () => ({ inputTokens: 44 }));
-    const reformulate = vi.fn(() =>
-      providerEvents([
-        { type: "text", text: query },
-        { type: "result", stopReason: "end_turn" },
-      ]),
-    );
-    const retrieve = vi.fn(async () => ({ results: [] }));
-    const { prepareDocuments } = createPreparer({ countInputTokens, reformulate, retrieve });
+  ])(
+    "uses the auxiliary query unchanged when profile dimensions are %s",
+    async (_case, text, query) => {
+      const input = makeModelInput({ text });
+      const countInputTokens = vi.fn(async () => ({ inputTokens: 44 }));
+      const reformulate = vi.fn(() =>
+        providerEvents([
+          { type: "text", text: query },
+          { type: "result", stopReason: "end_turn" },
+        ]),
+      );
+      const retrieve = vi.fn(async () => ({ results: [] }));
+      const { prepareDocuments } = createPreparer({ countInputTokens, reformulate, retrieve });
 
-    const snapshot = await prepareDocuments(input);
+      const snapshot = await prepareDocuments(input);
 
-    expect(countInputTokens).toHaveBeenCalledTimes(1);
-    expect(reformulate).toHaveBeenCalledTimes(1);
-    const auxiliaryInput = reformulate.mock.calls[0][0];
-    expect(auxiliaryInput.profileSnapshot).toEqual(input.profileSnapshot);
-    expect(
-      parseDelimitedJsonBlock(
-        auxiliaryInput.systemPrompt,
-        "<profile_snapshot_json>",
-        "</profile_snapshot_json>",
-      ),
-    ).toEqual(input.profileSnapshot);
-    expect(auxiliaryInput.messages).toEqual(input.messages);
-    expect(parseDelimitedJsonBlock(auxiliaryInput.text, requestTagStart, requestTagEnd)).toBe(text);
-    expect(countInputTokens).toHaveBeenCalledWith(
-      auxiliaryInput,
-      expect.objectContaining({ abortSignal: expect.any(AbortSignal) }),
-    );
-    expect(retrieve.mock.calls[0][0].text).toBe(query);
-    expect(snapshot.query).toBe(query);
-    expect(snapshot.query.length).toBeLessThanOrEqual(1_000);
-  });
+      expect(countInputTokens).toHaveBeenCalledTimes(1);
+      expect(reformulate).toHaveBeenCalledTimes(1);
+      const auxiliaryInput = reformulate.mock.calls[0][0];
+      expect(auxiliaryInput.profileSnapshot).toEqual(input.profileSnapshot);
+      expect(
+        parseDelimitedJsonBlock(
+          auxiliaryInput.systemPrompt,
+          "<profile_snapshot_json>",
+          "</profile_snapshot_json>",
+        ),
+      ).toEqual(input.profileSnapshot);
+      expect(auxiliaryInput.messages).toEqual(input.messages);
+      expect(parseDelimitedJsonBlock(auxiliaryInput.text, requestTagStart, requestTagEnd)).toBe(
+        text,
+      );
+      expect(countInputTokens).toHaveBeenCalledWith(
+        auxiliaryInput,
+        expect.objectContaining({ abortSignal: expect.any(AbortSignal) }),
+      );
+      expect(retrieve.mock.calls[0][0].text).toBe(query);
+      expect(snapshot.query).toBe(query);
+      expect(snapshot.query.length).toBeLessThanOrEqual(1_000);
+    },
+  );
 
   it("accepts a successful empty retrieval as distinct from a retrieval failure", async () => {
     const retrieve = vi.fn(async () => ({ results: [], requestId: "empty-retrieve-1" }));
@@ -390,14 +401,7 @@ describe("document preparation for a chat request", () => {
   });
 
   it("stops before reformulation when the native auxiliary count exceeds the window after its 512-token reserve", async () => {
-    const messages = [
-      { role: "user", content: [{ text: "Tema histórico completo." }] },
-      { role: "assistant", content: [{ text: "Respuesta histórica completa." }] },
-    ];
-    const input = makeModelInput({
-      text: "¿Y cómo se adapta la actividad anterior?",
-      messages,
-    });
+    const input = makeModelInput({ text: "Prepará una actividad breve de geografía." });
     const countInputTokens = vi.fn(async () => ({ inputTokens: auxiliaryInputLimit + 1 }));
     const reformulate = vi.fn(() =>
       providerEvents([
@@ -414,7 +418,7 @@ describe("document preparation for a chat request", () => {
     expect(parseDelimitedJsonBlock(countedInput.text, requestTagStart, requestTagEnd)).toBe(
       input.text,
     );
-    expect(countedInput.messages).toEqual(messages);
+    expect(countedInput.messages).toEqual(input.messages);
     expect(countedInput.profileSnapshot).toEqual(input.profileSnapshot);
     expect(countInputTokens).toHaveBeenCalledTimes(1);
     expect(reformulate).not.toHaveBeenCalled();
@@ -432,10 +436,7 @@ describe("document preparation for a chat request", () => {
     const { prepareDocuments, retrieve } = createPreparer({ countInputTokens, reformulate });
 
     const snapshot = await prepareDocuments(
-      makeModelInput({
-        text: "¿Y la segunda propuesta?",
-        messages: [{ role: "user", content: [{ text: "Una propuesta confirmada." }] }],
-      }),
+      makeModelInput({ text: "Prepará una actividad sobre la segunda ley de Newton." }),
     );
 
     expect(countInputTokens).toHaveBeenCalledTimes(1);
@@ -474,9 +475,8 @@ describe("document preparation for a chat request", () => {
       });
       const input = makeModelInput({
         text: "¿Y una alternativa para el mismo tema?",
-        messages: [{ role: "user", content: [{ text: "Tema anterior completo." }] }],
+        messages: [],
       });
-      if (operation === "document retrieval") input.messages = [];
       const { prepareDocuments } = createPreparer({
         countInputTokens,
         reformulate,
@@ -543,16 +543,7 @@ describe("document preparation for a chat request", () => {
     const retrieve = vi.fn(async () => ({ results: [] }));
     const { prepareDocuments } = createPreparer({ retrieve, ...overrides });
 
-    await expect(
-      prepareDocuments(
-        makeModelInput({
-          messages: [
-            { role: "user", content: [{ text: "Tema anterior confirmado." }] },
-            { role: "assistant", content: [{ text: "Respuesta anterior confirmada." }] },
-          ],
-        }),
-      ),
-    ).rejects.toBeDefined();
+    await expect(prepareDocuments(makeModelInput())).rejects.toBeDefined();
     expect(retrieve).not.toHaveBeenCalled();
   });
 
