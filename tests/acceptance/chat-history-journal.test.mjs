@@ -178,6 +178,7 @@ function installConversationMetaRoute(environment, conversations) {
 describe("per-conversation recovery references", () => {
   it("keeps separate admitted references, removes plaintext at acceptance, and removes each terminal entry", async () => {
     const streams = new Map();
+    const activeRequests = new Map();
     let storageAtSecondPost = "";
     const environment = createHistoryEnvironment({
       listHandler: async () =>
@@ -198,17 +199,30 @@ describe("per-conversation recovery references", () => {
             },
           ],
         }),
-      turnsHandler: async ({ conversationId }) =>
-        jsonResponse({
+      turnsHandler: async ({ conversationId }) => {
+        const active = activeRequests.get(conversationId);
+        const priorQueryId = conversationId === firstConversationId ? firstQueryId : secondQueryId;
+        const activeOrdinal = active ? active.baseOrdinal + 1 : undefined;
+        return jsonResponse({
           version: 1,
           conversationId,
-          throughOrdinal: 1,
+          throughOrdinal: activeOrdinal ?? 1,
           closed: false,
-          canContinue: true,
+          canContinue: !active,
           turns: [
-            makeTurn(1, conversationId === firstConversationId ? firstQueryId : secondQueryId),
+            makeTurn(1, priorQueryId),
+            ...(active && activeOrdinal !== undefined
+              ? [
+                  makeTurn(activeOrdinal, active.queryId, {
+                    status: "in_progress",
+                    answerManifest: { count: 1, complete: false },
+                    cursor: 1,
+                  }),
+                ]
+              : []),
           ],
-        }),
+        });
+      },
       textHandler: async ({ conversationId, ordinal, url }) =>
         jsonResponse({
           version: 1,
@@ -222,6 +236,7 @@ describe("per-conversation recovery references", () => {
       runtimeHandler: async (request) => {
         if (request.conversationId === secondConversationId)
           storageAtSecondPost = storageText(environment.storage);
+        activeRequests.set(request.conversationId, request);
         const stream = streamFor(request);
         streams.set(request.conversationId, stream);
         return stream.response;
@@ -231,7 +246,7 @@ describe("per-conversation recovery references", () => {
           version: 2,
           conversationId: request.conversationId,
           queryId: request.queryId,
-          ordinal: 2,
+          ordinal: (activeRequests.get(request.conversationId)?.baseOrdinal ?? 1) + 1,
           status: "completed",
           question: "Pregunta admitida.",
           answer: "Respuesta terminal recuperada.",
@@ -279,6 +294,7 @@ describe("per-conversation recovery references", () => {
     expect(storageText(environment.storage)).not.toMatch(/educationLevels|subjects/);
 
     streams.get(secondConversationId).complete();
+    activeRequests.delete(secondConversationId);
     await vi.waitFor(async () => {
       await app.flush();
       expect(state(app)?.queryStatus).toBe("completed");
@@ -498,18 +514,21 @@ describe("per-conversation recovery references", () => {
             { conversationId: secondConversationId, label: "Dos", lastOrdinal: 1, closed: false },
           ],
         }),
-      turnsHandler: async ({ conversationId }) =>
-        jsonResponse({
+      turnsHandler: async ({ conversationId }) => {
+        const active = activeRequests.get(conversationId);
+        const activeOrdinal = active ? active.baseOrdinal + 1 : undefined;
+        const priorQueryId = conversationId === firstConversationId ? firstQueryId : secondQueryId;
+        return jsonResponse({
           version: 1,
           conversationId,
-          throughOrdinal: 2,
+          throughOrdinal: activeOrdinal ?? 1,
           closed: false,
-          canContinue: true,
+          canContinue: !active,
           turns: [
-            makeTurn(1, firstQueryId),
-            ...(activeRequests.has(conversationId)
+            makeTurn(1, priorQueryId),
+            ...(active && activeOrdinal !== undefined
               ? [
-                  makeTurn(2, activeRequests.get(conversationId).queryId, {
+                  makeTurn(activeOrdinal, active.queryId, {
                     status: "in_progress",
                     answerManifest: { count: 1, complete: false },
                     cursor: 1,
@@ -517,7 +536,8 @@ describe("per-conversation recovery references", () => {
                 ]
               : []),
           ],
-        }),
+        });
+      },
       textHandler: async ({ conversationId, ordinal, url }) =>
         jsonResponse({
           version: 1,
@@ -548,7 +568,7 @@ describe("per-conversation recovery references", () => {
           version: 2,
           conversationId: request.conversationId,
           queryId: request.queryId,
-          ordinal: 2,
+          ordinal: (activeRequests.get(request.conversationId)?.baseOrdinal ?? 1) + 1,
           status: "in_progress",
           question: active.text,
           answer: "Prefijo durable.",

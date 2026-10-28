@@ -358,67 +358,95 @@ it("replaces a delayed stale opening with the latest closed conversation before 
   expect(environment.runtimeRequests).toEqual([]);
 });
 
-it("keeps a same-ordinal closure observed while its open transcript is hydrating", async () => {
-  const textGate = deferred();
-  let serverSummary = summary(1, false, "2026-10-26T09:00:00.000Z");
-  let turnsReads = 0;
-  const environment = createHistoryEnvironment({
-    listHandler: () => jsonResponse({ version: 1, conversations: [serverSummary] }),
-    turnsHandler: ({ conversationId }) => {
-      turnsReads += 1;
-      if (turnsReads === 1) return olderOpenView(conversationId);
-      return jsonResponse({
-        version: 1,
-        conversationId,
-        label: "Conversación actualizada",
-        updatedAt: latestUpdatedAt,
+it.each([
+  { status: "completed", closed: false, canContinue: true },
+  { status: "failed", closed: true, canContinue: false },
+])(
+  "rereads a same-ordinal in-progress turn after terminal activity (%s)",
+  async ({ status, closed, canContinue }) => {
+    const textGate = deferred();
+    let serverSummary = {
+      ...summary(1, false, "2026-10-26T09:00:00.000Z"),
+      activeQueryId: firstQueryId,
+    };
+    let turnsReads = 0;
+    const environment = createHistoryEnvironment({
+      listHandler: () => jsonResponse({ version: 1, conversations: [serverSummary] }),
+      turnsHandler: ({ conversationId }) => {
+        turnsReads += 1;
+        if (turnsReads === 1) {
+          return jsonResponse({
+            version: 1,
+            conversationId,
+            label: "Conversación actualizada",
+            updatedAt: "2026-10-26T09:00:00.000Z",
+            throughOrdinal: 1,
+            closed: false,
+            canContinue: false,
+            turns: [
+              {
+                ...turn(1, firstQueryId, "in_progress"),
+                answerManifest: { count: 1, complete: false },
+              },
+            ],
+          });
+        }
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          label: "Conversación actualizada",
+          updatedAt: latestUpdatedAt,
+          throughOrdinal: 1,
+          closed,
+          canContinue,
+          turns: [turn(1, firstQueryId, status)],
+        });
+      },
+      textHandler: async ({ conversationId, ordinal, url }) => {
+        if (turnsReads === 1) await textGate.promise;
+        return historyText({ conversationId, ordinal, url });
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    const opening = app.current().props.onSelectConversation(firstConversationId);
+    await app.flush();
+    expect(environment.apiRequests.filter(({ path }) => path.endsWith("/text"))).toHaveLength(2);
+    serverSummary = summary(1, closed);
+    await app.current().props.onRefreshHistory();
+    await app.flush();
+    expect(
+      app
+        .current()
+        .props.state.history.conversations.find(
+          ({ conversationId }) => conversationId === firstConversationId,
+        ),
+    ).toMatchObject({ lastOrdinal: 1, closed, updatedAt: latestUpdatedAt });
+
+    textGate.resolve();
+    expect(await opening).toBe(true);
+    await app.flush();
+    expect(turnsReads).toBe(2);
+    expect(app.current().props.state).toMatchObject({
+      ordinal: 1,
+      queryStatus: status,
+      canContinue,
+      history: {
+        selectedConversationId: firstConversationId,
+        turnsStatus: "ready",
         throughOrdinal: 1,
-        closed: true,
-        canContinue: false,
-        turns: [turn(1, firstQueryId, "failed")],
-      });
-    },
-    textHandler: async ({ conversationId, ordinal, url }) => {
-      if (turnsReads === 1) await textGate.promise;
-      return historyText({ conversationId, ordinal, url });
-    },
-  });
-  const app = mount(environment);
-  await app.flush();
-
-  const opening = app.current().props.onSelectConversation(firstConversationId);
-  await app.flush();
-  serverSummary = summary(1, true);
-  await app.current().props.onRefreshHistory();
-  await app.flush();
-
-  textGate.resolve();
-  expect(await opening).toBe(true);
-  await app.flush();
-  expect(turnsReads).toBe(2);
-  expect(app.current().props.state).toMatchObject({
-    ordinal: 1,
-    queryStatus: "failed",
-    canContinue: false,
-    history: {
-      selectedConversationId: firstConversationId,
-      turnsStatus: "ready",
-      throughOrdinal: 1,
-      closed: true,
-      canContinue: false,
-      turns: [{ ordinal: 1, queryId: firstQueryId, status: "failed" }],
-    },
-  });
-  expect(
-    app
-      .current()
-      .props.state.history.conversations.find(
-        ({ conversationId }) => conversationId === firstConversationId,
-      ),
-  ).toMatchObject({ lastOrdinal: 1, closed: true, updatedAt: latestUpdatedAt });
-  expect(app.current().props.onSubmit("Do not continue a closed thread")).toBe(false);
-  expect(environment.runtimeRequests).toEqual([]);
-});
+        closed,
+        canContinue,
+        turns: [{ ordinal: 1, queryId: firstQueryId, status }],
+      },
+    });
+    expect(environment.runtimeRequests).toEqual([]);
+    if (closed) {
+      expect(app.current().props.onSubmit("Do not continue a closed thread")).toBe(false);
+    }
+  },
+);
 
 it("keeps the safe closed transcript and retry error if a stale opening cannot be reread", async () => {
   const textGate = deferred();
