@@ -864,6 +864,245 @@ describe("active recovery preserves authoritative activity", () => {
   );
 });
 
+describe("delayed SSE terminals preserve newer conversation state", () => {
+  function eventFrame(event) {
+    return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  }
+
+  async function startDelayedTerminalScenario({ currentAtTerminal }) {
+    const encoder = new TextEncoder();
+    let remoteSummary;
+    let originalRequest;
+    let streamController;
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({ version: 1, conversations: remoteSummary ? [remoteSummary] : [] }),
+      turnsHandler: ({ conversationId }) => {
+        const ordinal = remoteSummary?.lastOrdinal ?? 1;
+        const queryId = ordinal > 1 ? secondQueryId : firstQueryId;
+        const active = Boolean(remoteSummary?.activeQueryId);
+        const failedAndClosed = ordinal > 1 && Boolean(remoteSummary?.closed);
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          label: "Hilo",
+          throughOrdinal: ordinal,
+          closed: remoteSummary?.closed ?? false,
+          canContinue: !remoteSummary?.closed && !active,
+          turns: [
+            {
+              ...turn(ordinal, queryId),
+              ...(active
+                ? {
+                    status: "in_progress",
+                    answerManifest: { count: 0, complete: false },
+                    cursor: 0,
+                  }
+                : failedAndClosed
+                  ? {
+                      status: "failed",
+                      answerManifest: { count: 1, complete: false },
+                      cursor: 1,
+                      failure: { code: "runtime_failed" },
+                    }
+                  : {}),
+            },
+          ],
+        });
+      },
+      textHandler: turnText,
+      runtimeHandler: (request) => {
+        originalRequest = request;
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              streamController = controller;
+              controller.enqueue(
+                encoder.encode(
+                  eventFrame({
+                    type: "accepted",
+                    conversationId: request.conversationId,
+                    queryId: request.queryId,
+                    ordinal: 1,
+                  }),
+                ),
+              );
+              controller.enqueue(
+                encoder.encode(
+                  eventFrame({
+                    type: "text",
+                    queryId: request.queryId,
+                    index: 0,
+                    text: "Respuesta Q1",
+                  }),
+                ),
+              );
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+
+    expect(props(app).onSubmit("Pregunta Q1")).toBe(true);
+    await app.flush();
+    expect(originalRequest).toMatchObject({ operation: "start", baseOrdinal: 0 });
+    expect(props(app).state).toMatchObject({
+      ordinal: 1,
+      queryStatus: "streaming",
+      history: {
+        turns: [
+          {
+            ordinal: 1,
+            queryId: originalRequest.queryId,
+            status: "in_progress",
+            answer: "Respuesta Q1",
+          },
+        ],
+      },
+    });
+
+    remoteSummary = currentAtTerminal(originalRequest.conversationId, originalRequest.queryId);
+    await props(app).onRefreshHistory();
+    await app.flush();
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === originalRequest.conversationId,
+      ),
+    ).toMatchObject(remoteSummary);
+
+    return {
+      app,
+      environment,
+      originalRequest,
+      streamController,
+      turnsReadCount: () =>
+        environment.apiRequests.filter(
+          ({ path }) => path === `/chat/conversations/${originalRequest.conversationId}/turns`,
+        ).length,
+      emitTerminal: async (event) => {
+        streamController.enqueue(encoder.encode(eventFrame(event)));
+        await app.flush();
+      },
+      closeStream: async () => {
+        streamController.close();
+        await app.flush();
+      },
+    };
+  }
+
+  it.each([
+    {
+      name: "completed SSE",
+      terminalEvent: (queryId) => ({ type: "completed", queryId }),
+    },
+    {
+      name: "failed but continuable SSE",
+      terminalEvent: (queryId) => ({
+        type: "failed",
+        code: "provider_error",
+        message: "No se pudo completar.",
+        recordStatus: "failed",
+        queryId,
+        canContinue: true,
+      }),
+    },
+  ])("reloads latest history before applying a stale $name terminal", async ({ terminalEvent }) => {
+    const scenario = await startDelayedTerminalScenario({
+      currentAtTerminal: (conversationId) => ({
+        conversationId,
+        label: "Pregunta Q1",
+        lastOrdinal: 2,
+        closed: true,
+      }),
+    });
+    const turnsBeforeTerminal = scenario.turnsReadCount();
+
+    await scenario.emitTerminal(terminalEvent(scenario.originalRequest.queryId));
+    expect(props(scenario.app).state.canContinue).toBe(false);
+    expect(
+      props(scenario.app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === scenario.originalRequest.conversationId,
+      ),
+    ).toMatchObject({ lastOrdinal: 2, closed: true });
+    expect(await scenario.app.html()).not.toContain(
+      "La respuesta está completa. Podés continuar este hilo.",
+    );
+
+    await scenario.closeStream();
+
+    expect(scenario.turnsReadCount()).toBeGreaterThan(turnsBeforeTerminal);
+    expect(props(scenario.app).state).toMatchObject({
+      ordinal: 2,
+      queryStatus: "failed",
+      canContinue: false,
+      history: {
+        selectedConversationId: scenario.originalRequest.conversationId,
+        turnsStatus: "ready",
+        throughOrdinal: 2,
+        closed: true,
+        canContinue: false,
+        turns: [
+          {
+            ordinal: 2,
+            queryId: secondQueryId,
+            status: "failed",
+            question: "ORIGINAL_TEXT_2",
+            answer: "ORIGINAL_TEXT_2",
+            failure: { code: "runtime_failed" },
+          },
+        ],
+      },
+    });
+    expect(
+      props(scenario.app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === scenario.originalRequest.conversationId,
+      ),
+    ).toMatchObject({ lastOrdinal: 2, closed: true });
+    const requestsBeforeRejectedFollowUp = scenario.environment.runtimeRequests.length;
+    expect(props(scenario.app).onSubmit("No continuar")).toBe(false);
+    expect(scenario.environment.runtimeRequests).toHaveLength(requestsBeforeRejectedFollowUp);
+  });
+
+  it("keeps a current completed SSE terminal continuable without a history reload", async () => {
+    const scenario = await startDelayedTerminalScenario({
+      currentAtTerminal: (conversationId, queryId) => ({
+        conversationId,
+        label: "Pregunta Q1",
+        lastOrdinal: 1,
+        closed: false,
+        activeQueryId: queryId,
+      }),
+    });
+    const turnsBeforeTerminal = scenario.turnsReadCount();
+
+    await scenario.emitTerminal({ type: "completed", queryId: scenario.originalRequest.queryId });
+    expect(props(scenario.app).state).toMatchObject({
+      ordinal: 1,
+      queryStatus: "completed",
+      canContinue: true,
+    });
+    await scenario.closeStream();
+
+    expect(scenario.turnsReadCount()).toBe(turnsBeforeTerminal);
+    expect(props(scenario.app).state).toMatchObject({
+      ordinal: 1,
+      queryStatus: "completed",
+      canContinue: true,
+    });
+    expect(
+      props(scenario.app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === scenario.originalRequest.conversationId,
+      ),
+    ).toMatchObject({ lastOrdinal: 1, closed: false });
+    expect(await scenario.app.html()).toContain(
+      "La respuesta está completa. Podés continuar este hilo.",
+    );
+  });
+});
+
 describe("history removal state transitions", () => {
   async function mountRemovalDom(hideHandler, { listHandler, metaHandler } = {}) {
     const environment = createHistoryEnvironment({
