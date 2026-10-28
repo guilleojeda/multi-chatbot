@@ -864,6 +864,242 @@ describe("active recovery preserves authoritative activity", () => {
   );
 });
 
+describe("delayed active recovery snapshots preserve the current transcript", () => {
+  it.each([
+    {
+      name: "the same active Q1",
+      latestSummary: { lastOrdinal: 1, closed: false, activeQueryId: firstQueryId },
+      latestStatus: "in_progress",
+      latestQueryId: firstQueryId,
+      latestOrdinal: 1,
+      shouldReload: false,
+    },
+    {
+      name: "closed Q1",
+      latestSummary: { lastOrdinal: 1, closed: true },
+      latestStatus: "failed",
+      latestQueryId: firstQueryId,
+      latestOrdinal: 1,
+      shouldReload: true,
+    },
+    {
+      name: "an open Q2",
+      latestSummary: { lastOrdinal: 2, closed: false },
+      latestStatus: "completed",
+      latestQueryId: secondQueryId,
+      latestOrdinal: 2,
+      shouldReload: true,
+    },
+    {
+      name: "an active Q2",
+      latestSummary: { lastOrdinal: 2, closed: false, activeQueryId: secondQueryId },
+      latestStatus: "in_progress",
+      latestQueryId: secondQueryId,
+      latestOrdinal: 2,
+      shouldReload: true,
+    },
+    {
+      name: "closed Q2",
+      latestSummary: { lastOrdinal: 2, closed: true },
+      latestStatus: "failed",
+      latestQueryId: secondQueryId,
+      latestOrdinal: 2,
+      shouldReload: true,
+    },
+  ])(
+    "keeps a delayed in-progress Q1 snapshot from replacing $name",
+    async ({ latestSummary, latestStatus, latestQueryId, latestOrdinal, shouldReload }) => {
+      let currentSummary = {
+        conversationId: firstConversationId,
+        label: "Hilo",
+        lastOrdinal: 1,
+        closed: false,
+        activeQueryId: firstQueryId,
+      };
+      const recovery = deferred();
+      const latestRecovery = deferred();
+      let environment;
+      const turnReads = () =>
+        environment.apiRequests.filter(
+          ({ path }) => path === `/chat/conversations/${firstConversationId}/turns`,
+        ).length;
+      const transcriptTurn = (ordinal) => {
+        const queryId = ordinal === 1 ? firstQueryId : secondQueryId;
+        const status =
+          ordinal < currentSummary.lastOrdinal
+            ? "completed"
+            : currentSummary.activeQueryId
+              ? "in_progress"
+              : currentSummary.closed
+                ? "failed"
+                : "completed";
+        return {
+          ...turn(ordinal, queryId),
+          status,
+          answerManifest: {
+            count: status === "in_progress" ? 0 : 1,
+            complete: status === "completed",
+          },
+          cursor: status === "in_progress" ? 0 : 1,
+          ...(status === "failed" ? { failure: { code: "runtime_failed" } } : {}),
+        };
+      };
+      environment = createHistoryEnvironment({
+        listHandler: () => jsonResponse({ version: 1, conversations: [currentSummary] }),
+        turnsHandler: ({ conversationId }) =>
+          jsonResponse({
+            version: 1,
+            conversationId,
+            label: "Hilo",
+            throughOrdinal: currentSummary.lastOrdinal,
+            closed: currentSummary.closed,
+            canContinue: !currentSummary.closed && !currentSummary.activeQueryId,
+            turns: Array.from({ length: currentSummary.lastOrdinal }, (_, index) =>
+              transcriptTurn(index + 1),
+            ),
+          }),
+        textHandler: ({ conversationId, ordinal, url }) =>
+          jsonResponse({
+            version: 1,
+            conversationId,
+            ordinal,
+            queryId: ordinal === 1 ? firstQueryId : secondQueryId,
+            role: url.searchParams.get("role"),
+            chunks: [{ index: 0, text: `TRANSCRIPT_Q${ordinal}_${url.searchParams.get("role")}` }],
+            complete: true,
+          }),
+        recoverHandler: (request) => {
+          if (request.queryId === firstQueryId) return recovery.promise;
+          return latestRecovery.promise;
+        },
+      });
+      markChatJournalAdmitted(
+        environment.config,
+        environment.identity,
+        {
+          version: 2,
+          operation: "start",
+          conversationId: firstConversationId,
+          queryId: firstQueryId,
+          baseOrdinal: 0,
+        },
+        1,
+      );
+      writeChatSelection(environment.config, environment.identity, firstConversationId);
+
+      const app = mount(environment);
+      await app.flush();
+      expect(environment.runtimeRequests.map(({ request }) => request.queryId)).toContain(
+        firstQueryId,
+      );
+
+      currentSummary = {
+        conversationId: firstConversationId,
+        label: "Hilo",
+        ...latestSummary,
+      };
+      await props(app).onRefreshHistory();
+      await app.flush();
+      const turnReadsBeforeRecovery = turnReads();
+      expect(
+        props(app).state.history.conversations.find(
+          ({ conversationId }) => conversationId === firstConversationId,
+        ),
+      ).toMatchObject(latestSummary);
+
+      recovery.resolve(
+        jsonResponse({
+          version: 2,
+          conversationId: firstConversationId,
+          queryId: firstQueryId,
+          ordinal: 1,
+          status: "in_progress",
+          question: "Pregunta recuperada Q1",
+          answer: "Prefijo recuperado Q1",
+          canContinue: false,
+        }),
+      );
+      await app.flush();
+
+      expect(turnReads() > turnReadsBeforeRecovery).toBe(shouldReload);
+      const state = props(app).state;
+      expect(state.history).toMatchObject({
+        selectedConversationId: firstConversationId,
+        throughOrdinal: latestOrdinal,
+        closed: latestSummary.closed,
+      });
+      expect(state.history.turns.at(-1)).toMatchObject({
+        ordinal: latestOrdinal,
+        queryId: latestQueryId,
+        status: latestStatus,
+      });
+      expect(
+        state.history.conversations.find(
+          ({ conversationId }) => conversationId === firstConversationId,
+        ),
+      ).toMatchObject(latestSummary);
+      const html = await app.html();
+      if (shouldReload) {
+        expect(html).toContain(`TRANSCRIPT_Q${latestOrdinal}_user`);
+        expect(html).not.toContain("Prefijo recuperado Q1");
+      } else {
+        expect(html).toContain("Pregunta recuperada Q1");
+        expect(html).toContain("Prefijo recuperado Q1");
+      }
+      if (latestSummary.closed) {
+        expect(html).toContain(" · Cerrada");
+        expect(html).not.toContain(" · En curso");
+      } else if (latestSummary.activeQueryId) {
+        expect(html).toContain(" · En curso");
+      }
+      if (latestStatus === "in_progress" && latestQueryId === firstQueryId) {
+        expect(state).toMatchObject({
+          queryId: firstQueryId,
+          ordinal: 1,
+          queryStatus: "streaming",
+          answer: "Prefijo recuperado Q1",
+        });
+        expect(state.history.turns.at(-1)).toMatchObject({
+          question: "Pregunta recuperada Q1",
+          answer: "Prefijo recuperado Q1",
+        });
+        expect(turnReads()).toBe(turnReadsBeforeRecovery);
+      } else if (latestStatus === "in_progress") {
+        expect(state.history.turns.at(-1)).toMatchObject({
+          question: "TRANSCRIPT_Q2_user",
+          answer: "TRANSCRIPT_Q2_assistant",
+        });
+        latestRecovery.resolve(
+          jsonResponse({
+            version: 2,
+            conversationId: firstConversationId,
+            queryId: secondQueryId,
+            ordinal: 2,
+            status: "in_progress",
+            question: "Pregunta vigente Q2",
+            answer: "Prefijo vigente Q2",
+            canContinue: false,
+          }),
+        );
+        await app.flush();
+        expect(props(app).state).toMatchObject({
+          queryId: secondQueryId,
+          ordinal: 2,
+          queryStatus: "streaming",
+          answer: "Prefijo vigente Q2",
+        });
+      } else {
+        expect(state.ordinal).toBe(latestOrdinal);
+        expect(state.queryStatus).toBe(latestStatus);
+        expect(state.history.turns.at(-1)).toMatchObject({
+          question: `TRANSCRIPT_Q${latestOrdinal}_user`,
+          answer: `TRANSCRIPT_Q${latestOrdinal}_assistant`,
+        });
+      }
+    },
+  );
+});
+
 describe("delayed SSE terminals preserve newer conversation state", () => {
   function eventFrame(event) {
     return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
