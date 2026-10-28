@@ -14,6 +14,7 @@ export type ChatHistoryConversation = {
   lastOrdinal: number;
   closed: boolean;
   activeQueryId?: string;
+  pendingQueryId?: string;
   hasDraft?: boolean;
   durable?: boolean;
 };
@@ -619,7 +620,7 @@ export function ChatScreen({
                           {conversation.hasDraft ? (
                             <p>El borrador de esta conversación se descartará.</p>
                           ) : null}
-                          {conversation.activeQueryId ? (
+                          {conversation.activeQueryId || conversation.pendingQueryId ? (
                             <p>
                               El pedido en curso puede terminar de procesarse. Quitarla no cancela
                               ese pedido ni devuelve su consumo.

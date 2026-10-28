@@ -227,7 +227,34 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
       "x-amzn-bedrock-agentcore-runtime-session-id": conversationId,
     },
   };
-  return { handler, context, sentCommands, auxiliary, store };
+  return { handler, context, sentCommands, auxiliary, store, rows };
+}
+
+function addAssistantChunk(harness, { index, keyQueryId = queryId, keyIndex }) {
+  const item = {
+    pk: conversationPk,
+    sk: `${turnSk}#${keyQueryId}#ASSISTANT#${keyIndex ?? String(index).padStart(8, "0")}`,
+    conversationId,
+    queryId,
+    ordinal: 8,
+    role: "assistant",
+    index,
+    text: "Additional durable text.",
+  };
+  harness.rows.set(keyOf(item), item);
+}
+
+function corruptAssistantChunkKey(harness, corruption) {
+  const chunk = [...harness.rows.values()].find(
+    (item) => item.sk === `${turnSk}#${queryId}#ASSISTANT#00000000`,
+  );
+  harness.rows.delete(keyOf(chunk));
+  const sk =
+    corruption === "queryId"
+      ? chunk.sk.replace(`#${queryId}#`, `#${queryIdForOrdinal(7)}#`)
+      : chunk.sk.replace(/#00000000$/, "#0");
+  const corrupted = { ...chunk, sk };
+  harness.rows.set(keyOf(corrupted), corrupted);
 }
 
 async function publicValue(result) {
@@ -431,4 +458,97 @@ describe("submission storage validates status and phase together", () => {
       });
     },
   );
+});
+
+describe("submission storage validates terminal answer chunks", () => {
+  it.each([
+    {
+      status: "completed",
+      phase: "complete",
+      answer: "Saved answer.",
+      answerCount: 1,
+      answerComplete: true,
+    },
+    {
+      status: "failed",
+      phase: "failed",
+      answer: "Saved prefix.",
+      answerCount: 1,
+      answerComplete: false,
+    },
+  ])("rejects an answer chunk beyond a terminal $status cursor", async (turn) => {
+    const harness = createHarness(turn);
+    addAssistantChunk(harness, { index: 1 });
+
+    await expect(harness.store.getSubmission({ sub, botId, queryId })).rejects.toThrow(
+      /beyond the terminal cursor/,
+    );
+    const recovered = await harness.handler(recoverRequest, harness.context);
+    expect(recovered).toMatchObject({
+      type: "failed",
+      code: "temporarily_unavailable",
+      recordStatus: "unconfirmed",
+      queryId,
+    });
+    expect(JSON.stringify(recovered)).not.toContain("Additional durable text.");
+  });
+
+  it.each([
+    { status: "completed", phase: "complete", answer: "Saved answer.", answerComplete: true },
+    { status: "failed", phase: "failed", answer: "Saved prefix.", answerComplete: false },
+  ])(
+    "rejects terminal $status chunks whose key disagrees with the stored identity",
+    async (turn) => {
+      const harness = createHarness({ ...turn, answerCount: 1 });
+      corruptAssistantChunkKey(harness, "queryId");
+
+      await expect(harness.store.getSubmission({ sub, botId, queryId })).rejects.toThrow(
+        /malformed text chunk/,
+      );
+      expect(await harness.handler(recoverRequest, harness.context)).toMatchObject({
+        type: "failed",
+        code: "temporarily_unavailable",
+        recordStatus: "unconfirmed",
+        queryId,
+      });
+    },
+  );
+
+  it.each([
+    { status: "completed", phase: "complete", answer: "Saved answer.", answerComplete: true },
+    { status: "failed", phase: "failed", answer: "Saved prefix.", answerComplete: false },
+  ])("rejects terminal $status chunks whose key index is not canonically padded", async (turn) => {
+    const harness = createHarness({ ...turn, answerCount: 1 });
+    corruptAssistantChunkKey(harness, "index");
+
+    await expect(harness.store.getSubmission({ sub, botId, queryId })).rejects.toThrow(
+      /malformed text chunk/,
+    );
+    expect(await harness.handler(recoverRequest, harness.context)).toMatchObject({
+      type: "failed",
+      code: "temporarily_unavailable",
+      recordStatus: "unconfirmed",
+      queryId,
+    });
+  });
+
+  it("preserves a valid in-progress prefix when a later chunk races the turn snapshot", async () => {
+    const harness = createHarness({
+      status: "in_progress",
+      phase: "invocation_claimed",
+      answer: "Saved prefix.",
+      answerCount: 1,
+      answerComplete: false,
+    });
+    addAssistantChunk(harness, { index: 1 });
+
+    await expect(harness.store.getSubmission({ sub, botId, queryId })).resolves.toMatchObject({
+      status: "in_progress",
+      answer: "Saved prefix.",
+    });
+    expect(await harness.handler(recoverRequest, harness.context)).toMatchObject({
+      status: "in_progress",
+      answer: "Saved prefix.",
+    });
+  });
 });

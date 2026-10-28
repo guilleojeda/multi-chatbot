@@ -868,7 +868,6 @@ describe("the DynamoDB usage and submission store adapter", () => {
     const question = submissionChunk(2, queryId, "user", 0, "Pregunta original.");
     const firstAnswer = submissionChunk(2, queryId, "assistant", 0, "Primera ");
     const secondAnswer = submissionChunk(2, queryId, "assistant", 1, "respuesta.");
-    const beyondCursor = submissionChunk(2, queryId, "assistant", 2, "respuesta zombi");
     const records = new Map(
       [
         record,
@@ -881,7 +880,6 @@ describe("the DynamoDB usage and submission store adapter", () => {
         question,
         firstAnswer,
         secondAnswer,
-        beyondCursor,
         documentChunk(2, queryId),
       ].map((item) => [keyId({ pk: item.pk, sk: item.sk }), item]),
     );
@@ -903,7 +901,6 @@ describe("the DynamoDB usage and submission store adapter", () => {
       questionManifest: { count: 1, complete: true },
       answerManifest: { count: 2, complete: true },
     });
-    expect(snapshot.answer).not.toContain("zombi");
     expect(record.status).toBeUndefined();
 
     expect(strongReadKeys(documentClient)).toContainEqual({
@@ -926,6 +923,44 @@ describe("the DynamoDB usage and submission store adapter", () => {
         .filter((command) => command instanceof BatchGetCommand)
         .every((command) => command.input.RequestItems[tableName].ConsistentRead === true),
     ).toBe(true);
+  });
+
+  it("rejects a terminal submission with assistant text beyond its cursor", async () => {
+    const record = submissionRecord({ ordinal: 2 });
+    const turn = turnRecord({
+      status: "completed",
+      phase: "complete",
+      resultDeadlineAt: record.resultDeadlineAt,
+      questionManifest: { count: 1, complete: true },
+      answerManifest: { count: 2, complete: true },
+      cursor: 2,
+    });
+    const question = submissionChunk(2, queryId, "user", 0, "Pregunta original.");
+    const firstAnswer = submissionChunk(2, queryId, "assistant", 0, "Primera ");
+    const secondAnswer = submissionChunk(2, queryId, "assistant", 1, "respuesta.");
+    const beyondCursor = submissionChunk(2, queryId, "assistant", 2, "respuesta zombi");
+    const records = new Map(
+      [
+        record,
+        turn,
+        metaRecord({
+          lastOrdinal: 2,
+          activeQueryId: undefined,
+          activeOwnerAttemptId: undefined,
+        }),
+        question,
+        firstAnswer,
+        secondAnswer,
+        beyondCursor,
+        documentChunk(2, queryId),
+      ].map((item) => [keyId({ pk: item.pk, sk: item.sk }), item]),
+    );
+    const { store } = makeStore(mapReadRecords(records));
+    const getSubmission = requireMethod(store, "getSubmission");
+
+    await expect(getSubmission({ ...owner, queryId })).rejects.toThrow(
+      /assistant chunk beyond the terminal cursor/,
+    );
   });
 
   it("returns a boolean from the conditional single-invocation claim", async () => {

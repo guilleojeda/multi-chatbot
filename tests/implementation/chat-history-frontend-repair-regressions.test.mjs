@@ -32,6 +32,8 @@ import {
   writeChatSelection,
 } from "../../web/chat-journal.ts";
 import { ChatBrowserFixture } from "../fixtures/chat/harness.ts";
+import { AccountApp as RealAccountApp } from "../../web/AccountApp.tsx";
+import { siteConfig } from "../../config/site.ts";
 
 let AccountApp;
 let ChatScreen;
@@ -504,6 +506,213 @@ describe("active recovery preserves authoritative activity", () => {
       activeQueryId: firstQueryId,
     });
   });
+
+  it("keeps a local terminal state when delayed verified META is still active at the same ordinal", async () => {
+    const delayedMeta = deferred();
+    let listReads = 0;
+    let streamController;
+    let submittedRequest;
+    const encoder = new TextEncoder();
+    const rows = [
+      {
+        conversationId: firstConversationId,
+        label: "A en curso",
+        lastOrdinal: 1,
+        closed: false,
+      },
+      {
+        conversationId: secondConversationId,
+        label: "B reciente",
+        lastOrdinal: 1,
+        closed: false,
+      },
+    ];
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: ++listReads === 1 ? rows : [rows[1]],
+        }),
+      metaHandler: () => delayedMeta.promise,
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          label: conversationId === firstConversationId ? "A en curso" : "B reciente",
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1, conversationId === firstConversationId ? firstQueryId : secondQueryId)],
+        }),
+      textHandler: turnText,
+      runtimeHandler: (request) => {
+        submittedRequest = request;
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              streamController = controller;
+              controller.enqueue(
+                encoder.encode(
+                  `event: accepted\ndata: ${JSON.stringify({
+                    type: "accepted",
+                    conversationId: firstConversationId,
+                    queryId: request.queryId,
+                    ordinal: 2,
+                  })}\n\n`,
+                ),
+              );
+              controller.enqueue(
+                encoder.encode(
+                  `event: text\ndata: ${JSON.stringify({
+                    type: "text",
+                    queryId: request.queryId,
+                    index: 0,
+                    text: "Listo",
+                  })}\n\n`,
+                ),
+              );
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    expect(props(app).onSubmit("Seguimiento")).toBe(true);
+    await app.flush();
+
+    const refresh = props(app).onRefreshHistory();
+    await app.flush();
+    expect(
+      environment.apiRequests.some(
+        ({ path }) => path === `/chat/conversations/${firstConversationId}`,
+      ),
+    ).toBe(true);
+    streamController.enqueue(
+      encoder.encode(
+        `event: completed\ndata: ${JSON.stringify({
+          type: "completed",
+          queryId: submittedRequest.queryId,
+        })}\n\n`,
+      ),
+    );
+    streamController.close();
+    await app.flush();
+    expect(props(app).state.queryStatus).toBe("completed");
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ).activeQueryId,
+    ).toBeUndefined();
+
+    delayedMeta.resolve(
+      jsonResponse({
+        version: 1,
+        ...rows[0],
+        lastOrdinal: 2,
+        activeQueryId: submittedRequest.queryId,
+      }),
+    );
+    await refresh;
+    await app.flush();
+
+    expect(props(app).state.queryStatus).toBe("completed");
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ).activeQueryId,
+    ).toBeUndefined();
+    expect(await app.html()).not.toContain(" · En curso");
+  });
+
+  it("retains an unselected history-only terminal when refresh reuses an older META read", async () => {
+    const delayedMeta = deferred();
+    const firstList = deferred();
+    let listReads = 0;
+    const rows = [
+      {
+        conversationId: firstConversationId,
+        label: "A finalizada",
+        createdAt: "2026-10-27T12:00:00.000Z",
+        updatedAt: "2026-10-27T12:30:00.000Z",
+        lastOrdinal: 1,
+        closed: false,
+      },
+      {
+        conversationId: secondConversationId,
+        label: "B reciente",
+        createdAt: "2026-10-27T12:05:00.000Z",
+        updatedAt: "2026-10-27T12:35:00.000Z",
+        lastOrdinal: 1,
+        closed: false,
+      },
+    ];
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        ++listReads === 1
+          ? firstList.promise
+          : jsonResponse({ version: 1, conversations: [rows[1]] }),
+      metaHandler: () => delayedMeta.promise,
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          label: conversationId === firstConversationId ? "A finalizada" : "B reciente",
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1, conversationId === firstConversationId ? firstQueryId : secondQueryId)],
+        }),
+      textHandler: turnText,
+    });
+    markChatJournalAdmitted(
+      environment.config,
+      environment.identity,
+      {
+        version: 2,
+        operation: "start",
+        conversationId: firstConversationId,
+        queryId: firstQueryId,
+        baseOrdinal: 0,
+      },
+      1,
+    );
+    writeChatSelection(environment.config, environment.identity, firstConversationId);
+
+    const app = mount(environment);
+    await app.flush();
+    expect(
+      environment.apiRequests.some(
+        ({ path }) => path === `/chat/conversations/${firstConversationId}`,
+      ),
+    ).toBe(true);
+    firstList.resolve(jsonResponse({ version: 1, conversations: rows }));
+    await app.flush();
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ).activeQueryId,
+    ).toBeUndefined();
+
+    expect(await props(app).onSelectConversation(secondConversationId)).toBe(true);
+    await app.flush();
+    const refresh = props(app).onRefreshHistory();
+    await app.flush();
+    delayedMeta.resolve(jsonResponse({ version: 1, ...rows[0], activeQueryId: firstQueryId }));
+    await refresh;
+    await app.flush();
+
+    expect(props(app).state.history.selectedConversationId).toBe(secondConversationId);
+    const retained = props(app).state.history.conversations.find(
+      ({ conversationId }) => conversationId === firstConversationId,
+    );
+    expect(retained).toBeDefined();
+    expect(retained.activeQueryId).toBeUndefined();
+    expect(retained.lastOrdinal).toBe(1);
+  });
 });
 
 describe("history removal state transitions", () => {
@@ -662,6 +871,287 @@ describe("history removal state transitions", () => {
     expect(conversationRow(domState.document, "Conversación A")).toBeUndefined();
     const rowB = conversationRow(domState.document, "Conversación B");
     expect(domState.document.activeElement).toBe(rowB.querySelector(".chat-history__item"));
+  });
+
+  it("keeps a known pre-admission rejection out of the pending disclosure after reselection", async () => {
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+            {
+              conversationId: secondConversationId,
+              label: "Conversación B",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1, conversationId === firstConversationId ? firstQueryId : secondQueryId)],
+        }),
+      textHandler: turnText,
+      runtimeHandler: (request) => {
+        const encoder = new TextEncoder();
+        return new Response(
+          encoder.encode(
+            `event: failed\ndata: ${JSON.stringify({
+              type: "failed",
+              code: "context_unavailable",
+              message: "No se pudo preparar el contexto.",
+              recordStatus: "not_admitted",
+              queryId: request.queryId,
+              canContinue: true,
+            })}\n\n`,
+          ),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const app = mount(environment);
+    await app.flush();
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    expect(props(app).onSubmit("El contexto no está disponible")).toBe(true);
+    await app.flush();
+    const request = environment.runtimeRequests[0].request;
+    expect(props(app).state.queryStatus).toBe("rejected");
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ).pendingQueryId,
+    ).toBeUndefined();
+    expect(
+      readChatJournals(environment.config, environment.identity).get(firstConversationId),
+    ).toMatchObject({
+      admitted: false,
+      request: { queryId: request.queryId },
+    });
+
+    expect(await props(app).onSelectConversation(secondConversationId)).toBe(true);
+    await app.flush();
+    expect(await props(app).onSelectConversation(firstConversationId)).toBe(true);
+    await app.flush();
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ).pendingQueryId,
+    ).toBeUndefined();
+  });
+
+  it("does not disclose an admitted journal as active after META confirms its terminal ordinal", async () => {
+    const environment = createHistoryEnvironment({
+      listHandler: () =>
+        jsonResponse({
+          version: 1,
+          conversations: [
+            {
+              conversationId: firstConversationId,
+              label: "Conversación A",
+              lastOrdinal: 1,
+              closed: false,
+            },
+            {
+              conversationId: secondConversationId,
+              label: "Conversación B",
+              lastOrdinal: 1,
+              closed: false,
+            },
+          ],
+        }),
+      turnsHandler: ({ conversationId }) =>
+        jsonResponse({
+          version: 1,
+          conversationId,
+          throughOrdinal: 1,
+          closed: false,
+          canContinue: true,
+          turns: [turn(1, conversationId === firstConversationId ? firstQueryId : secondQueryId)],
+        }),
+      textHandler: turnText,
+    });
+    markChatJournalAdmitted(
+      environment.config,
+      environment.identity,
+      {
+        version: 2,
+        operation: "start",
+        conversationId: firstConversationId,
+        queryId: firstQueryId,
+        baseOrdinal: 0,
+      },
+      1,
+    );
+    writeChatSelection(environment.config, environment.identity, secondConversationId);
+
+    const app = mount(environment);
+    await app.flush();
+
+    expect(props(app).state.history.selectedConversationId).toBe(secondConversationId);
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ),
+    ).toMatchObject({ lastOrdinal: 1, closed: false });
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ).pendingQueryId,
+    ).toBeUndefined();
+  });
+
+  it("keeps an unconfirmed follow-up disclosure with its conversation through mobile selection changes", async () => {
+    const domState = await createPhase8Dom();
+    domStates.push(domState);
+    const fixture = new ChatBrowserFixture();
+    fixture.seedHistoryDemo();
+    let initialActiveStreams;
+    let holdRuntime = false;
+    let releaseRuntime;
+    const runtimeGate = new Promise((resolve) => {
+      releaseRuntime = resolve;
+    });
+    let firstHide = true;
+    const fixtureFetch = fixture.fetch.bind(fixture);
+    vi.stubGlobal("fetch", async (input, init = {}) => {
+      const url = String(input);
+      if (firstHide && init.method === "POST" && url.endsWith("/hide")) {
+        firstHide = false;
+        return jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503);
+      }
+      const response = await fixtureFetch(input, init);
+      if (holdRuntime && url.includes("bedrock-agentcore")) await runtimeGate;
+      return response;
+    });
+    const flush = async () => {
+      await act(async () => {
+        for (let attempt = 0; attempt < 45; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      });
+    };
+    const click = async (element) => {
+      expect(element).not.toBeNull();
+      await act(async () => {
+        element.click();
+        await Promise.resolve();
+      });
+      await flush();
+    };
+    const findRow = (label) =>
+      [...domState.document.querySelectorAll(".chat-history__conversation")].find((row) =>
+        row.textContent?.includes(label),
+      );
+    const targetLabel = "conversación 3";
+    const otherLabel = "conversación 4";
+
+    try {
+      await act(async () => {
+        domState.root.render(
+          React.createElement(RealAccountApp, {
+            route: { kind: "chat" },
+            projectName: siteConfig.projectName,
+            profileConfig: siteConfig.profile,
+            getSession: () => fixture.session,
+          }),
+        );
+      });
+      await flush();
+      expect(
+        domState.document.querySelectorAll(".chat-history__conversation").length,
+      ).toBeGreaterThan(2);
+      initialActiveStreams = fixture.snapshot("#/chat").admittedStreams;
+
+      await click(findRow(targetLabel).querySelector(".chat-history__item"));
+      const targetId = "70000000-0000-4000-8000-000000000003";
+      holdRuntime = true;
+      const textarea = domState.document.querySelector("textarea");
+      const valueSetter = Object.getOwnPropertyDescriptor(
+        domState.dom.window.HTMLTextAreaElement.prototype,
+        "value",
+      ).set;
+      valueSetter.call(textarea, "Seguimiento antes de recibir el ACK");
+      textarea.dispatchEvent(new domState.dom.window.Event("input", { bubbles: true }));
+      textarea.dispatchEvent(new domState.dom.window.Event("change", { bubbles: true }));
+      await flush();
+      await act(async () => {
+        domState.document
+          .querySelector(".chat-form")
+          .dispatchEvent(
+            new domState.dom.window.Event("submit", { bubbles: true, cancelable: true }),
+          );
+      });
+      await flush();
+      for (
+        let attempt = 0;
+        attempt < 20 && fixture.snapshot("#/chat").admittedStreams <= initialActiveStreams;
+        attempt += 1
+      ) {
+        await flush();
+      }
+      expect(fixture.snapshot("#/chat").admittedStreams).toBe(initialActiveStreams + 1);
+
+      await click(domState.document.querySelector(".chat-mobile-history-back"));
+      await click(findRow(otherLabel).querySelector(".chat-history__item"));
+      await click(domState.document.querySelector(".chat-mobile-history-back"));
+      expect(findRow(targetLabel).querySelector("[aria-current]")).toBeNull();
+      expect(findRow(otherLabel).querySelector(".chat-history__meta").textContent).not.toContain(
+        "En curso",
+      );
+
+      await click(findRow(targetLabel).querySelector(".chat-history__remove"));
+      let confirmation = findRow(targetLabel).querySelector(".chat-history__remove-confirmation");
+      expect(confirmation.textContent).toContain("El pedido en curso puede terminar de procesarse");
+      await click(confirmation.querySelector(".chat-history__remove-confirm"));
+      confirmation = findRow(targetLabel).querySelector(".chat-history__remove-confirmation");
+      expect(confirmation.textContent).toContain("El pedido en curso puede terminar de procesarse");
+      expect(confirmation.textContent).toContain("No pudimos confirmar");
+
+      await click(confirmation.querySelector('button[type="button"]'));
+      expect(findRow(targetLabel).querySelector(".chat-history__remove-confirmation")).toBeNull();
+      await click(findRow(targetLabel).querySelector(".chat-history__remove"));
+      confirmation = findRow(targetLabel).querySelector(".chat-history__remove-confirmation");
+      await act(async () => {
+        confirmation.dispatchEvent(
+          new domState.dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+      });
+      await flush();
+      expect(findRow(targetLabel).querySelector(".chat-history__remove-confirmation")).toBeNull();
+
+      fixture.finishStream("complete");
+      releaseRuntime();
+      await flush();
+      await click(findRow(targetLabel).querySelector(".chat-history__item"));
+      await flush();
+      await click(domState.document.querySelector(".chat-mobile-history-back"));
+      await click(findRow(targetLabel).querySelector(".chat-history__remove"));
+      confirmation = findRow(targetLabel).querySelector(".chat-history__remove-confirmation");
+      expect(confirmation.textContent).not.toContain(
+        "El pedido en curso puede terminar de procesarse",
+      );
+      await click(confirmation.querySelector('button[type="button"]'));
+      expect(firstHide).toBe(false);
+      expect(
+        fixture
+          .snapshot("#/chat")
+          .conversations.find(({ conversationId }) => conversationId === targetId).hiddenAt,
+      ).toBeUndefined();
+    } finally {
+      releaseRuntime();
+    }
   });
 
   it("disables the composer only for the selected conversation being removed", async () => {
