@@ -55,7 +55,12 @@ export type AccountRoute =
 
 type RetryOperation = () => Promise<void>;
 type RouteIdentity = { key: string; epoch: number };
-type HideOperation = { conversationId: string; ownerKey: string; generation: number };
+type HideOperation = {
+  conversationId: string;
+  ownerKey: string;
+  generation: number;
+  complete: (confirmed: boolean) => void;
+};
 type TrackedChatJournalEntry = ChatJournalEntry & { knownNotAdmitted?: boolean };
 type HistoryOpeningContext = {
   conversationId: string;
@@ -655,8 +660,10 @@ export function AccountApp({
     hiddenConversationIdsRef.current.clear();
     serverConfirmedConversationIdsRef.current.clear();
     metadataChecksRef.current.clear();
+    const pendingHideOperation = hideOperationRef.current;
     hideOperationRef.current = null;
     hideOperationGenerationRef.current += 1;
+    pendingHideOperation?.complete(false);
     historyOpeningContextRef.current = null;
   }, []);
 
@@ -1715,6 +1722,21 @@ export function AccountApp({
         removal,
       },
     });
+    const operation = hideOperationRef.current;
+    if (
+      operation?.conversationId === conversationId &&
+      operation.ownerKey === chatOwnerKey(identity)
+    ) {
+      settleHideOperation(operation, true);
+    }
+  }
+
+  function settleHideOperation(operation: HideOperation, confirmed: boolean) {
+    if (hideOperationRef.current !== operation) return;
+    // A confirming META result can settle the UI before the POST transport returns.
+    hideOperationRef.current = null;
+    hideOperationGenerationRef.current += 1;
+    operation.complete(confirmed);
   }
 
   async function checkConversationMetadata(
@@ -3395,7 +3417,7 @@ export function AccountApp({
     }));
   }
 
-  async function hideConversation(conversationId: string): Promise<boolean> {
+  function hideConversation(conversationId: string): Promise<boolean> {
     const identity = state.view === "ready" ? state.identity : undefined;
     const config = configRef.current;
     const activeSession = sessionRef.current;
@@ -3408,22 +3430,28 @@ export function AccountApp({
       chatOwnerKeyRef.current !== ownerKey ||
       !uuidPatternForHistory(conversationId)
     ) {
-      return false;
+      return Promise.resolve(false);
     }
-    if (hiddenConversationIdsRef.current.has(conversationId)) return true;
+    if (hiddenConversationIdsRef.current.has(conversationId)) return Promise.resolve(true);
     const currentHistory = chatScreenStateRef.current.history ?? emptyHistoryState();
     const row = currentHistory.conversations.find(
       (conversation) => conversation.conversationId === conversationId,
     );
-    if (!row || (row.pending && !row.durable)) return false;
+    if (!row || (row.pending && !row.durable)) return Promise.resolve(false);
 
     const currentOperation = hideOperationRef.current;
-    if (currentOperation) return false;
+    if (currentOperation) return Promise.resolve(false);
     const currentRemoval = currentHistory.removal;
-    if (currentRemoval && currentRemoval.conversationId !== conversationId) return false;
+    if (currentRemoval && currentRemoval.conversationId !== conversationId)
+      return Promise.resolve(false);
+
+    let complete!: (confirmed: boolean) => void;
+    const completion = new Promise<boolean>((resolve) => {
+      complete = resolve;
+    });
 
     const generation = ++hideOperationGenerationRef.current;
-    const operation = { conversationId, ownerKey, generation };
+    const operation = { conversationId, ownerKey, generation, complete };
     hideOperationRef.current = operation;
     setHistory((history) => ({
       ...history,
@@ -3434,41 +3462,41 @@ export function AccountApp({
       hideOperationRef.current.generation === generation &&
       chatOwnerKeyRef.current === ownerKey;
 
-    try {
-      await hideChatConversation(config, activeSession, conversationId, isActive);
-      if (!isActive()) return false;
-      retireHiddenConversation(conversationId, config, identity);
-      hideOperationRef.current = null;
-      return true;
-    } catch (error) {
-      if (!isActive()) return false;
-      const apiError = asApiError(error);
-      hideOperationRef.current = null;
-      if (apiError.status === 401) {
-        invalidateChat(config);
-        profileUnauthorized();
-        return false;
-      }
-      if (apiError.status === 403) {
-        invalidateChat(config);
-        profileForbidden();
-        return false;
-      }
-      if (apiError.code === "CONVERSATION_HIDDEN") {
+    void hideChatConversation(config, activeSession, conversationId, isActive).then(
+      () => {
+        if (!isActive()) return;
         retireHiddenConversation(conversationId, config, identity);
-        return true;
-      }
-      setHistory((history) => ({
-        ...history,
-        removal: {
-          conversationId,
-          status: "unconfirmed",
-          error:
-            "No pudimos confirmar si se quitó la conversación. Sigue en tu historial hasta resolverlo; podés reintentar de forma segura.",
-        },
-      }));
-      return false;
-    }
+      },
+      (error) => {
+        if (!isActive()) return;
+        const apiError = asApiError(error);
+        if (apiError.status === 401) {
+          invalidateChat(config);
+          profileUnauthorized();
+          return;
+        }
+        if (apiError.status === 403) {
+          invalidateChat(config);
+          profileForbidden();
+          return;
+        }
+        if (apiError.code === "CONVERSATION_HIDDEN") {
+          retireHiddenConversation(conversationId, config, identity);
+          return;
+        }
+        setHistory((history) => ({
+          ...history,
+          removal: {
+            conversationId,
+            status: "unconfirmed",
+            error:
+              "No pudimos confirmar si se quitó la conversación. Sigue en tu historial hasta resolverlo; podés reintentar de forma segura.",
+          },
+        }));
+        settleHideOperation(operation, false);
+      },
+    );
+    return completion;
   }
 
   function submitChat(text: string): boolean {

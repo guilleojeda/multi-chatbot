@@ -716,26 +716,29 @@ describe("active recovery preserves authoritative activity", () => {
 });
 
 describe("history removal state transitions", () => {
-  async function mountRemovalDom(hideHandler) {
+  async function mountRemovalDom(hideHandler, { listHandler, metaHandler } = {}) {
     const environment = createHistoryEnvironment({
-      listHandler: () =>
-        jsonResponse({
-          version: 1,
-          conversations: [
-            {
-              conversationId: firstConversationId,
-              label: "Conversación A",
-              lastOrdinal: 1,
-              closed: false,
-            },
-            {
-              conversationId: secondConversationId,
-              label: "Conversación B",
-              lastOrdinal: 1,
-              closed: false,
-            },
-          ],
-        }),
+      listHandler:
+        listHandler ??
+        (() =>
+          jsonResponse({
+            version: 1,
+            conversations: [
+              {
+                conversationId: firstConversationId,
+                label: "Conversación A",
+                lastOrdinal: 1,
+                closed: false,
+              },
+              {
+                conversationId: secondConversationId,
+                label: "Conversación B",
+                lastOrdinal: 1,
+                closed: false,
+              },
+            ],
+          })),
+      metaHandler,
       turnsHandler: ({ conversationId }) =>
         jsonResponse({
           version: 1,
@@ -839,6 +842,107 @@ describe("history removal state transitions", () => {
     await render();
     expect(props(app).state.history.removal).toBeUndefined();
   });
+
+  it.each(["success", "transport error"])(
+    "keeps B's open confirmation and focus when A's POST returns late with %s after META hid A",
+    async (lateAOutcome) => {
+      const pendingHide = deferred();
+      const rows = [
+        {
+          conversationId: firstConversationId,
+          label: "Conversación A",
+          lastOrdinal: 1,
+          closed: false,
+        },
+        {
+          conversationId: secondConversationId,
+          label: "Conversación B",
+          lastOrdinal: 1,
+          closed: false,
+        },
+      ];
+      let listAttempt = 0;
+      const hideHandler = vi.fn(() => pendingHide.promise);
+      const { app, domState, environment, render } = await mountRemovalDom(hideHandler, {
+        listHandler: () =>
+          jsonResponse({
+            version: 1,
+            conversations: listAttempt++ === 0 ? rows : [rows[1]],
+          }),
+        metaHandler: ({ conversationId }) =>
+          conversationId === firstConversationId
+            ? jsonResponse({ code: "CONVERSATION_HIDDEN" }, 404)
+            : jsonResponse({
+                version: 1,
+                ...rows[1],
+              }),
+      });
+
+      await clickPhase8(hideButtonFor(domState.document, "Conversación A"), app, domState);
+      await clickPhase8(
+        conversationRow(domState.document, "Conversación A").querySelector(
+          ".chat-history__remove-confirm",
+        ),
+        app,
+        domState,
+      );
+      expect(hideHandler).toHaveBeenCalledTimes(1);
+      expect(statusText(domState.document, "Quitando…")).not.toBeNull();
+
+      await clickPhase8(
+        domState.document.querySelector('[aria-label="Actualizar historial"]'),
+        app,
+        domState,
+      );
+      expect(conversationRow(domState.document, "Conversación A")).toBeUndefined();
+      expect(conversationRow(domState.document, "Conversación B")).toBeDefined();
+      expect(hideButtonFor(domState.document, "Conversación B").disabled).toBe(false);
+      expect(statusText(domState.document, "Quitando…")).toBeUndefined();
+
+      await clickPhase8(hideButtonFor(domState.document, "Conversación B"), app, domState);
+      const confirmationB = conversationRow(domState.document, "Conversación B").querySelector(
+        ".chat-history__remove-confirmation",
+      );
+      const cancelB = buttonByText(domState.document, "Cancelar");
+      expect(confirmationB).not.toBeNull();
+      expect(domState.document.activeElement).toBe(cancelB);
+      expect(
+        environment.apiRequests.filter(
+          ({ method, path }) => method === "POST" && path.endsWith("/hide"),
+        ),
+      ).toHaveLength(1);
+
+      if (lateAOutcome === "success") {
+        pendingHide.resolve(
+          jsonResponse({
+            version: 1,
+            conversationId: firstConversationId,
+            hiddenAt: "2026-10-27T14:00:00.000Z",
+          }),
+        );
+      } else {
+        pendingHide.reject(new TypeError("connection closed after the hide was committed"));
+      }
+      await render();
+
+      expect(conversationRow(domState.document, "Conversación A")).toBeUndefined();
+      expect(
+        conversationRow(domState.document, "Conversación B").querySelector(
+          ".chat-history__remove-confirmation",
+        ),
+      ).toBe(confirmationB);
+      expect(domState.document.activeElement).toBe(cancelB);
+      expect(statusText(domState.document, "Conversación quitada del historial.")).toBeUndefined();
+      expect(domState.document.querySelector('[role="alert"]')).toBeNull();
+      expect(hideHandler).toHaveBeenCalledTimes(1);
+
+      await clickPhase8(cancelB, app, domState);
+      expect(domState.document.activeElement).toBe(
+        hideButtonFor(domState.document, "Conversación B"),
+      );
+      expect(hideHandler).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("reopens an uncertain removal for retry and focuses the next row after confirmation", async () => {
     let attempts = 0;
