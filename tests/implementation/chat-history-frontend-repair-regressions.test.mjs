@@ -713,6 +713,114 @@ describe("active recovery preserves authoritative activity", () => {
     expect(retained.activeQueryId).toBeUndefined();
     expect(retained.lastOrdinal).toBe(1);
   });
+
+  it.each([
+    {
+      name: "a later closed META snapshot",
+      newerSummary: { lastOrdinal: 2, closed: true },
+      expectedSummary: { lastOrdinal: 2, closed: true },
+      expectedHistory: { closed: true, canContinue: false },
+    },
+    {
+      name: "a later active META snapshot",
+      newerSummary: { lastOrdinal: 2, closed: false, activeQueryId: secondQueryId },
+      expectedSummary: { lastOrdinal: 2, closed: false, activeQueryId: secondQueryId },
+      expectedHistory: { closed: false, canContinue: false },
+    },
+  ])(
+    "does not let an older terminal recover overwrite $name",
+    async ({ newerSummary, expectedSummary, expectedHistory }) => {
+      let currentSummary = {
+        conversationId: firstConversationId,
+        label: "Hilo",
+        lastOrdinal: 1,
+        closed: false,
+        activeQueryId: firstQueryId,
+      };
+      const recovery = deferred();
+      const environment = createHistoryEnvironment({
+        listHandler: () => jsonResponse({ version: 1, conversations: [currentSummary] }),
+        turnsHandler: () =>
+          jsonResponse({
+            version: 1,
+            conversationId: firstConversationId,
+            label: "Hilo",
+            throughOrdinal: 1,
+            closed: false,
+            canContinue: false,
+            turns: [
+              {
+                ...turn(1, firstQueryId),
+                status: "in_progress",
+                answerManifest: { count: 0, complete: false },
+                cursor: 0,
+              },
+            ],
+          }),
+        textHandler: turnText,
+        recoverHandler: () => recovery.promise,
+      });
+      const request = {
+        version: 2,
+        operation: "start",
+        conversationId: firstConversationId,
+        queryId: firstQueryId,
+        baseOrdinal: 0,
+        text: "Pregunta original",
+      };
+      writePendingChatJournal(environment.config, environment.identity, request);
+      markChatJournalAdmitted(environment.config, environment.identity, request, 1);
+      writeChatSelection(environment.config, environment.identity, firstConversationId);
+
+      const app = mount(environment);
+      await app.flush();
+      expect(
+        environment.runtimeRequests.map(({ request: runtimeRequest }) => runtimeRequest.operation),
+      ).toEqual(["recover"]);
+
+      currentSummary = {
+        conversationId: firstConversationId,
+        label: "Hilo",
+        ...newerSummary,
+      };
+      await props(app).onRefreshHistory();
+      await app.flush();
+      expect(
+        props(app).state.history.conversations.find(
+          ({ conversationId }) => conversationId === firstConversationId,
+        ),
+      ).toMatchObject(expectedSummary);
+
+      recovery.resolve(
+        jsonResponse({
+          version: 2,
+          conversationId: firstConversationId,
+          queryId: firstQueryId,
+          ordinal: 1,
+          status: "completed",
+          question: "Pregunta original",
+          answer: "Respuesta recuperada",
+          canContinue: true,
+        }),
+      );
+      await app.flush();
+
+      const summary = props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      );
+      expect(summary).toMatchObject(expectedSummary);
+      expect(props(app).state.canContinue).toBe(false);
+      expect(props(app).state.history).toMatchObject(expectedHistory);
+      const html = await app.html();
+      if (expectedSummary.closed) {
+        expect(html).toContain(" · Cerrada");
+        expect(html).not.toContain(" · Abierta");
+        expect(html).not.toContain("La respuesta está completa. Podés continuar este hilo.");
+      } else {
+        expect(html).toContain(" · En curso");
+      }
+    },
+  );
 });
 
 describe("history removal state transitions", () => {
