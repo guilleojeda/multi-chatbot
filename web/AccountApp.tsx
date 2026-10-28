@@ -56,6 +56,7 @@ export type AccountRoute =
 type RetryOperation = () => Promise<void>;
 type RouteIdentity = { key: string; epoch: number };
 type HideOperation = { conversationId: string; ownerKey: string; generation: number };
+type TrackedChatJournalEntry = ChatJournalEntry & { knownNotAdmitted?: boolean };
 type HistoryOpeningContext = {
   conversationId: string;
   selectedConversationId: string | null;
@@ -92,6 +93,18 @@ function sameChatJournalScope(left: PublicConfig, right: PublicConfig) {
     (left.runtimeArn ?? "") === (right.runtimeArn ?? "") &&
     (left.runtimeQualifier ?? "") === (right.runtimeQualifier ?? "") &&
     left.botId === right.botId
+  );
+}
+
+function sameUnadmittedChatRequest(left: TrackedChatJournalEntry, right: ChatJournalEntry) {
+  return (
+    !left.admitted &&
+    !right.admitted &&
+    left.request.conversationId === right.request.conversationId &&
+    left.request.queryId === right.request.queryId &&
+    left.request.operation === right.request.operation &&
+    left.request.baseOrdinal === right.request.baseOrdinal &&
+    left.request.text === right.request.text
   );
 }
 
@@ -455,7 +468,7 @@ export function AccountApp({
     ownerKey: string;
     conversationId: string;
   } | null>(null);
-  const chatJournalsRef = useRef(new Map<string, ChatJournalEntry>());
+  const chatJournalsRef = useRef(new Map<string, TrackedChatJournalEntry>());
   const chatDraftsRef = useRef(new Map<string, string>());
   const localConversationsRef = useRef(
     new Map<string, ChatHistoryState["conversations"][number]>(),
@@ -680,10 +693,10 @@ export function AccountApp({
 
       chatJournalBootstrapOwnerRef.current = nextOwner;
       const owner = { sub: identity.sub, botId: identity.botId };
-      let journals = new Map<string, ChatJournalEntry>();
+      let journals = new Map<string, TrackedChatJournalEntry>();
       let selectedId: string | null = null;
       try {
-        journals = readChatJournals(config, owner);
+        journals = new Map(readChatJournals(config, owner));
         selectedId = readChatSelection(config, owner);
       } catch {
         // History remains available when this tab cannot use session storage.
@@ -1753,11 +1766,20 @@ export function AccountApp({
   ) {
     if (hiddenConversationIdsRef.current.has(conversation.conversationId)) return;
     serverConfirmedConversationIdsRef.current.add(conversation.conversationId);
-    const draft = chatDraftsRef.current.get(conversation.conversationId) ?? "";
-    localConversationsRef.current.set(conversation.conversationId, {
-      ...conversation,
-      hasDraft: draft.length > 0 || undefined,
-    });
+    const existing =
+      localConversationsRef.current.get(conversation.conversationId) ??
+      chatScreenStateRef.current.history?.conversations.find(
+        (local) => local.conversationId === conversation.conversationId,
+      );
+    if (!existing || serverConversationSupersedesLocal(existing, conversation)) {
+      const draft = chatDraftsRef.current.get(conversation.conversationId) ?? "";
+      localConversationsRef.current.set(conversation.conversationId, {
+        ...conversation,
+        hasDraft: draft.length > 0 || undefined,
+      });
+    } else {
+      localConversationsRef.current.set(conversation.conversationId, existing);
+    }
     setHistory((history) => ({
       ...history,
       conversations: mergeHistoryConversations(
@@ -2717,7 +2739,13 @@ export function AccountApp({
     }
 
     for (const [conversationId, entry] of loadedJournals) {
-      chatJournalsRef.current.set(conversationId, entry);
+      const previous = chatJournalsRef.current.get(conversationId);
+      chatJournalsRef.current.set(
+        conversationId,
+        previous?.knownNotAdmitted && sameUnadmittedChatRequest(previous, entry)
+          ? { ...entry, knownNotAdmitted: true }
+          : entry,
+      );
     }
     const storedLiveJournal = chatJournalsRef.current.get(selectedConversationId) ?? null;
     const liveJournalOwner = chatJournalOwnerRef.current;
@@ -3491,7 +3519,7 @@ export function AccountApp({
       return false;
     }
     stopChatRecovery();
-    const pendingJournal: ChatJournalEntry = { request, admitted: false };
+    const pendingJournal: TrackedChatJournalEntry = { request, admitted: false };
     chatJournalsRef.current.set(conversationId, pendingJournal);
     chatJournalRef.current = pendingJournal;
     chatJournalOwnerRef.current = { config: apiConfig, identity };
@@ -3885,8 +3913,13 @@ export function AccountApp({
           } else if (retryablePreAdmissionFailure) {
             // Count or document preparation failed before admission. Keep this exact body and ID
             // for an explicit retry, including when the request follows an admitted turn.
-            chatJournalRef.current = { request, admitted: false };
-            chatJournalsRef.current.set(conversationId, chatJournalRef.current);
+            const rejectedJournal: TrackedChatJournalEntry = {
+              request,
+              admitted: false,
+              knownNotAdmitted: true,
+            };
+            chatJournalRef.current = rejectedJournal;
+            chatJournalsRef.current.set(conversationId, rejectedJournal);
             chatConversationIdRef.current = conversationId;
           } else if (previousJournal?.admitted) {
             try {
@@ -4101,9 +4134,27 @@ export function AccountApp({
     if (!apiConfig || !session) return <AccountScreen {...screenProps} />;
     const visibleChatState =
       chatOwnerKeyRef.current === chatOwnerKey(state.identity) ? chatScreenState : emptyChatState();
+    const visibleChatHistory = visibleChatState.history;
+    const chatScreenStateWithJournalActivity = visibleChatHistory
+      ? {
+          ...visibleChatState,
+          history: {
+            ...visibleChatHistory,
+            conversations: visibleChatHistory.conversations.map((conversation) => {
+              const journal = chatJournalsRef.current.get(conversation.conversationId);
+              return journal &&
+                !journal.admitted &&
+                !journal.knownNotAdmitted &&
+                journal.request.conversationId === conversation.conversationId
+                ? { ...conversation, pendingQueryId: journal.request.queryId }
+                : conversation;
+            }),
+          },
+        }
+      : visibleChatState;
     return (
       <ChatScreen
-        state={{ ...visibleChatState, projectName }}
+        state={{ ...chatScreenStateWithJournalActivity, projectName }}
         onSubmit={submitChat}
         onSignOut={signOut}
         onRetryProfile={retryChatProfile}

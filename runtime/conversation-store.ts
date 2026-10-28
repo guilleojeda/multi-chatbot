@@ -1660,8 +1660,10 @@ export function createConversationStoreAdapter(input: {
       if (
         chunkOrdinal !== ordinal ||
         String(chunkOrdinal).padStart(8, "0") !== match[1] ||
+        match[2] !== input.queryId ||
         !Number.isSafeInteger(chunkIndex) ||
         chunkIndex < 0 ||
+        String(chunkIndex).padStart(8, "0") !== match[4] ||
         item.pk !== turn.pk ||
         item.conversationId !== marker.conversationId ||
         item.ordinal !== ordinal ||
@@ -1672,6 +1674,9 @@ export function createConversationStoreAdapter(input: {
         item.role !== role
       )
         throw new Error("Submission contains a malformed text chunk.");
+      if (role === "assistant" && turn.status !== "in_progress" && chunkIndex >= cursor) {
+        throw new Error("Submission contains an assistant chunk beyond the terminal cursor.");
+      }
       if (role === "user") questionPieces.push({ index: chunkIndex, text: item.text });
       else if (chunkIndex < cursor) answerPieces.push({ index: chunkIndex, text: item.text });
     }
