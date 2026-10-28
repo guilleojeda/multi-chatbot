@@ -1066,6 +1066,129 @@ describe("delayed SSE terminals preserve newer conversation state", () => {
     expect(scenario.environment.runtimeRequests).toHaveLength(requestsBeforeRejectedFollowUp);
   });
 
+  it("reloads newer closed history for a stale failed recovery without a snapshot version", async () => {
+    let currentSummary = {
+      conversationId: firstConversationId,
+      label: "Hilo",
+      lastOrdinal: 1,
+      closed: false,
+      activeQueryId: firstQueryId,
+    };
+    const recovery = deferred();
+    const environment = createHistoryEnvironment({
+      listHandler: () => jsonResponse({ version: 1, conversations: [currentSummary] }),
+      turnsHandler: ({ conversationId }) => {
+        const ordinal = currentSummary.lastOrdinal;
+        const queryId = ordinal === 1 ? firstQueryId : secondQueryId;
+        const failedAndClosed = ordinal === 2 && currentSummary.closed;
+        return jsonResponse({
+          version: 1,
+          conversationId,
+          label: "Hilo",
+          throughOrdinal: ordinal,
+          closed: currentSummary.closed,
+          canContinue: !currentSummary.closed && !currentSummary.activeQueryId,
+          turns: [
+            {
+              ...turn(ordinal, queryId),
+              ...(failedAndClosed
+                ? {
+                    status: "failed",
+                    answerManifest: { count: 1, complete: false },
+                    cursor: 1,
+                    failure: { code: "runtime_failed" },
+                  }
+                : {
+                    status: "in_progress",
+                    answerManifest: { count: 0, complete: false },
+                    cursor: 0,
+                  }),
+            },
+          ],
+        });
+      },
+      textHandler: turnText,
+      recoverHandler: () => recovery.promise,
+    });
+    markChatJournalAdmitted(
+      environment.config,
+      environment.identity,
+      {
+        version: 2,
+        operation: "start",
+        conversationId: firstConversationId,
+        queryId: firstQueryId,
+        baseOrdinal: 0,
+      },
+      1,
+    );
+    writeChatSelection(environment.config, environment.identity, firstConversationId);
+
+    const app = mount(environment);
+    await app.flush();
+    expect(environment.runtimeRequests.map(({ request }) => request.operation)).toContain(
+      "recover",
+    );
+
+    currentSummary = {
+      conversationId: firstConversationId,
+      label: "Hilo",
+      lastOrdinal: 2,
+      closed: true,
+    };
+    await props(app).onRefreshHistory();
+    await app.flush();
+    const turnsBeforeTerminal = environment.apiRequests.filter(
+      ({ path }) => path === `/chat/conversations/${firstConversationId}/turns`,
+    ).length;
+
+    recovery.resolve(
+      jsonResponse({
+        type: "failed",
+        code: "provider_error",
+        message: "No se pudo completar.",
+        recordStatus: "failed",
+        queryId: firstQueryId,
+        canContinue: true,
+      }),
+    );
+    await app.flush();
+
+    expect(
+      environment.apiRequests.filter(
+        ({ path }) => path === `/chat/conversations/${firstConversationId}/turns`,
+      ).length,
+    ).toBeGreaterThan(turnsBeforeTerminal);
+    expect(props(app).state).toMatchObject({
+      ordinal: 2,
+      queryStatus: "failed",
+      canContinue: false,
+      history: {
+        selectedConversationId: firstConversationId,
+        turnsStatus: "ready",
+        throughOrdinal: 2,
+        closed: true,
+        canContinue: false,
+        turns: [
+          {
+            ordinal: 2,
+            queryId: secondQueryId,
+            status: "failed",
+            question: "ORIGINAL_TEXT_2",
+            answer: "ORIGINAL_TEXT_2",
+            failure: { code: "runtime_failed" },
+          },
+        ],
+      },
+    });
+    expect(
+      props(app).state.history.conversations.find(
+        ({ conversationId }) => conversationId === firstConversationId,
+      ),
+    ).toMatchObject({ lastOrdinal: 2, closed: true });
+    expect(await app.html()).not.toContain("Podés continuar este hilo.");
+  });
+
   it("keeps a current completed SSE terminal continuable without a history reload", async () => {
     const scenario = await startDelayedTerminalScenario({
       currentAtTerminal: (conversationId, queryId) => ({

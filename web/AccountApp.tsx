@@ -2325,15 +2325,14 @@ export function AccountApp({
   ) {
     if (!isCurrentSelection()) return { kind: "inactive" as const };
     const isTerminal = snapshot.status === "completed" || snapshot.status === "failed";
-    const observedConversation = getObservedConversationSummary(request.conversationId);
     if (
       isTerminal &&
-      observedConversation &&
-      (observedConversation.lastOrdinal > snapshot.ordinal ||
-        (observedConversation.lastOrdinal === snapshot.ordinal &&
-          observedConversation.activeQueryId &&
-          observedConversation.activeQueryId !== snapshot.queryId) ||
-        (observedConversation.closed && snapshot.canContinue))
+      terminalSnapshotIsSuperseded(
+        request.conversationId,
+        snapshot.queryId,
+        snapshot.ordinal,
+        snapshot.canContinue,
+      )
     ) {
       return {
         kind: "needs-reload" as const,
@@ -2405,6 +2404,23 @@ export function AccountApp({
     if (!local) return visible;
     if (!visible) return local;
     return serverConversationSupersedesLocal(local, visible) ? visible : local;
+  }
+
+  function terminalSnapshotIsSuperseded(
+    conversationId: string,
+    queryId: string,
+    ordinal: number,
+    canContinue: boolean,
+  ) {
+    const observed = getObservedConversationSummary(conversationId);
+    return Boolean(
+      observed &&
+      (observed.lastOrdinal > ordinal ||
+        (observed.lastOrdinal === ordinal &&
+          observed.activeQueryId &&
+          observed.activeQueryId !== queryId) ||
+        (observed.closed && canContinue)),
+    );
   }
 
   async function loadMoreHistory(reload = false) {
@@ -3148,6 +3164,18 @@ export function AccountApp({
         }
 
         if (result.recordStatus === "failed") {
+          if (
+            terminalSnapshotIsSuperseded(
+              request.conversationId,
+              result.queryId ?? request.queryId,
+              request.baseOrdinal + 1,
+              result.canContinue ?? false,
+            )
+          ) {
+            stopCycle();
+            void selectConversation(request.conversationId);
+            return;
+          }
           serverConfirmedConversationIdsRef.current.add(request.conversationId);
           const reference = {
             version: 2 as const,
@@ -3443,15 +3471,7 @@ export function AccountApp({
     if (hiddenConversationIdsRef.current.has(conversationId)) return;
     const existing = getObservedConversationSummary(conversationId);
     if (!existing) return;
-    if (
-      existing.lastOrdinal > ordinal ||
-      (existing.closed && !closed) ||
-      (existing.lastOrdinal >= ordinal &&
-        existing.activeQueryId &&
-        existing.activeQueryId !== queryId)
-    ) {
-      return;
-    }
+    if (terminalSnapshotIsSuperseded(conversationId, queryId ?? "", ordinal, !closed)) return;
     const summary = {
       ...existing,
       lastOrdinal: Math.max(existing.lastOrdinal, ordinal),
@@ -3695,6 +3715,21 @@ export function AccountApp({
           retireHiddenConversation(conversationId, apiConfig, identity);
           return;
         }
+        if (
+          (event.type === "completed" &&
+            terminalSnapshotIsSuperseded(conversationId, queryId, baseOrdinal + 1, true)) ||
+          (event.type === "failed" &&
+            event.recordStatus === "failed" &&
+            terminalSnapshotIsSuperseded(
+              conversationId,
+              event.queryId ?? queryId,
+              baseOrdinal + 1,
+              event.canContinue ?? false,
+            ))
+        ) {
+          void selectConversation(conversationId);
+          return;
+        }
         const before = chatScreenStateRef.current;
         if (event.type === "accepted") {
           serverConfirmedConversationIdsRef.current.add(conversationId);
@@ -3810,6 +3845,19 @@ export function AccountApp({
         ) {
           retireHiddenConversation(conversationId, apiConfig, identity);
           return;
+        }
+        if (
+          !("version" in result) &&
+          (result.status === "completed" ||
+            (result.status === "failed" && result.recordStatus === "failed"))
+        ) {
+          const ordinal = result.status === "completed" ? result.ordinal : baseOrdinal + 1;
+          const terminalQueryId = result.queryId ?? queryId;
+          const canContinue = result.status === "completed" ? true : (result.canContinue ?? false);
+          if (terminalSnapshotIsSuperseded(conversationId, terminalQueryId, ordinal, canContinue)) {
+            void selectConversation(conversationId);
+            return;
+          }
         }
         const before = chatScreenStateRef.current;
         if ("version" in result) {
