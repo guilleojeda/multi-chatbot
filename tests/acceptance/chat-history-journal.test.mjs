@@ -395,12 +395,14 @@ describe("per-conversation recovery references", () => {
         label: "Conversación con journal retirado",
         lastOrdinal: 3,
         closed: false,
+        activeQueryId: firstQueryId,
       },
       {
         conversationId: secondConversationId,
         label: "Conversación con journal actual",
         lastOrdinal: 3,
         closed: false,
+        activeQueryId: secondQueryId,
       },
     ];
     const listHandler = async () => jsonResponse({ version: 1, conversations });

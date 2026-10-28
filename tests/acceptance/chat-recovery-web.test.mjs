@@ -353,6 +353,7 @@ function createEnvironment({
           label: historyMeta.label,
           lastOrdinal: historyMeta.lastOrdinal,
           closed: historyMeta.closed,
+          ...(historyMeta.activeQueryId ? { activeQueryId: historyMeta.activeQueryId } : {}),
         });
       }
       if (!historySnapshot) return jsonResponse({ code: "CONVERSATION_UNAVAILABLE" }, 404);
@@ -362,15 +363,18 @@ function createEnvironment({
           version: 1,
           conversationId: historySnapshot.conversationId,
           throughOrdinal: historySnapshot.ordinal,
-          closed: false,
-          canContinue: true,
+          closed: historySnapshot.closed ?? false,
+          canContinue: historySnapshot.canContinue ?? true,
           turns: [
             {
               ordinal: historySnapshot.ordinal,
               queryId: historySnapshot.queryId,
-              status: "completed",
+              status: historySnapshot.status ?? "completed",
               questionManifest: { count: 1, complete: true },
-              answerManifest: { count: 1, complete: true },
+              answerManifest: {
+                count: 1,
+                complete: (historySnapshot.status ?? "completed") === "completed",
+              },
               cursor: 1,
             },
           ],
@@ -782,10 +786,22 @@ describe("the chat recovery journal and restored submission", () => {
     let pollCount = 0;
     const restored = createEnvironment({
       storage,
-      historyMeta: confirmedHistoryMeta(admittedRequest.conversationId, {
-        label: originalQuestion,
-        lastOrdinal: admittedRequest.baseOrdinal + 1,
-      }),
+      historyMeta: {
+        ...confirmedHistoryMeta(admittedRequest.conversationId, {
+          label: originalQuestion,
+          lastOrdinal: admittedRequest.baseOrdinal + 1,
+        }),
+        activeQueryId: admittedRequest.queryId,
+      },
+      historySnapshot: {
+        conversationId: admittedRequest.conversationId,
+        ordinal: admittedRequest.baseOrdinal + 1,
+        queryId: admittedRequest.queryId,
+        question: originalQuestion,
+        answer: "Prefijo durable.",
+        status: "in_progress",
+        canContinue: false,
+      },
       recoverHandler: (request) => {
         pollCount += 1;
         if (pollCount === 1) {
