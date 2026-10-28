@@ -1793,9 +1793,6 @@ export function AccountApp({
 
   function showReferenceVerificationError(conversationId: string, message: string) {
     if (hiddenConversationIdsRef.current.has(conversationId)) return;
-    if (historyOpeningContextRef.current?.conversationId === conversationId) {
-      historyOpeningContextRef.current = null;
-    }
     localConversationsRef.current.delete(conversationId);
     if (chatPendingConversationOpenRef.current?.conversationId === conversationId) {
       chatPendingConversationOpenRef.current = null;
@@ -1803,6 +1800,18 @@ export function AccountApp({
     const current = chatScreenStateRef.current;
     const history = current.history ?? emptyHistoryState();
     const selected = history.selectedConversationId === conversationId;
+    const opening = history.openingConversationId === conversationId;
+    const openContext = historyOpeningContextRef.current;
+    const restoreOpeningContext =
+      opening &&
+      !selected &&
+      openContext?.conversationId === conversationId &&
+      openContext.selectedConversationId === history.selectedConversationId
+        ? openContext
+        : null;
+    if (historyOpeningContextRef.current?.conversationId === conversationId) {
+      historyOpeningContextRef.current = null;
+    }
     const conversations =
       history.removal?.conversationId === conversationId
         ? history.conversations
@@ -1831,11 +1840,24 @@ export function AccountApp({
         conversations,
         loadingMore: false,
         selectedConversationId: selected ? null : history.selectedConversationId,
-        turnsStatus: selected ? "idle" : history.turnsStatus,
+        turnsStatus: selected
+          ? "idle"
+          : opening
+            ? (restoreOpeningContext?.turnsStatus ??
+              (history.selectedConversationId
+                ? history.turns.length > 0
+                  ? "ready"
+                  : "idle"
+                : "idle"))
+            : history.turnsStatus,
         turns: selected ? [] : history.turns,
         turnsNextCursor: selected ? null : history.turnsNextCursor,
         openingConversationId: undefined,
-        turnsError: selected ? undefined : history.turnsError,
+        turnsError: selected
+          ? undefined
+          : opening
+            ? restoreOpeningContext?.turnsError
+            : history.turnsError,
       },
     });
   }
