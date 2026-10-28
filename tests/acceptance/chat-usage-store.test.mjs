@@ -977,8 +977,6 @@ describe("the DynamoDB usage and submission store adapter", () => {
       if (claims === 2) throw conditionalFailure();
       return {};
     });
-    const { documentClient, store } = makeStore(send);
-    const claimInvocation = requireMethod(store, "claimInvocation");
     const claim = {
       conversationId,
       ordinal: 2,
@@ -986,6 +984,9 @@ describe("the DynamoDB usage and submission store adapter", () => {
       ownerAttemptId: "attempt-a",
       now: Date.parse("2026-10-22T02:31:00.000Z"),
     };
+    // Storage transition timestamps use the adapter clock after their read.
+    const { documentClient, store } = makeStore(send, () => claim.now);
+    const claimInvocation = requireMethod(store, "claimInvocation");
 
     await expect(claimInvocation(claim)).resolves.toBe(true);
     await expect(claimInvocation({ ...claim, ownerAttemptId: "attempt-b" })).resolves.toBe(false);
@@ -1058,7 +1059,9 @@ describe("the DynamoDB usage and submission store adapter", () => {
   });
 
   it("completes a turn and releases its conversation reservation in one transaction", async () => {
-    const { documentClient, store } = makeStore();
+    const now = Date.parse("2026-10-22T02:50:00.000Z");
+    // Keep the adapter clock coherent with this fixed-time transition fixture.
+    const { documentClient, store } = makeStore(undefined, () => now);
     const completeTurn = requireMethod(store, "completeTurn");
 
     await completeTurn({
@@ -1066,7 +1069,7 @@ describe("the DynamoDB usage and submission store adapter", () => {
       ordinal: 2,
       queryId,
       ownerAttemptId: "attempt-a",
-      now: Date.parse("2026-10-22T02:50:00.000Z"),
+      now,
       answerManifest: { count: 2, complete: true },
     });
 

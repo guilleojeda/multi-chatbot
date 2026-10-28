@@ -702,6 +702,150 @@ describe("chat Runtime implementation regressions", () => {
     }
   });
 
+  it("does not report completion when its durable reads cross the result deadline", async () => {
+    const admittedAt = Date.parse("2026-10-19T16:00:00.000Z");
+    let clockNow = admittedAt;
+    let deadline;
+    let completionNow;
+    let runtimeState;
+    let readCount = 0;
+    const readsStarted = deferred();
+    const releaseReads = deferred();
+    const turn = {
+      pk: `CONV#${conversationId}`,
+      sk: "TURN#00000001",
+      conversationId,
+      queryId,
+      ordinal: 1,
+      status: "in_progress",
+      phase: "invocation_claimed",
+      ownerAttemptId: "pending",
+      resultDeadlineAt: admittedAt + 60 * 60 * 1000,
+      cursor: 1,
+      answerManifest: { count: 1, complete: false },
+    };
+    const meta = {
+      pk: `CONV#${conversationId}`,
+      sk: "META",
+      conversationId,
+      sub: "teacher-123",
+      botId: "bot-aurora",
+      lastOrdinal: 1,
+      closed: false,
+      activeQueryId: queryId,
+      activeOwnerAttemptId: "pending",
+    };
+    const documentClient = {
+      async send(command) {
+        if (command instanceof GetCommand) {
+          readCount += 1;
+          if (readCount === 2) readsStarted.resolve();
+          if (readCount <= 2) await releaseReads.promise;
+          if (command.input.Key.sk === "META") {
+            return { Item: readCount <= 2 ? meta : undefined };
+          }
+          return { Item: turn };
+        }
+        if (command instanceof TransactWriteCommand) {
+          const turnUpdate = command.input.TransactItems.find(
+            ({ Update }) => Update?.Key?.sk === turn.sk,
+          )?.Update;
+          const writeTime = turnUpdate?.ExpressionAttributeValues?.[":nowMs"];
+          if (typeof writeTime !== "number") {
+            throw new Error("Completion transaction omitted its deadline condition.");
+          }
+          if (writeTime >= deadline) {
+            throw Object.assign(new Error("Completion was past its deadline."), {
+              name: "ConditionalCheckFailedException",
+            });
+          }
+          return {};
+        }
+        throw new Error(`Unexpected command ${command.constructor.name}`);
+      },
+    };
+    const durableStore = createConversationStoreAdapter({
+      documentClient,
+      tableName: "chat-completion-deadline-regression",
+      now: () => clockNow,
+    });
+    const harness = makeHarness({
+      clock: () => clockNow,
+      generate: (input) =>
+        (async function* () {
+          yield { type: "text", text: "Respuesta durable." };
+          clockNow = input.resultDeadlineAt - 10;
+          yield { type: "result", stopReason: "end_turn" };
+        })(),
+      storeOverrides: (state) => {
+        runtimeState = state;
+        return {
+          async completeTurn(input) {
+            const submission = state.submissions.get(`teacher-123/bot-aurora/${queryId}`);
+            expect(submission).toBeDefined();
+            completionNow = input.now;
+            deadline = submission.resultDeadlineAt;
+            turn.resultDeadlineAt = deadline;
+            turn.ownerAttemptId = input.ownerAttemptId;
+            meta.activeOwnerAttemptId = input.ownerAttemptId;
+            return durableStore.completeTurn(input);
+          },
+        };
+      },
+    });
+    const eventsPromise = collect(request(harness));
+
+    try {
+      await readsStarted.promise;
+      expect(clockNow).toBe(deadline - 10);
+      expect(completionNow).toBe(deadline - 10);
+      clockNow = deadline + 10;
+      releaseReads.resolve();
+      const events = await eventsPromise;
+
+      expect(events.some(({ type }) => type === "completed")).toBe(false);
+      expect(events.at(-1)).toMatchObject({ type: "failed" });
+      expect(runtimeState.completed).toHaveLength(0);
+      expect(runtimeState.failed).toHaveLength(1);
+      expect(readCount).toBeGreaterThanOrEqual(3);
+    } finally {
+      releaseReads.resolve();
+    }
+  });
+
+  it("keeps an applied completion when its acknowledgement is lost after the deadline", async () => {
+    const admittedAt = Date.parse("2026-10-19T16:00:00.000Z");
+    let clockNow = admittedAt;
+    const harness = makeHarness({
+      clock: () => clockNow,
+      generate: () =>
+        (async function* () {
+          yield { type: "text", text: "Respuesta durable." };
+          yield { type: "result", stopReason: "end_turn" };
+        })(),
+      storeOverrides: (state) => ({
+        async completeTurn(input) {
+          const submission = state.submissions.get(`teacher-123/bot-aurora/${input.queryId}`);
+          expect(submission).toBeDefined();
+          submission.status = "completed";
+          submission.stage = "complete";
+          submission.canContinue = true;
+          submission.answerManifest = structuredClone(input.answerManifest);
+          clockNow = submission.resultDeadlineAt + 10;
+          throw new Error("completion acknowledgement timed out");
+        },
+      }),
+    });
+
+    const events = await collect(request(harness));
+
+    expect(clockNow).toBeGreaterThan(
+      harness.state.submissions.get(`teacher-123/bot-aurora/${queryId}`).resultDeadlineAt,
+    );
+    expect(events.at(-1)).toMatchObject({ type: "completed", queryId });
+    expect(harness.state.failed).toHaveLength(0);
+  });
+
   it("signals local provider cancellation at the deadline and closes without remote terminal evidence", async () => {
     const admittedAt = Date.parse("2026-10-19T16:00:00.000Z");
     const deadlineMs = 60 * 60 * 1000;

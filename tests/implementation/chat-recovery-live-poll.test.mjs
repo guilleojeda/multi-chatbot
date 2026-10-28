@@ -129,6 +129,38 @@ describe("chat recovery after an uncertain stream in the current view", () => {
         if (url === `/api/chat/conversations/${conversationId}`) {
           return confirmedMetadataResponse(url, init);
         }
+        if (url === `/api/chat/conversations/${conversationId}/turns`) {
+          return jsonResponse({
+            version: 1,
+            conversationId,
+            throughOrdinal: 1,
+            closed: false,
+            canContinue: false,
+            turns: [
+              {
+                ordinal: 1,
+                queryId,
+                status: "in_progress",
+                questionManifest: { count: 1, complete: true },
+                answerManifest: { count: 1, complete: false },
+                cursor: 1,
+              },
+            ],
+          });
+        }
+        if (url.startsWith(`/api/chat/conversations/${conversationId}/turns/1/text?`)) {
+          const textUrl = new URL(url, "https://app.invalid");
+          const role = textUrl.searchParams.get("role");
+          return jsonResponse({
+            version: 1,
+            conversationId,
+            ordinal: 1,
+            queryId,
+            role,
+            chunks: [{ index: 0, text: role === "user" ? question : "Prefijo durable." }],
+            complete: true,
+          });
+        }
         if (url === runtimeUrl()) {
           const actual = JSON.parse(String(init.body));
           requests.push(actual);

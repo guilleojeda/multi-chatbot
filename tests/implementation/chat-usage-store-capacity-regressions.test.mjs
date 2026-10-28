@@ -28,6 +28,14 @@ function transactionItems(command) {
   );
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 function makeHarness(records) {
   const send = vi.fn(async (command) => {
     if (command instanceof GetCommand) {
@@ -390,3 +398,202 @@ it("rejects a near-capacity turn with no references before sending its quota tra
     rejectionHarness.send.mock.calls.some(([command]) => command instanceof TransactWriteCommand),
   ).toBe(false);
 });
+
+const deadlineTransitionCases = [
+  {
+    name: "claimInvocation",
+    reads: 1,
+    phase: "admitted",
+    cursor: 0,
+    async run(store, input) {
+      return store.claimInvocation({
+        conversationId,
+        ordinal: 2,
+        queryId: queryIdFor(2),
+        ownerAttemptId: "attempt",
+        now: input.now,
+      });
+    },
+    timestamp(command) {
+      return command instanceof UpdateCommand
+        ? command.input.ExpressionAttributeValues?.[":nowMs"]
+        : undefined;
+    },
+    isTransition(command) {
+      return command instanceof UpdateCommand;
+    },
+  },
+  {
+    name: "appendChunk",
+    reads: 1,
+    phase: "invocation_claimed",
+    cursor: 0,
+    async run(store, input) {
+      return store.appendChunk({
+        conversationId,
+        ordinal: 2,
+        queryId: queryIdFor(2),
+        ownerAttemptId: "attempt",
+        role: "assistant",
+        index: 0,
+        text: "Respuesta durable.",
+        now: input.now,
+      });
+    },
+    timestamp(command) {
+      if (!(command instanceof TransactWriteCommand)) return undefined;
+      return transactionActions(command).find((action) => action.Update)?.Update
+        ?.ExpressionAttributeValues?.[":now"];
+    },
+    isTransition(command) {
+      return command instanceof TransactWriteCommand;
+    },
+  },
+  {
+    name: "completeTurn",
+    reads: 2,
+    phase: "invocation_claimed",
+    cursor: 1,
+    async run(store, input) {
+      return store.completeTurn({
+        conversationId,
+        ordinal: 2,
+        queryId: queryIdFor(2),
+        ownerAttemptId: "attempt",
+        now: input.now,
+        answerManifest: { count: 1, complete: true },
+      });
+    },
+    timestamp(command) {
+      if (!(command instanceof TransactWriteCommand)) return undefined;
+      return transactionActions(command).find((action) => action.Update)?.Update
+        ?.ExpressionAttributeValues?.[":nowMs"];
+    },
+    isTransition(command) {
+      return command instanceof TransactWriteCommand;
+    },
+  },
+];
+
+function deadlineTransitionHarness(testCase) {
+  const initialNow = Date.parse("2026-10-28T12:00:00.000Z");
+  const deadline = initialNow + 1_000;
+  let actualNow = initialNow;
+  let getCount = 0;
+  const readsStarted = deferred();
+  const releaseReads = deferred();
+  const turn = {
+    pk: `CONV#${conversationId}`,
+    sk: "TURN#00000002",
+    conversationId,
+    queryId: queryIdFor(2),
+    ordinal: 2,
+    status: "in_progress",
+    phase: testCase.phase,
+    ownerAttemptId: "attempt",
+    resultDeadlineAt: deadline,
+    cursor: testCase.cursor,
+    answerManifest: { count: testCase.cursor, complete: false },
+  };
+  const meta = {
+    pk: `CONV#${conversationId}`,
+    sk: "META",
+    conversationId,
+    sub: owner.sub,
+    botId: owner.botId,
+    lastOrdinal: 2,
+    closed: false,
+    activeQueryId: queryIdFor(2),
+    activeOwnerAttemptId: "attempt",
+  };
+  const records = new Map([
+    [keyId(turn), turn],
+    [keyId(meta), meta],
+  ]);
+  let appliedWrites = 0;
+  const send = vi.fn(async (command) => {
+    if (command instanceof GetCommand) {
+      getCount += 1;
+      if (getCount === testCase.reads) readsStarted.resolve();
+      await releaseReads.promise;
+      return { Item: records.get(keyId(command.input.Key)) };
+    }
+    if (testCase.isTransition(command)) {
+      const writeTime = testCase.timestamp(command);
+      if (writeTime === undefined) throw new Error("Transition omitted its deadline timestamp.");
+      if (writeTime >= deadline) {
+        throw Object.assign(new Error("Deadline condition failed."), {
+          name: "ConditionalCheckFailedException",
+        });
+      }
+      appliedWrites += 1;
+      return {};
+    }
+    return {};
+  });
+  const store = createConversationStoreAdapter({
+    documentClient: { send },
+    tableName: "conversations",
+    now: () => actualNow,
+  });
+  return {
+    actualNow: (value) => {
+      actualNow = value;
+    },
+    appliedWrites: () => appliedWrites,
+    deadline,
+    initialNow,
+    readsStarted: readsStarted.promise,
+    releaseReads: () => releaseReads.resolve(),
+    send,
+    store,
+    testCase,
+  };
+}
+
+for (const testCase of deadlineTransitionCases) {
+  it(`${testCase.name} remains allowed when its own reads finish before the deadline`, async () => {
+    const harness = deadlineTransitionHarness(testCase);
+    const transition = testCase.run(harness.store, { now: harness.initialNow });
+
+    await harness.readsStarted;
+    const writeTime = harness.deadline - 1;
+    harness.actualNow(writeTime);
+    harness.releaseReads();
+    if (testCase.name === "claimInvocation") {
+      await expect(transition).resolves.toBe(true);
+    } else {
+      await expect(transition).resolves.toBeUndefined();
+    }
+
+    const command = harness.send.mock.calls
+      .map(([sent]) => sent)
+      .find((sent) => testCase.isTransition(sent));
+    expect(command).toBeTruthy();
+    expect(testCase.timestamp(command)).toBe(writeTime);
+    expect(harness.appliedWrites()).toBe(1);
+  });
+
+  it(`${testCase.name} cannot persist when its own reads cross the deadline`, async () => {
+    const harness = deadlineTransitionHarness(testCase);
+    const transition = testCase.run(harness.store, { now: harness.initialNow });
+
+    await harness.readsStarted;
+    const writeTime = harness.deadline + 10;
+    harness.actualNow(writeTime);
+    harness.releaseReads();
+
+    if (testCase.name === "claimInvocation") {
+      await expect(transition).resolves.toBe(false);
+    } else {
+      await expect(transition).rejects.toThrow();
+    }
+    const commands = harness.send.mock.calls.map(([sent]) => sent);
+    const transitionCommands = commands.filter((sent) => testCase.isTransition(sent));
+    expect(transitionCommands.length).toBeLessThanOrEqual(1);
+    if (transitionCommands.length === 1) {
+      expect(testCase.timestamp(transitionCommands[0])).toBe(writeTime);
+    }
+    expect(harness.appliedWrites()).toBe(0);
+  });
+}
