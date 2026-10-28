@@ -98,6 +98,74 @@ const continuation = {
   invocation: { modelId: "global.anthropic.claude-sonnet-4-6", revision: "revision-123" },
 };
 
+function summaryContextHarness(sourceOrdinal) {
+  const summaryId = "e8f0feca-8714-421c-9152-5f229f5af829";
+  const summaryKey = `SUMMARY#${encodeURIComponent(summaryId)}#VERSION#1`;
+  const meta = {
+    pk: `CONV#${conversationId}`,
+    sk: "META",
+    conversationId,
+    sub: "teacher-123",
+    botId: "bot-aurora",
+    lastOrdinal: 1,
+    summary: { summaryId, throughOrdinal: 1 },
+  };
+  const summary = {
+    pk: `CONV#${conversationId}`,
+    sk: summaryKey,
+    conversationId,
+    sub: "teacher-123",
+    botId: "bot-aurora",
+    version: 1,
+    summaryId,
+    throughOrdinal: 1,
+    modelId: "global.anthropic.claude-sonnet-4-6",
+    revision: "summary-r1",
+    preparedAt: now,
+    inputTokens: 8,
+    textManifest: { count: 1, complete: true },
+    sourceReferences: [{ ordinal: 1, queryId: queryIds[0] }],
+  };
+  const summaryText = {
+    pk: `CONV#${conversationId}`,
+    sk: `${summaryKey}#TEXT#00000000`,
+    conversationId,
+    sub: "teacher-123",
+    botId: "bot-aurora",
+    summaryId,
+    version: 1,
+    index: 0,
+    text: "Resumen durable de la conversación.",
+  };
+  const sourceTurn = completedTurn(1, queryIds[0], { ordinal: sourceOrdinal });
+  const documentClient = {
+    send: vi.fn(async (command) => {
+      if (command instanceof GetCommand) {
+        const item =
+          command.input.Key.sk === "META"
+            ? meta
+            : command.input.Key.sk === summaryKey
+              ? summary
+              : command.input.Key.sk === "TURN#00000001"
+                ? sourceTurn
+                : undefined;
+        return { Item: item };
+      }
+      if (command instanceof QueryCommand) {
+        if (command.input.ExpressionAttributeValues[":prefix"] === `${summaryKey}#TEXT#`) {
+          return { Items: [summaryText] };
+        }
+      }
+      throw new Error(`Unexpected document operation: ${command.constructor.name}`);
+    }),
+  };
+  const store = createConversationStoreAdapter({
+    documentClient,
+    tableName: "conversations-aurora-dev",
+  });
+  return { documentClient, store };
+}
+
 describe("conversation context references", () => {
   it("records an explicitly empty context for the first turn", async () => {
     const documentClient = { send: vi.fn(async () => ({})) };
@@ -352,5 +420,41 @@ describe("conversation context references", () => {
     await expect(store.readContext({ conversationId })).rejects.toThrow(
       /incomplete reference manifest/,
     );
+  });
+
+  it("reads a current summary whose source turn has a numeric ordinal without loading its originals", async () => {
+    const { documentClient, store } = summaryContextHarness(1);
+
+    const context = await store.readContext({ conversationId });
+
+    expect(context.summary).toMatchObject({
+      summaryId: "e8f0feca-8714-421c-9152-5f229f5af829",
+      throughOrdinal: 1,
+      sourceReferences: [{ ordinal: 1, queryId: queryIds[0] }],
+    });
+    const commands = documentClient.send.mock.calls.map(([command]) => command);
+    expect(
+      commands.filter((command) => command instanceof GetCommand).map(({ input }) => input.Key.sk),
+    ).toEqual(["META", "SUMMARY#e8f0feca-8714-421c-9152-5f229f5af829#VERSION#1", "TURN#00000001"]);
+    expect(
+      commands
+        .filter((command) => command instanceof QueryCommand)
+        .map(({ input }) => input.ExpressionAttributeValues[":prefix"]),
+    ).toEqual(["SUMMARY#e8f0feca-8714-421c-9152-5f229f5af829#VERSION#1#TEXT#"]);
+  });
+
+  it("rejects a current summary whose source turn ordinal is stored as a string", async () => {
+    const { documentClient, store } = summaryContextHarness("1");
+
+    await expect(store.readContext({ conversationId })).rejects.toThrow(
+      /summary source turns are malformed/,
+    );
+    expect(
+      documentClient.send.mock.calls.some(
+        ([command]) =>
+          command instanceof QueryCommand &&
+          command.input.ExpressionAttributeValues[":prefix"].startsWith("TURN#"),
+      ),
+    ).toBe(false);
   });
 });

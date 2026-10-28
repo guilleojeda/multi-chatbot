@@ -1803,9 +1803,12 @@ export function AccountApp({
     const current = chatScreenStateRef.current;
     const history = current.history ?? emptyHistoryState();
     const selected = history.selectedConversationId === conversationId;
-    const conversations = history.conversations.filter(
-      (conversation) => conversation.conversationId !== conversationId,
-    );
+    const conversations =
+      history.removal?.conversationId === conversationId
+        ? history.conversations
+        : history.conversations.filter(
+            (conversation) => conversation.conversationId !== conversationId,
+          );
     setChat({
       ...current,
       ...(selected
@@ -2360,10 +2363,19 @@ export function AccountApp({
             (conversation) => conversation.conversationId === selectedConversationId,
           )
         : undefined;
+      const removalConversation = currentHistory.removal
+        ? currentHistory.conversations.find(
+            (conversation) =>
+              conversation.conversationId === currentHistory.removal?.conversationId,
+          )
+        : undefined;
       const existing = retryFromStart
-        ? selectedConversation
-          ? [selectedConversation]
-          : []
+        ? [
+            ...(selectedConversation ? [selectedConversation] : []),
+            ...(removalConversation && removalConversation.conversationId !== selectedConversationId
+              ? [removalConversation]
+              : []),
+          ]
         : currentHistory.conversations;
       const conversations = mergeHistoryConversations(
         localConversationsRef.current,

@@ -473,7 +473,7 @@ export function createContextStorage(input: {
     );
     const byOrdinal = new Map<number, Record<string, unknown>>();
     for (const row of rows) {
-      const ordinal = Number(row.ordinal);
+      const ordinal = row.ordinal;
       if (
         row.pk !== `CONV#${conversationId}` ||
         row.sk !== `TURN#${String(ordinal).padStart(8, "0")}` ||
