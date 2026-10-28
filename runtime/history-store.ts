@@ -126,7 +126,7 @@ function validMeta(value: unknown, id: string): value is Meta {
     typeof value.sub === "string" &&
     typeof value.botId === "string" &&
     positive(value.lastOrdinal) &&
-    (value.closed === undefined || typeof value.closed === "boolean") &&
+    typeof value.closed === "boolean" &&
     (value.activeQueryId === undefined || typeof value.activeQueryId === "string")
   );
 }
@@ -275,7 +275,7 @@ export function createHistoryStore(input: {
       ...(isVerifiedTimestamp(meta.createdAt) ? { createdAt: meta.createdAt } : {}),
       ...(updatedAt ? { updatedAt } : {}),
       lastOrdinal: meta.lastOrdinal,
-      closed: meta.closed === true,
+      closed: meta.closed,
       ...(typeof meta.activeQueryId === "string" ? { activeQueryId: meta.activeQueryId } : {}),
     };
   }
@@ -719,7 +719,7 @@ export function createHistoryStore(input: {
       ...(isVerifiedTimestamp(currentMeta.createdAt) ? { createdAt: currentMeta.createdAt } : {}),
       ...(updatedAt ? { updatedAt } : {}),
       throughOrdinal,
-      closed: currentMeta.closed === true,
+      closed: currentMeta.closed,
       canContinue: descriptors.some(
         (turn) =>
           turn.ordinal === throughOrdinal &&

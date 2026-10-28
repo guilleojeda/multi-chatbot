@@ -108,6 +108,7 @@ function summaryContextHarness(sourceOrdinal) {
     sub: "teacher-123",
     botId: "bot-aurora",
     lastOrdinal: 1,
+    closed: false,
     summary: { summaryId, throughOrdinal: 1 },
   };
   const summary = {
@@ -244,6 +245,7 @@ describe("conversation context references", () => {
       sub: "teacher-123",
       botId: "bot-aurora",
       lastOrdinal: 3,
+      closed: false,
     };
     const documentClient = {
       send: vi.fn(async (command) =>
@@ -311,6 +313,7 @@ describe("conversation context references", () => {
       sub: "teacher-123",
       botId: "bot-aurora",
       lastOrdinal: 7000,
+      closed: false,
     };
     const documentClient = {
       send: vi.fn(async (command) =>
@@ -394,6 +397,7 @@ describe("conversation context references", () => {
       sub: "teacher-123",
       botId: "bot-aurora",
       lastOrdinal: 1,
+      closed: false,
     };
     const documentClient = {
       send: vi.fn(async (command) => {

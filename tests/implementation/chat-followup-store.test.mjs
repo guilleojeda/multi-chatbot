@@ -71,6 +71,7 @@ describe("continuation store ownership guard", () => {
       conversationId: turn.conversationId,
       sub: turn.sub,
       lastOrdinal: 3,
+      closed: false,
     };
     const documentClient = {
       send: vi.fn(async (command) =>
@@ -95,6 +96,7 @@ describe("continuation store ownership guard", () => {
       sub: turn.sub,
       botId: turn.botId,
       lastOrdinal: turn.baseOrdinal,
+      closed: false,
     };
     const documentClient = {
       send: vi.fn(async (command) =>
@@ -188,6 +190,7 @@ describe("continuation store ownership guard", () => {
       sub: turn.sub,
       botId: turn.botId,
       lastOrdinal: 4,
+      closed: false,
       activeQueryId: turn.queryId,
       activeOwnerAttemptId: "attempt-followup",
     };
@@ -311,6 +314,7 @@ describe("continuation store ownership guard", () => {
       sub: turn.sub,
       botId: turn.botId,
       lastOrdinal: turn.baseOrdinal,
+      closed: false,
     };
     const dailyKey = {
       pk: `USER#${turn.sub}#BOT#${turn.botId}`,
@@ -411,6 +415,7 @@ describe("continuation store ownership guard", () => {
         sub: turn.sub,
         botId: turn.botId,
         lastOrdinal: 4,
+        closed: false,
         activeQueryId: turn.queryId,
         activeOwnerAttemptId: turn.ownerAttemptId,
       };
