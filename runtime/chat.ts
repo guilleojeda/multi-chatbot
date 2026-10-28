@@ -1396,7 +1396,7 @@ async function recoverSnapshot(
       }
       submission = latest;
     } catch {
-      return safeFailure("temporarily_unavailable", "not_admitted", request.queryId);
+      return safeFailure("temporarily_unavailable", "unconfirmed", request.queryId);
     }
     const reconciledVisibilityFailure = await snapshotVisibilityFailure(submission, owner, store);
     if (reconciledVisibilityFailure) return reconciledVisibilityFailure;

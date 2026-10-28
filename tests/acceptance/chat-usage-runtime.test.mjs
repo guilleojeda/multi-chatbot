@@ -1313,6 +1313,206 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps an expired recovery unconfirmed when reconciliation times out before applying", async () => {
+    const harness = makeHarness();
+    await collectEvents(invoke(harness.handler, startPayload()));
+    const submission = harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }));
+    submission.status = "in_progress";
+    submission.answer = "Prefijo durable.";
+    submission.canContinue = false;
+    harness.state.metaByConversation.get(conversationId).activeQueryId = queryId;
+    harness.state.now = submission.resultDeadlineAt;
+    const auxiliaryReadsBefore = harness.state.calls.filter(([name]) =>
+      ["getProfile", "readContext"].includes(name),
+    ).length;
+    harness.store.reconcileTurn.mockImplementationOnce(async () => {
+      throw new Error("reconciliation timed out before applying");
+    });
+
+    const uncertain = await invoke(harness.handler, {
+      version: 2,
+      operation: "recover",
+      conversationId,
+      queryId,
+    });
+
+    expect(uncertain).toMatchObject({
+      type: "failed",
+      code: "temporarily_unavailable",
+      recordStatus: "unconfirmed",
+      queryId,
+    });
+    expect(harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }))).toMatchObject({
+      status: "in_progress",
+      question: startPayload().text,
+      answer: "Prefijo durable.",
+    });
+    expect(harness.state.metaByConversation.get(conversationId).activeQueryId).toBe(queryId);
+
+    const recovered = await invoke(harness.handler, {
+      version: 2,
+      operation: "recover",
+      conversationId,
+      queryId,
+    });
+
+    expect(recovered).toMatchObject({
+      version: 2,
+      conversationId,
+      queryId,
+      status: "failed",
+      question: startPayload().text,
+      answer: "Prefijo durable.",
+      canContinue: false,
+    });
+    expect(harness.store.reconcileTurn).toHaveBeenCalledTimes(2);
+    expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.continueTurn).not.toHaveBeenCalled();
+    expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
+    expect(harness.store.readQuota).toHaveBeenCalledTimes(1);
+    expect(
+      harness.state.calls.filter(([name]) => ["getProfile", "readContext"].includes(name)),
+    ).toHaveLength(auxiliaryReadsBefore);
+    expect(harness.state.providerCalls).toBe(1);
+  });
+
+  it("keeps an applied reconciliation unconfirmed when its acknowledgement times out", async () => {
+    const harness = makeHarness();
+    await collectEvents(invoke(harness.handler, startPayload()));
+    const submission = harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }));
+    submission.status = "in_progress";
+    submission.answer = "Prefijo durable.";
+    submission.canContinue = false;
+    harness.state.metaByConversation.get(conversationId).activeQueryId = queryId;
+    harness.state.now = submission.resultDeadlineAt;
+    const auxiliaryReadsBefore = harness.state.calls.filter(([name]) =>
+      ["getProfile", "readContext"].includes(name),
+    ).length;
+    const reconcile = harness.store.reconcileTurn.getMockImplementation();
+    harness.store.reconcileTurn.mockImplementationOnce(async (input) => {
+      await reconcile(input);
+      throw new Error("reconciliation acknowledgement timed out");
+    });
+
+    const uncertain = await invoke(harness.handler, {
+      version: 2,
+      operation: "recover",
+      conversationId,
+      queryId,
+    });
+
+    expect(uncertain).toMatchObject({
+      type: "failed",
+      code: "temporarily_unavailable",
+      recordStatus: "unconfirmed",
+      queryId,
+    });
+    expect(harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }))).toMatchObject({
+      status: "failed",
+      question: startPayload().text,
+      answer: "Prefijo durable.",
+      canContinue: false,
+    });
+    expect(harness.state.metaByConversation.get(conversationId)).toMatchObject({ closed: true });
+
+    const recovered = await invoke(harness.handler, {
+      version: 2,
+      operation: "recover",
+      conversationId,
+      queryId,
+    });
+
+    expect(recovered).toMatchObject({
+      version: 2,
+      conversationId,
+      queryId,
+      status: "failed",
+      question: startPayload().text,
+      answer: "Prefijo durable.",
+      canContinue: false,
+    });
+    expect(harness.store.reconcileTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.continueTurn).not.toHaveBeenCalled();
+    expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
+    expect(harness.store.readQuota).toHaveBeenCalledTimes(1);
+    expect(
+      harness.state.calls.filter(([name]) => ["getProfile", "readContext"].includes(name)),
+    ).toHaveLength(auxiliaryReadsBefore);
+    expect(harness.state.providerCalls).toBe(1);
+  });
+
+  it("keeps reconciliation unconfirmed when the post-reconcile submission lookup fails", async () => {
+    const harness = makeHarness();
+    await collectEvents(invoke(harness.handler, startPayload()));
+    const submission = harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }));
+    submission.status = "in_progress";
+    submission.answer = "Prefijo durable.";
+    submission.canContinue = false;
+    harness.state.metaByConversation.get(conversationId).activeQueryId = queryId;
+    harness.state.now = submission.resultDeadlineAt;
+    const auxiliaryReadsBefore = harness.state.calls.filter(([name]) =>
+      ["getProfile", "readContext"].includes(name),
+    ).length;
+    const getSubmission = harness.store.getSubmission.getMockImplementation();
+    let failedPostReconcileLookup = false;
+    harness.store.getSubmission.mockImplementation(async (input) => {
+      if (harness.store.reconcileTurn.mock.calls.length > 0 && !failedPostReconcileLookup) {
+        failedPostReconcileLookup = true;
+        throw new Error("post-reconcile submission lookup timed out");
+      }
+      return getSubmission(input);
+    });
+
+    const uncertain = await invoke(harness.handler, {
+      version: 2,
+      operation: "recover",
+      conversationId,
+      queryId,
+    });
+
+    expect(uncertain).toMatchObject({
+      type: "failed",
+      code: "temporarily_unavailable",
+      recordStatus: "unconfirmed",
+      queryId,
+    });
+    expect(failedPostReconcileLookup).toBe(true);
+    expect(harness.state.submissions.get(keyOf({ sub: caller.sub, queryId }))).toMatchObject({
+      status: "failed",
+      question: startPayload().text,
+      answer: "Prefijo durable.",
+      canContinue: false,
+    });
+    expect(harness.state.metaByConversation.get(conversationId)).toMatchObject({ closed: true });
+
+    const recovered = await invoke(harness.handler, {
+      version: 2,
+      operation: "recover",
+      conversationId,
+      queryId,
+    });
+
+    expect(recovered).toMatchObject({
+      version: 2,
+      conversationId,
+      queryId,
+      status: "failed",
+      question: startPayload().text,
+      answer: "Prefijo durable.",
+      canContinue: false,
+    });
+    expect(harness.store.reconcileTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.store.continueTurn).not.toHaveBeenCalled();
+    expect(harness.store.claimInvocation).toHaveBeenCalledTimes(1);
+    expect(harness.store.readQuota).toHaveBeenCalledTimes(1);
+    expect(
+      harness.state.calls.filter(([name]) => ["getProfile", "readContext"].includes(name)),
+    ).toHaveLength(auxiliaryReadsBefore);
+    expect(harness.state.providerCalls).toBe(1);
+  });
+
   it("does not downgrade a completed record when the completion acknowledgement is ambiguous", async () => {
     const harness = makeHarness({
       storeOverrides: {
