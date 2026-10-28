@@ -49,12 +49,6 @@ function meta(id = conversationId, overrides = {}) {
   };
 }
 
-function legacyMeta(id) {
-  const item = meta(id, { activeQueryId: undefined, lastOrdinal: 2, historyLabel: "Geometría" });
-  delete item.closed;
-  return item;
-}
-
 function historyDescriptor(id, historyOrder = `0000#${id}`, scope = owner) {
   return {
     pk: `CONV#${id}`,
@@ -147,6 +141,26 @@ describe("the public DynamoDB history store", () => {
     expect(typeof createHistoryStore, "Expected exported createHistoryStore").toBe("function");
   });
 
+  it.each(["readConversationMeta", "listConversations"])(
+    "rejects current-format history META without its required closed field in %s",
+    async (method) => {
+      const missingClosedMeta = meta(conversationId);
+      delete missingClosedMeta.closed;
+      const send = vi.fn(async (command) => {
+        if (command instanceof QueryCommand) {
+          return { Items: [historyDescriptor(conversationId)] };
+        }
+        if (command instanceof GetCommand) return { Item: missingClosedMeta };
+        throw new Error(`Unexpected document operation: ${command.constructor.name}`);
+      });
+      const { store } = makeStore(send);
+
+      await expect(store[method]({ ...owner, conversationId, limit: 1 })).rejects.toMatchObject({
+        code: expect.stringMatching(/conversation_unavailable|history_unavailable/),
+      });
+    },
+  );
+
   it("lists GSI descriptors through consistent owned META reads", async () => {
     const firstId = conversationId;
     const staleForeignId = otherConversationId;
@@ -175,7 +189,14 @@ describe("the public DynamoDB history store", () => {
         }),
       ],
       [staleForeignId, meta(staleForeignId, { sub: "someone-else" })],
-      [secondId, legacyMeta(secondId)],
+      [
+        secondId,
+        meta(secondId, {
+          activeQueryId: undefined,
+          lastOrdinal: 2,
+          historyLabel: "Geometría",
+        }),
+      ],
     ]);
     const send = vi.fn(async (command) => {
       if (command instanceof QueryCommand) {

@@ -230,6 +230,7 @@ describe("the DynamoDB conversation store adapter", () => {
       conversationId,
       ...owner,
       lastOrdinal: 4,
+      closed: false,
     };
     const { documentClient, store } = makeStore(vi.fn().mockResolvedValue({ Item: meta }));
 
@@ -248,6 +249,28 @@ describe("the DynamoDB conversation store adapter", () => {
     });
   });
 
+  it.each(["getMeta", "readContext"])(
+    "rejects current-format META when the required closed field is missing in %s",
+    async (method) => {
+      const meta = {
+        pk: `CONV#${conversationId}`,
+        sk: "META",
+        conversationId,
+        ...owner,
+        lastOrdinal: 4,
+      };
+      const send = vi.fn(async (command) => {
+        if (command instanceof GetCommand) return { Item: meta };
+        if (command instanceof QueryCommand) return { Items: [] };
+        throw new Error(`Unexpected document operation: ${command.constructor.name}`);
+      });
+      const { store } = makeStore(send);
+
+      await expect(store[method]({ conversationId })).rejects.toBeInstanceOf(Error);
+      expect(send.mock.calls.some(([command]) => command instanceof QueryCommand)).toBe(false);
+    },
+  );
+
   it("reconstructs every completed exchange in order across all consistent query pages", async () => {
     const firstId = "c0a9cf23-5413-4f97-8f88-b976c9c4d6c1";
     const secondId = "fcdd5a71-b6db-4ad9-a2c3-934cb56fe749";
@@ -258,7 +281,7 @@ describe("the DynamoDB conversation store adapter", () => {
     const pages = [
       {
         Items: [
-          { pk: `CONV#${conversationId}`, sk: "META", ...owner, lastOrdinal: 4 },
+          { pk: `CONV#${conversationId}`, sk: "META", ...owner, lastOrdinal: 4, closed: false },
           turnRecord(1, firstId, {
             questionManifest: { count: 2, complete: true },
             answerManifest: { count: 2, complete: true },
@@ -302,6 +325,7 @@ describe("the DynamoDB conversation store adapter", () => {
       conversationId,
       ...owner,
       lastOrdinal: 4,
+      closed: false,
       activeQueryId: thirdId,
       activeOwnerAttemptId: "attempt-third",
     };
@@ -366,6 +390,7 @@ describe("the DynamoDB conversation store adapter", () => {
               conversationId,
               ...owner,
               lastOrdinal: 2,
+              closed: false,
               activeQueryId: pendingId,
               activeOwnerAttemptId: "attempt-pending",
             },
@@ -465,6 +490,7 @@ describe("the DynamoDB conversation store adapter", () => {
                 conversationId,
                 ...owner,
                 lastOrdinal: 1,
+                closed: false,
               },
             };
           }
@@ -498,6 +524,7 @@ describe("the DynamoDB conversation store adapter", () => {
       sk: "META",
       conversationId,
       ...owner,
+      closed: false,
     });
     expect(turn).toMatchObject({
       pk: `CONV#${conversationId}`,
@@ -655,6 +682,8 @@ describe("the DynamoDB conversation store adapter", () => {
     );
     expect(meta).toBeTruthy();
     expect(meta.ConditionExpression).toBeTruthy();
+    expect(meta.ConditionExpression).toContain("#closed = :false");
+    expect(meta.ConditionExpression).not.toMatch(/attribute_not_exists\(#closed\)/);
     expect(namedAttributes(meta).some((name) => /ordinal/i.test(name))).toBe(true);
     expect(expressionValues(meta)).toContain(expectedLastOrdinal);
     expect(turn).toMatchObject({
