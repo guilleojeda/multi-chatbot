@@ -595,6 +595,108 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
     expect(conversationRow(domState.document, secondLabel)).toBeDefined();
   });
 
+  it.each(["success", "transport error"])(
+    "lets B finish its own removal when A's POST returns a late %s after META hid A",
+    async (lateAOutcome) => {
+      const pendingA = deferred();
+      const pendingB = deferred();
+      const rows = historyRows();
+      const postedConversationIds = [];
+      let listAttempt = 0;
+      const env = makeEnvironment({
+        conversations: rows,
+        listHandler: async () =>
+          jsonResponse({
+            version: 1,
+            conversations: listAttempt++ === 0 ? rows : [rows[1]],
+          }),
+        metaHandler: async ({ conversationId }) =>
+          conversationId === firstConversationId
+            ? jsonResponse({ code: "CONVERSATION_HIDDEN" }, 404)
+            : jsonResponse(visibleMetadata(rows[1])),
+        hideHandler: ({ conversationId }) => {
+          postedConversationIds.push(conversationId);
+          return conversationId === firstConversationId ? pendingA.promise : pendingB.promise;
+        },
+        turnsHandler: async ({ conversationId }) =>
+          turnsPage(
+            conversationId,
+            conversationId === firstConversationId ? firstLabel : secondLabel,
+          ),
+        textHandler: async ({ conversationId, ordinal, url }) =>
+          textPage(conversationId, ordinal, url.searchParams.get("role")),
+      });
+      const app = await mount(env);
+
+      await selectConversation(app, secondLabel);
+      componentProps(app).onDraftChange("borrador de B");
+      await render(app);
+
+      await clickPhase8(actionButton(domState.document, firstLabel), app, domState);
+      await confirmHide(app);
+      expect(postedConversationIds).toEqual([firstConversationId]);
+      expect(statusText(domState.document, "Quitando…")).not.toBeNull();
+
+      await clickText(app, "Actualizar historial");
+      expect(listCalls(env)).toHaveLength(2);
+      expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
+      expect(conversationRow(domState.document, secondLabel)).toBeDefined();
+      expect(hideButtonFor(domState.document, secondLabel).disabled).toBe(false);
+      expect(statusText(domState.document, "Quitando…")).toBeUndefined();
+      expect(selectButton(domState.document, secondLabel).getAttribute("aria-current")).toBe(
+        "page",
+      );
+      expect(domState.document.querySelector("textarea")?.value).toBe("borrador de B");
+
+      await clickPhase8(actionButton(domState.document, secondLabel), app, domState);
+      expect(buttonByText(domState.document, "Quitar del historial")).toBeDefined();
+      await confirmHide(app);
+
+      // B must reach the server while A's original transport is still unresolved.
+      expect(postedConversationIds).toEqual([firstConversationId, secondConversationId]);
+      expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
+      expect(conversationRow(domState.document, secondLabel)).toBeDefined();
+      expect(hideButtonFor(domState.document, secondLabel).disabled).toBe(true);
+      expect(statusText(domState.document, "Quitando…")).not.toBeNull();
+      expect(statusText(domState.document, "Conversación quitada del historial.")).toBeNull();
+
+      if (lateAOutcome === "success") {
+        pendingA.resolve(
+          jsonResponse({ version: 1, conversationId: firstConversationId, hiddenAt }),
+        );
+      } else {
+        pendingA.reject(new TypeError("connection closed after the hide was committed"));
+      }
+      await render(app);
+
+      expect(postedConversationIds).toEqual([firstConversationId, secondConversationId]);
+      expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
+      expect(conversationRow(domState.document, secondLabel)).toBeDefined();
+      expect(hideButtonFor(domState.document, secondLabel).disabled).toBe(true);
+      expect(statusText(domState.document, "Quitando…")).not.toBeNull();
+      expect(statusText(domState.document, "Conversación quitada del historial.")).toBeNull();
+      expect(domState.document.querySelector('[role="alert"]')).toBeNull();
+      expect(selectButton(domState.document, secondLabel).getAttribute("aria-current")).toBe(
+        "page",
+      );
+      expect(domState.document.querySelector("textarea")?.value).toBe("borrador de B");
+
+      pendingB.resolve(
+        jsonResponse({ version: 1, conversationId: secondConversationId, hiddenAt }),
+      );
+      await render(app);
+
+      expect(postedConversationIds).toEqual([firstConversationId, secondConversationId]);
+      expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
+      expect(conversationRow(domState.document, secondLabel)).toBeUndefined();
+      expect(statusText(domState.document, "Conversación quitada del historial.")).not.toBeNull();
+      expect(hideCalls(env).map(({ conversationId }) => conversationId)).toEqual([
+        firstConversationId,
+        secondConversationId,
+      ]);
+    },
+  );
+
   it("does not let late opening or list responses resurrect a removed row or replace another selection", async () => {
     const lateTurns = deferred();
     const staleList = deferred();
