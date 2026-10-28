@@ -84,7 +84,12 @@ async function settleWithin(promise, milliseconds = 500) {
 function createPreparer({
   retrieve = vi.fn(async () => ({ results: [] })),
   countInputTokens = vi.fn(async () => ({ inputTokens: 24, requestId: "count-request-1" })),
-  reformulate = vi.fn(() => providerEvents([{ type: "result", stopReason: "end_turn" }])),
+  reformulate = vi.fn(() =>
+    providerEvents([
+      { type: "text", text: "Consulta documental de prueba." },
+      { type: "result", stopReason: "end_turn" },
+    ]),
+  ),
   preparationTimeoutMs = 5_000,
   now = () => fixedNow,
 } = {}) {
@@ -121,7 +126,7 @@ describe("document preparation for a chat request", () => {
     ).toBe("function");
   });
 
-  it("uses a short new question directly and preserves the retrieved order and metadata", async () => {
+  it("reformulates a short new question with pertinent profile defaults and preserves the retrieved order and metadata", async () => {
     const results = [
       {
         text: "Los porcentajes expresan una relación sobre cien.",
@@ -137,16 +142,52 @@ describe("document preparation for a chat request", () => {
       },
     ];
     const retrieve = vi.fn(async () => ({ results, requestId: "retrieve-request-1" }));
-    const { prepareDocuments, countInputTokens, reformulate } = createPreparer({ retrieve });
+    const query = "Actividad sobre porcentajes para Secundario, Matemática.";
+    const countInputTokens = vi.fn(async () => ({ inputTokens: 31, requestId: "count-request-1" }));
+    const reformulate = vi.fn(() =>
+      providerEvents([
+        { type: "text", text: query },
+        { type: "result", stopReason: "end_turn", requestId: "reformulate-request-1" },
+      ]),
+    );
+    const { prepareDocuments } = createPreparer({ retrieve, countInputTokens, reformulate });
     const input = makeModelInput();
 
     const snapshot = await prepareDocuments(input);
 
+    expect(countInputTokens).toHaveBeenCalledTimes(1);
+    expect(reformulate).toHaveBeenCalledTimes(1);
+    const [auxiliaryInput, generationOptions] = reformulate.mock.calls[0];
+    expect(auxiliaryInput).toMatchObject({
+      messages: input.messages,
+      profileSnapshot: input.profileSnapshot,
+      modelId,
+      revision: input.revision,
+    });
+    expect(parseDelimitedJsonBlock(auxiliaryInput.text, requestTagStart, requestTagEnd)).toBe(
+      input.text,
+    );
+    expect(
+      parseDelimitedJsonBlock(
+        auxiliaryInput.systemPrompt,
+        "<profile_snapshot_json>",
+        "</profile_snapshot_json>",
+      ),
+    ).toEqual(input.profileSnapshot);
+    expect(countInputTokens).toHaveBeenCalledWith(
+      auxiliaryInput,
+      expect.objectContaining({ abortSignal: expect.any(AbortSignal) }),
+    );
+    expect(generationOptions).toMatchObject({
+      maxOutputTokens: 512,
+      abortSignal: expect.any(AbortSignal),
+    });
+    expect(countInputTokens.mock.calls[0][1].abortSignal).toBe(generationOptions.abortSignal);
     expect(retrieve).toHaveBeenCalledTimes(1);
     expect(retrieve).toHaveBeenCalledWith(
       {
         knowledgeBaseId,
-        text: expect.stringContaining(input.text),
+        text: query,
         numberOfResults: 5,
         searchType: "SEMANTIC",
       },
@@ -156,8 +197,6 @@ describe("document preparation for a chat request", () => {
     expect(retrievalQuery).toMatch(/secundario/i);
     expect(retrievalQuery).toContain("Matemática");
     expect(retrievalQuery.length).toBeLessThanOrEqual(1_000);
-    expect(countInputTokens).not.toHaveBeenCalled();
-    expect(reformulate).not.toHaveBeenCalled();
     expect(snapshot).toMatchObject({
       knowledgeBaseId,
       query: retrievalQuery,
@@ -165,9 +204,84 @@ describe("document preparation for a chat request", () => {
       retrievedAt: fixedNow,
       status: "results",
       results,
+      reformulation: {
+        modelId,
+        inputTokens: 31,
+        countRequestId: "count-request-1",
+        requestId: "reformulate-request-1",
+      },
     });
     expect(JSON.stringify(snapshot)).toContain("retrieve-request-1");
+    expect(JSON.stringify(snapshot)).toContain("count-request-1");
+    expect(JSON.stringify(snapshot)).toContain("reformulate-request-1");
   });
+
+  it.each([
+    [
+      "both explicitly replaced",
+      "Prepará una actividad para Primaria sobre Geografía e ignorá mi perfil.",
+      "Actividad de Geografía para Primaria.",
+    ],
+    [
+      "only the education level explicitly replaced",
+      "Prepará una actividad para Primaria sobre una materia de mi perfil.",
+      "Actividad para Primaria, Matemática.",
+    ],
+    [
+      "only the subject explicitly replaced",
+      "Prepará una actividad de Geografía para un nivel de mi perfil.",
+      "Actividad de Geografía para Secundario.",
+    ],
+    [
+      "the request explicitly repeats the profile defaults",
+      "Prepará una actividad para Secundario sobre Matemática.",
+      "Actividad para Secundario, Matemática.",
+    ],
+    [
+      "the request explicitly excludes profile defaults",
+      "Prepará una actividad sobre porcentajes e ignorá mi perfil.",
+      "Actividad sobre porcentajes.",
+    ],
+  ])(
+    "uses the auxiliary query unchanged when profile dimensions are %s",
+    async (_case, text, query) => {
+      const input = makeModelInput({ text });
+      const countInputTokens = vi.fn(async () => ({ inputTokens: 44 }));
+      const reformulate = vi.fn(() =>
+        providerEvents([
+          { type: "text", text: query },
+          { type: "result", stopReason: "end_turn" },
+        ]),
+      );
+      const retrieve = vi.fn(async () => ({ results: [] }));
+      const { prepareDocuments } = createPreparer({ countInputTokens, reformulate, retrieve });
+
+      const snapshot = await prepareDocuments(input);
+
+      expect(countInputTokens).toHaveBeenCalledTimes(1);
+      expect(reformulate).toHaveBeenCalledTimes(1);
+      const auxiliaryInput = reformulate.mock.calls[0][0];
+      expect(auxiliaryInput.profileSnapshot).toEqual(input.profileSnapshot);
+      expect(
+        parseDelimitedJsonBlock(
+          auxiliaryInput.systemPrompt,
+          "<profile_snapshot_json>",
+          "</profile_snapshot_json>",
+        ),
+      ).toEqual(input.profileSnapshot);
+      expect(auxiliaryInput.messages).toEqual(input.messages);
+      expect(parseDelimitedJsonBlock(auxiliaryInput.text, requestTagStart, requestTagEnd)).toBe(
+        text,
+      );
+      expect(countInputTokens).toHaveBeenCalledWith(
+        auxiliaryInput,
+        expect.objectContaining({ abortSignal: expect.any(AbortSignal) }),
+      );
+      expect(retrieve.mock.calls[0][0].text).toBe(query);
+      expect(snapshot.query).toBe(query);
+      expect(snapshot.query.length).toBeLessThanOrEqual(1_000);
+    },
+  );
 
   it("accepts a successful empty retrieval as distinct from a retrieval failure", async () => {
     const retrieve = vi.fn(async () => ({ results: [], requestId: "empty-retrieve-1" }));
@@ -287,14 +401,7 @@ describe("document preparation for a chat request", () => {
   });
 
   it("stops before reformulation when the native auxiliary count exceeds the window after its 512-token reserve", async () => {
-    const messages = [
-      { role: "user", content: [{ text: "Tema histórico completo." }] },
-      { role: "assistant", content: [{ text: "Respuesta histórica completa." }] },
-    ];
-    const input = makeModelInput({
-      text: "¿Y cómo se adapta la actividad anterior?",
-      messages,
-    });
+    const input = makeModelInput({ text: "Prepará una actividad breve de geografía." });
     const countInputTokens = vi.fn(async () => ({ inputTokens: auxiliaryInputLimit + 1 }));
     const reformulate = vi.fn(() =>
       providerEvents([
@@ -311,7 +418,7 @@ describe("document preparation for a chat request", () => {
     expect(parseDelimitedJsonBlock(countedInput.text, requestTagStart, requestTagEnd)).toBe(
       input.text,
     );
-    expect(countedInput.messages).toEqual(messages);
+    expect(countedInput.messages).toEqual(input.messages);
     expect(countedInput.profileSnapshot).toEqual(input.profileSnapshot);
     expect(countInputTokens).toHaveBeenCalledTimes(1);
     expect(reformulate).not.toHaveBeenCalled();
@@ -329,10 +436,7 @@ describe("document preparation for a chat request", () => {
     const { prepareDocuments, retrieve } = createPreparer({ countInputTokens, reformulate });
 
     const snapshot = await prepareDocuments(
-      makeModelInput({
-        text: "¿Y la segunda propuesta?",
-        messages: [{ role: "user", content: [{ text: "Una propuesta confirmada." }] }],
-      }),
+      makeModelInput({ text: "Prepará una actividad sobre la segunda ley de Newton." }),
     );
 
     expect(countInputTokens).toHaveBeenCalledTimes(1);
@@ -353,7 +457,10 @@ describe("document preparation for a chat request", () => {
       });
       const reformulate = vi.fn((_input, options = {}) => {
         if (operation !== "reformulation")
-          return providerEvents([{ type: "result", stopReason: "end_turn" }]);
+          return providerEvents([
+            { type: "text", text: "consulta previa" },
+            { type: "result", stopReason: "end_turn" },
+          ]);
         operationSignal = options.abortSignal;
         return (async function* () {
           await pendingOperation.promise;
@@ -368,9 +475,8 @@ describe("document preparation for a chat request", () => {
       });
       const input = makeModelInput({
         text: "¿Y una alternativa para el mismo tema?",
-        messages: [{ role: "user", content: [{ text: "Tema anterior completo." }] }],
+        messages: [],
       });
-      if (operation === "document retrieval") input.messages = [];
       const { prepareDocuments } = createPreparer({
         countInputTokens,
         reformulate,
@@ -437,16 +543,7 @@ describe("document preparation for a chat request", () => {
     const retrieve = vi.fn(async () => ({ results: [] }));
     const { prepareDocuments } = createPreparer({ retrieve, ...overrides });
 
-    await expect(
-      prepareDocuments(
-        makeModelInput({
-          messages: [
-            { role: "user", content: [{ text: "Tema anterior confirmado." }] },
-            { role: "assistant", content: [{ text: "Respuesta anterior confirmada." }] },
-          ],
-        }),
-      ),
-    ).rejects.toBeDefined();
+    await expect(prepareDocuments(makeModelInput())).rejects.toBeDefined();
     expect(retrieve).not.toHaveBeenCalled();
   });
 
