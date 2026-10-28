@@ -658,7 +658,7 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
       expect(conversationRow(domState.document, secondLabel)).toBeDefined();
       expect(hideButtonFor(domState.document, secondLabel).disabled).toBe(true);
       expect(statusText(domState.document, "Quitando…")).not.toBeNull();
-      expect(statusText(domState.document, "Conversación quitada del historial.")).toBeNull();
+      expect(statusText(domState.document, "Conversación quitada del historial.")).toBeUndefined();
 
       if (lateAOutcome === "success") {
         pendingA.resolve(
@@ -674,7 +674,7 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
       expect(conversationRow(domState.document, secondLabel)).toBeDefined();
       expect(hideButtonFor(domState.document, secondLabel).disabled).toBe(true);
       expect(statusText(domState.document, "Quitando…")).not.toBeNull();
-      expect(statusText(domState.document, "Conversación quitada del historial.")).toBeNull();
+      expect(statusText(domState.document, "Conversación quitada del historial.")).toBeUndefined();
       expect(domState.document.querySelector('[role="alert"]')).toBeNull();
       expect(selectButton(domState.document, secondLabel).getAttribute("aria-current")).toBe(
         "page",
