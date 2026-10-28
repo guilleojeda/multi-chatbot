@@ -2377,8 +2377,8 @@ export function createConversationStoreAdapter(input: {
       now: number;
     }): Promise<boolean> {
       const key = turnKey(claim.conversationId, claim.ordinal);
-      const now = isoDate(claim.now);
       const current = await getItem(key);
+      const now = isoDate(claim.now);
       const projectedTurn = {
         ...(current ?? {
           ...key,
@@ -2421,6 +2421,9 @@ export function createConversationStoreAdapter(input: {
         },
       };
       preflight([claimUpdate], [projectedTurn]);
+      const writeNow = currentTime();
+      claimUpdate.Update.ExpressionAttributeValues[":now"] = isoDate(writeNow);
+      claimUpdate.Update.ExpressionAttributeValues[":nowMs"] = writeNow;
       try {
         await documentClient.send(new UpdateCommand(claimUpdate.Update));
         return true;
@@ -2514,6 +2517,12 @@ export function createConversationStoreAdapter(input: {
         update,
       ];
       preflight(actions, [output, projectedTurn]);
+      const writeNow = currentTime();
+      const writeAt = isoDate(writeNow);
+      output.createdAt = writeAt;
+      projectedTurn.updatedAt = writeAt;
+      update.Update.ExpressionAttributeValues[":updatedAt"] = writeAt;
+      update.Update.ExpressionAttributeValues[":now"] = writeNow;
       try {
         await documentClient.send(new TransactWriteCommand({ TransactItems: actions }));
       } catch (error) {
@@ -2648,6 +2657,14 @@ export function createConversationStoreAdapter(input: {
       };
       const actions = [turnUpdate, metaUpdate];
       preflight(actions, [projectedTurn, projectedMeta]);
+      const writeNow = currentTime();
+      const writeAt = isoDate(writeNow);
+      const refreshedHistoryUpdate = historyActivityUpdateParts(writeAt, turn.conversationId);
+      turnUpdate.Update.ExpressionAttributeValues[":now"] = writeAt;
+      turnUpdate.Update.ExpressionAttributeValues[":nowMs"] = writeNow;
+      metaUpdate.Update.ExpressionAttributeValues[":now"] = writeAt;
+      metaUpdate.Update.ExpressionAttributeValues[":historyOrder"] =
+        refreshedHistoryUpdate.values[":historyOrder"];
       try {
         await documentClient.send(new TransactWriteCommand({ TransactItems: actions }));
       } catch (error) {

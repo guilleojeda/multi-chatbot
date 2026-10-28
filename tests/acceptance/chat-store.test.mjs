@@ -771,7 +771,10 @@ describe("the DynamoDB conversation store adapter", () => {
   });
 
   it("commits terminal state with the conversation release and guards against a completed-turn downgrade", async () => {
-    const { documentClient, store } = makeStore();
+    // Keep the adapter clock coherent with the fixed completion timestamp below.
+    const { documentClient, store } = makeStore(undefined, () =>
+      Date.parse("2026-10-19T17:00:00.000Z"),
+    );
 
     await store.completeTurn({
       conversationId,
