@@ -116,6 +116,14 @@ function getKey(command) {
   return command.input.Key ?? {};
 }
 
+function decodeCursor(cursor) {
+  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+}
+
+function encodeCursor(cursor) {
+  return Buffer.from(JSON.stringify(cursor)).toString("base64url");
+}
+
 function expectNoPrivateFields(value) {
   expect(JSON.stringify(value)).not.toMatch(
     /profileSnapshot|profile|#DOCUMENT#|#CONTEXT#|documentContext|contextManifest|fingerprint|ownerAttemptId/i,
@@ -353,6 +361,11 @@ describe("the public DynamoDB history store", () => {
     });
     expect(first.turns.map(({ ordinal }) => ordinal)).toEqual([2, 3]);
     expect(typeof first.nextCursor).toBe("string");
+    expect(decodeCursor(first.nextCursor)).toMatchObject({
+      throughOrdinal: 3,
+      nextOrdinal: 1,
+      key: { pk: `CONV#${conversationId}`, sk: "TURN#00000002" },
+    });
     expectNoPrivateFields(first);
 
     const second = await store.readTurns({
@@ -387,6 +400,59 @@ describe("the public DynamoDB history store", () => {
       "TURN#00000001",
     ]);
     expect(sent.some((command) => JSON.stringify(command.input).includes("SEND#"))).toBe(false);
+  });
+
+  it.each([
+    [
+      "a turn-key suffix with the current previous-ordinal position",
+      (cursor) => {
+        cursor.key.sk += "#obsolete-fragment-key";
+      },
+    ],
+    [
+      "the key ordinal as nextOrdinal with an exact current turn key",
+      (cursor) => {
+        cursor.nextOrdinal = 2;
+      },
+    ],
+  ])("rejects a turn cursor containing %s", async (_label, mutate) => {
+    const savedTurns = new Map([
+      ["TURN#00000002", turn(2, queryIds[1])],
+      ["TURN#00000001", turn(1, queryIds[0])],
+    ]);
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) {
+        return {
+          Item:
+            command.input.Key.sk === "META"
+              ? meta(conversationId, { lastOrdinal: 2 })
+              : savedTurns.get(command.input.Key.sk),
+        };
+      }
+      throw new Error(`Unexpected document operation: ${command.constructor.name}`);
+    });
+    const { documentClient, store } = makeStore(send);
+    const first = await store.readTurns({ ...owner, conversationId, limit: 1 });
+    expect(first.turns.map(({ ordinal }) => ordinal)).toEqual([2]);
+    expect(first.nextCursor).toBeTypeOf("string");
+
+    const malformedCursor = decodeCursor(first.nextCursor);
+    mutate(malformedCursor);
+    const commandCount = commands(documentClient).length;
+
+    await expect(
+      store.readTurns({
+        ...owner,
+        conversationId,
+        limit: 1,
+        cursor: encodeCursor(malformedCursor),
+      }),
+    ).rejects.toMatchObject({ code: "invalid_cursor" });
+    expect(commands(documentClient).slice(commandCount)).toMatchObject([
+      expect.objectContaining({
+        input: expect.objectContaining({ Key: { pk: `CONV#${conversationId}`, sk: "META" } }),
+      }),
+    ]);
   });
 
   it("marks an open conversation with a completed latest turn as continuable", async () => {

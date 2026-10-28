@@ -232,6 +232,60 @@ function writeJournal(env, conversationId, { admitted = false, text = "borrador"
   return request;
 }
 
+async function beginUnconfirmedRemovalAfterRefresh() {
+  const pendingHide = deferred();
+  const rows = historyRows();
+  const server = { listIncludesA: false, metaAHidden: false };
+  const metadataReads = [];
+  let listAttempt = 0;
+  let hideAttempt = 0;
+  const env = makeEnvironment({
+    conversations: rows,
+    listHandler: async () =>
+      jsonResponse({
+        version: 1,
+        conversations: listAttempt++ === 0 || server.listIncludesA ? rows : [rows[1]],
+      }),
+    metaHandler: async ({ conversationId }) => {
+      metadataReads.push(conversationId);
+      if (conversationId === firstConversationId) {
+        return server.metaAHidden
+          ? jsonResponse({ code: "CONVERSATION_HIDDEN" }, 404)
+          : jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503);
+      }
+      return jsonResponse(visibleMetadata(rows[1]));
+    },
+    hideHandler: async ({ conversationId }) => {
+      hideAttempt += 1;
+      return hideAttempt === 1
+        ? pendingHide.promise
+        : jsonResponse({ version: 1, conversationId, hiddenAt });
+    },
+  });
+  const app = await mount(env);
+
+  await clickHideFor(app, env, firstLabel);
+  await confirmHide(app);
+  expect(hideAttempt).toBe(1);
+  await clickText(app, "Actualizar historial");
+  expect(listCalls(env)).toHaveLength(2);
+  expect(metadataReads).toContain(firstConversationId);
+
+  pendingHide.reject(new TypeError("connection lost after the server may have committed"));
+  await render(app);
+
+  return {
+    app,
+    env,
+    rows,
+    server,
+    metadataReads,
+    get hideAttempts() {
+      return hideAttempt;
+    },
+  };
+}
+
 beforeAll(async () => {
   const loaded = await (await import("../support/history-web-harness.mjs")).loadHistoryAccountApp();
   AccountApp = loaded.AccountApp;
@@ -383,6 +437,71 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
     expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
     expect(visibleHistoryState(app).selectedConversationId).toBeNull();
     expect(env.runtimeRequests).toHaveLength(0);
+  });
+
+  it("keeps an unselected removal reachable when refresh omits the row and META is unavailable", async () => {
+    const { app, env } = await beginUnconfirmedRemovalAfterRefresh();
+
+    expect(visibleHistoryState(app).removal).toMatchObject({
+      conversationId: firstConversationId,
+      status: "unconfirmed",
+    });
+    expect(conversationRow(domState.document, firstLabel)).toBeDefined();
+    expect(conversationRow(domState.document, secondLabel)).toBeDefined();
+    expect(domState.document.body.textContent).toContain("sigue en tu historial");
+    expect(hideButtonFor(domState.document, firstLabel)).toMatchObject({ disabled: false });
+    expect(hideButtonFor(domState.document, secondLabel)).toMatchObject({ disabled: true });
+    expect(
+      env.apiRequests.filter(
+        ({ method, conversationId }) => method === "GET" && conversationId === firstConversationId,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("retries the same unconfirmed removal and then allows removing another row", async () => {
+    const { app, env, hideAttempts } = await beginUnconfirmedRemovalAfterRefresh();
+
+    expect(hideAttempts).toBe(1);
+    await clickHideFor(app, env, firstLabel);
+    await confirmHide(app);
+
+    expect(hideCalls(env).map(({ conversationId }) => conversationId)).toEqual([
+      firstConversationId,
+      firstConversationId,
+    ]);
+    expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
+    expect(hideButtonFor(domState.document, secondLabel).disabled).toBe(false);
+
+    await clickHideFor(app, env, secondLabel);
+    await confirmHide(app);
+
+    expect(hideCalls(env).map(({ conversationId }) => conversationId)).toEqual([
+      firstConversationId,
+      firstConversationId,
+      secondConversationId,
+    ]);
+    expect(conversationRow(domState.document, secondLabel)).toBeUndefined();
+    expect(visibleHistoryState(app).removal).toBeUndefined();
+  });
+
+  it("confirms an uncertain removal when a later refresh sees hidden META and blocks stale resurrection", async () => {
+    const { app, env, server, metadataReads } = await beginUnconfirmedRemovalAfterRefresh();
+    server.metaAHidden = true;
+
+    await clickText(app, "Actualizar historial");
+
+    expect(
+      metadataReads.filter((conversationId) => conversationId === firstConversationId),
+    ).toHaveLength(2);
+    expect(visibleHistoryState(app).removal).toBeUndefined();
+    expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
+    expect(conversationRow(domState.document, secondLabel)).toBeDefined();
+
+    server.listIncludesA = true;
+    await clickText(app, "Actualizar historial");
+
+    expect(conversationRow(domState.document, firstLabel)).toBeUndefined();
+    expect(conversationRow(domState.document, secondLabel)).toBeDefined();
   });
 
   it("does not let late opening or list responses resurrect a removed row or replace another selection", async () => {
