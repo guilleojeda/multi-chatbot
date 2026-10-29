@@ -101,7 +101,7 @@ function fitsEnvelope(body: Record<string, unknown>): boolean {
   });
   return Buffer.byteLength(serialized, "utf8") + ENVELOPE_RESERVE <= MAX_BYTES;
 }
-function asStorageError(error: unknown, fallback: Code): Err {
+function asStorageError(error: unknown): Err {
   const codes: Code[] = [
     "invalid_cursor",
     "invalid_request",
@@ -115,7 +115,7 @@ function asStorageError(error: unknown, fallback: Code): Err {
     mapped.code = error.code as Code;
     return mapped;
   }
-  return fail(fallback, "Conversation history is temporarily unavailable.");
+  return fail("history_unavailable", "Conversation history is temporarily unavailable.");
 }
 function validMeta(value: unknown, id: string): value is Meta {
   return (
@@ -250,7 +250,7 @@ export function createHistoryStore(input: {
     try {
       meta = await baseStore.getMeta({ conversationId: id });
     } catch (error) {
-      throw asStorageError(error, "conversation_unavailable");
+      throw asStorageError(error);
     }
     if (!meta) throw fail("conversation_unavailable", "Conversation is unavailable.");
     if (meta.sub !== sub || meta.botId !== botId)
@@ -347,7 +347,7 @@ export function createHistoryStore(input: {
       ) {
         throw fail("conversation_unavailable", "Conversation is unavailable.");
       }
-      const mapped = asStorageError(error, "history_unavailable");
+      const mapped = asStorageError(error);
       if (error instanceof Error && mapped.code === "history_unavailable") {
         mapped.message = error.message;
       }
@@ -415,7 +415,7 @@ export function createHistoryStore(input: {
           }),
         );
       } catch (error) {
-        throw asStorageError(error, "history_unavailable");
+        throw asStorageError(error);
       }
       queryPages += 1;
       const candidates = Array.isArray(page.Items) ? page.Items.filter(isRecord) : [];
@@ -448,7 +448,7 @@ export function createHistoryStore(input: {
         try {
           meta = await baseStore.getMeta({ conversationId: id });
         } catch (error) {
-          throw asStorageError(error, "history_unavailable");
+          throw asStorageError(error);
         }
         // GSI updates are eventual; stale, hidden, and now-foreign projections are skipped.
         if (!meta || meta.sub !== scope.sub || meta.botId !== botId) continue;
@@ -568,7 +568,7 @@ export function createHistoryStore(input: {
         }),
       );
     } catch (error) {
-      throw asStorageError(error, "conversation_unavailable");
+      throw asStorageError(error);
     }
     const candidates = Array.isArray(remainder.Items) ? remainder.Items.filter(isRecord) : [];
     if (candidates.length > 1) {
@@ -630,7 +630,7 @@ export function createHistoryStore(input: {
           }),
         );
       } catch (error) {
-        throw asStorageError(error, "conversation_unavailable");
+        throw asStorageError(error);
       }
       if (!isRecord(result.Item)) {
         throw fail("conversation_unavailable", "Conversation history has a missing turn.");
@@ -679,7 +679,7 @@ export function createHistoryStore(input: {
             currentMeta = reconciled.meta;
             unconfirmable = !reconciled.confirmable;
           } catch (error) {
-            throw asStorageError(error, "conversation_unavailable");
+            throw asStorageError(error);
           }
           if (
             !validTurn(current, {
@@ -817,7 +817,7 @@ export function createHistoryStore(input: {
       );
       turn = isRecord(result.Item) ? result.Item : undefined;
     } catch (error) {
-      throw asStorageError(error, "conversation_unavailable");
+      throw asStorageError(error);
     }
     if (!turn) throw fail("conversation_unavailable", "Conversation turn is unavailable.");
     if (
@@ -891,7 +891,7 @@ export function createHistoryStore(input: {
           }),
         );
       } catch (error) {
-        throw asStorageError(error, "conversation_unavailable");
+        throw asStorageError(error);
       }
     }
 
