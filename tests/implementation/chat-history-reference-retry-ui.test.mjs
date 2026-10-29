@@ -3,8 +3,10 @@ import { createRoot } from "react-dom/client";
 import { JSDOM } from "jsdom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountApp } from "../../web/AccountApp.tsx";
+import { writePendingChatJournal } from "../../web/chat-journal.ts";
 import {
   createHistoryEnvironment,
+  deferred,
   jsonResponse,
   firstConversationId as A,
   secondConversationId as B,
@@ -57,7 +59,14 @@ function text({ conversationId, url }) {
   });
 }
 
-async function mount({ listHandler, metaHandler, session, identityHandler, profileHandler }) {
+async function mount({
+  listHandler,
+  metaHandler,
+  session,
+  identityHandler,
+  profileHandler,
+  beforeRender,
+}) {
   const environment = createHistoryEnvironment({
     listHandler,
     metaHandler,
@@ -85,6 +94,7 @@ async function mount({ listHandler, metaHandler, session, identityHandler, profi
   vi.stubGlobal("navigator", dom.window.navigator);
   vi.stubGlobal("FormData", dom.window.FormData);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  beforeRender?.(environment);
 
   const root = createRoot(document.getElementById("root"));
   const settle = async () => {
@@ -115,6 +125,9 @@ async function mount({ listHandler, metaHandler, session, identityHandler, profi
     document,
     async refresh() {
       await click('[aria-label="Actualizar historial"]');
+    },
+    async flush() {
+      await render();
     },
     async select(conversationId) {
       const element = [...document.querySelectorAll(".chat-history__item")].find((button) =>
@@ -147,6 +160,52 @@ afterEach(() => {
 });
 
 describe("reference verification retry in the real AccountApp DOM", () => {
+  it("does not restore an uncertain start body while META verification is pending or unavailable", async () => {
+    const body = "Contenido del inicio todavía no verificado";
+    const pendingMeta = deferred();
+    let metadataReads = 0;
+    const app = await mount({
+      listHandler: () => jsonResponse({ version: 1, conversations: [] }),
+      metaHandler: () => {
+        metadataReads += 1;
+        return metadataReads === 1 ? pendingMeta.promise : jsonResponse({ version: 1, ...rowA });
+      },
+      beforeRender(environment) {
+        writePendingChatJournal(environment.config, environment.identity, {
+          version: 2,
+          operation: "start",
+          conversationId: A,
+          queryId: QA,
+          baseOrdinal: 0,
+          text: body,
+        });
+      },
+    });
+    const { document } = app;
+
+    try {
+      expect(metadataReads).toBe(1);
+      expect(document.body.textContent).not.toContain(body);
+
+      pendingMeta.resolve(jsonResponse({ code: "HISTORY_UNAVAILABLE" }, 503));
+      await app.flush();
+
+      expect(document.body.textContent).not.toContain(body);
+      expect(document.body.textContent).toContain("No pudimos verificar una referencia");
+      expect(document.querySelectorAll(".chat-history__item")).toHaveLength(0);
+      expect(app.environment.runtimeRequests).toHaveLength(0);
+
+      await app.refresh();
+
+      expect(metadataReads).toBe(2);
+      expect(document.querySelectorAll(".chat-history__item")).toHaveLength(1);
+      expect(document.body.textContent).not.toContain(body);
+      expect(app.environment.runtimeRequests).toHaveLength(0);
+    } finally {
+      await app.dispose();
+    }
+  });
+
   it("rechecks a failed unselected reference and restores it only after visible META", async () => {
     let lists = 0;
     let metas = 0;

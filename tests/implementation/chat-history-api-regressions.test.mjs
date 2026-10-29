@@ -44,6 +44,16 @@ function textEvent() {
   };
 }
 
+function metaEvent() {
+  return {
+    rawPath: `/api/chat/conversations/${conversationId}`,
+    requestContext: {
+      http: { method: "GET" },
+      authorizer: { jwt: { claims: { sub, token_use: "access" } } },
+    },
+  };
+}
+
 function baseTurns(overrides = {}) {
   return {
     version: 1,
@@ -128,6 +138,59 @@ describe("chat history API presentation metadata regressions", () => {
       message: "No pudimos completar la solicitud.",
     });
   });
+});
+
+describe("conversation META verification failures", () => {
+  const visibleMeta = {
+    pk: `CONV#${conversationId}`,
+    sk: "META",
+    conversationId,
+    sub,
+    botId,
+    lastOrdinal: 1,
+    closed: false,
+    historyLabel: "Pregunta inicial",
+  };
+
+  it.each([
+    ["an operational GetItem failure", "operational", 503, "HISTORY_UNAVAILABLE"],
+    ["genuine absence", "missing", 404, "NOT_FOUND"],
+    ["an owned hidden conversation", "hidden", 404, "CONVERSATION_HIDDEN"],
+  ])(
+    "preserves %s as a distinct result through the real store and handler",
+    async (_name, scenario, status, code) => {
+      const send = vi.fn(async (command) => {
+        expect(command).toBeInstanceOf(GetCommand);
+        expect(command.input).toMatchObject({
+          Key: { pk: `CONV#${conversationId}`, sk: "META" },
+          ConsistentRead: true,
+        });
+        if (scenario === "operational") {
+          throw Object.assign(new Error("Rate exceeded"), {
+            name: "ProvisionedThroughputExceededException",
+          });
+        }
+        if (scenario === "missing") return {};
+        return { Item: { ...visibleMeta, hiddenAt: null } };
+      });
+      const store = createHistoryStore({
+        documentClient: { send },
+        tableName: "history-meta-api-test",
+        botId,
+      });
+      const handler = createChatHistoryHandler({
+        botId,
+        store,
+        getMembership: async () => true,
+      });
+
+      const response = await handler(metaEvent());
+
+      expect(response.statusCode).toBe(status);
+      expect(JSON.parse(response.body)).toMatchObject({ code });
+      expect(send).toHaveBeenCalledTimes(1);
+    },
+  );
 });
 
 describe("completed assistant text integrity regressions", () => {
