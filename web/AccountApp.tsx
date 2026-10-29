@@ -3653,9 +3653,9 @@ export function AccountApp({
       ...existing,
       lastOrdinal: Math.max(existing.lastOrdinal, ordinal),
       closed,
-      activeQueryId: undefined,
-      pending: undefined,
     };
+    delete summary.activeQueryId;
+    delete summary.pending;
     localConversationsRef.current.set(conversationId, summary);
     setHistory((current) => ({
       ...current,
