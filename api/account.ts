@@ -31,7 +31,7 @@ type Identity = {
   getUserByEmail(email: string): Promise<AccountUser | null>;
   getCaller(accessToken: string): Promise<Caller | null>;
   setPermanentPassword(input: { sub: string; password: string }): Promise<void>;
-  markEmailVerified(input: { sub: string }): Promise<void>;
+  markEmailVerified(input: { sub: string; email: string }): Promise<void>;
 };
 
 type Store = {
@@ -351,7 +351,7 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
 
     if (!user.emailVerified) {
       try {
-        await identity.markEmailVerified({ sub: invitation.sub });
+        await identity.markEmailVerified({ sub: invitation.sub, email: invitation.email });
       } catch {
         return safeFailure();
       }

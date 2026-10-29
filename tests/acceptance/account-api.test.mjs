@@ -109,14 +109,15 @@ function makeHarness({
       state.user.status = "CONFIRMED";
       state.user.password = password;
     },
-    async markEmailVerified({ sub }) {
-      state.calls.push(["markEmailVerified", sub]);
+    async markEmailVerified({ sub, email }) {
+      state.calls.push(["markEmailVerified", sub, email]);
       if (state.user.sub !== sub) throw new Error("Unexpected user sub");
       if (state.verificationFailure) {
         const failure = state.verificationFailure;
         state.verificationFailure = undefined;
         throw failure;
       }
+      state.user.email = email;
       state.user.emailVerified = true;
     },
   };
@@ -326,7 +327,7 @@ describe("the public account API", () => {
       expect(state.user.emailVerified).toBe(true);
       expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
       expect(state.calls).toContainEqual(["setPermanentPassword", "user-123", "Correct-Horse-42!"]);
-      expect(state.calls).toContainEqual(["markEmailVerified", "user-123"]);
+      expect(state.calls).toContainEqual(["markEmailVerified", "user-123", "teacher@example.test"]);
       expect(state.calls).toContainEqual([
         "useInvitationAndAddMember",
         "invite-1",
