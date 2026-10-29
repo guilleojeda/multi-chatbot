@@ -170,12 +170,15 @@ export function createCognitoIdentityAdapter(input: {
       );
     },
 
-    async markEmailVerified(input: { sub: string }): Promise<void> {
+    async markEmailVerified(input: { sub: string; email: string }): Promise<void> {
       await client.send(
         new AdminUpdateUserAttributesCommand({
           UserPoolId: userPoolId,
           Username: input.sub,
-          UserAttributes: [{ Name: "email_verified", Value: "true" }],
+          UserAttributes: [
+            { Name: "email", Value: input.email },
+            { Name: "email_verified", Value: "true" },
+          ],
         }),
       );
     },
