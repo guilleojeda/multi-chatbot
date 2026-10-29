@@ -4262,59 +4262,7 @@ export function AccountApp({
           return;
         }
         if (result.status === "completed") {
-          const admittedRequest = {
-            version: 2 as const,
-            operation,
-            conversationId,
-            queryId,
-            baseOrdinal,
-          };
-          try {
-            markChatJournalAdmitted(apiConfig, identity, admittedRequest, result.ordinal);
-          } catch {
-            // The in-memory result remains usable; the helper removes plaintext on failure.
-          }
-          const admittedJournal: ChatJournalEntry = {
-            request: admittedRequest,
-            admitted: true,
-            ordinal: result.ordinal,
-          };
-          chatJournalsRef.current.set(conversationId, admittedJournal);
-          clearChatJournalEntry(apiConfig, identity, conversationId);
-          chatJournalsRef.current.delete(conversationId);
-          chatJournalRef.current = null;
-          chatDraftsRef.current.set(conversationId, "");
-          const nextState: ChatScreenState = {
-            ...before,
-            queryId,
-            queryStatus: "completed",
-            draft: "",
-            answerComplete: true,
-            ordinal: result.ordinal,
-            canContinue: true,
-            queryError: undefined,
-            queryErrorCode: undefined,
-            recoveryLoading: false,
-            canRetry: false,
-            history: {
-              ...(before.history ?? emptyHistoryState()),
-              selectedConversationId: conversationId,
-              throughOrdinal: result.ordinal,
-            },
-          };
-          setChat(
-            withSubmissionTurn(nextState, {
-              ordinal: result.ordinal,
-              status: "completed",
-              question: text,
-              answer: before.answer || "",
-              questionComplete: true,
-              answerComplete: true,
-              canContinue: true,
-              failure: undefined,
-            }),
-          );
-          updateLocalConversation(conversationId, text, result.ordinal, null);
+          // The SSE completed event already finalized this request in onEvent.
           return;
         }
         const failureCode = result.code.toLowerCase();
