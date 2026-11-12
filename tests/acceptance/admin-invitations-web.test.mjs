@@ -954,6 +954,51 @@ describe("AdminApp: acceso desde la web", () => {
     expect(harness.document.activeElement).toBe(getButton(harness, "Invitar"));
   });
 
+  it("requiere confirmar la revocación cuando una cuenta activa también tiene una invitación", async () => {
+    const email = "activa-con-invitacion@example.test";
+    const { harness } = await startAdmin({
+      behavior: {
+        lookup: async ({ path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: { sub: "active-person", email },
+            access: { state: "active", revision: 6 },
+            invitation: {
+              expiresAt: expiry,
+              delivery: { status: "accepted", messageId: "ses-active" },
+            },
+          }),
+      },
+    });
+
+    await search(harness, email);
+    expect(bodyText(harness.document)).toMatch(/acceso activo/i);
+    expect(button(harness.document, "Cancelar invitación")).toBeFalsy();
+    expect(bodyText(harness.document)).not.toMatch(/Cancelar invitación/i);
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
+
+    await harness.click(getButton(harness, "Revocar"));
+    const confirmation = bodyText(harness.document).toLowerCase();
+    expect(confirmation).toContain(email);
+    expect(confirmation).toContain("docentes");
+    expect(confirmation).toMatch(/se revocará el acceso.*nuevas consultas/i);
+    expect(confirmation).toMatch(/conservará su cuenta y sus conversaciones/i);
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
+
+    await harness.click(getButton(harness, "Confirmar revocación"));
+
+    const [request] = apiCalls(harness, "POST", /\/access\/revoke$/);
+    expect(request).toMatchObject({
+      path: "/api/admin/bots/docentes/access/revoke",
+      body: { email, expectedSub: "active-person", expectedRevision: 6 },
+    });
+    expect(request.body.operationId).toEqual(expect.any(String));
+    expect(apiCalls(harness, "POST", /\/invitations$/)).toHaveLength(0);
+    expect(bodyText(harness.document)).toMatch(/acceso revocado/i);
+    expect(bodyText(harness.document)).not.toMatch(/acceso activo|invitación pendiente/i);
+    expect(button(harness.document, "Cancelar invitación")).toBeFalsy();
+  });
+
   it("cancela una invitación pendiente sin convertirla en acceso revocado", async () => {
     const email = "pendiente@example.test";
     const { harness } = await startAdmin({
@@ -1298,5 +1343,22 @@ describe("AdminApp: acceso desde la web", () => {
     expect(body).toMatch(/pendiente.*acept|acept.*persona|todav[ií]a no.*acceso/i);
     expect(apiCalls(harness, "POST", /\/invitations$/)).toHaveLength(1);
     expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
+
+    await harness.click(getButton(harness, "Cancelar invitación"));
+    const cancellationConfirmation = bodyText(harness.document).toLowerCase();
+    expect(cancellationConfirmation).toContain(email);
+    expect(cancellationConfirmation).toContain("docentes");
+    expect(cancellationConfirmation).toContain("cancelar invitación");
+    expect(cancellationConfirmation).not.toMatch(/revocará el acceso/i);
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
+    await harness.click(getButton(harness, "Confirmar cancelación"));
+
+    const [cancellation] = apiCalls(harness, "POST", /\/access\/revoke$/);
+    expect(cancellation).toMatchObject({
+      path: "/api/admin/bots/docentes/access/revoke",
+      body: { email, expectedSub: "revoked-person", expectedRevision: 15 },
+    });
+    expect(bodyText(harness.document)).toMatch(/invitación cancelada.*acceso sigue revocado/i);
+    expect(bodyText(harness.document)).not.toMatch(/invitación pendiente|acceso activo/i);
   });
 });

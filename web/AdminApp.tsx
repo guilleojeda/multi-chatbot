@@ -1089,7 +1089,9 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const canRevoke = Boolean(
     profile?.person && profile.access.state === "active" && profile.botId === selectedBotId,
   );
-  const canCancelInvitation = Boolean(profile?.invitation && profile.botId === selectedBotId);
+  const canCancelInvitation = Boolean(
+    profile?.invitation && profile.access.state !== "active" && profile.botId === selectedBotId,
+  );
   const invitationIntent: InvitationIntent = profile?.invitation ? "reissue" : "invite";
   const confirmationPending =
     confirmation === "revoke" || confirmation === "cancel"

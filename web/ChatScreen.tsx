@@ -220,7 +220,8 @@ export function ChatScreen({
     (state.queryStatus === "completed" && state.canContinue !== false) ||
     (state.queryStatus === "failed" && state.canContinue !== false) ||
     (state.queryStatus === "rejected" && Boolean(state.quota)) ||
-    (state.queryStatus === "rejected" && state.queryErrorCode === "storage_capacity_exceeded");
+    (state.queryStatus === "rejected" && state.queryErrorCode === "storage_capacity_exceeded") ||
+    (state.queryStatus === "rejected" && state.queryErrorCode === "access_revoked");
   const hasUsableContinuationBase =
     state.canContinue === true &&
     typeof state.ordinal === "number" &&

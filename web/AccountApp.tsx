@@ -4022,7 +4022,8 @@ export function AccountApp({
         current.canContinue !== false) ||
       (current.queryStatus === "rejected" && Boolean(current.quota)) ||
       (current.queryStatus === "rejected" &&
-        current.queryErrorCode === "storage_capacity_exceeded");
+        current.queryErrorCode === "storage_capacity_exceeded") ||
+      (current.queryStatus === "rejected" && current.queryErrorCode === "access_revoked");
     const hasUsableContinuationBase =
       current.canContinue === true &&
       typeof current.ordinal === "number" &&

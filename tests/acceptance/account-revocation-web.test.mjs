@@ -142,7 +142,6 @@ function runtimeFailure(request, code = "access_revoked") {
     message: "Tu acceso a nuevas consultas está revocado.",
     recordStatus: "not_admitted",
     queryId: request.queryId,
-    canContinue: true,
   });
 }
 
@@ -383,6 +382,131 @@ describe("docente web access after revocation", () => {
       expect(sendIsBlocked(harness.document)).toBe(true);
     }
     expect(harness.runtimeRequests).toHaveLength(1);
+  });
+
+  it("sends an explicit follow-up from the retained thread after a current active recheck", async () => {
+    let accountReads = 0;
+    let runtimeCalls = 0;
+    const harness = await createMounted({
+      profileHandler: completeProfile,
+      accountHandler: async () =>
+        accountJson({
+          ...teacherIdentity,
+          access: { state: "active", revision: accountReads++ === 0 ? 4 : 6 },
+        }),
+      runtimeHandler: async ({ request }) => {
+        runtimeCalls += 1;
+        if (runtimeCalls === 1) return runtimeFailure(request);
+        return completedStream(request, "Respuesta del seguimiento reenviado.");
+      },
+      ...historyHandlers({ canContinue: true }),
+    });
+    await openConversation(harness);
+    await waitForButton(harness, "Enviar");
+
+    const draft = "Continuá este hilo después de confirmar el acceso.";
+    await harness.setValue(accountControl(harness.document, "Escribí tu consulta"), draft);
+    await harness.click(accountButton(harness.document, "Enviar"));
+    await waitForPage(harness, "No se admitió esta consulta. Comprobando tu acceso actual.");
+    await vi.waitFor(() => expect(harness.accountRequests).toHaveLength(2));
+    expect(accountButton(harness.document, "Enviar").disabled).toBe(false);
+    expect(accountControl(harness.document, "Escribí tu consulta").value).toBe(draft);
+    expect(accountText(harness.document)).toContain("Usá descuentos y precios de ejemplo.");
+    expect(harness.runtimeRequests).toHaveLength(1);
+
+    // The thread and draft remain selected while /me is confirmed again; history is not reopened.
+    await harness.setRoute({ kind: "profile" });
+    await waitForPage(harness, "Mi perfil");
+    await harness.setRoute({ kind: "chat" });
+    await waitForPage(harness, "Usá descuentos y precios de ejemplo.");
+    expect(harness.accountRequests).toHaveLength(4);
+    expect(accountButton(harness.document, "Enviar").disabled).toBe(false);
+    expect(accountControl(harness.document, "Escribí tu consulta").value).toBe(draft);
+    expect(accountText(harness.document)).toContain("Prepará una actividad de porcentajes.");
+    expect(accountText(harness.document)).toContain("Usá descuentos y precios de ejemplo.");
+    expect(harness.runtimeRequests).toHaveLength(1);
+
+    await harness.click(accountButton(harness.document, "Enviar"));
+    await waitForPage(harness, "Respuesta del seguimiento reenviado.");
+    expect(harness.runtimeRequests).toHaveLength(2);
+    expect(harness.runtimeRequests[0].request).toMatchObject({
+      operation: "message",
+      conversationId: accountConversationId,
+      baseOrdinal: 1,
+      text: draft,
+    });
+    expect(harness.runtimeRequests[1].request).toMatchObject({
+      version: 2,
+      operation: "message",
+      conversationId: accountConversationId,
+      baseOrdinal: 1,
+      text: draft,
+    });
+    expect(harness.runtimeRequests[1].request.queryId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    expect(harness.runtimeRequests[1].request.queryId).not.toBe(
+      harness.runtimeRequests[0].request.queryId,
+    );
+  });
+
+  it("keeps a rejected start draft for an explicit new start after a current active recheck", async () => {
+    let accountReads = 0;
+    let runtimeCalls = 0;
+    const harness = await createMounted({
+      profileHandler: completeProfile,
+      accountHandler: async () =>
+        accountJson({
+          ...teacherIdentity,
+          access: { state: "active", revision: accountReads++ === 0 ? 4 : 6 },
+        }),
+      listHandler: async () => accountJson({ version: 1, conversations: [] }),
+      runtimeHandler: async ({ request }) => {
+        runtimeCalls += 1;
+        if (runtimeCalls === 1) return runtimeFailure(request);
+        return completedStream(request, "Respuesta del nuevo inicio admitido.");
+      },
+    });
+    await waitForButton(harness, "Enviar");
+
+    const draft = "Empezá esta consulta después de confirmar el acceso.";
+    await harness.setValue(accountControl(harness.document, "Escribí tu consulta"), draft);
+    await harness.click(accountButton(harness.document, "Enviar"));
+    await waitForPage(harness, "No se admitió esta consulta. Comprobando tu acceso actual.");
+    await vi.waitFor(() => expect(harness.accountRequests).toHaveLength(2));
+    expect(accountButton(harness.document, "Enviar").disabled).toBe(false);
+    expect(accountControl(harness.document, "Escribí tu consulta").value).toBe(draft);
+    expect(harness.runtimeRequests).toHaveLength(1);
+
+    await harness.setRoute({ kind: "profile" });
+    await waitForPage(harness, "Mi perfil");
+    await harness.setRoute({ kind: "chat" });
+    await waitForButton(harness, "Enviar");
+    expect(harness.accountRequests).toHaveLength(4);
+    expect(accountButton(harness.document, "Enviar").disabled).toBe(false);
+    expect(accountControl(harness.document, "Escribí tu consulta").value).toBe(draft);
+    expect(harness.runtimeRequests).toHaveLength(1);
+
+    await harness.click(accountButton(harness.document, "Enviar"));
+    await waitForPage(harness, "Respuesta del nuevo inicio admitido.");
+    expect(harness.runtimeRequests).toHaveLength(2);
+    expect(harness.runtimeRequests[0].request).toMatchObject({
+      operation: "start",
+      baseOrdinal: 0,
+      text: draft,
+    });
+    expect(harness.runtimeRequests[1].request).toMatchObject({
+      version: 2,
+      operation: "start",
+      baseOrdinal: 0,
+      text: draft,
+    });
+    expect(harness.runtimeRequests[1].request.conversationId).not.toBe(
+      harness.runtimeRequests[0].request.conversationId,
+    );
+    expect(harness.runtimeRequests[1].request.queryId).not.toBe(
+      harness.runtimeRequests[0].request.queryId,
+    );
   });
 
   it("keeps new sends paused after an access rejection if the current status read fails, then resumes on a newer active read", async () => {
