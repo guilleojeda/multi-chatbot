@@ -215,11 +215,15 @@ export function ChatScreen({
   }
 
   const sending = state.queryStatus === "sending" || state.queryStatus === "streaming";
+  const quotaRejection =
+    state.queryStatus === "rejected" &&
+    Boolean(state.quota) &&
+    (state.queryErrorCode === "quota_exceeded" || state.queryErrorCode === "quota_policy_changed");
   const canSubmitForState =
     state.queryStatus === "idle" ||
     (state.queryStatus === "completed" && state.canContinue !== false) ||
     (state.queryStatus === "failed" && state.canContinue !== false) ||
-    (state.queryStatus === "rejected" && Boolean(state.quota)) ||
+    quotaRejection ||
     (state.queryStatus === "rejected" && state.queryErrorCode === "storage_capacity_exceeded") ||
     (state.queryStatus === "rejected" && state.queryErrorCode === "access_revoked");
   const hasUsableContinuationBase =
@@ -259,7 +263,7 @@ export function ChatScreen({
     state.profileStatus === "complete" &&
     state.queryStatus !== "unconfirmed" &&
     (state.queryStatus !== "rejected" ||
-      Boolean(state.quota) ||
+      quotaRejection ||
       state.queryErrorCode === "storage_capacity_exceeded" ||
       state.queryErrorCode === "stale_base" ||
       state.queryErrorCode === "access_revoked") &&
@@ -267,9 +271,14 @@ export function ChatScreen({
   const quotaElapsed =
     state.quotaReceivedAt === undefined ? 0 : Math.max(0, quotaNow - state.quotaReceivedAt);
   const quotaTime = state.quota ? remainingQuotaTime(state.quota, quotaElapsed) : null;
-  const quotaMessage = quotaTime
-    ? `Llegaste al límite de uso, vas a poder seguir usando la aplicación en ${quotaTime}`
-    : null;
+  const zeroQuota = Boolean(
+    state.quota && (state.quota.daily.limit === 0 || state.quota.monthly.limit === 0),
+  );
+  const quotaMessage = zeroQuota
+    ? "Llegaste al límite de uso. Para volver a consultar, debe ampliarse el cupo"
+    : quotaTime
+      ? `Llegaste al límite de uso, vas a poder seguir usando la aplicación en ${quotaTime}`
+      : null;
   const progressMessage = state.recoveryLoading
     ? "Recuperando el último envío…"
     : state.queryStatus === "sending"
@@ -910,9 +919,16 @@ export function ChatScreen({
                 ) : null}
 
                 {quotaMessage ? (
-                  <p className="chat-quota-message" role="status" aria-live="polite">
-                    {quotaMessage}
-                  </p>
+                  <>
+                    <p className="chat-quota-message" role="status" aria-live="polite">
+                      {quotaMessage}
+                    </p>
+                    {zeroQuota ? (
+                      <p className="chat-context-note">
+                        Podés volver a intentar para comprobar si el cupo cambió
+                      </p>
+                    ) : null}
+                  </>
                 ) : null}
 
                 {state.answer && !currentTurnAlreadyInHistory ? (
@@ -957,7 +973,7 @@ export function ChatScreen({
                   </>
                 ) : null}
                 {state.queryStatus === "rejected" ? (
-                  state.quota ? null : (
+                  state.queryErrorCode === "quota_exceeded" ? null : (
                     <>
                       {!staleBaseRefreshRequired ? (
                         <p className="chat-result-error" role="alert">

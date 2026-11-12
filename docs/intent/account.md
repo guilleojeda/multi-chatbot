@@ -32,13 +32,21 @@ Iniciar otro ingreso, incluso desde una invitación para una cuenta existente, r
 
 La razón de estas fronteras se conserva en [Identidad común, acceso por chatbot y sesión de pestaña](../decisions/0001-identidad-y-sesion.md).
 
-## Consultar cuotas
+## Administrar cuotas
 
 El mismo administrador global selecciona el chatbot y abre **Cuotas**, sin buscar a una persona por email. La sección muestra los límites diarios y mensuales por persona, leídos de la política vigente del chatbot. **Actualizar límites** vuelve a consultar; entrar a la sección, cambiar de chatbot o ingresar de nuevo también inicia una lectura. Cero y un límite diario mayor que el mensual son valores válidos. La revisión de la política es interna y no se presenta al operador.
 
 `GET /api/admin/bots/{botId}/quota` exige el cliente y grupo administrativos antes de acceder a datos. La tabla se resuelve en el catálogo del servidor y la lectura es consistente. Un bot desconocido devuelve404; si falta la política, es inválida o falla la lectura, devuelve503 `QUOTA_UNAVAILABLE`, sin inventar límites o crear una política. La pantalla distingue carga y error, permite reintentar explícitamente y descarta respuestas de un chatbot, sección o sesión anteriores. Una respuesta no válida no se presenta como información vigente.
 
-Consultar no escribe la política, modifica consumo o consulta cuentas individuales. Los límites no se editan desde el panel todavía. **Acceso** conserva la búsqueda y las operaciones de invitación y revocación bajo la misma selección de chatbot.
+**Guardar límites** envía ambos valores y la revisión observada a `PUT /api/admin/bots/{botId}/quota`, con el mismo cliente, grupo y catálogo. Los límites son enteros seguros no negativos e independientes; vacío no se convierte en cero. El servidor rechaza cuerpos parciales, campos adicionales o valores inválidos con400 `INVALID_INPUT` y campos identificables. Antes de guardar cero se informa: «Un límite en 0 bloquea nuevas consultas hasta que se amplíe. Los envíos ya admitidos continúan». Cancelar un borrador restaura lo consultado, antes de enviarlo.
+
+El escritor lee y valida la política consistentemente. Una revisión distinta produce409 `STATE_CHANGED`, aunque los valores deseados ya coincidan. Si revisión y valores coinciden, confirma `changed:false` sin escribir. Para cambiar, genera una revisión UUID y actualiza solo ambos límites y revisión, condicionado a los tres valores originales. Conserva atributos restantes, consumo, perfiles, acceso e historial. La respuesta200 incluye la política de esa escritura y `changed:true`; otra edición puede reemplazarla antes de recibirse.
+
+Un error del Update permite una sola lectura consistente de resolución: solo la revisión generada por esa invocación y ambos valores exactos confirman el guardado. Otro estado produce409; la base todavía observada o una lectura fallida produce503 `SAVE_UNCONFIRMED`, pues la escritura podría seguir en vuelo. No se guardan recibos, historial ni IDs de operación de cuotas. Un duplicado con revisión vieja no vuelve a escribir; restaurar valores anteriores usa otra revisión.
+
+El formulario congela los parámetros al enviar y evita doble clic.400 conserva el borrador para corregirlo. Conflicto, fallo de guardado, red o respuesta inválida exigen **Actualizar límites** antes de decidir otra edición; esa lectura reemplaza el borrador. Consultar después solo acredita el estado actual, no quién lo escribió ni que una escritura pendiente fracasó. No hay rebase o reenvío automático; la renovación401 conserva su único replay del mismo cuerpo.
+
+Los cambios se aplican al próximo envío nuevo, también con chat y Runtime abiertos, sin borrar o recalcular consumo ni cancelar admitidos. Consultar no escribe o consulta cuentas individuales. Bot, sección y sesión delimitan las respuestas, incluso si reingresa la misma persona; el borrador no se persiste en storage. **Acceso** conserva búsqueda, invitación y revocación bajo la misma selección de chatbot. Ver [admisión y cupos](chat.md#envíos-y-cupos).
 
 ## Recuperar la contraseña
 

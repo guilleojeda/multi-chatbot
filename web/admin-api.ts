@@ -11,7 +11,7 @@ export type AdminPublicConfig = {
 };
 
 export type AdminRequestOptions = {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PUT";
   body?: unknown;
 };
 
@@ -29,6 +29,19 @@ export function parseAdminQuotaResponse(value: unknown, expectedBotId: string): 
   } catch {
     throw new Error("INVALID_RESPONSE");
   }
+}
+
+export type AdminQuotaSaveResponse = QuotaPolicy & { changed: boolean };
+
+export function parseAdminQuotaSaveResponse(
+  value: unknown,
+  expectedBotId: string,
+): AdminQuotaSaveResponse {
+  if (!isRecord(value) || value.botId !== expectedBotId || typeof value.changed !== "boolean") {
+    throw new Error("INVALID_RESPONSE");
+  }
+
+  return { ...parseAdminQuotaResponse(value, expectedBotId), changed: value.changed };
 }
 
 export function assertAdminPublicConfig(value: unknown): AdminPublicConfig {

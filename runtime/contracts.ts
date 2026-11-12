@@ -187,6 +187,7 @@ export type ConversationMeta = {
 export type ConversationStoreErrorCode =
   | "access_revoked"
   | "quota_exceeded"
+  | "quota_policy_changed"
   | "quota_period_changed"
   | "submission_exists"
   | "conversation_busy"

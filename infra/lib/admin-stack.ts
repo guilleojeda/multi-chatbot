@@ -113,7 +113,7 @@ export class AdminStack extends Stack {
       );
       this.handler.addToRolePolicy(
         new iam.PolicyStatement({
-          actions: ["dynamodb:GetItem"],
+          actions: ["dynamodb:GetItem", "dynamodb:UpdateItem"],
           resources: [bot.chat.conversationTable.tableArn],
           conditions: {
             "ForAllValues:StringEquals": {
@@ -157,6 +157,7 @@ export class AdminStack extends Stack {
       ["AdminMeRoute", "/api/admin/me", apigateway.HttpMethod.GET],
       ["AdminBotsRoute", "/api/admin/bots", apigateway.HttpMethod.GET],
       ["AdminQuotaRoute", "/api/admin/bots/{botId}/quota", apigateway.HttpMethod.GET],
+      ["AdminQuotaUpdateRoute", "/api/admin/bots/{botId}/quota", apigateway.HttpMethod.PUT],
       [
         "AdminRevokeAccessRoute",
         "/api/admin/bots/{botId}/access/revoke",

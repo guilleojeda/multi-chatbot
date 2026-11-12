@@ -10,6 +10,7 @@ import {
 import {
   adminRequest,
   parseAdminQuotaResponse,
+  parseAdminQuotaSaveResponse,
   readAdminPublicConfig,
   type AdminPublicConfig,
 } from "./admin-api";
@@ -43,16 +44,26 @@ type AdminProfile = {
 };
 type Message = { kind: "status" | "error"; text: string };
 type AdminSection = "access" | "quotas";
+type QuotaField = "dailyLimit" | "monthlyLimit";
+type QuotaDraft = { dailyLimit: string; monthlyLimit: string };
 type QuotaView =
   | { kind: "idle" }
   | { kind: "loading"; botId: string }
-  | { kind: "ready"; botId: string; dailyLimit: number; monthlyLimit: number }
+  | {
+      kind: "ready";
+      botId: string;
+      dailyLimit: number;
+      monthlyLimit: number;
+      revision: string;
+    }
   | { kind: "error"; botId: string; text: string };
 type InvitationIntent = "invite" | "reissue";
 type AdminAction = InvitationIntent | "revoke" | "cancel";
 
 const recoveryNotice =
   "Si la cuenta está activa y tiene un email verificado, recibirás un código para continuar.";
+const zeroQuotaNotice =
+  "Un límite en 0 bloquea nuevas consultas hasta que se amplíe. Los envíos ya admitidos continúan.";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -210,6 +221,18 @@ function recoveryError(error: unknown, confirmation: boolean): string {
 
 function emailIsValid(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+function parseQuotaDraftValue(value: string): number | null {
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function quotaDraftHasZero(draft: QuotaDraft): boolean {
+  return (
+    parseQuotaDraftValue(draft.dailyLimit) === 0 || parseQuotaDraftValue(draft.monthlyLimit) === 0
+  );
 }
 
 type ConfirmationDialogProps = {
@@ -379,6 +402,10 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const [selectedBotId, setSelectedBotId] = useState("");
   const [activeSection, setActiveSection] = useState<AdminSection>("access");
   const [quotaView, setQuotaView] = useState<QuotaView>({ kind: "idle" });
+  const [quotaDraft, setQuotaDraft] = useState<QuotaDraft | null>(null);
+  const [quotaFieldErrors, setQuotaFieldErrors] = useState<Partial<Record<QuotaField, string>>>({});
+  const [quotaSavePending, setQuotaSavePending] = useState(false);
+  const [quotaSaveNeedsRefresh, setQuotaSaveNeedsRefresh] = useState(false);
   const [email, setEmail] = useState("");
   const [profile, setProfile] = useState<AdminProfile | null>(null);
   const [lookupPending, setLookupPending] = useState(false);
@@ -419,6 +446,10 @@ export function AdminApp({ getSession }: AdminAppProps) {
     setSelectedBotId("");
     setActiveSection("access");
     setQuotaView({ kind: "idle" });
+    setQuotaDraft(null);
+    setQuotaFieldErrors({});
+    setQuotaSavePending(false);
+    setQuotaSaveNeedsRefresh(false);
     setProfile(null);
     setConfirmation(null);
     setLookupPending(false);
@@ -507,6 +538,11 @@ export function AdminApp({ getSession }: AdminAppProps) {
         isIdentityActive(identityTicket) && quotaReadEpochRef.current === readTicket;
 
       setQuotaView({ kind: "loading", botId: requestedBotId });
+      setQuotaDraft(null);
+      setQuotaFieldErrors({});
+      setQuotaSavePending(false);
+      setQuotaSaveNeedsRefresh(false);
+      setMessage(null);
       if (!session || !currentConfig) {
         if (isCurrent()) {
           setQuotaView({
@@ -533,6 +569,11 @@ export function AdminApp({ getSession }: AdminAppProps) {
           botId: requestedBotId,
           dailyLimit: policy.dailyLimit,
           monthlyLimit: policy.monthlyLimit,
+          revision: policy.revision,
+        });
+        setQuotaDraft({
+          dailyLimit: String(policy.dailyLimit),
+          monthlyLimit: String(policy.monthlyLimit),
         });
       } catch (error) {
         if (!isCurrent()) return;
@@ -557,10 +598,138 @@ export function AdminApp({ getSession }: AdminAppProps) {
             ? "El servidor devolvió límites de cuotas no válidos. No se muestran valores; seleccioná Actualizar límites para volver a consultar."
             : "No pudimos consultar los límites actuales del chatbot. Revisá la conexión y seleccioná Actualizar límites para reintentar.",
         });
+        setQuotaDraft(null);
       }
     },
     [isIdentityActive, leaveSession],
   );
+
+  const saveQuota = async () => {
+    const session = sessionRef.current;
+    const currentConfig = configRef.current;
+    const currentView = quotaView;
+    const currentDraft = quotaDraft;
+    const requestedBotId = selectedBotId;
+    const identityTicket = identityEpochRef.current;
+    const scopeTicket = scopeEpochRef.current;
+    const readTicket = quotaReadEpochRef.current;
+    if (
+      !session ||
+      !currentConfig ||
+      currentView.kind !== "ready" ||
+      currentView.botId !== requestedBotId ||
+      !currentDraft ||
+      quotaSavePending ||
+      quotaSaveNeedsRefresh
+    ) {
+      return;
+    }
+
+    const values: Record<QuotaField, number | null> = {
+      dailyLimit: parseQuotaDraftValue(currentDraft.dailyLimit),
+      monthlyLimit: parseQuotaDraftValue(currentDraft.monthlyLimit),
+    };
+    const fieldErrors: Partial<Record<QuotaField, string>> = {};
+    for (const field of ["dailyLimit", "monthlyLimit"] as const) {
+      if (values[field] === null) {
+        fieldErrors[field] =
+          field === "dailyLimit"
+            ? "Consultas por día: ingresá un entero mayor o igual a 0, hasta el máximo seguro."
+            : "Consultas por mes: ingresá un entero mayor o igual a 0, hasta el máximo seguro.";
+      }
+    }
+    if (Object.keys(fieldErrors).length > 0) {
+      setQuotaFieldErrors(fieldErrors);
+      setMessage({ kind: "error", text: "Revisá los límites indicados antes de guardar." });
+      return;
+    }
+
+    const frozenBody = {
+      dailyLimit: values.dailyLimit as number,
+      monthlyLimit: values.monthlyLimit as number,
+      expectedRevision: currentView.revision,
+    };
+    const isCurrent = () =>
+      isIdentityActive(identityTicket) &&
+      scopeEpochRef.current === scopeTicket &&
+      quotaReadEpochRef.current === readTicket;
+    setQuotaSavePending(true);
+    setQuotaFieldErrors({});
+    setMessage({ kind: "status", text: "Guardando límites…" });
+    try {
+      const response = await adminRequest(
+        currentConfig,
+        session,
+        `/admin/bots/${encodeURIComponent(requestedBotId)}/quota`,
+        { method: "PUT", body: frozenBody },
+        isCurrent,
+      );
+      if (!isCurrent()) return;
+      const saved = parseAdminQuotaSaveResponse(response, requestedBotId);
+      setQuotaView({
+        kind: "ready",
+        botId: requestedBotId,
+        dailyLimit: saved.dailyLimit,
+        monthlyLimit: saved.monthlyLimit,
+        revision: saved.revision,
+      });
+      setQuotaDraft({
+        dailyLimit: String(saved.dailyLimit),
+        monthlyLimit: String(saved.monthlyLimit),
+      });
+      setQuotaSaveNeedsRefresh(false);
+      setMessage({
+        kind: "status",
+        text: saved.changed ? "Límites guardados." : "Los límites ya estaban configurados así.",
+      });
+    } catch (error) {
+      if (!isCurrent()) return;
+      const status = apiErrorStatus(error);
+      if (status === 401 || status === 403) {
+        leaveSession(
+          session,
+          identityTicket,
+          status === 403 ? "forbidden" : "login",
+          status === 403
+            ? "Esta cuenta ya no tiene permiso de administrador. La sesión se cerró."
+            : "La sesión venció. Iniciá sesión nuevamente.",
+        );
+        return;
+      }
+      if (status === 400) {
+        const fields = asApiError(error).fields ?? [];
+        const nextFieldErrors: Partial<Record<QuotaField, string>> = {};
+        for (const field of fields) {
+          if (field === "dailyLimit" || field === "monthlyLimit") {
+            nextFieldErrors[field] =
+              "El servidor rechazó este límite. Corregilo e intentá otra vez.";
+          }
+        }
+        setQuotaFieldErrors(nextFieldErrors);
+        setMessage({
+          kind: "error",
+          text:
+            Object.keys(nextFieldErrors).length > 0
+              ? "El servidor rechazó uno o más límites. Corregí los campos indicados."
+              : "El servidor rechazó los límites. Revisá el formulario e intentá otra vez.",
+        });
+      } else if (status === 409) {
+        setQuotaSaveNeedsRefresh(true);
+        setMessage({
+          kind: "error",
+          text: "La configuración cambió. Actualizar límites reemplaza el borrador por los valores vigentes.",
+        });
+      } else {
+        setQuotaSaveNeedsRefresh(true);
+        setMessage({
+          kind: "error",
+          text: "No pudimos confirmar el guardado. Actualizar límites reemplaza el borrador por los valores vigentes; no se reenviará automáticamente.",
+        });
+      }
+    } finally {
+      if (isCurrent()) setQuotaSavePending(false);
+    }
+  };
 
   useEffect(() => {
     if (stage !== "ready" || activeSection !== "quotas" || !selectedBotId) return;
@@ -848,6 +1017,10 @@ export function AdminApp({ getSession }: AdminAppProps) {
     setConfirmation(null);
     setMessage(null);
     setQuotaView({ kind: "idle" });
+    setQuotaDraft(null);
+    setQuotaFieldErrors({});
+    setQuotaSavePending(false);
+    setQuotaSaveNeedsRefresh(false);
     setActiveSection(nextSection);
   };
 
@@ -857,6 +1030,10 @@ export function AdminApp({ getSession }: AdminAppProps) {
     quotaReadEpochRef.current += 1;
     setSelectedBotId(nextBotId);
     setQuotaView({ kind: "idle" });
+    setQuotaDraft(null);
+    setQuotaFieldErrors({});
+    setQuotaSavePending(false);
+    setQuotaSaveNeedsRefresh(false);
     setProfile(null);
     setConfirmation(null);
     setLookupPending(false);
@@ -1201,6 +1378,16 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const canCancelInvitation = Boolean(
     profile?.invitation && profile.access.state !== "active" && profile.botId === selectedBotId,
   );
+  const quotaReady =
+    quotaView.kind === "ready" && quotaView.botId === selectedBotId ? quotaView : null;
+  const quotaDraftChanged = Boolean(
+    quotaReady &&
+    quotaDraft &&
+    (quotaDraft.dailyLimit !== String(quotaReady.dailyLimit) ||
+      quotaDraft.monthlyLimit !== String(quotaReady.monthlyLimit)),
+  );
+  const quotaSaveDisabled =
+    !quotaReady || !quotaDraft || !quotaDraftChanged || quotaSavePending || quotaSaveNeedsRefresh;
   const invitationIntent: InvitationIntent = profile?.invitation ? "reissue" : "invite";
   const confirmationPending =
     confirmation === "revoke" || confirmation === "cancel"
@@ -1493,7 +1680,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
               </div>
             </div>
 
-            {activeSection === "access" && message ? (
+            {message ? (
               <p
                 ref={message.kind === "error" ? alertRef : undefined}
                 className={`admin-message${message.kind === "error" ? " admin-message--error" : ""}`}
@@ -1721,6 +1908,88 @@ export function AdminApp({ getSession }: AdminAppProps) {
                       <dd>{quotaView.monthlyLimit}</dd>
                     </div>
                   </dl>
+                ) : null}
+                {quotaReady && quotaDraft ? (
+                  <form
+                    className="admin-quota-editor"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void saveQuota();
+                    }}
+                  >
+                    <p className="admin-quota-editor__heading">Editar límites</p>
+                    <div className="admin-quota-editor__fields">
+                      {(
+                        [
+                          ["dailyLimit", "Consultas por día"],
+                          ["monthlyLimit", "Consultas por mes"],
+                        ] as const
+                      ).map(([field, label]) => {
+                        const error = quotaFieldErrors[field];
+                        const errorId = `admin-quota-${field}-error`;
+                        return (
+                          <div className="admin-quota-field" key={field}>
+                            <label htmlFor={`admin-quota-${field}`}>{label}</label>
+                            <input
+                              id={`admin-quota-${field}`}
+                              name={field}
+                              type="text"
+                              inputMode="numeric"
+                              value={quotaDraft[field]}
+                              aria-invalid={error ? "true" : "false"}
+                              aria-describedby={error ? errorId : undefined}
+                              disabled={quotaSavePending}
+                              onChange={(event) => {
+                                const value = event.currentTarget.value;
+                                setQuotaDraft((current) =>
+                                  current ? { ...current, [field]: value } : current,
+                                );
+                                setQuotaFieldErrors((current) => {
+                                  if (!current[field]) return current;
+                                  const next = { ...current };
+                                  delete next[field];
+                                  return next;
+                                });
+                              }}
+                            />
+                            {error ? (
+                              <p id={errorId} className="admin-field-error" role="alert">
+                                {error}
+                              </p>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {quotaDraftHasZero(quotaDraft) ? (
+                      <p className="admin-quota-zero" role="status">
+                        {zeroQuotaNotice}
+                      </p>
+                    ) : null}
+                    <p className="admin-field-hint">
+                      El consumo acumulado se conserva y el cambio se aplica al próximo envío.
+                    </p>
+                    <div className="admin-quota-editor__actions">
+                      <button className="admin-button" type="submit" disabled={quotaSaveDisabled}>
+                        Guardar límites
+                      </button>
+                      <button
+                        className="admin-button admin-button--quiet"
+                        type="button"
+                        disabled={quotaSavePending}
+                        onClick={() => {
+                          setQuotaDraft({
+                            dailyLimit: String(quotaReady.dailyLimit),
+                            monthlyLimit: String(quotaReady.monthlyLimit),
+                          });
+                          setQuotaFieldErrors({});
+                          setMessage(null);
+                        }}
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </form>
                 ) : null}
                 <button
                   className="admin-button admin-quota__refresh"

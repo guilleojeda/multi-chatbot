@@ -607,6 +607,19 @@ describe("AdminApp: consulta de cuotas desde la web", () => {
     });
   });
 
+  it("muestra el aviso de cero con ceros a la izquierda y no con un borrador vacío", async () => {
+    const harness = await startQuotaAdmin({
+      quota: async ({ path }) => policyResponse(path.split("/")[4], 12, 30, "zero-draft-revision"),
+    });
+
+    await openSection(harness, "Cuotas");
+    const daily = getQuotaInput(harness, "Consultas por día");
+    await harness.setValue(daily, "");
+    expect(bodyText(harness.document)).not.toContain(zeroQuotaNotice);
+    await harness.setValue(daily, "00");
+    expect(bodyText(harness.document)).toContain(zeroQuotaNotice);
+  });
+
   it("valida cada campo por separado sin inventar una relación diario-mensual", async () => {
     const harness = await startQuotaAdmin({
       quota: async ({ path }) =>
@@ -822,6 +835,53 @@ describe("AdminApp: consulta de cuotas desde la web", () => {
   });
 
   it.each([
+    ["409", () => jsonResponse({ code: "STATE_CHANGED" }, 409)],
+    ["503", () => jsonResponse({ code: "SAVE_UNCONFIRMED" }, 503)],
+  ])(
+    "mantiene la necesidad de actualizar después de cancelar un guardado incierto %s",
+    async (_caseName, uncertainResponse) => {
+      let saves = 0;
+      let reads = 0;
+      const harness = await startQuotaAdmin({
+        quota: async ({ path }) => {
+          reads += 1;
+          return policyResponse(path.split("/")[4], 8, 30, `refresh-required-${reads}`);
+        },
+        saveQuota: async ({ body, path }) => {
+          saves += 1;
+          return saves === 1
+            ? uncertainResponse()
+            : saveResponse(
+                path.split("/")[4],
+                body.dailyLimit,
+                body.monthlyLimit,
+                "saved-after-refresh",
+              );
+        },
+      });
+
+      await openSection(harness, "Cuotas");
+      await harness.setValue(getQuotaInput(harness, "Consultas por día"), "17");
+      await harness.click(getButton(harness, "Guardar límites"));
+      await harness.settle();
+      expect(quotaPutCalls(harness)).toHaveLength(1);
+
+      await harness.click(getCancelDraftButton(harness));
+      await harness.setValue(getQuotaInput(harness, "Consultas por día"), "19");
+      expect(getButton(harness, "Guardar límites").disabled).toBe(true);
+      await harness.click(getButton(harness, "Guardar límites"));
+      expect(quotaPutCalls(harness)).toHaveLength(1);
+
+      await harness.click(getButton(harness, "Actualizar límites"));
+      await harness.settle();
+      expect(quotaCalls(harness)).toHaveLength(2);
+      await harness.setValue(getQuotaInput(harness, "Consultas por día"), "19");
+      await harness.click(getButton(harness, "Guardar límites"));
+      expect(quotaPutCalls(harness)).toHaveLength(2);
+    },
+  );
+
+  it.each([
     ["la base", 8, 30],
     ["los valores deseados", 17, 42],
   ])(
@@ -914,21 +974,31 @@ describe("AdminApp: consulta de cuotas desde la web", () => {
       useRealSession: true,
       beforeMount: async (currentHarness) => {
         currentHarness.adminStorage.setItem("auth-refresh", "initial-refresh-token");
-        currentHarness.cognito("InitiateAuth", async ({ body }) =>
-          body.AuthFlow === "REFRESH_TOKEN_AUTH"
+        let refreshCount = 0;
+        currentHarness.cognito("InitiateAuth", async ({ body }) => {
+          if (body.AuthFlow !== "REFRESH_TOKEN_AUTH") {
+            return jsonResponse({
+              AuthenticationResult: {
+                AccessToken: "initial-admin-token",
+                IdToken: "initial-admin-id",
+              },
+            });
+          }
+          refreshCount += 1;
+          return refreshCount === 1
             ? jsonResponse({
-                AuthenticationResult: {
-                  AccessToken: "refreshed-admin-token",
-                  IdToken: "refreshed-admin-id",
-                },
-              })
-            : jsonResponse({
                 AuthenticationResult: {
                   AccessToken: "initial-admin-token",
                   IdToken: "initial-admin-id",
                 },
-              }),
-        );
+              })
+            : jsonResponse({
+                AuthenticationResult: {
+                  AccessToken: "refreshed-admin-token",
+                  IdToken: "refreshed-admin-id",
+                },
+              });
+        });
       },
       quota: async ({ path }) => policyResponse(path.split("/")[4], 8, 30, "real-session-revision"),
       saveQuota: async ({ body, path }) => {

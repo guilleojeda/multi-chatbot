@@ -10,7 +10,7 @@ import {
   createCognitoIdentityAdapter,
   createSesInvitationMailer,
 } from "./aws-adapters.js";
-import { createQuotaPolicyReader } from "./quota-policy-store.js";
+import { createQuotaPolicyReader, createQuotaPolicyWriter } from "./quota-policy-store.js";
 
 const runtimeConfig = parseAdminLambdaConfig();
 const identityClient = new CognitoIdentityProviderClient({ region: runtimeConfig.region });
@@ -36,6 +36,12 @@ const quotaReaders = Object.fromEntries(
     createQuotaPolicyReader(dynamoClient, bot.conversationTableName, bot.botId),
   ]),
 );
+const quotaWriters = Object.fromEntries(
+  runtimeConfig.bots.map((bot) => [
+    bot.botId,
+    createQuotaPolicyWriter(dynamoClient, bot.conversationTableName, bot.botId),
+  ]),
+);
 
 export const handler = createAdminHandler({
   config: {
@@ -51,6 +57,7 @@ export const handler = createAdminHandler({
   },
   stores,
   quotaReaders,
+  quotaWriters,
   identity: createCognitoIdentityAdapter({
     client: identityClient,
     userPoolId: runtimeConfig.userPoolId,
