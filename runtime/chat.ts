@@ -693,9 +693,10 @@ export function createChatHandler(dependencies: ChatDependencies) {
       return failureResponse(request, safeFailure("unauthorized", "not_admitted"));
     }
 
+    let access: AccessRecord | null;
     try {
-      const access = await accounts.getAccess({ sub, botId: config.botId });
-      if (access?.access !== "active") {
+      access = await accounts.getAccess({ sub, botId: config.botId });
+      if (!access || access.access === "none") {
         return failureResponse(request, safeFailure("access_denied", "not_admitted"));
       }
     } catch {
@@ -731,6 +732,12 @@ export function createChatHandler(dependencies: ChatDependencies) {
     }
     if (request.operation === "recover") {
       return safeFailure("conversation_unavailable", "not_admitted", request.queryId);
+    }
+    if (access.access === "revoked") {
+      return failureResponse(
+        request,
+        safeFailure("access_revoked", "not_admitted", request.queryId),
+      );
     }
     const reject = (failure: ReturnType<typeof safeFailure>) =>
       rejectAfterSubmissionLookup(request, profileKey, store, failure);
@@ -1114,6 +1121,9 @@ export function createChatHandler(dependencies: ChatDependencies) {
       const code = errorCode(error);
       if (code === "conversation_hidden") {
         return failureResponse(request, hiddenConversationFailure(request.queryId));
+      }
+      if (code === "access_revoked") {
+        return reject(safeFailure("access_revoked", "not_admitted", request.queryId));
       }
       if (code === "quota_period_changed") {
         return reject(safeFailure("temporarily_unavailable", "not_admitted", request.queryId));

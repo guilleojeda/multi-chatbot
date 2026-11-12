@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { GetCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { mapAccessRecord, maximumAccessRecordSizeBytes } from "../../api/access.ts";
 import { createAccountStoreAdapter } from "../../api/aws-adapters.ts";
 import { createPhase9AccountTransport } from "../support/phase9-account-transport.mjs";
 
@@ -128,6 +129,19 @@ describe("the account access DynamoDB adapter", () => {
     );
 
     await expect(store.getAccess({ sub, botId })).rejects.toThrow();
+  });
+
+  it("bounds ACCESS mapping to the complete supported schema and real identity key sizes", () => {
+    const unsupported = accessItem({ unsupported: "x".repeat(400 * 1024) });
+    const oversizedOperation = accessItem({
+      lastAdminOperation: { id: "x".repeat(129), kind: "revoke" },
+    });
+
+    expect(maximumAccessRecordSizeBytes({ sub, botId })).toBe(
+      798 + 2 * (Buffer.byteLength(botId, "utf8") + Buffer.byteLength(sub, "utf8")),
+    );
+    expect(mapAccessRecord(unsupported, { sub, botId })).toBeNull();
+    expect(mapAccessRecord(oversizedOperation, { sub, botId })).toBeNull();
   });
 
   it("registers INVITATION and replaces the ACCESS pointer in one CAS transaction", async () => {
@@ -746,7 +760,18 @@ describe("the account access DynamoDB adapter", () => {
       operationId: "same-revoke",
     });
 
-    expect(result).toEqual({ created: false, access: recorded });
+    expect(result).toMatchObject({
+      created: false,
+      access: {
+        sub,
+        botId,
+        access: "revoked",
+        revision: 13,
+        lastAdminOperation: { id: "same-revoke", kind: "revoke" },
+      },
+    });
+    expect(result.access).not.toHaveProperty("pk");
+    expect(result.access).not.toHaveProperty("sk");
     expect(send).toHaveBeenCalledOnce();
     expect(send.mock.calls[0][0]).toBeInstanceOf(GetCommand);
     expect(send.mock.calls[0][0].input).toMatchObject({

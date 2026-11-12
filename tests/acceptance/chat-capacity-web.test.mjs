@@ -128,7 +128,7 @@ function createEnvironment({ streamHandler }) {
     if (url === "/public-config.json") return jsonResponse(config);
     if (url === "/api/account/me") {
       apiRequests.push({ url, init });
-      return jsonResponse(identity);
+      return jsonResponse({ ...identity, access: { state: "active", revision: 1 } });
     }
     if (url === "/api/profile") {
       apiRequests.push({ url, init });

@@ -472,7 +472,7 @@ export function createChatHistoryHandler({ botId, store, getAccess }: HistoryHan
         "No pudimos cargar el historial. Intentá de nuevo.",
       );
     }
-    if (access?.access !== "active")
+    if (access?.access !== "active" && access?.access !== "revoked")
       return errorResponse(403, "FORBIDDEN", "Esta cuenta no tiene acceso a este proyecto.");
 
     try {

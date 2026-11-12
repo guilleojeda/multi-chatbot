@@ -81,6 +81,9 @@ export type ChatScreenState = {
 
 export type ChatScreenProps = {
   state: ChatScreenState;
+  accessStatus?: "active" | "revoked";
+  accessCheckPending?: boolean;
+  accessSendBlocked?: boolean;
   onSubmit: (text: string) => void | boolean;
   onSignOut: () => void | Promise<void>;
   onRetryProfile: () => void;
@@ -137,6 +140,9 @@ export function ChatScreen({
   onLoadEarlierTurns,
   onDraftChange,
   onHideConversation,
+  accessStatus = "active",
+  accessCheckPending = false,
+  accessSendBlocked = false,
 }: ChatScreenProps) {
   const [mobileView, setMobileView] = useState<"history" | "chat">(
     state.history?.selectedConversationId ? "chat" : "history",
@@ -225,7 +231,11 @@ export function ChatScreen({
     removal?.conversationId === history.selectedConversationId &&
     (removal.status === "hiding" || removal.status === "unconfirmed"),
   );
+  const accessRevoked = accessStatus === "revoked";
   const canSubmit =
+    !accessRevoked &&
+    !accessCheckPending &&
+    !accessSendBlocked &&
     state.profileStatus === "complete" &&
     state.history?.turnsStatus !== "loading" &&
     (state.history?.turnsStatus !== "error" || hasUsableContinuationBase) &&
@@ -250,7 +260,8 @@ export function ChatScreen({
     (state.queryStatus !== "rejected" ||
       Boolean(state.quota) ||
       state.queryErrorCode === "storage_capacity_exceeded" ||
-      state.queryErrorCode === "stale_base") &&
+      state.queryErrorCode === "stale_base" ||
+      state.queryErrorCode === "access_revoked") &&
     (state.queryStatus !== "failed" || state.canContinue !== false);
   const quotaElapsed =
     state.quotaReceivedAt === undefined ? 0 : Math.max(0, quotaNow - state.quotaReceivedAt);
@@ -704,6 +715,23 @@ export function ChatScreen({
               Las conversaciones se guardan para que puedas consultarlas y continuarlas desde otra
               sesión.
             </p>
+            {accessRevoked ? (
+              <p className="chat-context-note" role="status" aria-live="polite">
+                Tu acceso a nuevas consultas está revocado. Podés consultar y quitar tus
+                conversaciones anteriores.
+              </p>
+            ) : null}
+            {accessCheckPending ? (
+              <p className="chat-progress" role="status" aria-live="polite">
+                Comprobando tu acceso…
+              </p>
+            ) : null}
+            {accessSendBlocked && !accessCheckPending && !accessRevoked ? (
+              <p className="chat-context-note" role="status" aria-live="polite">
+                No pudimos comprobar el estado actual de tu acceso. Las nuevas consultas siguen
+                pausadas hasta confirmarlo.
+              </p>
+            ) : null}
             {historyTurns.length > 0 ? (
               <p className="chat-context-note" role="note">
                 En conversaciones largas usamos un resumen para continuar. Los mensajes originales

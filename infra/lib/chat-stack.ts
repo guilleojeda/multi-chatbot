@@ -173,7 +173,7 @@ export class ChatStack extends Stack {
     const sourceModelArn = `arn:aws:bedrock:${environment.region}::foundation-model/${modelId}`;
     this.runtime = new Runtime(this, "ConversationRuntime", {
       ...(environment.environment === "dev"
-        ? { runtimeName: `${environment.botResourcePrefix.replaceAll("-", "")}phase9` }
+        ? { runtimeName: `${environment.botResourcePrefix.replaceAll("-", "")}phase92` }
         : {}),
       agentRuntimeArtifact: AgentRuntimeArtifact.fromAsset(runtimeAssetPath, {
         platform: ecrAssets.Platform.LINUX_ARM64,
@@ -209,7 +209,7 @@ export class ChatStack extends Stack {
     });
     this.runtimeArn = this.runtime.agentRuntimeArn;
 
-    account.table.grant(this.runtime.role, "dynamodb:GetItem");
+    account.table.grant(this.runtime.role, "dynamodb:GetItem", "dynamodb:ConditionCheckItem");
     this.runtime.role.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:Retrieve"],

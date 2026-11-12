@@ -14,7 +14,20 @@ export type AccessRecord = {
   revision: number;
   currentInvitation?: { hash: string; expiresAt: number };
   activationClaim?: { invitationHash: string; claimedAt: string };
-  lastAdminOperation?: { id: string; kind: "invite"; invitationHash: string };
+  lastAdminOperation?:
+    { id: string; kind: "invite"; invitationHash: string } | { id: string; kind: "revoke" };
+};
+
+export type RevokeAccessInput = {
+  sub: string;
+  botId: string;
+  expectedRevision: number;
+  operationId: string;
+};
+
+export type RevokeAccessResult = {
+  access: AccessRecord;
+  created: boolean;
 };
 
 export type InvitationRecord = {
@@ -59,11 +72,35 @@ export type AccountAccessStore = {
   getAccess(input: { sub: string; botId: string }): Promise<AccessRecord | null>;
   getInvitation(tokenHash: string): Promise<InvitationRecord | null>;
   registerInvitation(input: RegisterInvitationInput): Promise<RegisterInvitationResult>;
+  revokeAccess(input: RevokeAccessInput): Promise<RevokeAccessResult>;
   recordInvitationDelivery(input: RecordInvitationDeliveryInput): Promise<void>;
   reserveActivation(input: ActivationInput): Promise<boolean>;
   releaseActivation(input: ActivationInput): Promise<void>;
   consumeInvitation(input: ActivationInput): Promise<boolean>;
 };
+
+const maxOperationIdLength = 128;
+// 798 bytes covers the ACCESS active maximum: a 128-code-unit/384-byte ID, three 64-byte hashes,
+// a 27-character ISO timestamp, safe revision, maximum finite JS expiry, keys, and all field names.
+const maxAccessRecordBaseBytes = 798;
+
+export function isValidOperationId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= maxOperationIdLength &&
+    value.trim() === value &&
+    !/[\r\n]/.test(value)
+  );
+}
+
+/** Upper bound for active ACCESS, including every supported optional record field. */
+export function maximumAccessRecordSizeBytes(identity: { sub: string; botId: string }): number {
+  return (
+    maxAccessRecordBaseBytes +
+    2 * (Buffer.byteLength(identity.botId, "utf8") + Buffer.byteLength(identity.sub, "utf8"))
+  );
+}
 
 export class StateChangedError extends Error {
   readonly code = "STATE_CHANGED";
@@ -82,6 +119,10 @@ function isHash(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
+function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
 function isIsoDate(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const parsed = Date.parse(value);
@@ -94,27 +135,40 @@ function isIsoDate(value: unknown): value is string {
 }
 
 function mapCurrentInvitation(value: unknown): AccessRecord["currentInvitation"] | null {
-  if (!isRecord(value) || !isHash(value.hash) || typeof value.expiresAt !== "number") return null;
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["hash", "expiresAt"]) ||
+    !isHash(value.hash) ||
+    typeof value.expiresAt !== "number"
+  )
+    return null;
   if (!Number.isFinite(value.expiresAt)) return null;
   return { hash: value.hash, expiresAt: value.expiresAt };
 }
 
 function mapActivationClaim(value: unknown): AccessRecord["activationClaim"] | null {
-  if (!isRecord(value) || !isHash(value.invitationHash) || !isIsoDate(value.claimedAt)) return null;
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["invitationHash", "claimedAt"]) ||
+    !isHash(value.invitationHash) ||
+    !isIsoDate(value.claimedAt)
+  )
+    return null;
   return { invitationHash: value.invitationHash, claimedAt: value.claimedAt };
 }
 
 function mapLastAdminOperation(value: unknown): AccessRecord["lastAdminOperation"] | null {
-  if (
-    !isRecord(value) ||
-    typeof value.id !== "string" ||
-    value.id.length === 0 ||
-    value.kind !== "invite" ||
-    !isHash(value.invitationHash)
-  ) {
-    return null;
+  if (!isRecord(value) || !isValidOperationId(value.id)) return null;
+  if (value.kind === "invite") {
+    if (!hasOnlyKeys(value, ["id", "kind", "invitationHash"]) || !isHash(value.invitationHash)) {
+      return null;
+    }
+    return { id: value.id, kind: "invite", invitationHash: value.invitationHash };
   }
-  return { id: value.id, kind: "invite", invitationHash: value.invitationHash };
+  if (value.kind === "revoke" && hasOnlyKeys(value, ["id", "kind"])) {
+    return { id: value.id, kind: "revoke" };
+  }
+  return null;
 }
 
 export function mapAccessRecord(
@@ -122,6 +176,21 @@ export function mapAccessRecord(
   identity: { sub: string; botId: string },
 ): AccessRecord | null {
   if (!value) return null;
+  if (
+    !hasOnlyKeys(value, [
+      "pk",
+      "sk",
+      "sub",
+      "botId",
+      "access",
+      "revision",
+      "currentInvitation",
+      "activationClaim",
+      "lastAdminOperation",
+    ])
+  ) {
+    return null;
+  }
   if (
     value.pk !== `BOT#${identity.botId}#USER#${identity.sub}` ||
     value.sk !== "ACCESS" ||
@@ -189,8 +258,7 @@ export function mapInvitationRecord(
     value.email.length === 0 ||
     typeof value.expiresAt !== "number" ||
     !Number.isFinite(value.expiresAt) ||
-    typeof value.operationId !== "string" ||
-    value.operationId.length === 0
+    !isValidOperationId(value.operationId)
   ) {
     return null;
   }

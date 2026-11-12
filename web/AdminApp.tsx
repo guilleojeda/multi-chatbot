@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type RefObject,
+} from "react";
 import { adminRequest, readAdminPublicConfig, type AdminPublicConfig } from "./admin-api";
 import { asApiError } from "./api";
 import type { Session } from "./session";
@@ -30,6 +38,7 @@ type AdminProfile = {
 };
 type Message = { kind: "status" | "error"; text: string };
 type InvitationIntent = "invite" | "reissue";
+type AdminAction = InvitationIntent | "revoke" | "cancel";
 
 const recoveryNotice =
   "Si la cuenta está activa y tiene un email verificado, recibirás un código para continuar.";
@@ -118,6 +127,24 @@ function parseProfile(value: unknown, expectedBotId: string): AdminProfile {
   };
 }
 
+function parseAccessMutation(
+  value: unknown,
+  expectedBotId: string,
+  operationId: string,
+): AdminProfile {
+  const profile = parseProfile(value, expectedBotId);
+  if (
+    !isRecord(value) ||
+    !isRecord(value.operation) ||
+    value.operation.id !== operationId ||
+    (value.operation.status !== "recorded" && value.operation.status !== "already_recorded") ||
+    value.invitation !== undefined
+  ) {
+    throw new Error("INVALID_RESPONSE");
+  }
+  return profile;
+}
+
 function apiErrorStatus(error: unknown): number {
   return asApiError(error).status;
 }
@@ -177,9 +204,10 @@ function emailIsValid(email: string): boolean {
 type ConfirmationDialogProps = {
   email: string;
   projectName: string;
-  action: InvitationIntent;
+  action: AdminAction;
   pending: boolean;
   triggerRef: RefObject<HTMLButtonElement | null>;
+  fallbackTriggerRef?: RefObject<HTMLButtonElement | null>;
   onCancel: () => void;
   onConfirm: () => void;
 };
@@ -190,6 +218,7 @@ function ConfirmationDialog({
   action,
   pending,
   triggerRef,
+  fallbackTriggerRef,
   onCancel,
   onConfirm,
 }: ConfirmationDialogProps) {
@@ -197,15 +226,19 @@ function ConfirmationDialog({
   const confirmRef = useRef<HTMLButtonElement>(null);
   const pendingStatusRef = useRef<HTMLParagraphElement>(null);
   const onCancelRef = useRef(onCancel);
+  const pendingRef = useRef(pending);
   onCancelRef.current = onCancel;
-  const titleId = "admin-invitation-confirmation-title";
+  pendingRef.current = pending;
+  const titleId = "admin-action-confirmation-title";
 
-  useEffect(() => {
-    const previousFocus = document.activeElement;
+  useLayoutEffect(() => {
     if (pending) pendingStatusRef.current?.focus();
     else cancelRef.current?.focus();
+  }, [pending]);
+
+  useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape" && !pending) {
+      if (event.key === "Escape" && !pendingRef.current) {
         event.preventDefault();
         onCancelRef.current();
       }
@@ -230,34 +263,74 @@ function ConfirmationDialog({
     document.addEventListener("keydown", handleKeyDown);
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
-      const focusWasInsideDialog =
-        previousFocus === cancelRef.current ||
-        previousFocus === confirmRef.current ||
-        previousFocus === pendingStatusRef.current;
-      if (focusWasInsideDialog && triggerRef.current?.isConnected) {
-        triggerRef.current.focus();
-      } else if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
-        previousFocus.focus();
-      } else if (triggerRef.current?.isConnected) {
-        triggerRef.current.focus();
-      }
     };
-  }, [pending, triggerRef]);
+  }, []);
+
+  useLayoutEffect(() => {
+    const previousFocus = document.activeElement;
+    return () => {
+      queueMicrotask(() => {
+        if (triggerRef.current?.isConnected) {
+          triggerRef.current.focus();
+        } else if (fallbackTriggerRef?.current?.isConnected) {
+          fallbackTriggerRef.current.focus();
+        } else if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
+          previousFocus.focus();
+        }
+      });
+    };
+  }, [fallbackTriggerRef, triggerRef]);
 
   const reissue = action === "reissue";
+  const actionTitle =
+    action === "revoke"
+      ? "Confirmá la revocación"
+      : action === "cancel"
+        ? "Confirmá la cancelación"
+        : reissue
+          ? "Confirmá la nueva invitación"
+          : "Confirmá la invitación";
+  const actionDescription =
+    action === "revoke" ? (
+      <>
+        Se revocará el acceso de <strong>{email}</strong> a nuevas consultas en{" "}
+        <strong>{projectName}</strong>. La persona conservará su cuenta y sus conversaciones.
+      </>
+    ) : action === "cancel" ? (
+      <>
+        Se cancelará la invitación de <strong>{email}</strong> para <strong>{projectName}</strong>.
+        La invitación dejará de habilitar el acceso a este chatbot.
+      </>
+    ) : (
+      <>
+        {reissue ? "Se enviará una nueva invitación a " : "Se invitará a "}
+        <strong>{email}</strong> para <strong>{projectName}</strong>. La persona deberá aceptar el
+        enlace para activar el acceso.
+      </>
+    );
+  const pendingCopy =
+    action === "revoke"
+      ? "Revocando acceso…"
+      : action === "cancel"
+        ? "Cancelando invitación…"
+        : "Registrando la invitación…";
+  const confirmationLabel =
+    action === "revoke"
+      ? "Confirmar revocación"
+      : action === "cancel"
+        ? "Confirmar cancelación"
+        : reissue
+          ? "Confirmar nueva invitación"
+          : "Confirmar invitación";
   return (
     <div className="admin-dialog-backdrop">
       <section className="admin-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId}>
         <p className="admin-eyebrow">Confirmación</p>
-        <h2 id={titleId}>{reissue ? "Confirmá la nueva invitación" : "Confirmá la invitación"}</h2>
-        <p>
-          {reissue ? "Se enviará una nueva invitación a " : "Se invitará a "}
-          <strong>{email}</strong> para <strong>{projectName}</strong>. La persona deberá aceptar el
-          enlace para activar el acceso.
-        </p>
+        <h2 id={titleId}>{actionTitle}</h2>
+        <p>{actionDescription}</p>
         {pending ? (
           <p ref={pendingStatusRef} role="status" tabIndex={-1}>
-            Registrando la invitación…
+            {pendingCopy}
           </p>
         ) : null}
         <div className="admin-dialog__actions">
@@ -268,7 +341,7 @@ function ConfirmationDialog({
             onClick={onCancel}
             disabled={pending}
           >
-            Volver
+            Cancelar
           </button>
           <button
             ref={confirmRef}
@@ -277,7 +350,7 @@ function ConfirmationDialog({
             onClick={onConfirm}
             disabled={pending}
           >
-            {reissue ? "Confirmar nueva invitación" : "Confirmar invitación"}
+            {confirmationLabel}
           </button>
         </div>
       </section>
@@ -297,7 +370,8 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const [profile, setProfile] = useState<AdminProfile | null>(null);
   const [lookupPending, setLookupPending] = useState(false);
   const [invitationPending, setInvitationPending] = useState(false);
-  const [confirmation, setConfirmation] = useState<InvitationIntent | null>(null);
+  const [accessMutationPending, setAccessMutationPending] = useState(false);
+  const [confirmation, setConfirmation] = useState<AdminAction | null>(null);
   const [recoveryEmail, setRecoveryEmail] = useState("");
   const [recoveryPending, setRecoveryPending] = useState(false);
   const [passwordError, setPasswordError] = useState("");
@@ -305,6 +379,8 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const alertRef = useRef<HTMLParagraphElement>(null);
   const invitationTriggerRef = useRef<HTMLButtonElement>(null);
+  const revokeTriggerRef = useRef<HTMLButtonElement>(null);
+  const cancelInvitationTriggerRef = useRef<HTMLButtonElement>(null);
   const sessionRef = useRef<Session | null>(null);
   const configRef = useRef<AdminPublicConfig | null>(null);
   const identityEpochRef = useRef(0);
@@ -313,6 +389,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const scopeEpochRef = useRef(0);
   const mountedRef = useRef(false);
   const invitationInFlightRef = useRef<string | null>(null);
+  const accessMutationInFlightRef = useRef<string | null>(null);
   const lookupRequestRef = useRef(0);
 
   const isIdentityActive = useCallback(
@@ -329,6 +406,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
     setConfirmation(null);
     setLookupPending(false);
     setInvitationPending(false);
+    setAccessMutationPending(false);
     setMessage(null);
   }, []);
 
@@ -662,6 +740,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
     setConfirmation(null);
     setLookupPending(false);
     setInvitationPending(false);
+    setAccessMutationPending(false);
     setMessage(null);
   };
 
@@ -673,6 +752,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
     setConfirmation(null);
     setLookupPending(false);
     setInvitationPending(false);
+    setAccessMutationPending(false);
     setMessage(null);
   };
 
@@ -738,7 +818,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
   };
 
   const beginInvitation = (intent: InvitationIntent) => {
-    if (!profile || !selectedBotId || invitationPending) return;
+    if (!profile || !selectedBotId || invitationPending || accessMutationPending) return;
     setConfirmation(intent);
     setMessage(null);
   };
@@ -851,6 +931,142 @@ export function AdminApp({ getSession }: AdminAppProps) {
     }
   };
 
+  const beginAccessMutation = (action: "revoke" | "cancel") => {
+    if (
+      !profile?.person ||
+      profile.botId !== selectedBotId ||
+      !selectedBotId ||
+      invitationPending ||
+      accessMutationPending
+    ) {
+      return;
+    }
+    setConfirmation(action);
+    setMessage(null);
+  };
+
+  const mutateAccess = async () => {
+    const session = sessionRef.current;
+    const currentConfig = configRef.current;
+    const currentProfile = profile;
+    const requestedEmail = email.trim();
+    const requestedBotId = selectedBotId;
+    const action = confirmation;
+    const ticket = identityEpochRef.current;
+    const scopeTicket = scopeEpochRef.current;
+    const person = currentProfile?.person;
+    if (
+      !session ||
+      !currentConfig ||
+      !currentProfile ||
+      !person ||
+      (action !== "revoke" && action !== "cancel") ||
+      !requestedBotId ||
+      currentProfile.botId !== requestedBotId ||
+      !emailIsValid(requestedEmail)
+    ) {
+      return;
+    }
+
+    const operationScope = JSON.stringify([
+      ticket,
+      scopeTicket,
+      requestedBotId,
+      requestedEmail,
+      person.sub,
+      currentProfile.access.revision,
+      action,
+    ]);
+    if (accessMutationInFlightRef.current === operationScope) return;
+    accessMutationInFlightRef.current = operationScope;
+    const operationId = makeOperationId();
+    const operationName = action === "revoke" ? "revocación" : "cancelación";
+    const isCurrent = () => isIdentityActive(ticket) && scopeEpochRef.current === scopeTicket;
+    setAccessMutationPending(true);
+    setMessage({
+      kind: "status",
+      text: action === "revoke" ? "Revocando el acceso…" : "Cancelando la invitación…",
+    });
+    try {
+      const result = await adminRequest(
+        currentConfig,
+        session,
+        `/admin/bots/${encodeURIComponent(requestedBotId)}/access/revoke`,
+        {
+          method: "POST",
+          body: {
+            email: requestedEmail,
+            expectedSub: person.sub,
+            expectedRevision: currentProfile.access.revision,
+            operationId,
+          },
+        },
+        isCurrent,
+      );
+      if (!isCurrent()) return;
+      const nextProfile = parseAccessMutation(result, requestedBotId, operationId);
+      if (nextProfile.person?.sub !== person.sub) throw new Error("INVALID_RESPONSE");
+      setProfile(nextProfile);
+      setConfirmation(null);
+      if (action === "cancel" && nextProfile.access.state === "revoked") {
+        setMessage({
+          kind: "status",
+          text: "Invitación cancelada. El acceso sigue revocado y la persona conserva su cuenta e historial.",
+        });
+      } else if (nextProfile.access.state === "revoked") {
+        setMessage({
+          kind: "status",
+          text: "Acceso revocado. La persona conserva su cuenta y sus conversaciones.",
+        });
+      } else if (nextProfile.access.state === "none") {
+        setMessage({
+          kind: "status",
+          text:
+            action === "cancel"
+              ? "La invitación se canceló. La ficha sigue sin acceso."
+              : "La ficha actual no muestra acceso ni una invitación pendiente.",
+        });
+      } else {
+        setMessage({
+          kind: "status",
+          text: "La ficha actual muestra acceso activo. Revisá el estado antes de realizar otro cambio.",
+        });
+      }
+    } catch (error) {
+      if (!isCurrent()) return;
+      if (apiErrorStatus(error) === 403 || apiErrorStatus(error) === 401) {
+        setConfirmation(null);
+        leaveSession(
+          session,
+          ticket,
+          apiErrorStatus(error) === 403 ? "forbidden" : "login",
+          apiErrorStatus(error) === 403
+            ? "Esta cuenta ya no tiene permiso de administrador. La sesión se cerró."
+            : "La sesión venció. Iniciá sesión nuevamente.",
+        );
+      } else if (apiErrorStatus(error) === 409) {
+        setConfirmation(null);
+        setProfile(null);
+        setMessage({
+          kind: "error",
+          text: `La ficha cambió antes de confirmar la ${operationName}. Volvé a buscarla antes de decidir otra acción.`,
+        });
+      } else {
+        setConfirmation(null);
+        setProfile(null);
+        setMessage({
+          kind: "error",
+          text: `No pudimos confirmar el resultado de la ${operationName}. Revisá la ficha antes de volver a decidir; no se repetirá automáticamente.`,
+        });
+      }
+    } finally {
+      if (accessMutationInFlightRef.current === operationScope) {
+        accessMutationInFlightRef.current = null;
+      }
+      if (isCurrent()) setAccessMutationPending(false);
+    }
+  };
+
   const signOut = async () => {
     const session = sessionRef.current;
     const ticket = identityEpochRef.current;
@@ -870,7 +1086,15 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const canInvite = Boolean(
     profile && profile.access.state !== "active" && profile.botId === selectedBotId,
   );
+  const canRevoke = Boolean(
+    profile?.person && profile.access.state === "active" && profile.botId === selectedBotId,
+  );
+  const canCancelInvitation = Boolean(profile?.invitation && profile.botId === selectedBotId);
   const invitationIntent: InvitationIntent = profile?.invitation ? "reissue" : "invite";
+  const confirmationPending =
+    confirmation === "revoke" || confirmation === "cancel"
+      ? accessMutationPending
+      : invitationPending;
 
   return (
     <div className="admin-shell">
@@ -1140,11 +1364,11 @@ export function AdminApp({ getSession }: AdminAppProps) {
               <div>
                 <p className="admin-eyebrow">Administración de acceso</p>
                 <h1 id="admin-title" ref={headingRef} tabIndex={-1}>
-                  Invitar a un chatbot
+                  Administrar acceso a un chatbot
                 </h1>
                 <p className="admin-description">
-                  Elegí el chatbot y buscá la cuenta por su email. El acceso se activa cuando la
-                  persona acepta la invitación.
+                  Elegí el chatbot y buscá la cuenta por su email. Una nueva invitación habilita el
+                  acceso cuando la persona la acepta; revocarlo conserva su cuenta y su historial.
                 </p>
               </div>
               <div className="admin-identity">
@@ -1227,7 +1451,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
                   <span className="admin-step">02</span>
                   <div>
                     <h2 id="admin-result-title">Ficha de acceso</h2>
-                    <p>Revisá la cuenta y el estado antes de invitar.</p>
+                    <p>Revisá la cuenta y el estado antes de cambiar el acceso.</p>
                   </div>
                 </div>
                 {lookupPending && !profile ? (
@@ -1272,17 +1496,42 @@ export function AdminApp({ getSession }: AdminAppProps) {
                         </p>
                       </div>
                     ) : null}
-                    {canInvite ? (
-                      <button
-                        ref={invitationTriggerRef}
-                        className="admin-button"
-                        type="button"
-                        onClick={() => beginInvitation(invitationIntent)}
-                        disabled={invitationPending}
-                      >
-                        {profile.invitation ? "Enviar nueva invitación" : "Invitar"}
-                      </button>
-                    ) : profile.access.state === "active" ? (
+                    <div className="admin-profile__actions">
+                      {canInvite ? (
+                        <button
+                          ref={invitationTriggerRef}
+                          className="admin-button"
+                          type="button"
+                          onClick={() => beginInvitation(invitationIntent)}
+                          disabled={invitationPending || accessMutationPending}
+                        >
+                          {profile.invitation ? "Enviar nueva invitación" : "Invitar"}
+                        </button>
+                      ) : null}
+                      {canRevoke ? (
+                        <button
+                          ref={revokeTriggerRef}
+                          className="admin-button admin-button--danger"
+                          type="button"
+                          onClick={() => beginAccessMutation("revoke")}
+                          disabled={invitationPending || accessMutationPending}
+                        >
+                          Revocar
+                        </button>
+                      ) : null}
+                      {canCancelInvitation ? (
+                        <button
+                          ref={cancelInvitationTriggerRef}
+                          className="admin-button admin-button--quiet"
+                          type="button"
+                          onClick={() => beginAccessMutation("cancel")}
+                          disabled={invitationPending || accessMutationPending}
+                        >
+                          Cancelar invitación
+                        </button>
+                      ) : null}
+                    </div>
+                    {profile.access.state === "active" ? (
                       <p className="admin-active-note">La cuenta tiene acceso a este chatbot.</p>
                     ) : null}
                   </div>
@@ -1309,12 +1558,29 @@ export function AdminApp({ getSession }: AdminAppProps) {
           email={email.trim()}
           projectName={selectedBot.projectName}
           action={confirmation}
-          pending={invitationPending}
-          triggerRef={invitationTriggerRef}
+          pending={confirmationPending}
+          triggerRef={
+            confirmation === "revoke"
+              ? revokeTriggerRef
+              : confirmation === "cancel"
+                ? cancelInvitationTriggerRef
+                : invitationTriggerRef
+          }
+          fallbackTriggerRef={
+            confirmation === "revoke" || confirmation === "cancel"
+              ? invitationTriggerRef
+              : undefined
+          }
           onCancel={() => {
-            if (!invitationPending) setConfirmation(null);
+            if (!invitationPending && !accessMutationPending) setConfirmation(null);
           }}
-          onConfirm={() => void sendInvitation()}
+          onConfirm={() => {
+            if (confirmation === "revoke" || confirmation === "cancel") {
+              void mutateAccess();
+            } else {
+              void sendInvitation();
+            }
+          }}
         />
       ) : null}
     </div>

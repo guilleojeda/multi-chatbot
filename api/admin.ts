@@ -1,5 +1,10 @@
 import { provisionInvitation } from "./invitations.js";
-import type { AccountAccessStore, AccessRecord, InvitationRecord } from "./access.js";
+import {
+  isValidOperationId,
+  type AccountAccessStore,
+  type AccessRecord,
+  type InvitationRecord,
+} from "./access.js";
 import type { InvitationUser } from "./invitations.js";
 
 type AdminStore = AccountAccessStore;
@@ -94,7 +99,10 @@ function pathFrom(event: HttpEvent): string {
   return event.requestContext?.http?.path || event.rawPath || "";
 }
 
-function botIdFromPath(path: string, suffix: "people/lookup" | "invitations"): string | null {
+function botIdFromPath(
+  path: string,
+  suffix: "people/lookup" | "invitations" | "access/revoke",
+): string | null {
   const match = path.match(new RegExp(`^/api/admin/bots/([^/]+)/${suffix.replace("/", "\\/")}$`));
   if (!match) return null;
   try {
@@ -199,16 +207,6 @@ function isStateChanged(error: unknown): boolean {
   return isObject(error) && (error.code === "STATE_CHANGED" || error.name === "STATE_CHANGED");
 }
 
-function validOperationId(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.trim() === value &&
-    value.length >= 1 &&
-    value.length <= 128 &&
-    !/[\r\n]/.test(value)
-  );
-}
-
 export function createAdminHandler(deps: {
   config: AdminConfig;
   stores: Record<string, AdminStore>;
@@ -307,6 +305,63 @@ export function createAdminHandler(deps: {
       }
     }
 
+    const revokeBotId = method === "POST" ? botIdFromPath(path, "access/revoke") : null;
+    if (revokeBotId !== null) {
+      const store = Object.hasOwn(stores, revokeBotId) ? stores[revokeBotId] : undefined;
+      if (!bots.has(revokeBotId) || !store) return response(404, { code: "NOT_FOUND" });
+      const body = parseBody(event);
+      if (
+        !body ||
+        !hasOnlyKeys(body, ["email", "expectedSub", "expectedRevision", "operationId"]) ||
+        typeof body.email !== "string" ||
+        typeof body.expectedSub !== "string" ||
+        body.expectedSub.length === 0 ||
+        !Number.isSafeInteger(body.expectedRevision) ||
+        (body.expectedRevision as number) < 0 ||
+        !isValidOperationId(body.operationId) ||
+        !isEmail(normalizeEmail(body.email))
+      ) {
+        return response(400, { code: "INVALID_INPUT" });
+      }
+
+      try {
+        const email = normalizeEmail(body.email);
+        const user = await deps.identity.getUserByEmail(email);
+        if (
+          !user ||
+          typeof user.sub !== "string" ||
+          user.sub.length === 0 ||
+          user.sub !== body.expectedSub ||
+          typeof user.email !== "string" ||
+          normalizeEmail(user.email) !== email
+        ) {
+          return response(409, { code: "STATE_CHANGED" });
+        }
+
+        const result = await store.revokeAccess({
+          sub: user.sub,
+          botId: revokeBotId,
+          expectedRevision: body.expectedRevision as number,
+          operationId: body.operationId,
+        });
+        if (result.access.sub !== user.sub || result.access.botId !== revokeBotId) {
+          throw new Error("Access record does not match the revocation request");
+        }
+        return response(200, {
+          botId: revokeBotId,
+          person: { sub: user.sub, email: user.email },
+          access: publicAccess(result.access, revokeBotId, user.sub),
+          operation: {
+            id: body.operationId,
+            status: result.created ? "recorded" : "already_recorded",
+          },
+        });
+      } catch (error) {
+        if (isStateChanged(error)) return response(409, { code: "STATE_CHANGED" });
+        return response(503, { code: "TRY_AGAIN" });
+      }
+    }
+
     const invitationBotId = method === "POST" ? botIdFromPath(path, "invitations") : null;
     if (invitationBotId !== null) {
       const bot = bots.get(invitationBotId);
@@ -321,7 +376,7 @@ export function createAdminHandler(deps: {
           (typeof body.expectedSub !== "string" || body.expectedSub.length === 0)) ||
         !Number.isSafeInteger(body.expectedRevision) ||
         (body.expectedRevision as number) < 0 ||
-        !validOperationId(body.operationId) ||
+        !isValidOperationId(body.operationId) ||
         !isEmail(normalizeEmail(body.email))
       ) {
         return response(400, { code: "INVALID_INPUT" });

@@ -142,6 +142,11 @@ export class AdminStack extends Stack {
       ["AdminMeRoute", "/api/admin/me", apigateway.HttpMethod.GET],
       ["AdminBotsRoute", "/api/admin/bots", apigateway.HttpMethod.GET],
       [
+        "AdminRevokeAccessRoute",
+        "/api/admin/bots/{botId}/access/revoke",
+        apigateway.HttpMethod.POST,
+      ],
+      [
         "AdminPeopleLookupRoute",
         "/api/admin/bots/{botId}/people/lookup",
         apigateway.HttpMethod.POST,

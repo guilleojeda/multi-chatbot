@@ -95,7 +95,7 @@ export function createProfileHandler({ config, store, now }: ProfileHandlerDepen
       return json(401, { code: "UNAUTHORIZED", message: "Iniciá sesión para continuar." });
     }
     const access = await store.getAccess({ sub, botId: config.botId });
-    if (access?.access !== "active") {
+    if (access?.access !== "active" && access?.access !== "revoked") {
       return json(403, {
         code: "FORBIDDEN",
         message: "Esta cuenta no tiene acceso a este proyecto.",

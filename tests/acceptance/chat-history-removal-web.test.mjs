@@ -920,7 +920,15 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
 
     await clickHideFor(app, env, firstLabel);
     await confirmHide(app);
+    await app.current().props.onSignOut();
+    await render(app);
+    const signOutCalls = env.session.signOut.mock.calls.length;
     env.identity.sub = "teacher-b";
+    env.session.accessToken.mockReturnValue("temporary-access-token-teacher-b");
+    env.session.restore.mockResolvedValue({
+      accessToken: "temporary-access-token-teacher-b",
+      idToken: "temporary-id-token-teacher-b",
+    });
     await app.setRoute("login");
     await render(app);
     await app.setRoute("chat");
@@ -931,7 +939,7 @@ describe("chat history removal in AccountApp and ChatScreen", () => {
     await render(app);
 
     expect(visibleHistoryState(app).conversations).toEqual([otherIdentityRow]);
-    expect(env.session.signOut).not.toHaveBeenCalled();
+    expect(env.session.signOut).toHaveBeenCalledTimes(signOutCalls);
     expect(domState.document.querySelector(".chat-history")).not.toBeNull();
   });
 

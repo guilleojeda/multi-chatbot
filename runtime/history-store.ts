@@ -211,6 +211,7 @@ function failureCode(value: unknown): { code: string } | undefined {
 export function createHistoryStore(input: {
   documentClient: DynamoDBDocumentClient;
   tableName: string;
+  accountTableName?: string;
   botId: string;
   historyIndexName?: string;
   now?: () => number;
@@ -231,7 +232,12 @@ export function createHistoryStore(input: {
   const indexName = input.historyIndexName ?? "ConversationHistory";
   const now = input.now ?? Date.now;
   const ownerKey = (sub: string) => "USER#" + sub + "#BOT#" + botId;
-  const baseStore = createConversationStoreAdapter({ documentClient, tableName, now });
+  const baseStore = createConversationStoreAdapter({
+    documentClient,
+    tableName,
+    accountTableName: input.accountTableName,
+    now,
+  });
   function scopeHash(scope: { sub: string; botId: string }): string {
     if (
       !scope ||

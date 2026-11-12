@@ -27,6 +27,7 @@ const accountStore = createAccountStoreAdapter({
 const historyStore = createHistoryStore({
   documentClient,
   tableName: conversationTableName,
+  accountTableName,
   botId,
   historyIndexName,
   now: Date.now,

@@ -73,6 +73,13 @@ type ConversationMetaCheck =
   | { kind: "hidden" }
   | { kind: "missing" }
   | { kind: "error"; error: ReturnType<typeof asApiError> };
+type AccountAccess = {
+  sub: string;
+  botId: string;
+  state: "none" | "active" | "revoked";
+  revision: number;
+};
+type ScopedAccountAccess = AccountAccess & { authGeneration: number };
 
 const recoveryNotice =
   "Si la cuenta está activa y tiene un email verificado, recibirás un código para continuar.";
@@ -430,6 +437,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function parseAccountAccess(value: unknown): AccountAccess {
+  if (
+    !isRecord(value) ||
+    typeof value.sub !== "string" ||
+    !value.sub ||
+    typeof value.botId !== "string" ||
+    !value.botId ||
+    !isRecord(value.access) ||
+    !["none", "active", "revoked"].includes(String(value.access.state)) ||
+    !Number.isSafeInteger(value.access.revision) ||
+    (value.access.revision as number) < 0
+  ) {
+    throw Object.assign(new Error("Account access response was invalid"), {
+      code: "INVALID_RESPONSE",
+      status: 502,
+    });
+  }
+  return {
+    sub: value.sub,
+    botId: value.botId,
+    state: value.access.state as AccountAccess["state"],
+    revision: value.access.revision as number,
+  };
+}
+
 function replaceHash(path: string) {
   window.history.replaceState(
     null,
@@ -460,6 +492,14 @@ export function AccountApp({
   const [chatScreenState, setChatScreenState] = useState<ChatScreenState>(emptyChatState);
   const [chatProfileRetryCount, setChatProfileRetryCount] = useState(0);
   const [chatRecoveryRevision, setChatRecoveryRevision] = useState(0);
+  const [accountAccess, setAccountAccess] = useState<ScopedAccountAccess | null>(null);
+  const [accessCheckPending, setAccessCheckPending] = useState(false);
+  const [accessSendBlocked, setAccessSendBlocked] = useState(false);
+  const accountAccessRef = useRef<ScopedAccountAccess | null>(null);
+  const accessSendBlockedRef = useRef(false);
+  const authGenerationRef = useRef(0);
+  const accessRefreshSequenceRef = useRef(0);
+  const accessObservationGenerationRef = useRef(0);
   const chatScreenStateRef = useRef(chatScreenState);
   const chatOwnerKeyRef = useRef<string | null>(null);
   const chatConversationIdRef = useRef<string | null>(null);
@@ -690,6 +730,61 @@ export function AccountApp({
     [clearCurrentChatJournal, setChat, stopChatRecovery],
   );
 
+  const resetAccessStatus = useCallback((advanceAuthGeneration = false) => {
+    if (advanceAuthGeneration) authGenerationRef.current += 1;
+    accountAccessRef.current = null;
+    setAccountAccess(null);
+    accessSendBlockedRef.current = false;
+    setAccessSendBlocked(false);
+    accessRefreshSequenceRef.current += 1;
+    setAccessCheckPending(false);
+  }, []);
+
+  const setAccessSendRestriction = useCallback((blocked: boolean) => {
+    accessSendBlockedRef.current = blocked;
+    setAccessSendBlocked(blocked);
+  }, []);
+
+  const supersedeRuntimeAccessCheck = useCallback(() => {
+    accessRefreshSequenceRef.current += 1;
+    setAccessCheckPending(false);
+  }, []);
+
+  const applyAccountAccess = useCallback(
+    (candidate: AccountAccess, authGeneration: number, expectedBotId: string) => {
+      const current = accountAccessRef.current;
+      if (current?.authGeneration === authGeneration) {
+        if (
+          current.botId === expectedBotId &&
+          (candidate.botId !== current.botId || candidate.sub !== current.sub)
+        ) {
+          return current;
+        }
+        if (current.sub === candidate.sub && current.botId === candidate.botId) {
+          if (
+            candidate.revision < current.revision ||
+            (candidate.revision === current.revision && candidate.state !== current.state)
+          ) {
+            return current;
+          }
+        } else if (current.botId === expectedBotId) {
+          return current;
+        }
+      }
+      if (candidate.botId !== expectedBotId) {
+        throw Object.assign(new Error("Account access response did not match this assistant"), {
+          code: "INVALID_RESPONSE",
+          status: 502,
+        });
+      }
+      const next = { ...candidate, authGeneration };
+      accountAccessRef.current = next;
+      setAccountAccess(next);
+      return next;
+    },
+    [],
+  );
+
   const activateChatIdentity = useCallback(
     (identity: { sub: string; botId: string }) => {
       const nextOwner = chatOwnerKey(identity);
@@ -759,6 +854,11 @@ export function AccountApp({
       )
         ? (currentChat.draft ?? "")
         : "";
+    const accessRejectedDraft =
+      currentChat.queryStatus === "rejected" && currentChat.queryErrorCode === "access_revoked"
+        ? (currentChat.draft ?? "")
+        : "";
+    const draftForNewConversation = capacityRejectedDraft || accessRejectedDraft;
     chatSelectionEpochRef.current += 1;
     historySelectionGenerationRef.current += 1;
     stopChatRecovery();
@@ -770,7 +870,7 @@ export function AccountApp({
     chatDisplayedQueryIdRef.current = null;
     chatPendingConversationOpenRef.current = null;
     historyOpeningContextRef.current = null;
-    chatDraftsRef.current.set("__new__", capacityRejectedDraft);
+    chatDraftsRef.current.set("__new__", draftForNewConversation);
     if (identity && config) {
       try {
         writeChatSelection(config, identity, null);
@@ -783,7 +883,7 @@ export function AccountApp({
       profileError: current.profileError,
       projectName: current.projectName,
       queryStatus: "idle",
-      draft: capacityRejectedDraft,
+      draft: draftForNewConversation,
       history: current.history
         ? {
             ...current.history,
@@ -874,37 +974,57 @@ export function AccountApp({
       authorizedRouteRef.current = null;
       retryOperationRef.current = async () => {
         if (!isActive()) return;
+        const requestAuthGeneration = authGenerationRef.current;
+        supersedeRuntimeAccessCheck();
         setState((current) => ({ ...current, pending: true, error: undefined }));
         try {
           const membership = await requestWithRefresh(config, session, "/account/me", {}, isActive);
+          if (!isActive() || requestAuthGeneration !== authGenerationRef.current) return;
+          const candidate = parseAccountAccess(membership);
+          const resolved = applyAccountAccess(candidate, requestAuthGeneration, config.botId);
+          if (!isActive() || requestAuthGeneration !== authGenerationRef.current) return;
           if (
-            !isRecord(membership) ||
-            typeof membership.sub !== "string" ||
-            membership.botId !== config.botId
+            resolved.authGeneration === requestAuthGeneration &&
+            resolved.sub === candidate.sub &&
+            resolved.botId === candidate.botId &&
+            resolved.state === candidate.state &&
+            resolved.revision === candidate.revision
           ) {
-            throw Object.assign(new Error("Membership response did not match this assistant"), {
-              code: "INVALID_RESPONSE",
-              status: 502,
-            });
+            accessObservationGenerationRef.current += 1;
+            setAccessSendRestriction(false);
           }
-          if (!isActive()) return;
-          activateChatIdentity({ sub: membership.sub, botId: membership.botId });
+          if (resolved.state === "none") {
+            authorizedRouteRef.current = null;
+            invalidateChat(config);
+            setState({
+              view: "denied",
+              email,
+              error: "Esta cuenta no tiene acceso a este asistente.",
+              pending: false,
+              retryable: false,
+              canSignOut: Boolean(session.accessToken()),
+              projectName,
+            });
+            return;
+          }
+          activateChatIdentity({ sub: resolved.sub, botId: resolved.botId });
           authorizedRouteRef.current = routeIdentity;
           setState({
             view: "ready",
             identity: {
-              sub: membership.sub,
-              botId: membership.botId,
+              sub: resolved.sub,
+              botId: resolved.botId,
               generation: ++identityGenerationRef.current,
             },
             email,
             projectName,
           });
         } catch (error) {
-          if (!isActive()) return;
+          if (!isActive() || requestAuthGeneration !== authGenerationRef.current) return;
           authorizedRouteRef.current = null;
           const apiError = asApiError(error);
           if (apiError.status === 401 || apiError.status === 403) {
+            resetAccessStatus(true);
             try {
               clearChatJournalForConfiguredBot(config);
             } catch {
@@ -926,7 +1046,15 @@ export function AccountApp({
 
       await retryOperationRef.current();
     },
-    [activateChatIdentity, invalidateChat, projectName],
+    [
+      activateChatIdentity,
+      applyAccountAccess,
+      invalidateChat,
+      projectName,
+      resetAccessStatus,
+      setAccessSendRestriction,
+      supersedeRuntimeAccessCheck,
+    ],
   );
 
   const initialize = useCallback(
@@ -1015,6 +1143,7 @@ export function AccountApp({
           return;
         }
         if (!restored) {
+          resetAccessStatus(true);
           try {
             clearChatJournalForConfiguredBot(config);
           } catch {
@@ -1033,6 +1162,7 @@ export function AccountApp({
         if (!isActive()) return;
         const apiError = asApiError(error);
         if (apiError.status === 401 || apiError.status === 403) {
+          resetAccessStatus(true);
           if (configRef.current) {
             try {
               clearChatJournalForConfiguredBot(configRef.current);
@@ -1052,7 +1182,15 @@ export function AccountApp({
         });
       }
     },
-    [checkMembership, getSession, inspectInvitation, invalidateChat, projectName, route],
+    [
+      checkMembership,
+      getSession,
+      inspectInvitation,
+      invalidateChat,
+      projectName,
+      resetAccessStatus,
+      route,
+    ],
   );
 
   useEffect(() => {
@@ -1090,6 +1228,7 @@ export function AccountApp({
   }
 
   function beginSignIn() {
+    resetAccessStatus(true);
     invalidateChat();
     authorizedRouteRef.current = null;
     retryOperationRef.current = null;
@@ -1335,6 +1474,7 @@ export function AccountApp({
   }
 
   const signOut = useCallback(() => {
+    resetAccessStatus(true);
     invalidateChat(configRef.current ?? undefined);
     authorizedRouteRef.current = null;
     setState({
@@ -1345,9 +1485,10 @@ export function AccountApp({
     });
     if (window.location.hash !== "#/login") window.location.hash = "/login";
     void sessionRef.current?.signOut();
-  }, [invalidateChat, projectName]);
+  }, [invalidateChat, projectName, resetAccessStatus]);
 
   const profileUnauthorized = useCallback(() => {
+    resetAccessStatus(true);
     invalidateChat(configRef.current ?? undefined);
     authorizedRouteRef.current = null;
     setState({
@@ -1358,9 +1499,10 @@ export function AccountApp({
     });
     if (window.location.hash !== "#/login") window.location.hash = "/login";
     void sessionRef.current?.signOut();
-  }, [invalidateChat, projectName]);
+  }, [invalidateChat, projectName, resetAccessStatus]);
 
   const profileForbidden = useCallback(() => {
+    resetAccessStatus(true);
     invalidateChat(configRef.current ?? undefined);
     authorizedRouteRef.current = null;
     setState({
@@ -1371,7 +1513,95 @@ export function AccountApp({
       canSignOut: Boolean(sessionRef.current?.accessToken()),
       projectName,
     });
-  }, [invalidateChat, projectName]);
+  }, [invalidateChat, projectName, resetAccessStatus]);
+
+  const refreshAccountAccess = useCallback(
+    async (
+      config: PublicConfig,
+      session: Session,
+      identity: { sub: string; botId: string },
+      authGeneration: number,
+      isActive: () => boolean,
+    ) => {
+      if (!isActive() || authGeneration !== authGenerationRef.current) return;
+      const sequence = ++accessRefreshSequenceRef.current;
+      setAccessCheckPending(true);
+      try {
+        const payload = await requestWithRefresh(config, session, "/account/me", {}, isActive);
+        if (
+          !isActive() ||
+          authGeneration !== authGenerationRef.current ||
+          sequence !== accessRefreshSequenceRef.current
+        ) {
+          return;
+        }
+        const candidate = parseAccountAccess(payload);
+        const resolved = applyAccountAccess(candidate, authGeneration, config.botId);
+        if (
+          resolved.authGeneration === authGeneration &&
+          candidate.sub === identity.sub &&
+          candidate.botId === identity.botId &&
+          resolved.sub === identity.sub &&
+          resolved.botId === identity.botId &&
+          resolved.state === candidate.state &&
+          resolved.revision === candidate.revision
+        ) {
+          accessObservationGenerationRef.current += 1;
+          setAccessSendRestriction(false);
+        }
+        if (resolved.sub !== identity.sub || resolved.botId !== identity.botId) return;
+        if (resolved.state !== "none") return;
+
+        authorizedRouteRef.current = null;
+        invalidateChat(config);
+        setState({
+          view: "denied",
+          error: "Esta cuenta no tiene acceso a este asistente.",
+          pending: false,
+          retryable: false,
+          canSignOut: Boolean(session.accessToken()),
+          projectName,
+        });
+      } catch (error) {
+        if (
+          !isActive() ||
+          authGeneration !== authGenerationRef.current ||
+          sequence !== accessRefreshSequenceRef.current
+        ) {
+          return;
+        }
+        const apiError = asApiError(error);
+        if (apiError.status === 401) profileUnauthorized();
+        else if (apiError.status === 403) profileForbidden();
+        else {
+          // A failed status read does not change the last confirmed access state.
+          const currentChat = chatScreenStateRef.current;
+          if (currentChat.queryErrorCode === "access_revoked") {
+            setChat({
+              ...currentChat,
+              queryError:
+                "No se admitió esta consulta. No pudimos comprobar el estado actual de tu acceso.",
+            });
+          }
+        }
+      } finally {
+        if (
+          authGeneration === authGenerationRef.current &&
+          sequence === accessRefreshSequenceRef.current
+        ) {
+          setAccessCheckPending(false);
+        }
+      }
+    },
+    [
+      applyAccountAccess,
+      invalidateChat,
+      profileForbidden,
+      profileUnauthorized,
+      projectName,
+      setAccessSendRestriction,
+    ],
+  );
 
   const authorizedRouteIsCurrent =
     authorizedRouteRef.current?.key === routeKey &&
@@ -2928,6 +3158,8 @@ export function AccountApp({
     const identityKey = chatOwnerKey(identity);
     const chatEpoch = chatEpochRef.current;
     const selectionEpoch = chatSelectionEpochRef.current;
+    const recoveryRouteEpoch = routeEpochRef.current;
+    const recoveryAuthGeneration = authGenerationRef.current;
     const generation = ++chatRecoveryGenerationRef.current;
     let active = true;
     let failures = 0;
@@ -2939,6 +3171,8 @@ export function AccountApp({
       generation === chatRecoveryGenerationRef.current &&
       chatEpochRef.current === chatEpoch &&
       selectionEpoch === chatSelectionEpochRef.current &&
+      routeEpochRef.current === recoveryRouteEpoch &&
+      recoveryAuthGeneration === authGenerationRef.current &&
       chatScreenStateRef.current.history?.selectedConversationId === selectedConversationId &&
       chatOwnerKeyRef.current === identityKey &&
       !hiddenConversationIdsRef.current.has(selectedConversationId) &&
@@ -3286,6 +3520,16 @@ export function AccountApp({
         }
 
         const failureCode = result.code.toLowerCase();
+        if (failureCode === "access_revoked") {
+          setAccessSendRestriction(true);
+          void refreshAccountAccess(
+            recoveryConfig,
+            recoverySession,
+            identity,
+            recoveryAuthGeneration,
+            isActive,
+          );
+        }
         if (failureCode === "access_denied") {
           invalidateChat();
           profileForbidden();
@@ -3454,9 +3698,11 @@ export function AccountApp({
     invalidateChat,
     profileForbidden,
     profileUnauthorized,
+    refreshAccountAccess,
     readyIdentity,
     route.kind,
     session,
+    setAccessSendRestriction,
     setChat,
     chatRecoveryRevision,
     chatScreenState.history?.openingConversationId,
@@ -3749,6 +3995,8 @@ export function AccountApp({
 
   function submitChat(text: string): boolean {
     const identity = state.view === "ready" ? state.identity : undefined;
+    const requestAuthGeneration = authGenerationRef.current;
+    const accessObservationAtSubmission = accessObservationGenerationRef.current;
     const current = chatScreenStateRef.current;
     const ownerKey = identity ? chatOwnerKey(identity) : null;
     const selectedConversationId = current.history?.selectedConversationId ?? null;
@@ -3780,6 +4028,16 @@ export function AccountApp({
       typeof current.ordinal === "number" &&
       Number.isSafeInteger(current.ordinal) &&
       current.ordinal > 0;
+    const currentAccess = accountAccessRef.current;
+    const accessAllowsNewSend = Boolean(
+      currentAccess &&
+      currentAccess.authGeneration === requestAuthGeneration &&
+      currentAccess.sub === identity?.sub &&
+      currentAccess.botId === identity?.botId &&
+      currentAccess.state === "active" &&
+      !accessCheckPending &&
+      !accessSendBlockedRef.current,
+    );
     if (
       !identity ||
       !ownerKey ||
@@ -3796,6 +4054,7 @@ export function AccountApp({
       (current.history?.turnsStatus === "error" && !retrying && !hasUsableContinuationBase) ||
       Boolean(current.history?.openingConversationId) ||
       (!retrying && !canStartNewRequest) ||
+      (!retrying && !accessAllowsNewSend) ||
       (previousJournal && !previousJournal.admitted && !retrying) ||
       chatSubmissionInFlightRef.current ||
       (selectedConversationId && current.canContinue === false && !retrying) ||
@@ -3849,6 +4108,7 @@ export function AccountApp({
     const chatEpoch = chatEpochRef.current;
     const selectionEpoch = chatSelectionEpochRef.current;
     const isActive = () =>
+      authGenerationRef.current === requestAuthGeneration &&
       chatEpochRef.current === chatEpoch &&
       chatSelectionEpochRef.current === selectionEpoch &&
       chatScreenStateRef.current.history?.selectedConversationId === conversationId &&
@@ -3856,6 +4116,15 @@ export function AccountApp({
       !hiddenConversationIdsRef.current.has(conversationId) &&
       chatRequestRef.current === controller &&
       !controller.signal.aborted;
+    const isCurrentAccessContext = () =>
+      Boolean(
+        identity &&
+        ownerKey &&
+        authGenerationRef.current === requestAuthGeneration &&
+        chatOwnerKeyRef.current === ownerKey &&
+        configRef.current?.botId === identity.botId &&
+        sessionRef.current === session,
+      );
     chatSubmissionInFlightRef.current = true;
     chatRequestRef.current = controller;
     chatDraftsRef.current.set(conversationId, text);
@@ -4266,6 +4535,14 @@ export function AccountApp({
           return;
         }
         const failureCode = result.code.toLowerCase();
+        const currentAccessObservation = accountAccessRef.current;
+        const accessRevocationWasSuperseded = Boolean(
+          failureCode === "access_revoked" &&
+          accessObservationGenerationRef.current !== accessObservationAtSubmission &&
+          currentAccessObservation?.authGeneration === requestAuthGeneration &&
+          currentAccessObservation.sub === identity.sub &&
+          currentAccessObservation.botId === identity.botId,
+        );
         const retryablePreAdmissionFailure =
           ["token_count_unavailable", "documents_unavailable", "context_unavailable"].includes(
             failureCode,
@@ -4361,6 +4638,12 @@ export function AccountApp({
           result.recordStatus === "not_admitted" &&
           !preserveUnconfirmedJournal &&
           !retryablePreAdmissionFailure;
+        const retainAccessRejectedDraft =
+          failureCode === "access_revoked" && !preserveUnconfirmedJournal;
+        if (retainAccessRejectedDraft) {
+          chatDraftsRef.current.set(conversationId, text);
+          if (operation === "start") chatDraftsRef.current.set("__new__", text);
+        }
         const remainingConversations = removeRejectedStart
           ? (before.history?.conversations ?? []).filter(
               (conversation) => conversation.conversationId !== conversationId,
@@ -4373,7 +4656,7 @@ export function AccountApp({
         const nextState: ChatScreenState = {
           ...before,
           queryId,
-          draft: failureCode === "stale_base" ? text : before.draft,
+          draft: failureCode === "stale_base" || retainAccessRejectedDraft ? text : before.draft,
           answerComplete: result.recordStatus === "failed",
           profileStatus: failureCode === "profile_required" ? "incomplete" : before.profileStatus,
           profileError: failureCode === "profile_required" ? undefined : before.profileError,
@@ -4386,7 +4669,14 @@ export function AccountApp({
           canContinue: result.canContinue ?? result.recordStatus !== "unconfirmed",
           quota: result.quota,
           quotaReceivedAt: result.quota ? performance.now() : undefined,
-          queryError: result.code.toLowerCase() === "quota_exceeded" ? undefined : result.message,
+          queryError:
+            result.code.toLowerCase() === "quota_exceeded"
+              ? undefined
+              : failureCode === "access_revoked"
+                ? accessRevocationWasSuperseded
+                  ? "No se admitió esta consulta. El estado actual del acceso ya se confirmó."
+                  : "No se admitió esta consulta. Comprobando tu acceso actual."
+                : result.message,
           queryErrorCode: result.code,
           recovered: retrying && result.recordStatus !== "not_admitted",
           recoveryLoading: false,
@@ -4437,6 +4727,16 @@ export function AccountApp({
         }
         if (result.recordStatus === "failed") {
           updateLocalConversation(conversationId, text, baseOrdinal + 1, null, !result.canContinue);
+        }
+        if (failureCode === "access_revoked" && !accessRevocationWasSuperseded) {
+          setAccessSendRestriction(true);
+          void refreshAccountAccess(
+            apiConfig,
+            session,
+            identity,
+            requestAuthGeneration,
+            isCurrentAccessContext,
+          );
         }
       })
       .catch((error: unknown) => {
@@ -4510,6 +4810,12 @@ export function AccountApp({
     const apiConfig = configRef.current;
     const session = sessionRef.current;
     if (!apiConfig || !session) return <AccountScreen {...screenProps} />;
+    const effectiveAccess =
+      accountAccess?.authGeneration === authGenerationRef.current &&
+      accountAccess.sub === state.identity.sub &&
+      accountAccess.botId === state.identity.botId
+        ? accountAccess
+        : null;
     const visibleChatState =
       chatOwnerKeyRef.current === chatOwnerKey(state.identity) ? chatScreenState : emptyChatState();
     const visibleChatHistory = visibleChatState.history;
@@ -4533,6 +4839,9 @@ export function AccountApp({
     return (
       <ChatScreen
         state={{ ...chatScreenStateWithJournalActivity, projectName }}
+        accessStatus={effectiveAccess?.state === "revoked" ? "revoked" : "active"}
+        accessCheckPending={accessCheckPending}
+        accessSendBlocked={accessSendBlocked}
         onSubmit={submitChat}
         onSignOut={signOut}
         onRetryProfile={retryChatProfile}

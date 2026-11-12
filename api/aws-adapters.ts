@@ -16,11 +16,14 @@ import { SendEmailCommand, type SESv2Client } from "@aws-sdk/client-sesv2";
 import {
   mapAccessRecord,
   mapInvitationRecord,
+  isValidOperationId,
   StateChangedError,
   type AccessRecord,
   type ActivationInput,
   type InvitationDelivery,
   type InvitationRecord,
+  type RevokeAccessInput,
+  type RevokeAccessResult,
   type RecordInvitationDeliveryInput,
   type RegisterInvitationInput,
   type RegisterInvitationResult,
@@ -264,6 +267,9 @@ export function createAccountStoreAdapter({
     if (!access) return null;
     const operation = access.lastAdminOperation;
     if (!operation || operation.id !== input.operationId) return null;
+    if (operation.kind !== "invite") {
+      throw new StateChangedError("The prior administrative operation is not an invitation.");
+    }
     const invitation = await getInvitation(operation.invitationHash);
     if (
       !invitation ||
@@ -279,6 +285,9 @@ export function createAccountStoreAdapter({
   async function registerInvitation(
     input: RegisterInvitationInput,
   ): Promise<RegisterInvitationResult> {
+    if (!isValidOperationId(input.operationId)) {
+      throw new TypeError("Invitation operation ID must contain between 1 and 128 characters.");
+    }
     const identity = { sub: input.sub, botId: input.botId };
     const access = await getAccess(identity);
     const replay = await readReplay(input, access);
@@ -395,7 +404,97 @@ export function createAccountStoreAdapter({
     }
   }
 
+  function confirmedRevokeReplay(
+    input: RevokeAccessInput,
+    access: AccessRecord | null,
+  ): RevokeAccessResult | null {
+    const operation = access?.lastAdminOperation;
+    if (!access || !operation || operation.id !== input.operationId) return null;
+    if (
+      operation.kind === "revoke" &&
+      access.revision === input.expectedRevision + 1 &&
+      access.access !== "active"
+    ) {
+      return { access, created: false };
+    }
+    throw new StateChangedError("The prior revocation is no longer the current ACCESS result.");
+  }
+
+  async function revokeAccess(input: RevokeAccessInput): Promise<RevokeAccessResult> {
+    if (
+      !isValidOperationId(input.operationId) ||
+      !Number.isSafeInteger(input.expectedRevision) ||
+      input.expectedRevision < 0
+    ) {
+      throw new TypeError("Revocation operation details are invalid.");
+    }
+    const identity = { sub: input.sub, botId: input.botId };
+    const access = await getAccess(identity);
+    if (!access) throw new StateChangedError("The account has no current ACCESS record.");
+
+    const replay = confirmedRevokeReplay(input, access);
+    if (replay) return replay;
+    if (access.revision !== input.expectedRevision) throw new StateChangedError();
+    const nextRevision = input.expectedRevision + 1;
+    if (!Number.isSafeInteger(nextRevision)) throw new StateChangedError();
+
+    const nextAccess: AccessRecord = {
+      ...access,
+      access: access.access === "active" ? "revoked" : access.access,
+      revision: nextRevision,
+      lastAdminOperation: { id: input.operationId, kind: "revoke" },
+    };
+    delete nextAccess.currentInvitation;
+
+    try {
+      await documentClient.send(
+        new UpdateCommand({
+          TableName: tableName,
+          Key: accessKey(input.botId, input.sub),
+          UpdateExpression:
+            "SET #access = :access, #revision = :nextRevision, #lastAdminOperation = :lastAdminOperation REMOVE #currentInvitation",
+          ConditionExpression:
+            "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND #revision = :expectedRevision",
+          ExpressionAttributeNames: {
+            "#access": "access",
+            "#revision": "revision",
+            "#lastAdminOperation": "lastAdminOperation",
+            "#currentInvitation": "currentInvitation",
+            "#sub": "sub",
+            "#botId": "botId",
+          },
+          ExpressionAttributeValues: {
+            ":access": nextAccess.access,
+            ":nextRevision": nextRevision,
+            ":lastAdminOperation": nextAccess.lastAdminOperation,
+            ":sub": input.sub,
+            ":botId": input.botId,
+            ":expectedRevision": input.expectedRevision,
+          },
+        }),
+      );
+      return { access: nextAccess, created: true };
+    } catch (error) {
+      const conditional = conditionalFailure(error);
+      let current: AccessRecord | null;
+      try {
+        current = await getAccess(identity);
+      } catch {
+        throw error;
+      }
+      const committedReplay = confirmedRevokeReplay(input, current);
+      if (committedReplay) return committedReplay;
+      if (conditional || current?.revision !== input.expectedRevision) {
+        throw new StateChangedError();
+      }
+      throw error;
+    }
+  }
+
   async function recordInvitationDelivery(input: RecordInvitationDeliveryInput): Promise<void> {
+    if (!isValidOperationId(input.operationId)) {
+      throw new TypeError("Invitation operation ID must contain between 1 and 128 characters.");
+    }
     try {
       await documentClient.send(
         new UpdateCommand({
@@ -646,6 +745,7 @@ export function createAccountStoreAdapter({
     getAccess,
     getInvitation,
     registerInvitation,
+    revokeAccess,
     recordInvitationDelivery,
     reserveActivation,
     releaseActivation,

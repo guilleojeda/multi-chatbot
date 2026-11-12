@@ -2156,7 +2156,11 @@ export class ChatBrowserFixture {
         throw new Error("Fixture membership network failure");
       }
       this.finish(item, 200, "membresía activa simulada");
-      return json({ sub, botId: this.publicConfig.botId });
+      return json({
+        sub,
+        botId: this.publicConfig.botId,
+        access: { state: "active", revision: 1 },
+      });
     }
     if (url.pathname === "/api/profile" && method === "GET") {
       if (!sub) {

@@ -112,7 +112,13 @@ describe("chat recovery after an uncertain stream in the current view", () => {
       vi.fn(async (input, init = {}) => {
         const url = String(input);
         if (url === "/public-config.json") return jsonResponse(config);
-        if (url === "/api/account/me") return jsonResponse({ sub: "teacher-a", botId: "docentes" });
+        if (url === "/api/account/me") {
+          return jsonResponse({
+            sub: "teacher-a",
+            botId: "docentes",
+            access: { state: "active", revision: 1 },
+          });
+        }
         if (url === "/api/profile") {
           return jsonResponse({
             sub: "teacher-a",
@@ -281,7 +287,13 @@ describe("chat recovery after an uncertain stream in the current view", () => {
       vi.fn(async (input, init = {}) => {
         const url = String(input);
         if (url === "/public-config.json") return jsonResponse(config);
-        if (url === "/api/account/me") return jsonResponse({ sub: "teacher-a", botId: "docentes" });
+        if (url === "/api/account/me") {
+          return jsonResponse({
+            sub: "teacher-a",
+            botId: "docentes",
+            access: { state: "active", revision: 1 },
+          });
+        }
         if (url === "/api/profile") {
           return jsonResponse({
             sub: "teacher-a",
@@ -400,7 +412,13 @@ describe("chat recovery after an uncertain stream in the current view", () => {
       vi.fn(async (input, init = {}) => {
         const url = String(input);
         if (url === "/public-config.json") return jsonResponse(config);
-        if (url === "/api/account/me") return jsonResponse({ sub: "teacher-a", botId: "docentes" });
+        if (url === "/api/account/me") {
+          return jsonResponse({
+            sub: "teacher-a",
+            botId: "docentes",
+            access: { state: "active", revision: 1 },
+          });
+        }
         if (url === "/api/profile") {
           return jsonResponse({
             sub: "teacher-a",
@@ -529,7 +547,13 @@ describe("chat recovery after an uncertain stream in the current view", () => {
       vi.fn(async (input, init = {}) => {
         const url = String(input);
         if (url === "/public-config.json") return jsonResponse(config);
-        if (url === "/api/account/me") return jsonResponse({ sub: "teacher-a", botId: "docentes" });
+        if (url === "/api/account/me") {
+          return jsonResponse({
+            sub: "teacher-a",
+            botId: "docentes",
+            access: { state: "active", revision: 1 },
+          });
+        }
         if (url === "/api/profile") {
           return jsonResponse({
             sub: "teacher-a",
@@ -662,7 +686,9 @@ describe("chat recovery after an uncertain stream in the current view", () => {
       vi.fn(async (input, init = {}) => {
         const url = String(input);
         if (url === "/public-config.json") return jsonResponse(config);
-        if (url === "/api/account/me") return jsonResponse(owner);
+        if (url === "/api/account/me") {
+          return jsonResponse({ ...owner, access: { state: "active", revision: 1 } });
+        }
         if (url === "/api/profile") {
           return jsonResponse({
             ...owner,

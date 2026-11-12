@@ -904,6 +904,7 @@ describe("AdminApp: acceso desde la web", () => {
     expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
     expect(bodyText(harness.document)).toContain(email);
     expect(bodyText(harness.document)).toMatch(/acceso activo/i);
+    expect(harness.document.activeElement).toBe(getButton(harness, "Revocar"));
 
     await harness.click(getButton(harness, "Revocar"));
     const confirmation = getButton(harness, "Confirmar revocación");
@@ -929,6 +930,7 @@ describe("AdminApp: acceso desde la web", () => {
     expect(harness.apiRequests.some(({ url }) => url.hostname !== "localhost")).toBe(false);
 
     const pendingConfirmation = button(harness.document, "Confirmar revocación");
+    expect(bodyText(harness.document)).toMatch(/revocando el acceso/i);
     if (pendingConfirmation) {
       expect(pendingConfirmation.disabled).toBe(true);
       await harness.click(pendingConfirmation);
@@ -949,6 +951,7 @@ describe("AdminApp: acceso desde la web", () => {
     await harness.settle();
     expect(bodyText(harness.document)).toMatch(/acceso revocado/i);
     expect(bodyText(harness.document)).not.toMatch(/acceso activo/i);
+    expect(harness.document.activeElement).toBe(getButton(harness, "Invitar"));
   });
 
   it("cancela una invitación pendiente sin convertirla en acceso revocado", async () => {

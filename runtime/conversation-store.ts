@@ -5,6 +5,7 @@ import {
   UpdateCommand,
   type DynamoDBDocumentClient,
 } from "@aws-sdk/lib-dynamodb";
+import { maximumAccessRecordSizeBytes } from "../api/access.js";
 import type { MessageData } from "@strands-agents/sdk";
 import type {
   AppendChunkInput,
@@ -690,9 +691,14 @@ function isChunkedContextSnapshot(value: unknown): boolean {
 export function createConversationStoreAdapter(input: {
   documentClient: DynamoDBDocumentClient;
   tableName: string;
+  accountTableName?: string;
   now?: () => number;
 }) {
   const { documentClient, tableName } = input;
+  const accountTableName =
+    typeof input.accountTableName === "string" && input.accountTableName.trim()
+      ? input.accountTableName
+      : undefined;
   const currentTime = input.now ?? Date.now;
   const contextStorage = createContextStorage({ documentClient, tableName });
   const zone = "America/Argentina/Cordoba";
@@ -717,6 +723,7 @@ export function createConversationStoreAdapter(input: {
 
   function storeError(
     code:
+      | "access_revoked"
       | "quota_exceeded"
       | "conversation_busy"
       | "conversation_hidden"
@@ -814,11 +821,11 @@ export function createConversationStoreAdapter(input: {
     };
   }
 
-  function itemKey(item: Record<string, unknown>): string {
+  function itemKey(item: Record<string, unknown>, targetTableName: string): string {
     if (typeof item.pk !== "string" || typeof item.sk !== "string") {
       throw new TypeError("DynamoDB transaction item has no valid key.");
     }
-    return item.pk + "\u0000" + item.sk;
+    return targetTableName + "\u0000" + item.pk + "\u0000" + item.sk;
   }
 
   function storageCapacityError(message: string): RangeError & {
@@ -830,19 +837,33 @@ export function createConversationStoreAdapter(input: {
   function preflight(
     actions: Record<string, unknown>[],
     affectedItems: Record<string, unknown>[],
+    reservedItems: {
+      tableName: string;
+      item: Record<string, unknown>;
+      sizeBytes?: number;
+    }[] = [],
   ): void {
     if (actions.length > actionLimit)
       throw storageCapacityError("DynamoDB transaction exceeds 100 actions.");
     const keys = new Set<string>();
-    for (const item of affectedItems) {
-      const key = itemKey(item);
+    const sizedItems = [
+      ...affectedItems.map((item) => ({ tableName, item, sizeBytes: undefined })),
+      ...reservedItems,
+    ];
+    let totalBytes = 0;
+    for (const { tableName: itemTableName, item, sizeBytes: reservedSize } of sizedItems) {
+      const key = itemKey(item, itemTableName);
       if (keys.has(key))
         throw new TypeError("DynamoDB transactions cannot target an item more than once.");
       keys.add(key);
-      if (dynamoItemSize(item) > itemLimit)
+      const sizeBytes = reservedSize ?? dynamoItemSize(item);
+      if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0)
+        throw new TypeError("DynamoDB transaction item size is invalid.");
+      if (sizeBytes > itemLimit)
         throw storageCapacityError("DynamoDB transaction item exceeds 400 KiB.");
+      totalBytes += sizeBytes;
     }
-    if (affectedItems.reduce((total, item) => total + dynamoItemSize(item), 0) > transactionLimit) {
+    if (totalBytes > transactionLimit) {
       throw storageCapacityError("DynamoDB transaction exceeds 4 MiB.");
     }
   }
@@ -975,6 +996,40 @@ export function createConversationStoreAdapter(input: {
     );
   }
 
+  function accessKey(input: { sub: string; botId: string }): Record<string, string> {
+    return {
+      pk: `BOT#${input.botId}#USER#${input.sub}`,
+      sk: "ACCESS",
+    };
+  }
+
+  function isAccessConditionFailure(
+    error: unknown,
+    actions: Record<string, unknown>[],
+    identity: { sub: string; botId: string },
+  ): boolean {
+    if (
+      !accountTableName ||
+      !isRecord(error) ||
+      error.name !== "TransactionCanceledException" ||
+      !Array.isArray(error.CancellationReasons)
+    ) {
+      return false;
+    }
+    const expectedKey = accessKey(identity);
+    const accessIndex = actions.findIndex((action) => {
+      const payload = isRecord(action.ConditionCheck) ? action.ConditionCheck : undefined;
+      const key = isRecord(payload?.Key) ? payload.Key : undefined;
+      return (
+        payload?.TableName === accountTableName &&
+        key?.pk === expectedKey.pk &&
+        key?.sk === expectedKey.sk
+      );
+    });
+    const reason = error.CancellationReasons[accessIndex];
+    return accessIndex >= 0 && isRecord(reason) && reason.Code === "ConditionalCheckFailed";
+  }
+
   function inputBaseOrdinal(turn: ContinueTurnInput): number {
     const value = turn.baseOrdinal;
     if (!isPositiveSafeInteger(value) || !Number.isSafeInteger(value + 1)) {
@@ -1094,6 +1149,9 @@ export function createConversationStoreAdapter(input: {
     operation: "start" | "message",
     baseOrdinal: number,
   ) {
+    if (!accountTableName) {
+      throw new Error("Account table configuration is required to admit a conversation turn.");
+    }
     const ordinal = baseOrdinal + 1;
     if (!Number.isSafeInteger(ordinal) || ordinal <= 0)
       throw new RangeError("Conversation ordinal cannot be safely incremented.");
@@ -1281,6 +1339,23 @@ export function createConversationStoreAdapter(input: {
             ":revision": turn.quota.policyRevision,
             ":dailyLimit": turn.quota.daily.limit,
             ":monthlyLimit": turn.quota.monthly.limit,
+          },
+        },
+      },
+      {
+        ConditionCheck: {
+          TableName: accountTableName,
+          Key: accessKey(turn),
+          ConditionExpression: "#access = :active AND #sub = :sub AND #botId = :botId",
+          ExpressionAttributeNames: {
+            "#access": "access",
+            "#sub": "sub",
+            "#botId": "botId",
+          },
+          ExpressionAttributeValues: {
+            ":active": "active",
+            ":sub": turn.sub,
+            ":botId": turn.botId,
           },
         },
       },
@@ -1492,7 +1567,13 @@ export function createConversationStoreAdapter(input: {
       },
     });
     affectedItems.push(marker);
-    preflight(transactionItems, affectedItems);
+    preflight(transactionItems, affectedItems, [
+      {
+        tableName: accountTableName,
+        item: accessKey(turn),
+        sizeBytes: maximumAccessRecordSizeBytes(turn),
+      },
+    ]);
     return { ordinal, transactionItems, affectedItems, marker };
   }
 
@@ -1501,6 +1582,7 @@ export function createConversationStoreAdapter(input: {
     original: unknown,
     operation: "start" | "message",
     baseOrdinal: number,
+    actions: Record<string, unknown>[],
   ): Promise<never> {
     const marker = await readExistingSubmission(turn.sub, turn.botId, turn.queryId);
     if (marker) {
@@ -1514,6 +1596,9 @@ export function createConversationStoreAdapter(input: {
         );
       }
       throw storeError("submission_exists", "Admission is already durable; load its snapshot.");
+    }
+    if (isAccessConditionFailure(original, actions, turn)) {
+      throw storeError("access_revoked", "Access no longer permits new submissions.");
     }
     if (!isConditionalFailure(original)) throw original;
     const meta = await adapter.getMeta({ conversationId: turn.conversationId });
@@ -2342,7 +2427,7 @@ export function createConversationStoreAdapter(input: {
           }),
         );
       } catch (error) {
-        return classifyAdmissionFailure(turn, error, operation, baseOrdinal);
+        return classifyAdmissionFailure(turn, error, operation, baseOrdinal, plan.transactionItems);
       }
       return { queryId: turn.queryId, ordinal: plan.ordinal };
     },
@@ -2364,7 +2449,7 @@ export function createConversationStoreAdapter(input: {
           }),
         );
       } catch (error) {
-        return classifyAdmissionFailure(turn, error, operation, baseOrdinal);
+        return classifyAdmissionFailure(turn, error, operation, baseOrdinal, plan.transactionItems);
       }
       return { queryId: turn.queryId, ordinal: plan.ordinal };
     },

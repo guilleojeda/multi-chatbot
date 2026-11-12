@@ -1189,10 +1189,10 @@ describe("the public global-admin invitation API", () => {
     const api = makeApi({ identity, store, mail, randomBytes });
 
     const response = await revoke(api.handler, {
-      ...change,
       expectedSub: "teacher-sub",
       expectedRevision: 3,
       operationId: "valid-revoke",
+      ...change,
     });
 
     expect(response.statusCode).toBe(400);
@@ -1308,6 +1308,7 @@ describe("the public global-admin invitation API", () => {
     const randomBytes = vi.fn(() => Buffer.alloc(32, 2));
     const mail = { sendInvitation: vi.fn() };
     const api = makeApi({ identity, store, mail, randomBytes });
+    api.config.sender = null;
 
     const response = await revoke(api.handler, {
       expectedSub: "teacher-sub",
@@ -1330,6 +1331,7 @@ describe("the public global-admin invitation API", () => {
       expectedRevision: 9,
       operationId: "revoke-observed-teacher",
     });
+    expect(identity.getUserByEmail).toHaveBeenCalledExactlyOnceWith(invitedEmail);
     expect(state.user.password).toBe(existingPassword);
     expect(identity.createUser).not.toHaveBeenCalled();
     expect(identity.setPermanentPassword).not.toHaveBeenCalled();

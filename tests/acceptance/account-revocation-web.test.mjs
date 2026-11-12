@@ -385,6 +385,52 @@ describe("docente web access after revocation", () => {
     expect(harness.runtimeRequests).toHaveLength(1);
   });
 
+  it("keeps new sends paused after an access rejection if the current status read fails, then resumes on a newer active read", async () => {
+    let access = { state: "active", revision: 4 };
+    let accountReads = 0;
+    const handlers = historyHandlers({ canContinue: true });
+    const harness = await createMounted({
+      profileHandler: completeProfile,
+      accountHandler: async () => {
+        accountReads += 1;
+        if (accountReads === 2) return accountJson({ code: "SERVICE_UNAVAILABLE" }, 503);
+        return accountJson({ ...teacherIdentity, access });
+      },
+      runtimeHandler: async ({ request }) => runtimeFailure(request),
+      ...handlers,
+    });
+    await openConversation(harness);
+    await waitForButton(harness, "Enviar");
+
+    await harness.setValue(
+      accountControl(harness.document, "Escribí tu consulta"),
+      "El Runtime rechaza el envío, pero el estado no se pudo leer.",
+    );
+    await harness.click(accountButton(harness.document, "Enviar"));
+    await waitForPage(harness, "No pudimos comprobar el estado actual de tu acceso.");
+    expect(accountText(harness.document)).not.toContain(
+      "Tu acceso a nuevas consultas está revocado.",
+    );
+    expect(harness.storage.getItem("auth-refresh")).toBe("controlled-refresh-token");
+
+    await harness.click(accountButton(harness.document, "Nueva conversación"));
+    const nextQuestion = "Una pregunta posterior a la lectura transitoria.";
+    await harness.setValue(accountControl(harness.document, "Escribí tu consulta"), nextQuestion);
+    expect(accountButton(harness.document, "Enviar").disabled).toBe(true);
+    await harness.submit(currentChatForm(harness));
+    expect(harness.runtimeRequests).toHaveLength(1);
+
+    access = { state: "active", revision: 6 };
+    await harness.setRoute({ kind: "profile" });
+    await waitForPage(harness, "Mi perfil");
+    await harness.setRoute({ kind: "chat" });
+    await waitForButton(harness, "Enviar");
+    expect(accountButton(harness.document, "Enviar").disabled).toBe(false);
+    expect(accountControl(harness.document, "Escribí tu consulta").value).toBe(nextQuestion);
+    expect(harness.accountRequests).toHaveLength(4);
+    expect(harness.runtimeRequests).toHaveLength(1);
+  });
+
   it("does not turn an earlier uncertain request into a confirmed rejection or change its IDs", async () => {
     let access = { state: "active", revision: 2 };
     const handlers = historyHandlers({ visible: false });
@@ -408,7 +454,7 @@ describe("docente web access after revocation", () => {
 
     await harness.click(accountButton(harness.document, "Reintentar el mismo envío"));
     await waitForPage(harness, "Tu acceso a nuevas consultas está revocado.");
-    expect(harness.runtimeRequests).toHaveLength(3);
+    expect(harness.runtimeRequests.length).toBeGreaterThanOrEqual(3);
     expect(harness.runtimeRequests[1].request).toMatchObject({
       version: 2,
       operation: "recover",
@@ -416,6 +462,18 @@ describe("docente web access after revocation", () => {
       queryId: firstRequest.queryId,
     });
     expect(harness.runtimeRequests[2].request).toEqual(firstRequest);
+    const retries = harness.runtimeRequests.map(({ request }) => request);
+    expect(retries.filter(({ operation }) => operation !== "recover")).toEqual([
+      firstRequest,
+      firstRequest,
+    ]);
+    for (const request of retries.filter(({ operation }) => operation === "recover")) {
+      expect(request).toMatchObject({
+        operation: "recover",
+        conversationId: firstRequest.conversationId,
+        queryId: firstRequest.queryId,
+      });
+    }
     expect(accountButton(harness.document, "Reintentar el mismo envío")).toBeDefined();
     expect(accountText(harness.document)).not.toContain("Iniciá sesión");
     expect(harness.storage.getItem("auth-refresh")).toBe("controlled-refresh-token");
@@ -624,6 +682,68 @@ describe("docente web access after revocation", () => {
     expect(accountButton(harness.document, "Enviar").disabled).toBe(false);
     expect(accountText(harness.document)).not.toContain("Iniciá sesión");
     expect(harness.storage.getItem("auth-refresh")).toBe("controlled-refresh-token");
+  });
+
+  it("ignores a delayed Runtime revocation for global sending after the same conversation was rechecked active", async () => {
+    const oldRuntimeResponse = deferred();
+    let accountReads = 0;
+    let releaseOldRuntime = false;
+    const handlers = historyHandlers({ visible: false });
+    const harness = await createMounted({
+      profileHandler: completeProfile,
+      accountHandler: async () => {
+        if (releaseOldRuntime) return accountJson({ code: "SERVICE_UNAVAILABLE" }, 503);
+        accountReads += 1;
+        return accountJson({
+          ...teacherIdentity,
+          access: { state: "active", revision: 3 + accountReads },
+        });
+      },
+      runtimeHandler: async ({ request }) => {
+        if (harness.runtimeRequests.length === 1) return oldRuntimeResponse.promise;
+        return completedStream(request, "Respuesta de la consulta nueva.");
+      },
+      ...handlers,
+    });
+
+    const originalQuestion = "La consulta iniciada antes de volver al chat.";
+    await harness.setValue(
+      accountControl(harness.document, "Escribí tu consulta"),
+      originalQuestion,
+    );
+    await harness.click(accountButton(harness.document, "Enviar"));
+    await vi.waitFor(() => expect(harness.runtimeRequests).toHaveLength(1));
+
+    await harness.setRoute({ kind: "profile" });
+    await waitForPage(harness, "Mi perfil");
+    await harness.setRoute({ kind: "chat" });
+    await waitForPage(harness, "Nueva conversación");
+    expect(harness.runtimeRequests[0].init.signal.aborted).toBe(false);
+    expect(harness.accountRequests).toHaveLength(3);
+
+    releaseOldRuntime = true;
+    oldRuntimeResponse.resolve(runtimeFailure(harness.runtimeRequests[0].request));
+    await waitForPage(harness, "El estado actual del acceso ya se confirmó.");
+    expect(harness.accountRequests).toHaveLength(3);
+    expect(harness.runtimeRequests[0].request.text).toBe(originalQuestion);
+    expect(accountControl(harness.document, "Escribí tu consulta").value).toBe(originalQuestion);
+    expect(accountText(harness.document)).toContain("No se admitió esta consulta.");
+    expect(accountText(harness.document)).not.toContain(
+      "Tu acceso a nuevas consultas está revocado.",
+    );
+    expect(harness.storage.getItem("auth-refresh")).toBe("controlled-refresh-token");
+
+    await harness.click(accountButton(harness.document, "Nueva conversación"));
+    const nextQuestion = "Una consulta nueva tras confirmar el acceso activo.";
+    await harness.setValue(accountControl(harness.document, "Escribí tu consulta"), nextQuestion);
+    expect(accountButton(harness.document, "Enviar").disabled).toBe(false);
+    await harness.click(accountButton(harness.document, "Enviar"));
+    await waitForPage(harness, "Respuesta de la consulta nueva.");
+    expect(harness.runtimeRequests).toHaveLength(2);
+    expect(harness.runtimeRequests[1].request).toMatchObject({
+      operation: "start",
+      text: nextQuestion,
+    });
   });
 
   it("ignores an older access revision and stale owner or bot state, then accepts the current same-owner state", async () => {

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  isValidOperationId,
   StateChangedError,
   type AccountAccessStore,
   type AccessRecord,
@@ -133,6 +134,9 @@ async function findReplay(
 ): Promise<ProvisionInvitationResult | null> {
   const operation = access?.lastAdminOperation;
   if (!operation || operation.id !== input.operationId) return null;
+  if (operation.kind !== "invite") {
+    throw new StateChangedError("The prior administrative operation is not an invitation.");
+  }
   const invitation = await deps.store.getInvitation(operation.invitationHash);
   if (
     !invitation ||
@@ -194,8 +198,7 @@ export async function provisionInvitation(
   const email = typeof input?.email === "string" ? normalizeEmail(input.email) : "";
   if (!isEmail(email)) throw new Error("Enter a valid recipient email address.");
   if (
-    typeof input.operationId !== "string" ||
-    input.operationId.trim().length === 0 ||
+    !isValidOperationId(input.operationId) ||
     !Number.isSafeInteger(input.expectedRevision) ||
     input.expectedRevision < 0 ||
     (input.expectedSub !== null &&

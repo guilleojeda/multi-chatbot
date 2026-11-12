@@ -348,7 +348,12 @@ describe("reference verification retry in the real AccountApp DOM", () => {
     const metaOwners = [];
     const app = await mount({
       session,
-      identityHandler: () => jsonResponse({ sub: ownerSub, botId: "docentes" }),
+      identityHandler: () =>
+        jsonResponse({
+          sub: ownerSub,
+          botId: "docentes",
+          access: { state: "active", revision: 1 },
+        }),
       profileHandler: () =>
         jsonResponse({
           sub: ownerSub,

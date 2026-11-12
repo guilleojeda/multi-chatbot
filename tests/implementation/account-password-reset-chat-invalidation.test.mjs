@@ -168,7 +168,7 @@ function createEnvironment(confirmSucceeds, holdConfirmation = false, authOption
     if (url === "/public-config.json") return Response.json(config);
     if (url === "/api/account/me") {
       membershipRequests.push(url);
-      return Response.json(currentIdentity);
+      return Response.json({ ...currentIdentity, access: { state: "active", revision: 1 } });
     }
     if (url === "/api/account/invitations/inspect") {
       return Response.json({
