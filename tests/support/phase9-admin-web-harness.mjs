@@ -1,6 +1,7 @@
 import React, { act } from "react";
 import { JSDOM } from "jsdom";
 import { vi } from "vitest";
+import { createSession } from "../../web/session.ts";
 
 const publicConfig = {
   environment: "dev",
@@ -77,18 +78,21 @@ function makeSession({
   return session;
 }
 
-export async function createAdminWebHarness(AdminApp, { restoreResults, signInResult } = {}) {
+export async function createAdminWebHarness(
+  AdminApp,
+  { restoreResults, signInResult, useRealSession = false } = {},
+) {
   const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
     url: "http://localhost/",
     pretendToBeVisual: true,
   });
   const document = dom.window.document;
   const adminStorage = new AdminMemoryStorage();
-  adminStorage.setItem("auth-refresh", "admin-refresh-token");
+  if (!useRealSession) adminStorage.setItem("auth-refresh", "admin-refresh-token");
   Object.defineProperty(dom.window, "sessionStorage", { configurable: true, value: adminStorage });
-  const session = makeSession({ restoreResults, signInResult, storage: adminStorage });
-  const getSession = vi.fn(() => session);
   const apiRequests = [];
+  const cognitoRequests = [];
+  const cognitoRoutes = new Map();
   const routes = [];
 
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -106,6 +110,20 @@ export async function createAdminWebHarness(AdminApp, { restoreResults, signInRe
 
     const method = (init.method ?? "GET").toUpperCase();
     const headers = new Headers(init.headers);
+    if (url.hostname === `cognito-idp.${publicConfig.region}.amazonaws.com`) {
+      const target = headers.get("x-amz-target") ?? "";
+      const request = {
+        operation: target.split(".").at(-1) ?? "",
+        target,
+        headers,
+        body: typeof init.body === "string" ? JSON.parse(init.body) : undefined,
+      };
+      cognitoRequests.push(request);
+      const route = cognitoRoutes.get(target);
+      if (!route) return jsonResponse({ __type: "UnexpectedOperationException" }, 500);
+      return route(request);
+    }
+
     const request = {
       method,
       path: url.pathname,
@@ -126,6 +144,16 @@ export async function createAdminWebHarness(AdminApp, { restoreResults, signInRe
   });
   vi.stubGlobal("fetch", fetch);
 
+  const session = useRealSession
+    ? createSession({
+        clientId: publicConfig.clientId,
+        region: publicConfig.region,
+        storage: adminStorage,
+        fetch,
+      })
+    : makeSession({ restoreResults, signInResult, storage: adminStorage });
+  const getSession = vi.fn(() => session);
+
   const { createRoot } = await import("react-dom/client");
   const root = createRoot(document.getElementById("root"));
 
@@ -137,9 +165,13 @@ export async function createAdminWebHarness(AdminApp, { restoreResults, signInRe
     getSession,
     fetch,
     apiRequests,
+    cognitoRequests,
     adminStorage,
     route(method, path, handler) {
       routes.push({ method: method.toUpperCase(), path, handler });
+    },
+    cognito(operation, handler) {
+      cognitoRoutes.set(`AWSCognitoIdentityProviderService.${operation}`, handler);
     },
     async settle() {
       await act(async () => {
