@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { App } from "aws-cdk-lib";
+import { App, CfnOutput, CfnResource, Fn, Stack } from "aws-cdk-lib";
 import { afterAll, describe, expect, it } from "vitest";
 import { resolveEnvironment } from "../../dist/config/project.js";
 import { AccountStack } from "../../dist/infra/lib/account-stack.js";
@@ -240,6 +240,70 @@ async function scenarioFor(environment, botIds = ["docentes"]) {
   };
   scenarioCache.set(cacheKey, scenario);
   return scenario;
+}
+
+function synthesizeSiteForRuntimeRevision(revision) {
+  const outputDirectory = mkdtempSync(
+    path.join(tmpdir(), `multi-chatbot-runtime-revision-${revision}-`),
+  );
+  temporaryDirectories.add(outputDirectory);
+  const app = new App({ outdir: outputDirectory });
+  const environment = resolveEnvironment("dev", "docentes");
+  const identity = new SharedIdentityStack(
+    app,
+    `${environment.resourcePrefix}-identity`,
+    environment,
+  );
+  const account = new AccountStack(
+    app,
+    `${environment.botResourcePrefix}-account`,
+    environment,
+    identity.userPool,
+  );
+  const runtimeStack = new Stack(app, `${environment.botResourcePrefix}-chat`, {
+    env: { account: environment.account, region: environment.region },
+  });
+  new CfnResource(runtimeStack, "RuntimeExportSource", {
+    type: "AWS::CloudFormation::WaitConditionHandle",
+    properties: {},
+  });
+  new CfnOutput(runtimeStack, "RuntimeArn", {
+    value: `arn:aws:bedrock-agentcore:${environment.region}:${environment.account}:runtime/${revision}`,
+    exportName: "multi-chatbot-dev-docentes-runtime-arn",
+  });
+  const chat = {
+    runtimeArn: Fn.importValue("multi-chatbot-dev-docentes-runtime-arn"),
+    runtimeQualifier: "DEFAULT",
+    revision,
+  };
+  const site = new PublicSiteStack(
+    app,
+    `${environment.botResourcePrefix}-site`,
+    environment,
+    identity,
+    account,
+    chat,
+  );
+  const assembly = app.synth();
+  return { assembly, siteId: site.node.id };
+}
+
+function deploymentProperties(scenario) {
+  const template = stackTemplate(scenario.assembly, scenario.siteId);
+  return onlyRecord(template, "Custom::CDKBucketDeployment").properties;
+}
+
+function configAssetText(scenario, objectKey) {
+  const manifest = assetManifest(scenario.assembly, scenario.siteId);
+  const asset = Object.values(manifest.files || {}).find((entry) =>
+    Object.values(entry.destinations || {}).some(({ objectKey: key }) => key === objectKey),
+  );
+  expect(asset, `expected a checked source asset for ${objectKey}`).toBeDefined();
+  if (!asset) return "";
+  return readFileSync(
+    path.join(scenario.assembly.directory, asset.source.path, "public-config.json"),
+    "utf8",
+  );
 }
 
 function accountRoleBedrockActions(accountTemplate) {
@@ -627,7 +691,7 @@ describe("chat infrastructure acceptance", () => {
   );
 
   it.each(["dev", "prod"])(
-    "%s publishes only the Runtime ARN and qualifier as public chat configuration",
+    "%s publishes the Runtime ARN, qualifier, and revision as public chat configuration",
     async (environment) => {
       const scenario = await scenarioFor(environment);
       expect(scenario, `expected the ${environment} infrastructure scenario`).toBeDefined();
@@ -652,6 +716,7 @@ describe("chat infrastructure acceptance", () => {
         botId: "docentes",
         apiBaseUrl: "/api",
         runtimeQualifier: "DEFAULT",
+        runtimeRevision: bot.chat.revision,
       });
       expect(parsed.runtimeArn).toBeNull();
       expect(parsed.userPoolId).toBeNull();
@@ -664,6 +729,7 @@ describe("chat infrastructure acceptance", () => {
           "region",
           "runtimeArn",
           "runtimeQualifier",
+          "runtimeRevision",
           "userPoolId",
         ].sort(),
       );
@@ -706,6 +772,24 @@ describe("chat infrastructure acceptance", () => {
       expect(records(siteTemplate, "AWS::BedrockAgentCore::Runtime")).toHaveLength(0);
     },
   );
+
+  it("redeploys public config when the Runtime revision changes while web assets stay fixed", () => {
+    const firstRevision = "1111111111111111111111111111111111111111";
+    const secondRevision = "2222222222222222222222222222222222222222";
+    const first = synthesizeSiteForRuntimeRevision(firstRevision);
+    const second = synthesizeSiteForRuntimeRevision(secondRevision);
+    const firstDeployment = deploymentProperties(first);
+    const secondDeployment = deploymentProperties(second);
+
+    expect(firstDeployment.SourceObjectKeys[0]).toBe(secondDeployment.SourceObjectKeys[0]);
+    expect(firstDeployment.SourceObjectKeys[1]).not.toBe(secondDeployment.SourceObjectKeys[1]);
+    expect(firstDeployment.SourceMarkers[1]).toEqual(secondDeployment.SourceMarkers[1]);
+
+    const firstConfig = configAssetText(first, firstDeployment.SourceObjectKeys[1]);
+    const secondConfig = configAssetText(second, secondDeployment.SourceObjectKeys[1]);
+    expect(firstConfig).toContain(`"runtimeRevision":"${firstRevision}"`);
+    expect(secondConfig).toContain(`"runtimeRevision":"${secondRevision}"`);
+  });
 
   it("keeps per-chatbot and per-environment Runtime and table identities separate", async () => {
     const dev = await scenarioFor("dev", ["docentes", "bot-uno", "bot-dos"]);
