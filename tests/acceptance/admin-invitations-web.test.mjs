@@ -50,10 +50,16 @@ function installAdminRoutes(harness, behavior = {}) {
   return handlers;
 }
 
-async function startAdmin({ restoreResults = adminTokens, signInResult, behavior } = {}) {
+async function startAdmin({
+  restoreResults = adminTokens,
+  signInResult,
+  behavior,
+  useRealSession = false,
+} = {}) {
   const harness = await createAdminWebHarness(AdminApp, {
     restoreResults: [...restoreResults],
     signInResult,
+    useRealSession,
   });
   harnesses.push(harness);
   const handlers = installAdminRoutes(harness, behavior);
@@ -735,5 +741,130 @@ describe("AdminApp: invitaciones desde la web", () => {
     expect(bodyText(harness.document)).not.toContain("Código de recuperación");
     expect(getInput(harness, "Chatbot", "select")).toBeTruthy();
     expect(harness.session.signIn).toHaveBeenCalledOnce();
+  });
+
+  it("recupera con Cognito, rechaza sin perder el formulario y luego permite ingresar sin tocar accesos", async () => {
+    const email = "admin.recovery@example.test";
+    const newPassword = "Correct-Horse8!";
+    const { harness } = await startAdmin({ restoreResults: [null], useRealSession: true });
+    harness.cognito("ForgotPassword", async () => jsonResponse({}));
+    harness.cognito("ConfirmForgotPassword", async ({ body }) =>
+      body.ConfirmationCode === "valid-code"
+        ? jsonResponse({})
+        : jsonResponse({ __type: "com.amazonaws.cognito#CodeMismatchException" }, 400),
+    );
+    harness.cognito("InitiateAuth", async ({ body }) => {
+      if (
+        body.AuthFlow !== "USER_PASSWORD_AUTH" ||
+        body.AuthParameters?.USERNAME !== email ||
+        body.AuthParameters?.PASSWORD !== newPassword
+      ) {
+        return jsonResponse({ __type: "com.amazonaws.cognito#NotAuthorizedException" }, 400);
+      }
+      return jsonResponse({
+        AuthenticationResult: {
+          AccessToken: "access-after-recovery",
+          IdToken: "id-after-recovery",
+          RefreshToken: "refresh-after-recovery",
+        },
+      });
+    });
+
+    expect(getButton(harness, "Ingresar")).toBeTruthy();
+    expect(harness.cognitoRequests).toHaveLength(0);
+    expect(harness.apiRequests).toHaveLength(0);
+
+    await harness.click(getButton(harness, "Recuperar contraseña"));
+    await harness.setValue(getInput(harness, "Email"), email);
+    await harness.click(getButton(harness, "Enviar código"));
+
+    const forgotRequests = harness.cognitoRequests.filter(
+      ({ operation }) => operation === "ForgotPassword",
+    );
+    expect(forgotRequests).toHaveLength(1);
+    expect(forgotRequests[0].body).toEqual({ ClientId: "admin-client", Username: email });
+    expect(bodyText(harness.document)).toMatch(/recibirás un código/i);
+    expect(getInput(harness, "Código de recuperación")).toBeTruthy();
+    expect(harness.apiRequests).toHaveLength(0);
+
+    await harness.setValue(getInput(harness, "Código de recuperación"), "local-code");
+    await harness.setValue(getInput(harness, "Elegí una nueva contraseña"), newPassword);
+    await harness.setValue(getInput(harness, "Confirmá la nueva contraseña"), "Different-Horse8!");
+    await harness.click(getButton(harness, "Cambiar contraseña"));
+
+    expect(bodyText(harness.document)).toMatch(/las contraseñas no coinciden/i);
+    expect(
+      harness.cognitoRequests.filter(({ operation }) => operation === "ConfirmForgotPassword"),
+    ).toHaveLength(0);
+
+    await harness.setValue(getInput(harness, "Confirmá la nueva contraseña"), newPassword);
+    await harness.setValue(getInput(harness, "Código de recuperación"), "wrong-code");
+    await harness.click(getButton(harness, "Cambiar contraseña"));
+
+    const rejectedConfirm = harness.cognitoRequests.filter(
+      ({ operation }) => operation === "ConfirmForgotPassword",
+    );
+    expect(rejectedConfirm).toHaveLength(1);
+    expect(rejectedConfirm[0].body).toEqual({
+      ClientId: "admin-client",
+      Username: email,
+      ConfirmationCode: "wrong-code",
+      Password: newPassword,
+    });
+    expect(status(harness.document).join(" ")).toMatch(/código no es correcto/i);
+    expect(getInput(harness, "Código de recuperación").value).toBe("wrong-code");
+    expect(getInput(harness, "Elegí una nueva contraseña").value).toBe(newPassword);
+    expect(bodyText(harness.document)).not.toMatch(/la contraseña se cambió/i);
+    expect(harness.apiRequests).toHaveLength(0);
+
+    await harness.setValue(getInput(harness, "Código de recuperación"), "valid-code");
+    await harness.click(getButton(harness, "Cambiar contraseña"));
+
+    const confirms = harness.cognitoRequests.filter(
+      ({ operation }) => operation === "ConfirmForgotPassword",
+    );
+    expect(confirms).toHaveLength(2);
+    expect(confirms[1].body).toEqual({
+      ClientId: "admin-client",
+      Username: email,
+      ConfirmationCode: "valid-code",
+      Password: newPassword,
+    });
+    expect(bodyText(harness.document)).toMatch(/la contraseña se cambió/i);
+    expect(getButton(harness, "Ingresar")).toBeTruthy();
+    expect(harness.session.accessToken()).toBeNull();
+    expect(harness.session.idToken()).toBeNull();
+    expect(harness.adminStorage.getItem("auth-refresh")).toBeNull();
+    expect(harness.cognitoRequests.map(({ operation }) => operation)).toEqual([
+      "ForgotPassword",
+      "ConfirmForgotPassword",
+      "ConfirmForgotPassword",
+    ]);
+    expect(harness.apiRequests).toHaveLength(0);
+
+    await harness.setValue(getInput(harness, "Email"), email);
+    await harness.setValue(getInput(harness, "Contraseña"), newPassword);
+    await harness.click(getButton(harness, "Ingresar"));
+
+    expect(harness.cognitoRequests.map(({ operation }) => operation)).toEqual([
+      "ForgotPassword",
+      "ConfirmForgotPassword",
+      "ConfirmForgotPassword",
+      "InitiateAuth",
+    ]);
+    expect(
+      harness.cognitoRequests.find(({ operation }) => operation === "InitiateAuth")?.body,
+    ).toEqual({
+      AuthFlow: "USER_PASSWORD_AUTH",
+      ClientId: "admin-client",
+      AuthParameters: { USERNAME: email, PASSWORD: newPassword },
+    });
+    expect(harness.session.accessToken()).toBe("access-after-recovery");
+    expect(harness.apiRequests.map(({ method, path }) => [method, path])).toEqual([
+      ["GET", "/api/admin/me"],
+      ["GET", "/api/admin/bots"],
+    ]);
+    expect(getInput(harness, "Chatbot", "select")).toBeTruthy();
+    expect(apiCalls(harness, "POST", /people\/lookup|invitations|accept/i)).toHaveLength(0);
   });
 });
