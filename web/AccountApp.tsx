@@ -4016,11 +4016,16 @@ export function AccountApp({
         current.queryErrorCode?.toLowerCase() || "",
       );
     const retrying = retryingUnconfirmed || retryingPreAdmissionFailure;
+    const quotaRejection =
+      current.queryStatus === "rejected" &&
+      Boolean(current.quota) &&
+      (current.queryErrorCode === "quota_exceeded" ||
+        current.queryErrorCode === "quota_policy_changed");
     const canStartNewRequest =
       current.queryStatus === "idle" ||
       ((current.queryStatus === "completed" || current.queryStatus === "failed") &&
         current.canContinue !== false) ||
-      (current.queryStatus === "rejected" && Boolean(current.quota)) ||
+      quotaRejection ||
       (current.queryStatus === "rejected" &&
         current.queryErrorCode === "storage_capacity_exceeded") ||
       (current.queryStatus === "rejected" && current.queryErrorCode === "access_revoked");

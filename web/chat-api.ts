@@ -495,22 +495,28 @@ function runtimeUrl(config: PublicConfig): string {
 
 function isQuotaView(value: unknown): value is QuotaView {
   if (!isRecord(value)) return false;
-  const periodIsValid = (period: unknown) =>
+  const periodIsValid = (period: unknown, pattern: RegExp) =>
     isRecord(period) &&
     Number.isSafeInteger(period.used) &&
     (period.used as number) >= 0 &&
     Number.isSafeInteger(period.limit) &&
     (period.limit as number) >= 0 &&
     Number.isSafeInteger(period.resetAt) &&
-    typeof period.period === "string";
-  return (
-    periodIsValid(value.daily) &&
-    periodIsValid(value.monthly) &&
+    typeof period.period === "string" &&
+    pattern.test(period.period);
+  if (
+    periodIsValid(value.daily, /^\d{4}-\d{2}-\d{2}$/) &&
+    periodIsValid(value.monthly, /^\d{4}-\d{2}$/) &&
     Number.isSafeInteger(value.serverNow) &&
     (value.blockedUntil === null || Number.isSafeInteger(value.blockedUntil)) &&
     typeof value.policyRevision === "string" &&
     value.policyRevision.length > 0
-  );
+  ) {
+    const dailyLimit = isRecord(value.daily) ? value.daily.limit : undefined;
+    const monthlyLimit = isRecord(value.monthly) ? value.monthly.limit : undefined;
+    return dailyLimit === 0 || monthlyLimit === 0 ? value.blockedUntil === null : true;
+  }
+  return false;
 }
 
 function applicationEvent(value: unknown): ChatApplicationEvent {

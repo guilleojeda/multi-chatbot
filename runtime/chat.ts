@@ -83,6 +83,9 @@ type ChatDependencies = {
   now(): number;
 };
 
+const quotaPolicyChangedMessage =
+  "Los límites de uso cambiaron mientras preparábamos la consulta. Podés volver a enviarla";
+
 type NewChatRequest = {
   version: 2;
   operation: "start" | "message";
@@ -1132,6 +1135,18 @@ export function createChatHandler(dependencies: ChatDependencies) {
         const suppliedQuota = isRecord(error) && isQuotaView(error.quota) ? error.quota : quota;
         return reject(safeFailure(code, "not_admitted", request.queryId, { quota: suppliedQuota }));
       }
+      if (code === "quota_policy_changed") {
+        const suppliedQuota = isRecord(error) && isQuotaView(error.quota) ? error.quota : undefined;
+        if (!suppliedQuota) {
+          return reject(safeFailure("temporarily_unavailable", "unconfirmed", request.queryId));
+        }
+        return reject(
+          safeFailure(code, "not_admitted", request.queryId, {
+            quota: suppliedQuota,
+            message: quotaPolicyChangedMessage,
+          }),
+        );
+      }
       if (code === "submission_exists") {
         return reject(safeFailure("temporarily_unavailable", "not_admitted", request.queryId));
       }
@@ -1339,19 +1354,26 @@ export function createChatInvocationHandler(
 
 function isQuotaView(value: unknown): value is QuotaView {
   if (!isRecord(value) || !isRecord(value.daily) || !isRecord(value.monthly)) return false;
-  return (
-    typeof value.daily.used === "number" &&
-    typeof value.daily.limit === "number" &&
-    typeof value.daily.resetAt === "number" &&
-    typeof value.daily.period === "string" &&
-    typeof value.monthly.used === "number" &&
-    typeof value.monthly.limit === "number" &&
-    typeof value.monthly.resetAt === "number" &&
-    typeof value.monthly.period === "string" &&
-    typeof value.serverNow === "number" &&
-    (value.blockedUntil === null || typeof value.blockedUntil === "number") &&
-    typeof value.policyRevision === "string"
-  );
+  const periodIsValid = (period: unknown, pattern: RegExp) =>
+    isRecord(period) &&
+    Number.isSafeInteger(period.used) &&
+    (period.used as number) >= 0 &&
+    Number.isSafeInteger(period.limit) &&
+    (period.limit as number) >= 0 &&
+    Number.isSafeInteger(period.resetAt) &&
+    typeof period.period === "string" &&
+    pattern.test(period.period);
+  if (
+    !periodIsValid(value.daily, /^\d{4}-\d{2}-\d{2}$/) ||
+    !periodIsValid(value.monthly, /^\d{4}-\d{2}$/) ||
+    !Number.isSafeInteger(value.serverNow) ||
+    (value.blockedUntil !== null && !Number.isSafeInteger(value.blockedUntil)) ||
+    typeof value.policyRevision !== "string" ||
+    value.policyRevision.length === 0
+  ) {
+    return false;
+  }
+  return value.daily.limit === 0 || value.monthly.limit === 0 ? value.blockedUntil === null : true;
 }
 
 function quotaPeriodsMatch(quota: QuotaView, timestamp: number): boolean {

@@ -205,6 +205,10 @@ function transactionCanceledAt(command, failedIndex) {
   });
 }
 
+function transactionActionIndex(command, predicate) {
+  return transactionActions(command).findIndex(predicate);
+}
+
 function actionPayload(action) {
   return action.Put ?? action.Update ?? action.Delete ?? action.ConditionCheck ?? null;
 }
@@ -605,6 +609,41 @@ describe("the DynamoDB usage and submission store adapter", () => {
     });
   });
 
+  it.each([
+    ["both limits", { dailyLimit: 0, monthlyLimit: 0 }],
+    ["daily limit", { dailyLimit: 0, monthlyLimit: 200, monthlyUsed: 200 }],
+    ["monthly limit", { dailyLimit: 20, monthlyLimit: 0, dailyUsed: 20 }],
+  ])(
+    "keeps blockedUntil null when %s is zero while preserving both reset periods",
+    async (_label, overrides) => {
+      const records = quotaRecords({
+        ...overrides,
+        dailyUsed: overrides.dailyUsed ?? 0,
+        monthlyUsed: overrides.monthlyUsed ?? 0,
+      });
+      const { store } = makeStore(mapReadRecords(records));
+      const readQuota = requireMethod(store, "readQuota");
+
+      await expect(
+        readQuota({ ...owner, now: Date.parse("2026-10-22T02:30:00.000Z") }),
+      ).resolves.toMatchObject({
+        daily: {
+          used: overrides.dailyUsed ?? 0,
+          limit: overrides.dailyLimit,
+          period: "2026-10-21",
+          resetAt: Date.parse("2026-10-22T03:00:00.000Z"),
+        },
+        monthly: {
+          used: overrides.monthlyUsed ?? 0,
+          limit: overrides.monthlyLimit,
+          period: "2026-10",
+          resetAt: Date.parse("2026-11-01T03:00:00.000Z"),
+        },
+        blockedUntil: null,
+      });
+    },
+  );
+
   it("keeps usage isolated by person and chatbot", async () => {
     const otherBot = { sub: owner.sub, botId: "bot-brisa" };
     const records = new Map([
@@ -964,9 +1003,23 @@ describe("the DynamoDB usage and submission store adapter", () => {
       return key?.sk === "QUOTA#POLICY" && Boolean(payload.ConditionExpression);
     });
     expect(policyGuard).toBeTruthy();
-    expect(
-      hasValue(actionPayload(policyGuard).ExpressionAttributeValues, input.quota.policyRevision),
-    ).toBe(true);
+    const policyCondition = actionPayload(policyGuard);
+    expect(policyCondition.ConditionExpression).not.toMatch(/\bOR\b/i);
+    for (const [field, expected] of [
+      ["revision", input.quota.policyRevision],
+      ["dailyLimit", input.quota.daily.limit],
+      ["monthlyLimit", input.quota.monthly.limit],
+    ]) {
+      const fieldToken =
+        Object.entries(policyCondition.ExpressionAttributeNames || {}).find(
+          ([, name]) => name === field,
+        )?.[0] || field;
+      const valueToken = policyCondition.ConditionExpression.match(
+        new RegExp(`${fieldToken}\\s*=\\s*(:[A-Za-z0-9_]+)`),
+      )?.[1];
+      expect(valueToken).toBeDefined();
+      expect(policyCondition.ExpressionAttributeValues?.[valueToken]).toBe(expected);
+    }
   });
 
   it("guards the stable query marker and active conversation ordinal in the same admission", async () => {
@@ -1061,6 +1114,304 @@ describe("the DynamoDB usage and submission store adapter", () => {
       code: "access_revoked",
     });
   });
+
+  it("reports a confirmed policy race with the current available quota", async () => {
+    const now = Date.parse("2026-10-22T02:30:00.000Z");
+    const initialQuota = quotaFor(now);
+    initialQuota.daily = { ...initialQuota.daily, used: 4, limit: 20 };
+    initialQuota.monthly = { ...initialQuota.monthly, used: 37, limit: 200 };
+    initialQuota.policyRevision = "policy-r7";
+    const input = admissionInput({
+      now,
+      resultDeadlineAt: now + 60 * 60 * 1000,
+      quota: initialQuota,
+    });
+    const records = quotaRecords({
+      dailyUsed: 4,
+      monthlyUsed: 37,
+      dailyLimit: 30,
+      monthlyLimit: 300,
+      revision: "policy-r8",
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof TransactWriteCommand) {
+        const policyIndex = transactionActionIndex(
+          command,
+          (action) => action.ConditionCheck?.Key?.sk === "QUOTA#POLICY",
+        );
+        expect(policyIndex).toBeGreaterThanOrEqual(0);
+        throw transactionCanceledAt(command, policyIndex);
+      }
+      return recordForRead(command, records);
+    });
+    const { documentClient, store } = makeStore(send, undefined, { accountTableName });
+
+    await expect(requireMethod(store, "startTurn")(input)).rejects.toMatchObject({
+      code: "quota_policy_changed",
+      quota: {
+        daily: { used: 4, limit: 30 },
+        monthly: { used: 37, limit: 300 },
+        blockedUntil: null,
+        policyRevision: "policy-r8",
+      },
+    });
+    expect(mutationCommands(documentClient)).toHaveLength(1);
+    expect(documentClient.send.mock.calls.flatMap(([command]) => commandWrites(command))).toEqual(
+      [],
+    );
+    expect(records.get(keyId(quotaKeys().policy))).toMatchObject({
+      dailyLimit: 30,
+      monthlyLimit: 300,
+      revision: "policy-r8",
+    });
+    expect(records.get(keyId({ ...quotaKeys().usage, sk: "USAGE#DAY#2026-10-21" }))).toMatchObject({
+      used: 4,
+    });
+  });
+
+  it("reports a zero-limit policy after cancellation without inventing a calendar unblock", async () => {
+    const records = quotaRecords({
+      dailyUsed: 0,
+      monthlyUsed: 0,
+      dailyLimit: 0,
+      monthlyLimit: 200,
+      revision: "policy-zero",
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof TransactWriteCommand) {
+        const policyIndex = transactionActionIndex(
+          command,
+          (action) => action.ConditionCheck?.Key?.sk === "QUOTA#POLICY",
+        );
+        throw transactionCanceledAt(command, policyIndex);
+      }
+      return recordForRead(command, records);
+    });
+    const { store } = makeStore(send, undefined, { accountTableName });
+
+    await expect(requireMethod(store, "startTurn")(admissionInput())).rejects.toMatchObject({
+      code: "quota_exceeded",
+      quota: {
+        daily: {
+          used: 0,
+          limit: 0,
+          resetAt: Date.parse("2026-10-22T03:00:00.000Z"),
+        },
+        monthly: { limit: 200, resetAt: Date.parse("2026-11-01T03:00:00.000Z") },
+        blockedUntil: null,
+        policyRevision: "policy-zero",
+      },
+    });
+  });
+
+  it.each([
+    [
+      "a generic conditional conflict",
+      ({ command }) => {
+        const index = transactionActionIndex(
+          command,
+          (action) => action.ConditionCheck?.Key?.sk === "QUOTA#POLICY",
+        );
+        return transactionCanceledAt(command, index);
+      },
+      {},
+      "conflict",
+    ],
+    [
+      "an SDK timeout",
+      () => Object.assign(new Error("DynamoDB request timed out"), { name: "TimeoutError" }),
+      {},
+      undefined,
+    ],
+    [
+      "an insufficient post-cancellation read",
+      ({ command }) => {
+        const index = transactionActionIndex(
+          command,
+          (action) => action.ConditionCheck?.Key?.sk === "QUOTA#POLICY",
+        );
+        return transactionCanceledAt(command, index);
+      },
+      { failQuotaRead: true },
+      undefined,
+    ],
+    [
+      "an insufficient SEND recheck",
+      ({ command }) => {
+        const index = transactionActionIndex(
+          command,
+          (action) => action.ConditionCheck?.Key?.sk === "QUOTA#POLICY",
+        );
+        return transactionCanceledAt(command, index);
+      },
+      { failSendRead: true },
+      undefined,
+    ],
+  ])("does not attribute %s to a policy race", async (_label, failure, options, expectedCode) => {
+    const input = admissionInput();
+    const records = quotaRecords();
+    const timeout = Object.assign(new Error("quota read timed out"), { name: "TimeoutError" });
+    let transactionCanceled = false;
+    let sendReads = 0;
+    const send = vi.fn(async (command) => {
+      if (command instanceof TransactWriteCommand) {
+        transactionCanceled = true;
+        throw failure({ command });
+      }
+      if (command instanceof GetCommand && String(command.input.Key.sk).startsWith("SEND#")) {
+        sendReads += 1;
+        if (options.failSendRead && transactionCanceled && sendReads >= 2) throw timeout;
+      }
+      if (options.failQuotaRead && command instanceof GetCommand) {
+        const key = command.input.Key;
+        if (key.sk === "QUOTA#POLICY") throw timeout;
+      }
+      return recordForRead(command, records);
+    });
+    const { store } = makeStore(send, undefined, { accountTableName });
+
+    const rejection = requireMethod(store, "startTurn")(input);
+    if (expectedCode) {
+      await expect(rejection).rejects.toMatchObject({ code: expectedCode });
+      await expect(rejection).rejects.not.toMatchObject({ code: "quota_policy_changed" });
+    } else if (options.failQuotaRead) {
+      await expect(rejection).rejects.toBe(timeout);
+    } else if (options.failSendRead) {
+      await expect(rejection).rejects.toBe(timeout);
+    } else {
+      await expect(rejection).rejects.toMatchObject({
+        name: "TimeoutError",
+        message: "DynamoDB request timed out",
+      });
+    }
+  });
+
+  it.each([
+    [
+      "a durable SEND",
+      { marker: true, policy: { dailyLimit: 30, monthlyLimit: 300, revision: "policy-r8" } },
+      "submission_exists",
+    ],
+    [
+      "an incompatible SEND",
+      {
+        marker: true,
+        markerVariant: "incompatible",
+        policy: { dailyLimit: 30, monthlyLimit: 300, revision: "policy-r8" },
+      },
+      "conflict",
+    ],
+    [
+      "a revoked ACCESS record",
+      { access: true, policy: { dailyLimit: 30, monthlyLimit: 300, revision: "policy-r8" } },
+      "access_revoked",
+    ],
+    [
+      "a hidden conversation",
+      {
+        meta: { hiddenAt: "2026-10-22T02:31:00.000Z" },
+        policy: { dailyLimit: 30, monthlyLimit: 300, revision: "policy-r8" },
+      },
+      "conversation_hidden",
+    ],
+    [
+      "an exhausted positive quota",
+      {
+        records: { dailyUsed: 20, monthlyUsed: 200 },
+        policy: { dailyLimit: 20, monthlyLimit: 200, revision: "policy-r8" },
+      },
+      "quota_exceeded",
+    ],
+    [
+      "a busy follow-up",
+      {
+        operation: "message",
+        baseOrdinal: 1,
+        contextReferences: [],
+        meta: { activeQueryId: "another-query" },
+        policy: { dailyLimit: 30, monthlyLimit: 300, revision: "policy-r8" },
+      },
+      "conversation_busy",
+    ],
+    [
+      "a stale follow-up base",
+      {
+        operation: "message",
+        baseOrdinal: 1,
+        contextReferences: [],
+        meta: { lastOrdinal: 2 },
+        policy: { dailyLimit: 30, monthlyLimit: 300, revision: "policy-r8" },
+      },
+      "stale_base",
+    ],
+  ])(
+    "preserves admission precedence over a policy race for %s",
+    async (_label, scenario, expectedCode) => {
+      const input = admissionInput({
+        ...(scenario.operation ? { operation: scenario.operation } : {}),
+        ...(scenario.baseOrdinal === undefined ? {} : { baseOrdinal: scenario.baseOrdinal }),
+        ...(scenario.contextReferences ? { contextReferences: scenario.contextReferences } : {}),
+      });
+      const records = quotaRecords({ ...(scenario.records ?? {}), ...(scenario.policy ?? {}) });
+      let sendReads = 0;
+      const marker = {
+        pk: "USER#" + owner.sub + "#BOT#" + owner.botId,
+        sk: "SEND#" + input.queryId,
+        ...owner,
+        queryId: input.queryId,
+        requestFingerprint: input.requestFingerprint,
+        operation: input.operation,
+        baseOrdinal: input.baseOrdinal,
+        conversationId,
+        ordinal: input.baseOrdinal + 1,
+        ...(scenario.markerVariant === "incompatible"
+          ? { requestFingerprint: "sha256:incompatible-request-fingerprint" }
+          : {}),
+      };
+      const meta = {
+        pk: "CONV#" + conversationId,
+        sk: "META",
+        conversationId,
+        ...owner,
+        lastOrdinal: Math.max(1, input.baseOrdinal),
+        closed: false,
+        ...(scenario.meta ?? {}),
+      };
+      const send = vi.fn(async (command) => {
+        if (command instanceof TransactWriteCommand) {
+          const failedIndex = scenario.access
+            ? transactionActionIndex(
+                command,
+                (action) => action.ConditionCheck?.TableName === accountTableName,
+              )
+            : transactionActionIndex(
+                command,
+                (action) => action.ConditionCheck?.Key?.sk === "QUOTA#POLICY",
+              );
+          expect(failedIndex).toBeGreaterThanOrEqual(0);
+          throw transactionCanceledAt(command, failedIndex);
+        }
+        if (command instanceof GetCommand && String(command.input.Key.sk).startsWith("SEND#")) {
+          sendReads += 1;
+          if (scenario.marker && sendReads === 2) return { Item: marker };
+        }
+        if (command instanceof GetCommand && command.input.Key.sk === "META" && scenario.meta) {
+          return { Item: meta };
+        }
+        return recordForRead(command, records);
+      });
+      const { store } = makeStore(send, undefined, { accountTableName });
+
+      await expect(
+        requireMethod(
+          store,
+          scenario.operation === "message" ? "continueTurn" : "startTurn",
+        )(input),
+      ).rejects.toMatchObject({
+        code: expectedCode,
+      });
+    },
+  );
 
   it("looks for the stable SEND before classifying a canceled admission as revoked", async () => {
     let sendReads = 0;

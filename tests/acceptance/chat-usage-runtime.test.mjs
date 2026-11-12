@@ -374,6 +374,13 @@ function quotaFailure(quota = defaultQuota) {
   });
 }
 
+function quotaPolicyChangedFailure(quota) {
+  return Object.assign(new Error("quota policy changed during admission"), {
+    code: "quota_policy_changed",
+    quota: clone(quota),
+  });
+}
+
 function seededMeta({ id = conversationId, sub = caller.sub, lastOrdinal = 2 } = {}) {
   return [id, { conversationId: id, sub, botId, lastOrdinal }];
 }
@@ -632,6 +639,151 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
     }
   });
 
+  it("rejects a zero-limit policy early with reset periods but no calendar unblock", async () => {
+    const zeroQuota = {
+      ...defaultQuota,
+      daily: { ...defaultQuota.daily, used: 0, limit: 0 },
+      monthly: { ...defaultQuota.monthly, used: 0, limit: 200 },
+      blockedUntil: null,
+      policyRevision: "zero-policy",
+    };
+    const harness = makeHarness({ quota: zeroQuota });
+
+    const failure = await terminalResult(invoke(harness.handler, startPayload()));
+
+    expect(failure).toMatchObject({
+      type: "failed",
+      code: "quota_exceeded",
+      recordStatus: "not_admitted",
+      queryId,
+      quota: {
+        daily: {
+          used: 0,
+          limit: 0,
+          resetAt: defaultQuota.daily.resetAt,
+        },
+        monthly: { limit: 200, resetAt: defaultQuota.monthly.resetAt },
+        blockedUntil: null,
+        policyRevision: "zero-policy",
+      },
+    });
+    expect(harness.store.startTurn).not.toHaveBeenCalled();
+    expect(harness.store.claimInvocation).not.toHaveBeenCalled();
+    expect(harness.state.providerCalls).toBe(0);
+  });
+
+  it("preserves a confirmed policy race in direct JSON and Runtime SSE", async () => {
+    const currentQuota = {
+      ...defaultQuota,
+      daily: { ...defaultQuota.daily, used: 4, limit: 30 },
+      monthly: { ...defaultQuota.monthly, used: 17, limit: 300 },
+      blockedUntil: null,
+      policyRevision: "policy-r2",
+    };
+    const makeRacingHarness = () =>
+      makeHarness({
+        storeOverrides: {
+          async startTurn() {
+            throw quotaPolicyChangedFailure(currentQuota);
+          },
+        },
+      });
+
+    const jsonHarness = makeRacingHarness();
+    const jsonFailure = await terminalResult(invoke(jsonHarness.handler, startPayload()));
+    expect(jsonFailure).toMatchObject({
+      type: "failed",
+      code: "quota_policy_changed",
+      recordStatus: "not_admitted",
+      queryId,
+      quota: currentQuota,
+    });
+    expect(jsonHarness.store.startTurn).toHaveBeenCalledTimes(1);
+    expect(jsonHarness.state.providerCalls).toBe(0);
+    expect(jsonHarness.store.claimInvocation).not.toHaveBeenCalled();
+    expect(jsonHarness.state.submissions.size).toBe(0);
+
+    const sseHarness = makeRacingHarness();
+    const app = new BedrockAgentCoreApp({
+      config: { logging: { enabled: false } },
+      invocationHandler: {
+        async process() {
+          return null;
+        },
+      },
+    });
+    const invocationHandler = createChatInvocationHandler(sseHarness.handler, app);
+    const sseResult = await invocationHandler.process(startPayload(), makeContext());
+    const sseEvents = await collectEvents(sseResult);
+    expect(sseEvents).toHaveLength(1);
+    expect(sseEvents[0]).toMatchObject({
+      event: "failed",
+      data: {
+        type: "failed",
+        code: "quota_policy_changed",
+        recordStatus: "not_admitted",
+        queryId,
+        quota: currentQuota,
+      },
+    });
+    expect(sseHarness.state.providerCalls).toBe(0);
+    expect(sseHarness.store.claimInvocation).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["malformed daily period", { ...defaultQuota, daily: { ...defaultQuota.daily, period: 7 } }],
+    ["malformed reset", { ...defaultQuota, blockedUntil: "later" }],
+  ])("does not publish a %s supplied quota as a confirmed policy race", async (_label, quota) => {
+    const harness = makeHarness({
+      storeOverrides: {
+        async startTurn() {
+          throw quotaPolicyChangedFailure(quota);
+        },
+      },
+    });
+
+    const failure = await terminalResult(invoke(harness.handler, startPayload()));
+
+    expect(failure).toMatchObject({
+      type: "failed",
+      code: "temporarily_unavailable",
+      recordStatus: "unconfirmed",
+      queryId,
+    });
+    expect(failure).not.toHaveProperty("quota");
+    expect(harness.state.providerCalls).toBe(0);
+    expect(harness.store.claimInvocation).not.toHaveBeenCalled();
+  });
+
+  it("leaves admission unconfirmed when the store cannot complete its SEND recheck", async () => {
+    let admissionAttempted = false;
+    const harness = makeHarness({
+      storeOverrides: {
+        async getSubmission() {
+          if (admissionAttempted) throw new Error("SEND recheck timed out");
+          return null;
+        },
+        async startTurn() {
+          admissionAttempted = true;
+          throw quotaPolicyChangedFailure(defaultQuota);
+        },
+      },
+    });
+
+    const failure = await terminalResult(invoke(harness.handler, startPayload()));
+
+    expect(failure).toMatchObject({
+      type: "failed",
+      code: "temporarily_unavailable",
+      recordStatus: "unconfirmed",
+      queryId,
+    });
+    expect(failure).not.toHaveProperty("quota");
+    expect(harness.state.providerCalls).toBe(0);
+    expect(harness.store.claimInvocation).not.toHaveBeenCalled();
+  });
+
   it("does not admit an incomplete profile or read the quota policy", async () => {
     const harness = makeHarness({
       profile: {
@@ -815,6 +967,139 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
       status: "completed",
     });
     expect(harness.state.providerCalls).toBe(2);
+  });
+
+  it("retries a confirmed policy race with a fresh ID on the same thread and base", async () => {
+    const updatedQuota = {
+      ...defaultQuota,
+      daily: { ...defaultQuota.daily, used: 4, limit: 30 },
+      monthly: { ...defaultQuota.monthly, used: 18, limit: 300 },
+      policyRevision: "usage-policy-2",
+    };
+    const harness = makeHarness({
+      metaByConversation: new Map([seededMeta({ lastOrdinal: 1 })]),
+    });
+    let attempts = 0;
+    harness.store.continueTurn = vi.fn(async (input) => {
+      attempts += 1;
+      harness.state.calls.push(["continueTurn", clone(input)]);
+      if (attempts === 1) throw quotaPolicyChangedFailure(updatedQuota);
+      const ordinal = input.baseOrdinal + 1;
+      const submission = createSubmission(input, ordinal);
+      harness.state.submissions.set(keyOf(input), submission);
+      harness.state.metaByConversation.set(input.conversationId, {
+        conversationId: input.conversationId,
+        sub: input.sub,
+        botId: input.botId,
+        lastOrdinal: ordinal,
+        activeQueryId: input.queryId,
+      });
+      return { queryId: input.queryId, ordinal };
+    });
+
+    const firstRequest = startPayload({
+      operation: "message",
+      baseOrdinal: 1,
+      text: "Primera continuación con política antigua.",
+    });
+    const firstFailure = await terminalResult(invoke(harness.handler, firstRequest));
+    expect(firstFailure).toMatchObject({
+      type: "failed",
+      code: "quota_policy_changed",
+      recordStatus: "not_admitted",
+      queryId,
+      quota: updatedQuota,
+    });
+    expect(harness.state.providerCalls).toBe(0);
+    expect(harness.state.submissions.size).toBe(0);
+
+    harness.state.quota = updatedQuota;
+    const retry = await collectEvents(
+      invoke(
+        harness.handler,
+        startPayload({
+          operation: "message",
+          baseOrdinal: 1,
+          queryId: secondQueryId,
+          text: "Segunda continuación con política vigente.",
+        }),
+      ),
+    );
+
+    expect(retry[0]).toMatchObject({
+      type: "accepted",
+      conversationId,
+      queryId: secondQueryId,
+      ordinal: 2,
+    });
+    expect(terminal(retry)).toMatchObject({ type: "completed", queryId: secondQueryId });
+    expect(harness.store.continueTurn).toHaveBeenCalledTimes(2);
+    expect(harness.store.continueTurn.mock.calls[1][0]).toMatchObject({
+      conversationId,
+      queryId: secondQueryId,
+      baseOrdinal: 1,
+      quota: updatedQuota,
+    });
+    expect(harness.state.providerCalls).toBe(1);
+  });
+
+  it("keeps an admitted generation and durable snapshot unchanged after a policy edit", async () => {
+    const generationStarted = deferred();
+    const releaseGeneration = deferred();
+    const harness = makeHarness({
+      generate: async function* () {
+        generationStarted.resolve();
+        await releaseGeneration.promise;
+        yield { type: "text", text: "Respuesta admitida antes del cambio." };
+        yield { type: "result", stopReason: "end_turn" };
+      },
+    });
+    const first = await invoke(harness.handler, startPayload());
+    const firstStream = first[Symbol.asyncIterator]();
+    expect((await firstStream.next()).value).toMatchObject({ type: "accepted", queryId });
+    const pendingText = firstStream.next();
+    expect(await waitFor(generationStarted.promise)).toBe(true);
+    const quotaReadsAfterAdmission = harness.store.readQuota.mock.calls.length;
+    const admittedQuota = clone(harness.store.startTurn.mock.calls[0][0].quota);
+    const changedQuota = {
+      ...defaultQuota,
+      daily: { ...defaultQuota.daily, used: 4, limit: 0 },
+      monthly: { ...defaultQuota.monthly, used: 18, limit: 200 },
+      blockedUntil: null,
+      policyRevision: "usage-policy-zero",
+    };
+    harness.state.quota = changedQuota;
+
+    releaseGeneration.resolve();
+    await pendingText;
+    const remaining = [];
+    for await (const event of firstStream) remaining.push(event);
+    expect(terminal(remaining)).toMatchObject({ type: "completed", queryId });
+    expect(harness.store.startTurn.mock.calls[0][0].quota).toEqual(admittedQuota);
+    expect(harness.state.providerCalls).toBe(1);
+
+    const duplicate = await invoke(harness.handler, startPayload());
+    const recovered = await invoke(harness.handler, {
+      version: 2,
+      operation: "recover",
+      conversationId,
+      queryId,
+    });
+    expect(duplicate).toMatchObject({
+      version: 2,
+      queryId,
+      status: "completed",
+      answer: "Respuesta admitida antes del cambio.",
+    });
+    expect(recovered).toMatchObject({
+      version: 2,
+      queryId,
+      status: "completed",
+      answer: "Respuesta admitida antes del cambio.",
+    });
+    expect(harness.store.readQuota).toHaveBeenCalledTimes(quotaReadsAfterAdmission);
+    expect(harness.store.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.state.providerCalls).toBe(1);
   });
 
   it("returns a conversation-busy rejection for a second ID while the first generation is active", async () => {

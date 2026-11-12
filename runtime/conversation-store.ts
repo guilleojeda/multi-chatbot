@@ -726,6 +726,7 @@ export function createConversationStoreAdapter(input: {
     code:
       | "access_revoked"
       | "quota_exceeded"
+      | "quota_policy_changed"
       | "conversation_busy"
       | "conversation_hidden"
       | "stale_base"
@@ -1006,6 +1007,23 @@ export function createConversationStoreAdapter(input: {
     });
     const reason = error.CancellationReasons[accessIndex];
     return accessIndex >= 0 && isRecord(reason) && reason.Code === "ConditionalCheckFailed";
+  }
+
+  function isPolicyConditionFailure(error: unknown, actions: Record<string, unknown>[]): boolean {
+    if (
+      !isRecord(error) ||
+      error.name !== "TransactionCanceledException" ||
+      !Array.isArray(error.CancellationReasons)
+    ) {
+      return false;
+    }
+    const policyIndex = actions.findIndex((action) => {
+      const payload = isRecord(action.ConditionCheck) ? action.ConditionCheck : undefined;
+      const key = isRecord(payload?.Key) ? payload.Key : undefined;
+      return payload?.TableName === tableName && key?.sk === "QUOTA#POLICY";
+    });
+    const reason = error.CancellationReasons[policyIndex];
+    return policyIndex >= 0 && isRecord(reason) && reason.Code === "ConditionalCheckFailed";
   }
 
   function inputBaseOrdinal(turn: ContinueTurnInput): number {
@@ -1579,6 +1597,7 @@ export function createConversationStoreAdapter(input: {
       throw storeError("access_revoked", "Access no longer permits new submissions.");
     }
     if (!isConditionalFailure(original)) throw original;
+    const policyConditionFailed = isPolicyConditionFailure(original, actions);
     const meta = await adapter.getMeta({ conversationId: turn.conversationId });
     if (
       meta &&
@@ -1603,6 +1622,14 @@ export function createConversationStoreAdapter(input: {
       if (meta) {
         throw storeError("conversation_busy", "Conversation already exists.");
       }
+    }
+    if (
+      policyConditionFailed &&
+      (quota.policyRevision !== turn.quota.policyRevision ||
+        quota.daily.limit !== turn.quota.daily.limit ||
+        quota.monthly.limit !== turn.quota.monthly.limit)
+    ) {
+      throw storeError("quota_policy_changed", "Quota policy changed before admission.", quota);
     }
     throw storeError("conflict", "Admission was conditionally rejected.");
   }
@@ -2377,11 +2404,12 @@ export function createConversationStoreAdapter(input: {
         ...(daily.used >= daily.limit ? [daily.resetAt] : []),
         ...(monthly.used >= monthly.limit ? [monthly.resetAt] : []),
       ];
+      const zeroLimit = daily.limit === 0 || monthly.limit === 0;
       return {
         daily,
         monthly,
         serverNow: now,
-        blockedUntil: exhausted.length > 0 ? Math.max(...exhausted) : null,
+        blockedUntil: zeroLimit ? null : exhausted.length > 0 ? Math.max(...exhausted) : null,
         policyRevision: policy.revision,
       };
     },

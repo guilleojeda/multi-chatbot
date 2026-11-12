@@ -393,7 +393,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
       expect(routes.map(({ properties }) => properties.RouteKey)).toContain(
         "GET /api/admin/bots/{botId}/quota",
       );
-      expect(routes.map(({ properties }) => properties.RouteKey)).not.toContain(
+      expect(routes.map(({ properties }) => properties.RouteKey)).toContain(
         "PUT /api/admin/bots/{botId}/quota",
       );
       expect(routes.map(({ properties }) => properties.RouteKey)).toContain(
@@ -457,7 +457,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
       expect(cachingIsDisabled(admin, apiBehavior || {})).toBe(true);
       expect(forwardsAuthorization(admin, apiBehavior || {})).toBe(true);
       expect(apiBehavior?.AllowedMethods).toEqual(
-        expect.arrayContaining(["GET", "HEAD", "OPTIONS", "POST"]),
+        expect.arrayContaining(["GET", "HEAD", "OPTIONS", "POST", "PUT"]),
       );
       const apiOrigin = origins.find(({ Id }) => Id === apiBehavior?.TargetOriginId);
       expect(apiOrigin?.CustomOriginConfig?.OriginProtocolPolicy).toBe("https-only");
@@ -599,14 +599,22 @@ describe("phase 9 admin infrastructure acceptance", () => {
           isExactTableResource(resources[0], conversationTable, admin, chat, assembly),
           "quota access is scoped to the exact conversation table ARN, without indexes or wildcards",
         ).toBe(true);
-        expect(statementActions(statement)).toEqual(["dynamodb:GetItem"]);
+        expect(
+          statementActions(statement).every((action) =>
+            ["dynamodb:GetItem", "dynamodb:UpdateItem"].includes(action),
+          ),
+        ).toBe(true);
         expect(hasExactLeadingKeyCondition(statement, expectedBotId)).toBe(true);
         quotaReadStatements.push(statement);
       }
       expect(
         quotaReadStatements.some((statement) => statement.Effect === "Allow"),
-        "a narrowly conditioned quota policy read grant must be allowed",
+        "a narrowly conditioned quota policy read/write grant must be allowed",
       ).toBe(true);
+      expect([...new Set(quotaReadStatements.flatMap(statementActions))].sort()).toEqual([
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+      ]);
       expect([...new Set(accountDynamoActions)].sort()).toEqual([
         "dynamodb:GetItem",
         "dynamodb:PutItem",

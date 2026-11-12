@@ -20,6 +20,11 @@ const config = {
 };
 
 const quotaMessagePrefix = "Llegaste al límite de uso, vas a poder seguir usando la aplicación en ";
+const zeroQuotaMessage =
+  "Llegaste al límite de uso. Para volver a consultar, debe ampliarse el cupo";
+const quotaRetryHelp = "Podés volver a intentar para comprobar si el cupo cambió";
+const quotaPolicyChangedMessage =
+  "Los límites de uso cambiaron mientras preparábamos la consulta. Podés volver a enviarla";
 
 function event(type, fields = {}) {
   return { type, ...fields };
@@ -113,26 +118,29 @@ function makeQuota({
   serverNow,
   dailyUsed = 20,
   monthlyUsed = 200,
+  dailyLimit = 20,
+  monthlyLimit = 200,
   dailyResetAt = serverNow + 8 * 60 * 60 * 1000,
   monthlyResetAt = serverNow + 21 * 24 * 60 * 60 * 1000,
   blockedUntil = Math.max(dailyResetAt, monthlyResetAt),
+  policyRevision = "quota-policy-1",
 } = {}) {
   return {
     daily: {
       used: dailyUsed,
-      limit: 20,
+      limit: dailyLimit,
       resetAt: dailyResetAt,
       period: "2026-10-21",
     },
     monthly: {
       used: monthlyUsed,
-      limit: 200,
+      limit: monthlyLimit,
       resetAt: monthlyResetAt,
       period: "2026-10",
     },
     serverNow,
     blockedUntil,
-    policyRevision: "quota-policy-1",
+    policyRevision,
   };
 }
 
@@ -168,6 +176,52 @@ describe("the v2 direct Runtime chat client", () => {
     expect(result.quota).toEqual(quota);
     expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "failed", quota }));
   });
+
+  it.each([
+    ["JSON", (failure) => jsonResponse(failure)],
+    ["SSE", (failure) => sseResponse([failure])],
+  ])(
+    "parses a quota-policy change failure from %s and preserves its current quota",
+    async (_transport, responseFor) => {
+      const streamChat = await loadStreamChat();
+      const serverNow = Date.UTC(2026, 9, 21, 12);
+      const request = startRequest();
+      const quota = makeQuota({
+        serverNow,
+        dailyUsed: 15,
+        monthlyUsed: 51,
+        dailyLimit: 25,
+        monthlyLimit: 100,
+        blockedUntil: null,
+        policyRevision: "quota-policy-2",
+      });
+      const failure = event("failed", {
+        code: "quota_policy_changed",
+        message: quotaPolicyChangedMessage,
+        recordStatus: "not_admitted",
+        queryId: request.queryId,
+        quota,
+      });
+      const fetch = vi.fn(async () => responseFor(failure));
+      vi.stubGlobal("fetch", fetch);
+      const onEvent = vi.fn();
+
+      const result = await streamChat(config, makeSession(), request, {
+        isActive: () => true,
+        onEvent,
+      });
+
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({
+        status: "failed",
+        code: "quota_policy_changed",
+        message: quotaPolicyChangedMessage,
+        recordStatus: "not_admitted",
+        queryId: request.queryId,
+        quota,
+      });
+    },
+  );
 
   it("returns a completed duplicate snapshot without creating another request or SSE terminal", async () => {
     const streamChat = await loadStreamChat();
@@ -275,6 +329,57 @@ describe("the v2 direct Runtime chat client", () => {
 });
 
 describe("the quota state on the chat screen", () => {
+  it("shows the zero-limit notice and retry help without inventing a reset countdown", async () => {
+    const serverNow = Date.UTC(2026, 9, 21, 12);
+    const quota = makeQuota({
+      serverNow,
+      dailyUsed: 0,
+      monthlyUsed: 0,
+      dailyLimit: 0,
+      monthlyLimit: 100,
+      blockedUntil: null,
+    });
+    const html = await renderChatScreen({
+      profileStatus: "complete",
+      queryStatus: "rejected",
+      queryErrorCode: "quota_exceeded",
+      question: "Consulta conservada mientras se amplía el cupo.",
+      draft: "Consulta conservada mientras se amplía el cupo.",
+      quota,
+    });
+    const text = plainText(html);
+
+    expect(text).toContain(zeroQuotaMessage);
+    expect(text).toContain(quotaRetryHelp);
+    expect(text).not.toContain(quotaMessagePrefix);
+    expect(text).not.toContain("vas a poder seguir usando la aplicación en");
+  });
+
+  it("shows the policy-change message instead of hiding a rejection that includes current quota", async () => {
+    const serverNow = Date.UTC(2026, 9, 21, 12);
+    const html = await renderChatScreen({
+      profileStatus: "complete",
+      queryStatus: "rejected",
+      queryErrorCode: "quota_policy_changed",
+      queryError: quotaPolicyChangedMessage,
+      question: "Consulta conservada mientras se actualizan los límites.",
+      draft: "Consulta conservada mientras se actualizan los límites.",
+      quota: makeQuota({
+        serverNow,
+        dailyUsed: 15,
+        monthlyUsed: 51,
+        dailyLimit: 25,
+        monthlyLimit: 100,
+        blockedUntil: null,
+        policyRevision: "quota-policy-2",
+      }),
+    });
+    const text = plainText(html);
+
+    expect(text).toContain(quotaPolicyChangedMessage);
+    expect(text).not.toContain(zeroQuotaMessage);
+  });
+
   it("uses server availability and clock for daily, monthly, and combined blocks", async () => {
     const serverNow = Date.UTC(2026, 9, 21, 12);
     const dailyResetAt = serverNow + 8 * 60 * 60 * 1000;

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { provisionInvitation } from "./invitations.js";
 import {
   isValidOperationId,
@@ -6,8 +7,12 @@ import {
   type InvitationRecord,
 } from "./access.js";
 import type { InvitationUser } from "./invitations.js";
-import type { QuotaPolicy } from "../config/quota-policy.js";
-import type { QuotaPolicyReader } from "./quota-policy-store.js";
+import {
+  isValidQuotaLimit,
+  isValidQuotaRevision,
+  type QuotaPolicy,
+} from "../config/quota-policy.js";
+import type { QuotaPolicyReader, QuotaPolicyWriter } from "./quota-policy-store.js";
 
 type AdminStore = AccountAccessStore;
 
@@ -95,6 +100,10 @@ function parseBody(event: HttpEvent): Record<string, unknown> | null {
 
 function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function exactKeys(value: Record<string, unknown>, expected: string[]): boolean {
+  return Object.keys(value).length === expected.length && hasOnlyKeys(value, expected);
 }
 
 function pathFrom(event: HttpEvent): string {
@@ -209,10 +218,30 @@ function isStateChanged(error: unknown): boolean {
   return isObject(error) && (error.code === "STATE_CHANGED" || error.name === "STATE_CHANGED");
 }
 
+function quotaPutFields(body: Record<string, unknown> | null): string[] {
+  if (!body) return ["body"];
+
+  const fields: string[] = [];
+  for (const key of Object.keys(body)) {
+    if (!["dailyLimit", "monthlyLimit", "expectedRevision"].includes(key)) fields.push(key);
+  }
+  if (!Object.hasOwn(body, "dailyLimit") || !isValidQuotaLimit(body.dailyLimit)) {
+    fields.push("dailyLimit");
+  }
+  if (!Object.hasOwn(body, "monthlyLimit") || !isValidQuotaLimit(body.monthlyLimit)) {
+    fields.push("monthlyLimit");
+  }
+  if (!Object.hasOwn(body, "expectedRevision") || !isValidQuotaRevision(body.expectedRevision)) {
+    fields.push("expectedRevision");
+  }
+  return [...new Set(fields)];
+}
+
 export function createAdminHandler(deps: {
   config: AdminConfig;
   stores: Record<string, AdminStore>;
   quotaReaders?: Record<string, QuotaPolicyReader>;
+  quotaWriters?: Record<string, QuotaPolicyWriter>;
   identity: AdminIdentity;
   mail: AdminMail;
   now: () => number;
@@ -220,6 +249,7 @@ export function createAdminHandler(deps: {
 }) {
   const { config, stores } = deps;
   const quotaReaders = deps.quotaReaders || {};
+  const quotaWriters = deps.quotaWriters || {};
   const bots = new Map(config.bots.map((bot) => [bot.botId, bot]));
 
   async function lookup(botId: string, email: string): Promise<HttpResponse> {
@@ -294,13 +324,79 @@ export function createAdminHandler(deps: {
       });
     }
 
-    const quotaBotId = method === "GET" ? botIdFromPath(path, "quota") : null;
+    const quotaBotId = method === "GET" || method === "PUT" ? botIdFromPath(path, "quota") : null;
     if (quotaBotId !== null) {
       if (!bots.has(quotaBotId)) return response(404, { code: "NOT_FOUND" });
       const readPolicy = Object.hasOwn(quotaReaders, quotaBotId)
         ? quotaReaders[quotaBotId]
         : undefined;
       if (!readPolicy) return response(503, { code: "QUOTA_UNAVAILABLE" });
+
+      if (method === "PUT") {
+        const writePolicy = Object.hasOwn(quotaWriters, quotaBotId)
+          ? quotaWriters[quotaBotId]
+          : undefined;
+        if (!writePolicy) return response(503, { code: "QUOTA_UNAVAILABLE" });
+        const body = parseBody(event);
+        const fields = quotaPutFields(body);
+        if (
+          !body ||
+          !exactKeys(body, ["dailyLimit", "monthlyLimit", "expectedRevision"]) ||
+          fields.length > 0
+        ) {
+          return response(400, { code: "INVALID_INPUT", fields });
+        }
+
+        let previous: QuotaPolicy;
+        try {
+          previous = await readPolicy();
+        } catch {
+          return response(503, { code: "QUOTA_UNAVAILABLE" });
+        }
+
+        const dailyLimit = body.dailyLimit as number;
+        const monthlyLimit = body.monthlyLimit as number;
+        const expectedRevision = body.expectedRevision as string;
+        if (expectedRevision !== previous.revision) {
+          return response(409, { code: "STATE_CHANGED" });
+        }
+        if (dailyLimit === previous.dailyLimit && monthlyLimit === previous.monthlyLimit) {
+          return response(200, { botId: quotaBotId, policy: previous, changed: false });
+        }
+
+        const next: QuotaPolicy = {
+          dailyLimit,
+          monthlyLimit,
+          revision: randomUUID(),
+        };
+        try {
+          const policy = await writePolicy({ previous, next });
+          return response(200, { botId: quotaBotId, policy, changed: true });
+        } catch {
+          let observed: QuotaPolicy;
+          try {
+            observed = await readPolicy();
+          } catch {
+            return response(503, { code: "SAVE_UNCONFIRMED" });
+          }
+          if (
+            observed.revision === next.revision &&
+            observed.dailyLimit === next.dailyLimit &&
+            observed.monthlyLimit === next.monthlyLimit
+          ) {
+            return response(200, { botId: quotaBotId, policy: next, changed: true });
+          }
+          if (
+            observed.revision === previous.revision &&
+            observed.dailyLimit === previous.dailyLimit &&
+            observed.monthlyLimit === previous.monthlyLimit
+          ) {
+            return response(503, { code: "SAVE_UNCONFIRMED" });
+          }
+          return response(409, { code: "STATE_CHANGED" });
+        }
+      }
+
       try {
         const policy: QuotaPolicy = await readPolicy();
         return response(200, { botId: quotaBotId, policy });
