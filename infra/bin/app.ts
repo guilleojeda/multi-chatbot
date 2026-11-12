@@ -53,6 +53,7 @@ new AdminStack(
       botId: siteConfig.botId,
       projectName: siteConfig.projectName,
       account,
+      chat,
       site,
     },
   ],

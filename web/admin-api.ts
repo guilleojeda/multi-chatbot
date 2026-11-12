@@ -1,5 +1,6 @@
 import { requestWithRefresh } from "./api";
 import type { Session } from "./session";
+import { parseQuotaPolicy, type QuotaPolicy } from "../config/quota-policy";
 
 export type AdminPublicConfig = {
   environment: string;
@@ -16,6 +17,18 @@ export type AdminRequestOptions = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function parseAdminQuotaResponse(value: unknown, expectedBotId: string): QuotaPolicy {
+  if (!isRecord(value) || value.botId !== expectedBotId || !isRecord(value.policy)) {
+    throw new Error("INVALID_RESPONSE");
+  }
+
+  try {
+    return parseQuotaPolicy(value.policy);
+  } catch {
+    throw new Error("INVALID_RESPONSE");
+  }
 }
 
 export function assertAdminPublicConfig(value: unknown): AdminPublicConfig {

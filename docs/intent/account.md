@@ -32,6 +32,14 @@ Iniciar otro ingreso, incluso desde una invitación para una cuenta existente, r
 
 La razón de estas fronteras se conserva en [Identidad común, acceso por chatbot y sesión de pestaña](../decisions/0001-identidad-y-sesion.md).
 
+## Consultar cuotas
+
+El mismo administrador global selecciona el chatbot y abre **Cuotas**, sin buscar a una persona por email. La sección muestra los límites diarios y mensuales por persona, leídos de la política vigente del chatbot. **Actualizar límites** vuelve a consultar; entrar a la sección, cambiar de chatbot o ingresar de nuevo también inicia una lectura. Cero y un límite diario mayor que el mensual son valores válidos. La revisión de la política es interna y no se presenta al operador.
+
+`GET /api/admin/bots/{botId}/quota` exige el cliente y grupo administrativos antes de acceder a datos. La tabla se resuelve en el catálogo del servidor y la lectura es consistente. Un bot desconocido devuelve404; si falta la política, es inválida o falla la lectura, devuelve503 `QUOTA_UNAVAILABLE`, sin inventar límites o crear una política. La pantalla distingue carga y error, permite reintentar explícitamente y descarta respuestas de un chatbot, sección o sesión anteriores. Una respuesta no válida no se presenta como información vigente.
+
+Consultar no escribe la política, modifica consumo o consulta cuentas individuales. Los límites no se editan desde el panel todavía. **Acceso** conserva la búsqueda y las operaciones de invitación y revocación bajo la misma selección de chatbot.
+
 ## Recuperar la contraseña
 
 Desde el login, «Recuperar contraseña» abre `/#/recover`. Una cuenta ya activada y con email verificado puede solicitar un código mediante `ForgotPassword`. El código llega por email y se ingresa junto con una nueva contraseña y su confirmación; `ConfirmForgotPassword` establece el cambio. No se crea otra cuenta ni se alteran el email, el `sub`, las invitaciones o el estado ACCESS. Una cuenta que todavía no activó su invitación debe completar ese recorrido.

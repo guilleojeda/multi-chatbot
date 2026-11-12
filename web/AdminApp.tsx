@@ -7,7 +7,12 @@ import {
   type FormEvent,
   type RefObject,
 } from "react";
-import { adminRequest, readAdminPublicConfig, type AdminPublicConfig } from "./admin-api";
+import {
+  adminRequest,
+  parseAdminQuotaResponse,
+  readAdminPublicConfig,
+  type AdminPublicConfig,
+} from "./admin-api";
 import { asApiError } from "./api";
 import type { Session } from "./session";
 import "./admin-style.css";
@@ -37,6 +42,12 @@ type AdminProfile = {
   invitation?: { expiresAt: number; delivery: Delivery; invitedEmail?: string };
 };
 type Message = { kind: "status" | "error"; text: string };
+type AdminSection = "access" | "quotas";
+type QuotaView =
+  | { kind: "idle" }
+  | { kind: "loading"; botId: string }
+  | { kind: "ready"; botId: string; dailyLimit: number; monthlyLimit: number }
+  | { kind: "error"; botId: string; text: string };
 type InvitationIntent = "invite" | "reissue";
 type AdminAction = InvitationIntent | "revoke" | "cancel";
 
@@ -366,6 +377,8 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const [adminSub, setAdminSub] = useState("");
   const [adminEmail, setAdminEmail] = useState("");
   const [selectedBotId, setSelectedBotId] = useState("");
+  const [activeSection, setActiveSection] = useState<AdminSection>("access");
+  const [quotaView, setQuotaView] = useState<QuotaView>({ kind: "idle" });
   const [email, setEmail] = useState("");
   const [profile, setProfile] = useState<AdminProfile | null>(null);
   const [lookupPending, setLookupPending] = useState(false);
@@ -387,6 +400,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
   const recoveryEpochRef = useRef(0);
   const recoveryPendingRef = useRef(false);
   const scopeEpochRef = useRef(0);
+  const quotaReadEpochRef = useRef(0);
   const mountedRef = useRef(false);
   const invitationInFlightRef = useRef<string | null>(null);
   const accessMutationInFlightRef = useRef<string | null>(null);
@@ -398,10 +412,13 @@ export function AdminApp({ getSession }: AdminAppProps) {
   );
 
   const clearPanel = useCallback(() => {
+    quotaReadEpochRef.current += 1;
     setAdminSub("");
     setAdminEmail("");
     setBots([]);
     setSelectedBotId("");
+    setActiveSection("access");
+    setQuotaView({ kind: "idle" });
     setProfile(null);
     setConfirmation(null);
     setLookupPending(false);
@@ -480,6 +497,79 @@ export function AdminApp({ getSession }: AdminAppProps) {
     [isIdentityActive, leaveSession],
   );
 
+  const loadQuota = useCallback(
+    async (requestedBotId: string) => {
+      const session = sessionRef.current;
+      const currentConfig = configRef.current;
+      const identityTicket = identityEpochRef.current;
+      const readTicket = ++quotaReadEpochRef.current;
+      const isCurrent = () =>
+        isIdentityActive(identityTicket) && quotaReadEpochRef.current === readTicket;
+
+      setQuotaView({ kind: "loading", botId: requestedBotId });
+      if (!session || !currentConfig) {
+        if (isCurrent()) {
+          setQuotaView({
+            kind: "error",
+            botId: requestedBotId,
+            text: "No pudimos consultar los límites. Iniciá sesión nuevamente e intentá otra vez.",
+          });
+        }
+        return;
+      }
+
+      try {
+        const response = await adminRequest(
+          currentConfig,
+          session,
+          `/admin/bots/${encodeURIComponent(requestedBotId)}/quota`,
+          {},
+          isCurrent,
+        );
+        if (!isCurrent()) return;
+        const policy = parseAdminQuotaResponse(response, requestedBotId);
+        setQuotaView({
+          kind: "ready",
+          botId: requestedBotId,
+          dailyLimit: policy.dailyLimit,
+          monthlyLimit: policy.monthlyLimit,
+        });
+      } catch (error) {
+        if (!isCurrent()) return;
+        const status = apiErrorStatus(error);
+        if (status === 403 || status === 401) {
+          leaveSession(
+            session,
+            identityTicket,
+            status === 403 ? "forbidden" : "login",
+            status === 403
+              ? "Esta cuenta ya no tiene permiso de administrador. La sesión se cerró."
+              : "La sesión venció. Iniciá sesión nuevamente.",
+          );
+          return;
+        }
+
+        const invalidResponse = error instanceof Error && error.message === "INVALID_RESPONSE";
+        setQuotaView({
+          kind: "error",
+          botId: requestedBotId,
+          text: invalidResponse
+            ? "El servidor devolvió límites de cuotas no válidos. No se muestran valores; seleccioná Actualizar límites para volver a consultar."
+            : "No pudimos consultar los límites actuales del chatbot. Revisá la conexión y seleccioná Actualizar límites para reintentar.",
+        });
+      }
+    },
+    [isIdentityActive, leaveSession],
+  );
+
+  useEffect(() => {
+    if (stage !== "ready" || activeSection !== "quotas" || !selectedBotId) return;
+    void loadQuota(selectedBotId);
+    return () => {
+      quotaReadEpochRef.current += 1;
+    };
+  }, [activeSection, loadQuota, selectedBotId, stage]);
+
   useEffect(() => {
     mountedRef.current = true;
     const ticket = ++identityEpochRef.current;
@@ -522,6 +612,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
       recoveryEpochRef.current += 1;
       recoveryPendingRef.current = false;
       scopeEpochRef.current += 1;
+      quotaReadEpochRef.current += 1;
     };
   }, [bootAttempt, getSession, isIdentityActive, loadPanel]);
 
@@ -744,10 +835,28 @@ export function AdminApp({ getSession }: AdminAppProps) {
     setMessage(null);
   };
 
+  const changeSection = (nextSection: AdminSection) => {
+    if (nextSection === activeSection) return;
+    quotaReadEpochRef.current += 1;
+    scopeEpochRef.current += 1;
+    lookupRequestRef.current += 1;
+    const abandonedAccessRequest = lookupPending || invitationPending || accessMutationPending;
+    if (abandonedAccessRequest) setProfile(null);
+    setLookupPending(false);
+    setInvitationPending(false);
+    setAccessMutationPending(false);
+    setConfirmation(null);
+    setMessage(null);
+    setQuotaView({ kind: "idle" });
+    setActiveSection(nextSection);
+  };
+
   const changeBot = (nextBotId: string) => {
     scopeEpochRef.current += 1;
     lookupRequestRef.current += 1;
+    quotaReadEpochRef.current += 1;
     setSelectedBotId(nextBotId);
+    setQuotaView({ kind: "idle" });
     setProfile(null);
     setConfirmation(null);
     setLookupPending(false);
@@ -1364,13 +1473,13 @@ export function AdminApp({ getSession }: AdminAppProps) {
           <section className="admin-workspace" aria-labelledby="admin-title">
             <div className="admin-workspace__heading">
               <div>
-                <p className="admin-eyebrow">Administración de acceso</p>
+                <p className="admin-eyebrow">Administración de chatbots</p>
                 <h1 id="admin-title" ref={headingRef} tabIndex={-1}>
-                  Administrar acceso a un chatbot
+                  Administrar chatbots
                 </h1>
                 <p className="admin-description">
-                  Elegí el chatbot y buscá la cuenta por su email. Una nueva invitación habilita el
-                  acceso cuando la persona la acepta; revocarlo conserva su cuenta y su historial.
+                  Seleccioná un chatbot para consultar sus límites o administrar el acceso de sus
+                  personas.
                 </p>
               </div>
               <div className="admin-identity">
@@ -1384,7 +1493,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
               </div>
             </div>
 
-            {message ? (
+            {activeSection === "access" && message ? (
               <p
                 ref={message.kind === "error" ? alertRef : undefined}
                 className={`admin-message${message.kind === "error" ? " admin-message--error" : ""}`}
@@ -1395,161 +1504,247 @@ export function AdminApp({ getSession }: AdminAppProps) {
               </p>
             ) : null}
 
-            <div className="admin-content-grid">
-              <section
-                className="admin-card admin-card--search"
-                aria-labelledby="admin-search-title"
-              >
-                <div className="admin-card__heading">
-                  <span className="admin-step">01</span>
-                  <div>
-                    <h2 id="admin-search-title">Elegí el destino y la persona</h2>
-                    <p>El chatbot define dónde se habilitará el acceso.</p>
-                  </div>
+            <div className="admin-workspace__controls">
+              {bots.length > 0 ? (
+                <div className="admin-bot-selector">
+                  <label htmlFor="admin-bot">Chatbot</label>
+                  <select
+                    id="admin-bot"
+                    value={selectedBotId}
+                    onChange={(event) => changeBot(event.currentTarget.value)}
+                  >
+                    {bots.map((bot) => (
+                      <option key={bot.botId} value={bot.botId}>
+                        {bot.projectName}
+                      </option>
+                    ))}
+                  </select>
                 </div>
-                {bots.length > 0 ? (
-                  <form className="admin-form" onSubmit={(event) => void searchPerson(event)}>
-                    <label htmlFor="admin-bot">Chatbot</label>
-                    <select
-                      id="admin-bot"
-                      value={selectedBotId}
-                      onChange={(event) => changeBot(event.currentTarget.value)}
-                    >
-                      {bots.map((bot) => (
-                        <option key={bot.botId} value={bot.botId}>
-                          {bot.projectName}
-                        </option>
-                      ))}
-                    </select>
-                    <label htmlFor="admin-person-email">Email</label>
-                    <input
-                      id="admin-person-email"
-                      name="email"
-                      type="email"
-                      autoComplete="off"
-                      value={email}
-                      onChange={(event) => changeEmail(event.currentTarget.value)}
-                      required
-                    />
-                    <p className="admin-field-hint">
-                      Buscamos la cuenta con este email. La búsqueda no crea cuentas ni envía
-                      invitaciones.
-                    </p>
-                    <button className="admin-button" type="submit" disabled={!selectedBotId}>
-                      {lookupPending ? "Buscar" : "Buscar"}
-                    </button>
-                  </form>
-                ) : (
-                  <p className="admin-empty">No hay chatbots disponibles en este ambiente.</p>
-                )}
-              </section>
-
-              <section
-                className="admin-card admin-card--result"
-                aria-labelledby="admin-result-title"
-                aria-live="polite"
-              >
-                <div className="admin-card__heading">
-                  <span className="admin-step">02</span>
-                  <div>
-                    <h2 id="admin-result-title">Ficha de acceso</h2>
-                    <p>Revisá la cuenta y el estado antes de cambiar el acceso.</p>
-                  </div>
-                </div>
-                {lookupPending && !profile ? (
-                  <div className="admin-result-placeholder">
-                    <span className="admin-spinner" aria-hidden="true" />
-                    Buscando la cuenta…
-                  </div>
-                ) : profile ? (
-                  <div className="admin-profile">
-                    <div className="admin-profile__identity">
-                      <span
-                        className={`admin-status-dot admin-status-dot--${profile.access.state}`}
-                        aria-hidden="true"
-                      />
-                      <div>
-                        <p className="admin-profile__email">
-                          {profile.person?.email ?? email.trim()}
-                        </p>
-                        <p className="admin-profile__state">{accessCopy(profile)}</p>
-                      </div>
-                    </div>
-                    {selectedBot ? (
-                      <p className="admin-profile__project">Chatbot: {selectedBot.projectName}</p>
-                    ) : null}
-                    {profile.invitation ? (
-                      <div className="admin-invitation-detail">
-                        <p>{deliveryCopy(profile.invitation.delivery)}</p>
-                        {profile.invitation.invitedEmail &&
-                        profile.person &&
-                        emailKey(profile.invitation.invitedEmail) !==
-                          emailKey(profile.person.email) ? (
-                          <p className="admin-invitation-detail__address-note">
-                            Esta invitación se envió a {profile.invitation.invitedEmail.trim()}. La
-                            ficha corresponde a la cuenta encontrada con el email actual{" "}
-                            {profile.person.email}; una nueva invitación se enviará a{" "}
-                            {profile.person.email}.
-                          </p>
-                        ) : null}
-                        <p className="admin-expiry">
-                          Vigencia hasta {formatExpiry(profile.invitation.expiresAt)}. Aceptar la
-                          invitación activa el acceso.
-                        </p>
-                      </div>
-                    ) : null}
-                    <div className="admin-profile__actions">
-                      {canInvite ? (
-                        <button
-                          ref={invitationTriggerRef}
-                          className="admin-button"
-                          type="button"
-                          onClick={() => beginInvitation(invitationIntent)}
-                          disabled={invitationPending || accessMutationPending}
-                        >
-                          {profile.invitation ? "Enviar nueva invitación" : "Invitar"}
-                        </button>
-                      ) : null}
-                      {canRevoke ? (
-                        <button
-                          ref={revokeTriggerRef}
-                          className="admin-button admin-button--danger"
-                          type="button"
-                          onClick={() => beginAccessMutation("revoke")}
-                          disabled={invitationPending || accessMutationPending}
-                        >
-                          Revocar
-                        </button>
-                      ) : null}
-                      {canCancelInvitation ? (
-                        <button
-                          ref={cancelInvitationTriggerRef}
-                          className="admin-button admin-button--quiet"
-                          type="button"
-                          onClick={() => beginAccessMutation("cancel")}
-                          disabled={invitationPending || accessMutationPending}
-                        >
-                          Cancelar invitación
-                        </button>
-                      ) : null}
-                    </div>
-                    {profile.access.state === "active" ? (
-                      <p className="admin-active-note">La cuenta tiene acceso a este chatbot.</p>
-                    ) : null}
-                  </div>
-                ) : (
-                  <div className="admin-result-placeholder">
-                    <span className="admin-result-placeholder__icon" aria-hidden="true">
-                      ↗
-                    </span>
-                    <p>La ficha aparecerá acá después de buscar un email.</p>
-                  </div>
-                )}
-              </section>
+              ) : (
+                <p className="admin-empty">No hay chatbots disponibles en este ambiente.</p>
+              )}
+              <nav className="admin-section-nav" aria-label="Secciones administrativas">
+                <button
+                  className="admin-section-nav__button"
+                  type="button"
+                  aria-pressed={activeSection === "access"}
+                  onClick={() => changeSection("access")}
+                >
+                  Acceso
+                </button>
+                <button
+                  className="admin-section-nav__button"
+                  type="button"
+                  aria-pressed={activeSection === "quotas"}
+                  disabled={!selectedBotId}
+                  onClick={() => changeSection("quotas")}
+                >
+                  Cuotas
+                </button>
+              </nav>
             </div>
+
+            {activeSection === "access" ? (
+              <div className="admin-content-grid" aria-label="Administración de acceso">
+                <section
+                  className="admin-card admin-card--search"
+                  aria-labelledby="admin-search-title"
+                >
+                  <div className="admin-card__heading">
+                    <span className="admin-step">01</span>
+                    <div>
+                      <h2 id="admin-search-title">Buscá una persona</h2>
+                      <p>El chatbot seleccionado define dónde se revisará o cambiará su acceso.</p>
+                    </div>
+                  </div>
+                  {bots.length > 0 ? (
+                    <form className="admin-form" onSubmit={(event) => void searchPerson(event)}>
+                      <label htmlFor="admin-person-email">Email</label>
+                      <input
+                        id="admin-person-email"
+                        name="email"
+                        type="email"
+                        autoComplete="off"
+                        value={email}
+                        onChange={(event) => changeEmail(event.currentTarget.value)}
+                        required
+                      />
+                      <p className="admin-field-hint">
+                        Buscamos la cuenta con este email. La búsqueda no crea cuentas ni envía
+                        invitaciones.
+                      </p>
+                      <button className="admin-button" type="submit" disabled={!selectedBotId}>
+                        {lookupPending ? "Buscar" : "Buscar"}
+                      </button>
+                    </form>
+                  ) : (
+                    <p className="admin-empty">No hay chatbots disponibles en este ambiente.</p>
+                  )}
+                </section>
+
+                <section
+                  className="admin-card admin-card--result"
+                  aria-labelledby="admin-result-title"
+                  aria-live="polite"
+                >
+                  <div className="admin-card__heading">
+                    <span className="admin-step">02</span>
+                    <div>
+                      <h2 id="admin-result-title">Ficha de acceso</h2>
+                      <p>Revisá la cuenta y el estado antes de cambiar el acceso.</p>
+                    </div>
+                  </div>
+                  {lookupPending && !profile ? (
+                    <div className="admin-result-placeholder">
+                      <span className="admin-spinner" aria-hidden="true" />
+                      Buscando la cuenta…
+                    </div>
+                  ) : profile ? (
+                    <div className="admin-profile">
+                      <div className="admin-profile__identity">
+                        <span
+                          className={`admin-status-dot admin-status-dot--${profile.access.state}`}
+                          aria-hidden="true"
+                        />
+                        <div>
+                          <p className="admin-profile__email">
+                            {profile.person?.email ?? email.trim()}
+                          </p>
+                          <p className="admin-profile__state">{accessCopy(profile)}</p>
+                        </div>
+                      </div>
+                      {selectedBot ? (
+                        <p className="admin-profile__project">Chatbot: {selectedBot.projectName}</p>
+                      ) : null}
+                      {profile.invitation ? (
+                        <div className="admin-invitation-detail">
+                          <p>{deliveryCopy(profile.invitation.delivery)}</p>
+                          {profile.invitation.invitedEmail &&
+                          profile.person &&
+                          emailKey(profile.invitation.invitedEmail) !==
+                            emailKey(profile.person.email) ? (
+                            <p className="admin-invitation-detail__address-note">
+                              Esta invitación se envió a {profile.invitation.invitedEmail.trim()}.
+                              La ficha corresponde a la cuenta encontrada con el email actual{" "}
+                              {profile.person.email}; una nueva invitación se enviará a{" "}
+                              {profile.person.email}.
+                            </p>
+                          ) : null}
+                          <p className="admin-expiry">
+                            Vigencia hasta {formatExpiry(profile.invitation.expiresAt)}. Aceptar la
+                            invitación activa el acceso.
+                          </p>
+                        </div>
+                      ) : null}
+                      <div className="admin-profile__actions">
+                        {canInvite ? (
+                          <button
+                            ref={invitationTriggerRef}
+                            className="admin-button"
+                            type="button"
+                            onClick={() => beginInvitation(invitationIntent)}
+                            disabled={invitationPending || accessMutationPending}
+                          >
+                            {profile.invitation ? "Enviar nueva invitación" : "Invitar"}
+                          </button>
+                        ) : null}
+                        {canRevoke ? (
+                          <button
+                            ref={revokeTriggerRef}
+                            className="admin-button admin-button--danger"
+                            type="button"
+                            onClick={() => beginAccessMutation("revoke")}
+                            disabled={invitationPending || accessMutationPending}
+                          >
+                            Revocar
+                          </button>
+                        ) : null}
+                        {canCancelInvitation ? (
+                          <button
+                            ref={cancelInvitationTriggerRef}
+                            className="admin-button admin-button--quiet"
+                            type="button"
+                            onClick={() => beginAccessMutation("cancel")}
+                            disabled={invitationPending || accessMutationPending}
+                          >
+                            Cancelar invitación
+                          </button>
+                        ) : null}
+                      </div>
+                      {profile.access.state === "active" ? (
+                        <p className="admin-active-note">La cuenta tiene acceso a este chatbot.</p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div className="admin-result-placeholder">
+                      <span className="admin-result-placeholder__icon" aria-hidden="true">
+                        ↗
+                      </span>
+                      <p>La ficha aparecerá acá después de buscar un email.</p>
+                    </div>
+                  )}
+                </section>
+              </div>
+            ) : (
+              <section className="admin-card admin-quota-card" aria-labelledby="admin-quota-title">
+                <div className="admin-card__heading">
+                  <span className="admin-step">03</span>
+                  <div>
+                    <h2 id="admin-quota-title">Límites de consultas</h2>
+                    <p>
+                      Estos valores muestran la política vigente para cada persona en este chatbot.
+                    </p>
+                  </div>
+                </div>
+                {selectedBot ? (
+                  <p className="admin-quota__bot">Chatbot: {selectedBot.projectName}</p>
+                ) : null}
+                {quotaView.kind === "loading" && quotaView.botId === selectedBotId ? (
+                  <div className="admin-result-placeholder" role="status">
+                    <span className="admin-spinner" aria-hidden="true" />
+                    Consultando los límites…
+                  </div>
+                ) : null}
+                {quotaView.kind === "error" && quotaView.botId === selectedBotId ? (
+                  <p className="admin-message admin-message--error" role="alert">
+                    {quotaView.text}
+                  </p>
+                ) : null}
+                {quotaView.kind === "ready" && quotaView.botId === selectedBotId ? (
+                  <dl className="admin-quota-values" aria-live="polite">
+                    <div>
+                      <dt>Consultas por día</dt>
+                      <dd>{quotaView.dailyLimit}</dd>
+                    </div>
+                    <div>
+                      <dt>Consultas por mes</dt>
+                      <dd>{quotaView.monthlyLimit}</dd>
+                    </div>
+                  </dl>
+                ) : null}
+                <button
+                  className="admin-button admin-quota__refresh"
+                  type="button"
+                  disabled={!selectedBotId}
+                  aria-disabled={quotaView.kind === "loading" && quotaView.botId === selectedBotId}
+                  onClick={() => {
+                    if (
+                      selectedBotId &&
+                      !(quotaView.kind === "loading" && quotaView.botId === selectedBotId)
+                    ) {
+                      void loadQuota(selectedBotId);
+                    }
+                  }}
+                >
+                  Actualizar límites
+                </button>
+              </section>
+            )}
             <footer className="admin-footer">
               <span>Administración compartida · {config?.environment}</span>
-              <span>El envío de un correo no activa el acceso.</span>
+              {activeSection === "access" ? (
+                <span>El envío de un correo no activa el acceso.</span>
+              ) : null}
             </footer>
           </section>
         ) : null}

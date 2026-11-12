@@ -399,6 +399,76 @@ describe("AdminApp: consulta de cuotas desde la web", () => {
     expect(quotaCalls(harness)).toHaveLength(2);
   });
 
+  it("ignora un 403 tardío de una búsqueda de Acceso después de cambiar a Cuotas", async () => {
+    const pendingLookup = deferred();
+    const harness = await startQuotaAdmin({
+      lookup: async () => pendingLookup.promise,
+      quota: async ({ path }) => policyResponse(path.split("/")[4], 16, 52),
+    });
+
+    await harness.setValue(getInput(harness, "Email"), "teacher@example.test");
+    await harness.click(getButton(harness, "Buscar"));
+    expect(status(harness.document).join(" ")).toMatch(/buscando/i);
+
+    await openSection(harness, "Cuotas");
+    await harness.settle();
+    expectPolicyValues(harness, 16, 52);
+
+    pendingLookup.resolve(jsonResponse({ code: "FORBIDDEN" }, 403));
+    await harness.settle();
+
+    expect(getSectionControl(harness, "Cuotas").getAttribute("aria-pressed")).toBe("true");
+    expect(getInput(harness, "Chatbot", "select").value).toBe("docentes");
+    expectPolicyValues(harness, 16, 52);
+    expect(alertText(harness.document)).toBe("");
+    expect(harness.session.signOut).not.toHaveBeenCalled();
+  });
+
+  it("descarta una búsqueda tardía de Acceso al volver desde Cuotas", async () => {
+    const pendingLookup = deferred();
+    const email = "teacher@example.test";
+    let lookupCount = 0;
+    const harness = await startQuotaAdmin({
+      lookup: async ({ path }) => {
+        lookupCount += 1;
+        return lookupCount === 1
+          ? pendingLookup.promise
+          : jsonResponse({
+              botId: path.split("/")[4],
+              person: { sub: "teacher-sub", email },
+              access: { state: "active", revision: 4 },
+            });
+      },
+      quota: async ({ path }) => policyResponse(path.split("/")[4], 16, 52),
+    });
+
+    await harness.setValue(getInput(harness, "Email"), email);
+    await harness.click(getButton(harness, "Buscar"));
+    await openSection(harness, "Cuotas");
+    await harness.settle();
+    await openSection(harness, "Acceso");
+
+    pendingLookup.resolve(
+      jsonResponse({
+        botId: "docentes",
+        person: { sub: "teacher-sub", email },
+        access: { state: "active", revision: 3 },
+      }),
+    );
+    await harness.settle();
+
+    expect(getInput(harness, "Email").value).toBe(email);
+    expect(bodyText(harness.document)).not.toContain(email);
+    expect(bodyText(harness.document)).not.toMatch(/acceso activo|ficha actualizada/i);
+    expect(button(harness.document, "Revocar")).toBeFalsy();
+
+    await harness.click(getButton(harness, "Buscar"));
+    await harness.settle();
+    expect(bodyText(harness.document)).toContain(email);
+    expect(bodyText(harness.document)).toMatch(/acceso activo/i);
+    expect(lookupCount).toBe(2);
+  });
+
   it("descarta una respuesta previa al cierre incluso al volver a ingresar la misma cuenta", async () => {
     const oldRead = deferred();
     let reads = 0;

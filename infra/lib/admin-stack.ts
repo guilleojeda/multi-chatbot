@@ -14,6 +14,7 @@ import type { Construct } from "constructs";
 import { fileURLToPath } from "node:url";
 import { adminConfig, type ResolvedEnvironment } from "../../config/project.js";
 import type { AccountStack } from "./account-stack.js";
+import type { ChatStack } from "./chat-stack.js";
 import type { PublicSiteStack } from "./public-site-stack.js";
 import type { SharedIdentityStack } from "./shared-identity-stack.js";
 
@@ -25,6 +26,7 @@ type AdminBot = {
   botId: string;
   projectName: string;
   account: AccountStack;
+  chat: ChatStack;
   site: PublicSiteStack;
 };
 
@@ -76,10 +78,11 @@ export class AdminStack extends Stack {
       preventUserExistenceErrors: true,
     });
 
-    const botCatalog = bots.map(({ botId, projectName, account, site }) => ({
+    const botCatalog = bots.map(({ botId, projectName, account, chat, site }) => ({
       botId,
       projectName,
       accountTableName: account.table.tableName,
+      conversationTableName: chat.conversationTable.tableName,
       clientId: account.userPoolClient.userPoolClientId,
       siteUrl: site.siteUrl,
     }));
@@ -107,6 +110,18 @@ export class AdminStack extends Stack {
         "dynamodb:GetItem",
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
+      );
+      this.handler.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["dynamodb:GetItem"],
+          resources: [bot.chat.conversationTable.tableArn],
+          conditions: {
+            "ForAllValues:StringEquals": {
+              "dynamodb:LeadingKeys": [`BOT#${bot.botId}`],
+            },
+            Null: { "dynamodb:LeadingKeys": "false" },
+          },
+        }),
       );
     }
     this.handler.addToRolePolicy(
@@ -141,6 +156,7 @@ export class AdminStack extends Stack {
     const adminRoutes = [
       ["AdminMeRoute", "/api/admin/me", apigateway.HttpMethod.GET],
       ["AdminBotsRoute", "/api/admin/bots", apigateway.HttpMethod.GET],
+      ["AdminQuotaRoute", "/api/admin/bots/{botId}/quota", apigateway.HttpMethod.GET],
       [
         "AdminRevokeAccessRoute",
         "/api/admin/bots/{botId}/access/revoke",
