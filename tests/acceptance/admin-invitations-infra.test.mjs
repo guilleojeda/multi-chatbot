@@ -44,6 +44,7 @@ function scenarioFor(environment) {
   const admin = findStack(scenario.assembly, `${prefix}-admin`);
   const identity = findStack(scenario.assembly, `${prefix}-identity`);
   const account = findStack(scenario.assembly, `${prefix}-${expectedBotId}-account`);
+  const chat = findStack(scenario.assembly, `${prefix}-${expectedBotId}-chat`);
   const site = findStack(scenario.assembly, `${prefix}-${expectedBotId}-site`);
   expect(admin, `the shared ${environment} admin stack must be present`).toBeDefined();
   expect(identity, `the shared ${environment} identity stack must be present`).toBeDefined();
@@ -51,9 +52,10 @@ function scenarioFor(environment) {
     account,
     `the ${environment} ${expectedBotId} account stack must be present`,
   ).toBeDefined();
+  expect(chat, `the ${environment} ${expectedBotId} chat stack must be present`).toBeDefined();
   expect(site, `the ${environment} ${expectedBotId} site stack must be present`).toBeDefined();
-  if (!admin || !identity || !account || !site) return undefined;
-  return { ...scenario, admin, identity, account, site };
+  if (!admin || !identity || !account || !chat || !site) return undefined;
+  return { ...scenario, admin, identity, account, chat, site };
 }
 
 function stackTagPairs(stack) {
@@ -178,6 +180,13 @@ function configuredBotIds(value) {
   return [...ids, ...Object.values(value).flatMap(configuredBotIds)];
 }
 
+function catalogBots(value) {
+  if (Array.isArray(value)) return value.flatMap(catalogBots);
+  if (!value || typeof value !== "object") return [];
+  const bots = typeof value.botId === "string" ? [value] : [];
+  return [...bots, ...Object.values(value).flatMap(catalogBots)];
+}
+
 function accessTokenSeconds(client) {
   const units = { seconds: 1, minutes: 60, hours: 3600, days: 86_400 };
   const validity = client.AccessTokenValidity;
@@ -205,6 +214,27 @@ function isInsecureTransportDeny(statement, bucket, admin, assembly) {
   );
 }
 
+function hasExactLeadingKeyCondition(statement, botId) {
+  const condition = statement.Condition;
+  if (!condition) return false;
+  const equals = condition["ForAllValues:StringEquals"]?.["dynamodb:LeadingKeys"];
+  const equalsValues = Array.isArray(equals) ? equals : [equals];
+  return (
+    equalsValues.length === 1 &&
+    equalsValues[0] === `BOT#${botId}` &&
+    ["false", false].includes(condition.Null?.["dynamodb:LeadingKeys"])
+  );
+}
+
+function isExactTableResource(resource, table, valueStack, targetStack, assembly) {
+  const serialized = JSON.stringify(resource);
+  return (
+    referencesResource(resource, valueStack, targetStack, table, assembly) &&
+    !serialized.includes("*") &&
+    !serialized.includes("/index/")
+  );
+}
+
 beforeAll(() => {
   for (const environment of environments) {
     const directory = makeSynthesisDirectory(environment);
@@ -226,7 +256,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
     const scenario = scenarioFor(environment);
     if (!scenario) return;
 
-    const { assembly, admin, identity, account, site } = scenario;
+    const { assembly, admin, identity, account, chat, site } = scenario;
     expect(admin.id).toBe(`multi-chatbot-${environment}-admin`);
     expect(admin.artifact.environment).toBe(`aws://118903272638/${expectedRegion}`);
     expect(stackTagPairs(admin)).toContainEqual(["project", "multi-chatbot"]);
@@ -241,16 +271,20 @@ describe("phase 9 admin infrastructure acceptance", () => {
     expect(records(admin, "AWS::S3::Bucket")).toHaveLength(1);
     expect(records(admin, "AWS::CloudFront::Distribution")).toHaveLength(1);
     expect(records(admin, "AWS::BedrockAgentCore::Runtime")).toHaveLength(0);
+    expect(records(admin, "AWS::DynamoDB::Table")).toHaveLength(0);
 
     expect(records(account, "AWS::Cognito::UserPool")).toHaveLength(0);
     expect(records(account, "AWS::Cognito::UserPoolClient")).toHaveLength(1);
+    expect(records(chat, "AWS::DynamoDB::Table")).toHaveLength(1);
     expect(records(site, "AWS::CloudFront::Distribution")).toHaveLength(1);
     expect(dependencies(assembly, admin)).toContain(identity.id);
     expect(dependencies(assembly, admin)).toContain(account.id);
+    expect(dependencies(assembly, admin)).toContain(chat.id);
     expect(dependencies(assembly, admin)).toContain(site.id);
     expect(dependencies(assembly, account)).not.toContain(admin.id);
     expect(dependencies(assembly, site)).not.toContain(admin.id);
     expect(dependencies(assembly, identity)).not.toContain(admin.id);
+    expect(dependencies(assembly, chat)).not.toContain(admin.id);
 
     for (const { resource } of [
       ...records(admin, "AWS::ApiGatewayV2::Api"),
@@ -277,6 +311,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
       const authorizers = records(admin, "AWS::ApiGatewayV2::Authorizer");
       const routes = records(admin, "AWS::ApiGatewayV2::Route");
       const lambda = applicationLambda(scenario);
+      const lambdaVariables = lambda.properties.Environment?.Variables || {};
       const integrations = records(admin, "AWS::ApiGatewayV2::Integration");
 
       expect(adminClient.properties.GenerateSecret).toBe(false);
@@ -298,6 +333,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
       ).toBe(true);
 
       expect(group.properties.RoleArn).toBeUndefined();
+      expect(lambdaVariables.ADMIN_GROUP).toBe(group.properties.GroupName);
       expect(
         referencesResource(group.properties.UserPoolId, admin, identity, identityPool, assembly),
       ).toBe(true);
@@ -354,6 +390,12 @@ describe("phase 9 admin infrastructure acceptance", () => {
         ).toBe(true);
       }
       expect(routes.map(({ properties }) => properties.RouteKey)).toContain("GET /api/admin/bots");
+      expect(routes.map(({ properties }) => properties.RouteKey)).toContain(
+        "GET /api/admin/bots/{botId}/quota",
+      );
+      expect(routes.map(({ properties }) => properties.RouteKey)).not.toContain(
+        "PUT /api/admin/bots/{botId}/quota",
+      );
       expect(routes.map(({ properties }) => properties.RouteKey)).toContain(
         "POST /api/admin/bots/{botId}/access/revoke",
       );
@@ -461,6 +503,9 @@ describe("phase 9 admin infrastructure acceptance", () => {
         clientId: null,
         apiBaseUrl: "/api",
       });
+      expect(configAssetContents?.contents || "").not.toMatch(
+        /BOT_CATALOG|conversationTableName|accountTableName|TableArn|TableName/,
+      );
       expect(
         sourceMarker(configAssetContents?.contents || "", "userPoolId"),
         "public userPoolId is supplied from this environment's identity stack",
@@ -489,7 +534,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
       const scenario = scenarioFor(environment);
       if (!scenario) return;
 
-      const { assembly, admin, identity, account, site } = scenario;
+      const { assembly, admin, identity, account, chat, site } = scenario;
       const lambda = applicationLambda(scenario);
       const lambdaAsset = resourceAsset(assembly, admin, lambda.properties.Code);
       expect(lambdaAsset, "the admin Lambda code is in this stack's checked assets").toBeDefined();
@@ -498,6 +543,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
       ).toBe(true);
       const pool = onlyRecord(identity, "AWS::Cognito::UserPool");
       const accountTable = onlyRecord(account, "AWS::DynamoDB::Table");
+      const conversationTable = onlyRecord(chat, "AWS::DynamoDB::Table");
       const accountClient = onlyRecord(account, "AWS::Cognito::UserPoolClient");
       const siteDistribution = onlyRecord(site, "AWS::CloudFront::Distribution");
       const variables = lambda.properties.Environment?.Variables || {};
@@ -522,21 +568,50 @@ describe("phase 9 admin infrastructure acceptance", () => {
       const botCatalog = parseJsonTemplateValue(variables.BOT_CATALOG);
       const botIds = configuredBotIds(botCatalog);
       expect(botIds).toEqual([expectedBotId]);
+      const [bot] = catalogBots(botCatalog);
+      expect(bot?.conversationTableName).toBeDefined();
+      expect(
+        referencesResource(variables.BOT_CATALOG, admin, chat, conversationTable, assembly),
+        "the internal server catalog selects the docentes conversation table from this environment's ChatStack",
+      ).toBe(true);
 
       const { statements } = lambdaPolicies(admin, lambda);
       const dynamoStatements = statements.filter(
         (statement) => resourceActions([statement], "dynamodb:").length > 0,
       );
       expect(dynamoStatements.length).toBeGreaterThan(0);
+      const quotaReadStatements = [];
+      const accountDynamoActions = [];
       for (const statement of dynamoStatements) {
-        for (const resource of statementResources(statement)) {
-          expect(resource).toBeDefined();
-          expect(
+        const resources = statementResources(statement);
+        const accountOnly =
+          resources.length > 0 &&
+          resources.every((resource) =>
             referencesResource(resource, admin, account, accountTable, assembly),
-            "DynamoDB access is scoped to the account table in the server catalog",
-          ).toBe(true);
+          );
+        if (accountOnly) {
+          accountDynamoActions.push(...statementActions(statement));
+          continue;
         }
+
+        expect(resources, "quota access names only the conversation table").toHaveLength(1);
+        expect(
+          isExactTableResource(resources[0], conversationTable, admin, chat, assembly),
+          "quota access is scoped to the exact conversation table ARN, without indexes or wildcards",
+        ).toBe(true);
+        expect(statementActions(statement)).toEqual(["dynamodb:GetItem"]);
+        expect(hasExactLeadingKeyCondition(statement, expectedBotId)).toBe(true);
+        quotaReadStatements.push(statement);
       }
+      expect(
+        quotaReadStatements.some((statement) => statement.Effect === "Allow"),
+        "a narrowly conditioned quota policy read grant must be allowed",
+      ).toBe(true);
+      expect([...new Set(accountDynamoActions)].sort()).toEqual([
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+      ]);
 
       const cognitoActions = resourceActions(statements, "cognito-idp:");
       expect([...new Set(cognitoActions)].sort()).toEqual([
@@ -604,6 +679,8 @@ describe("phase 9 admin infrastructure acceptance", () => {
     const prodAdminClient = onlyRecord(prod.admin, "AWS::Cognito::UserPoolClient");
     const devTable = onlyRecord(dev.account, "AWS::DynamoDB::Table");
     const prodTable = onlyRecord(prod.account, "AWS::DynamoDB::Table");
+    const devConversationTable = onlyRecord(dev.chat, "AWS::DynamoDB::Table");
+    const prodConversationTable = onlyRecord(prod.chat, "AWS::DynamoDB::Table");
     const devLambda = applicationLambda(dev);
     const prodLambda = applicationLambda(prod);
 
@@ -616,6 +693,35 @@ describe("phase 9 admin infrastructure acceptance", () => {
     expect(JSON.stringify(devTable.resource.Properties?.TableName)).not.toBe(
       JSON.stringify(prodTable.resource.Properties?.TableName),
     );
+    expect(JSON.stringify(devConversationTable.resource.Properties?.TableName)).not.toBe(
+      JSON.stringify(prodConversationTable.resource.Properties?.TableName),
+    );
+    const devCatalog = parseJsonTemplateValue(
+      devLambda.properties.Environment?.Variables?.BOT_CATALOG,
+    );
+    const prodCatalog = parseJsonTemplateValue(
+      prodLambda.properties.Environment?.Variables?.BOT_CATALOG,
+    );
+    expect(
+      referencesResource(
+        devLambda.properties.Environment?.Variables?.BOT_CATALOG,
+        dev.admin,
+        dev.chat,
+        devConversationTable,
+        dev.assembly,
+      ),
+    ).toBe(true);
+    expect(
+      referencesResource(
+        prodLambda.properties.Environment?.Variables?.BOT_CATALOG,
+        prod.admin,
+        prod.chat,
+        prodConversationTable,
+        prod.assembly,
+      ),
+    ).toBe(true);
+    expect(catalogBots(devCatalog)[0]?.conversationTableName).toBeDefined();
+    expect(catalogBots(prodCatalog)[0]?.conversationTableName).toBeDefined();
     expect(JSON.stringify(devLambda.properties.Environment)).toContain("dev");
     expect(JSON.stringify(prodLambda.properties.Environment)).toContain("prod");
     expect(JSON.stringify(prodLambda.properties.Environment)).not.toContain(testSender);
