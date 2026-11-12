@@ -65,6 +65,8 @@ export class PublicSiteStack extends Stack {
       },
     });
 
+    // The source marker keeps the Runtime output expression stable in CloudFormation.
+    // Fingerprinting its revision makes the deployment run again to resolve a replaced Runtime ARN.
     new s3deploy.BucketDeployment(this, "WebsiteDeployment", {
       sources: [
         s3deploy.Source.asset(websiteAssetPath),
@@ -74,7 +76,13 @@ export class PublicSiteStack extends Stack {
           clientId: account.userPoolClient.userPoolClientId,
           apiBaseUrl: "/api",
           botId: environment.botId,
-          ...(chat ? { runtimeArn: chat.runtimeArn, runtimeQualifier: chat.runtimeQualifier } : {}),
+          ...(chat
+            ? {
+                runtimeArn: chat.runtimeArn,
+                runtimeQualifier: chat.runtimeQualifier,
+                runtimeRevision: chat.revision,
+              }
+            : {}),
         }),
       ],
       destinationBucket: websiteBucket,

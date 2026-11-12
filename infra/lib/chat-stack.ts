@@ -61,6 +61,7 @@ function resolveRevision(): string {
 export class ChatStack extends Stack {
   readonly runtime: Runtime;
   readonly runtimeArn: string;
+  readonly revision: string;
   readonly runtimeQualifier = "DEFAULT";
   readonly conversationTable: dynamodb.Table;
   readonly documents: DocumentInfrastructure;
@@ -167,6 +168,7 @@ export class ChatStack extends Stack {
 
     const runtimeAssetPath = path.resolve(process.cwd(), "dist/runtime-image");
     const revision = resolveRevision();
+    this.revision = revision;
     const inferenceProfileArn = `arn:aws:bedrock:${environment.region}:${environment.account}:inference-profile/${inferenceProfileId}`;
     const sourceModelArn = `arn:aws:bedrock:${environment.region}::foundation-model/${modelId}`;
     this.runtime = new Runtime(this, "ConversationRuntime", {
