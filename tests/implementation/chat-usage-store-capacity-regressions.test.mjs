@@ -9,6 +9,7 @@ import { createConversationStoreAdapter } from "../../runtime/conversation-store
 import { dynamoItemSize } from "../../runtime/context-storage.ts";
 
 const now = Date.parse("2026-10-24T15:00:00.000Z");
+const accountTableName = "accounts-chat-usage-store-capacity-regressions";
 const count = 6_935;
 const conversationId = "b2000000-0000-4000-8000-000000000001";
 const queryIdFor = (ordinal) => `b3000000-0000-4000-8000-${String(ordinal).padStart(12, "0")}`;
@@ -46,6 +47,7 @@ function makeHarness(records) {
   });
   const store = createConversationStoreAdapter({
     documentClient: { send },
+    accountTableName,
     tableName: "conversations",
     now: () => now,
   });
@@ -533,6 +535,7 @@ function deadlineTransitionHarness(testCase) {
   });
   const store = createConversationStoreAdapter({
     documentClient: { send },
+    accountTableName,
     tableName: "conversations",
     now: () => actualNow,
   });

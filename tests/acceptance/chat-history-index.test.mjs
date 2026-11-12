@@ -7,6 +7,7 @@ import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dyn
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const adapterPath = path.join(projectRoot, "runtime/conversation-store.ts");
 const tableName = "conversations-aurora-dev";
+const accountTableName = "accounts-chat-history-index";
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
 const sub = "teacher-123";
@@ -70,7 +71,7 @@ function makeStore(send, now = () => secondActivityAt) {
     documentClient,
     store:
       typeof createConversationStoreAdapter === "function"
-        ? createConversationStoreAdapter({ documentClient, tableName, now })
+        ? createConversationStoreAdapter({ documentClient, accountTableName, tableName, now })
         : null,
   };
 }
@@ -213,7 +214,24 @@ describe("conversation history GSI writer acceptance", () => {
     expect(items.some((item) => String(item.sk).startsWith("HISTORY#"))).toBe(false);
 
     const actions = transaction.input.TransactItems;
-    expect(actions.filter((action) => action.ConditionCheck)).toHaveLength(1);
+    const checks = actions.filter((action) => action.ConditionCheck);
+    expect(checks).toHaveLength(2);
+    expect(checks).toContainEqual(
+      expect.objectContaining({
+        ConditionCheck: expect.objectContaining({
+          TableName: tableName,
+          Key: { pk: `BOT#${botId}`, sk: "QUOTA#POLICY" },
+        }),
+      }),
+    );
+    expect(checks).toContainEqual(
+      expect.objectContaining({
+        ConditionCheck: expect.objectContaining({
+          TableName: accountTableName,
+          Key: { pk: `BOT#${botId}#USER#${sub}`, sk: "ACCESS" },
+        }),
+      }),
+    );
     expect(actions.filter((action) => action.Update?.Key?.sk?.startsWith("USAGE#"))).toHaveLength(
       2,
     );

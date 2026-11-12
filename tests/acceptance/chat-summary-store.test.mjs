@@ -7,6 +7,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const adapterPath = path.join(projectRoot, "runtime/conversation-store.ts");
 const tableName = "conversations-summary-dev";
+const accountTableName = "accounts-chat-summary-store";
 const conversationId = "90000000-0000-4000-8000-000000000001";
 const owner = { sub: "summary-teacher", botId: "bot-summary" };
 const now = Date.parse("2026-10-24T15:00:00.000Z");
@@ -371,7 +372,12 @@ function makeDatabase(initialItems = [], hooks = {}) {
 }
 
 function makeStore(documentClient) {
-  return createConversationStoreAdapter({ documentClient, tableName, now: () => now });
+  return createConversationStoreAdapter({
+    documentClient,
+    accountTableName,
+    tableName,
+    now: () => now,
+  });
 }
 
 function transactions(calls) {

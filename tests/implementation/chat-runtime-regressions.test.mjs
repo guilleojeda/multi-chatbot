@@ -7,6 +7,7 @@ import { extractOriginalRequestText } from "../acceptance/helpers/model-input-te
 
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
+const accountTableName = "accounts-chat-runtime-regressions";
 const quotaView = {
   daily: {
     used: 0,
@@ -303,6 +304,7 @@ describe("chat Runtime implementation regressions", () => {
     };
     const storageCalls = [];
     const durableStore = createConversationStoreAdapter({
+      accountTableName,
       documentClient: {
         async send(command) {
           storageCalls.push(command.constructor.name);
@@ -766,6 +768,7 @@ describe("chat Runtime implementation regressions", () => {
     };
     const durableStore = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "chat-completion-deadline-regression",
       now: () => clockNow,
     });
@@ -1104,6 +1107,7 @@ describe("chat Runtime implementation regressions", () => {
     const documentClient = { send: vi.fn(async () => ({})) };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
     });
 
@@ -1139,6 +1143,7 @@ describe("chat Runtime implementation regressions", () => {
     const documentClient = { send: vi.fn(async () => ({})) };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations",
       now: () => Date.parse("2026-10-19T16:00:00.000Z"),
     });

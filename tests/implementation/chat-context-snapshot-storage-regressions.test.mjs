@@ -4,6 +4,7 @@ import { createContextStorage } from "../../runtime/context-storage.ts";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
 
 const tableName = "context-snapshot-regressions";
+const accountTableName = "accounts-context-snapshot-regressions";
 const conversationId = "b2000000-0000-4000-8000-000000000001";
 const owner = { sub: "snapshot-teacher", botId: "bot-snapshot" };
 const now = Date.parse("2026-10-24T15:00:00.000Z");
@@ -192,7 +193,12 @@ function makeDatabase(items = []) {
 }
 
 function makeStore(documentClient) {
-  return createConversationStoreAdapter({ documentClient, tableName, now: () => now });
+  return createConversationStoreAdapter({
+    documentClient,
+    accountTableName,
+    tableName,
+    now: () => now,
+  });
 }
 
 function invalidSnapshot(version, recentReferences) {

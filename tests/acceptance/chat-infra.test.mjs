@@ -418,6 +418,8 @@ describe("chat infrastructure acceptance", () => {
       expect(conversationTable.logicalId).toBe("ConversationTable75C14D21");
       if (environment === "dev") {
         expect(properties.AgentRuntimeName).toMatch(/^multichatbotdev[A-Za-z0-9_]+$/);
+        // Updating code leaves existing microVMs warm; dev must retire the pre-guard Runtime.
+        expect(properties.AgentRuntimeName).not.toBe("multichatbotdevdocentesphase9");
         expect(conversationTable.properties.TableName).toBe(
           "multi-chatbot-dev-docentes-conversations",
         );
@@ -501,7 +503,7 @@ describe("chat infrastructure acceptance", () => {
   );
 
   it.each(["dev", "prod"])(
-    "%s Runtime can read only the account/profile record and owns conversation admission",
+    "%s Runtime can read and condition-check account access and owns conversation admission",
     async (environment) => {
       const scenario = await scenarioFor(environment);
       expect(scenario, `expected the ${environment} infrastructure scenario`).toBeDefined();
@@ -527,26 +529,23 @@ describe("chat infrastructure acceptance", () => {
       );
       const accountTable = onlyRecord(accountTemplate, "AWS::DynamoDB::Table");
       const conversationTable = onlyRecord(chatTemplate, "AWS::DynamoDB::Table");
-      const accountReads = dynamoStatements.filter((statement) => {
-        const actionsForStatement = matchingActions([statement], "dynamodb:");
-        return (
-          actionsForStatement.includes("dynamodb:GetItem") &&
-          !actionsForStatement.some((action) => action !== "dynamodb:GetItem") &&
-          referencesExportedOutput(
-            statement.Resource,
-            accountTemplate,
-            bot.account.stackName,
-            accountTable.logicalId,
-          )
-        );
-      });
+      const accountReads = dynamoStatements.filter((statement) =>
+        referencesExportedOutput(
+          statement.Resource,
+          accountTemplate,
+          bot.account.stackName,
+          accountTable.logicalId,
+        ),
+      );
       const conversationWrites = dynamoStatements.filter((statement) =>
         referencesResource(statement.Resource, conversationTable.logicalId),
       );
       const accountTableActions = new Set(matchingActions(accountReads, "dynamodb:"));
       const conversationActions = new Set(matchingActions(conversationWrites, "dynamodb:"));
 
-      expect(accountTableActions).toEqual(new Set(["dynamodb:GetItem"]));
+      expect(accountTableActions).toEqual(
+        new Set(["dynamodb:GetItem", "dynamodb:ConditionCheckItem"]),
+      );
       expect([...conversationActions]).toEqual(
         expect.arrayContaining([
           "dynamodb:GetItem",

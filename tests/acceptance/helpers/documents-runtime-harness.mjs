@@ -113,6 +113,7 @@ export function makeRuntimeHarness(
   createChatHandler,
   {
     member = true,
+    access = member ? "active" : "none",
     profile = validProfile,
     meta = null,
     contextMessages = [],
@@ -137,6 +138,7 @@ export function makeRuntimeHarness(
 ) {
   const state = {
     member,
+    access,
     profile: clone(profile),
     profileReads: 0,
     meta: clone(meta),
@@ -325,7 +327,8 @@ export function makeRuntimeHarness(
     accounts: {
       async getAccess(input) {
         state.calls.push(["getAccess", clone(input)]);
-        return state.member ? { ...input, access: "active", revision: 1 } : null;
+        if (state.access === "none") return null;
+        return { ...input, access: state.access, revision: 1 };
       },
     },
     profiles: {

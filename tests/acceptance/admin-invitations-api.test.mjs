@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { createAccountHandler } from "../../api/account.ts";
 import { createAccountStoreAdapter } from "../../api/aws-adapters.ts";
 import { provisionInvitation } from "../../api/invitations.ts";
@@ -75,6 +76,10 @@ function makeAccess(sub, state = "none", revision = 0, currentInvitation, projec
   };
 }
 
+function invitationKey(hash) {
+  return { pk: `INVITE#${hash}`, sk: "INVITATION" };
+}
+
 function makeInvitation({
   sub = "teacher-sub",
   email = invitedEmail,
@@ -115,6 +120,10 @@ function makeStore(overrides = {}, projectId = botId) {
         projectId: input.botId,
         delivery: { status: "unconfirmed" },
       }),
+      created: true,
+    })),
+    revokeAccess: vi.fn(async (input) => ({
+      access: makeAccess(input.sub, "revoked", input.expectedRevision + 1),
       created: true,
     })),
     recordInvitationDelivery: vi.fn(async () => undefined),
@@ -293,6 +302,26 @@ async function invite(
 ) {
   return handler(
     event("POST", `/api/admin/bots/${bot}/invitations`, {
+      email,
+      expectedSub,
+      expectedRevision,
+      operationId,
+    }),
+  );
+}
+
+async function revoke(
+  handler,
+  {
+    email = invitedEmail,
+    expectedSub = "teacher-sub",
+    expectedRevision = 0,
+    operationId = "revoke-operation-1",
+    bot = botId,
+  } = {},
+) {
+  return handler(
+    event("POST", `/api/admin/bots/${bot}/access/revoke`, {
       email,
       expectedSub,
       expectedRevision,
@@ -1107,5 +1136,604 @@ describe("the public global-admin invitation API", () => {
     expect(currentAccess.currentInvitation).toMatchObject({
       hash: createHash("sha256").update(newToken).digest("hex"),
     });
+  });
+
+  it.each([
+    ["a missing access identity", { token: null, claims: null }, 401],
+    ["a token for another app client", { claims: claims({ clientId: "chat-client" }) }, 403],
+    ["a token without the global-admin group", { claims: claims({ groups: [] }) }, 403],
+    ["an ID token", { claims: claims({ tokenUse: "id" }) }, 403],
+  ])("rejects %s before looking up or revoking a person", async (_label, options, status) => {
+    const store = makeStore();
+    const { identity } = makeIdentity();
+    const api = makeApi({ identity, store });
+
+    const response = await adminRequest(
+      api.handler,
+      "POST",
+      `/api/admin/bots/${botId}/access/revoke`,
+      {
+        email: invitedEmail,
+        expectedSub: "teacher-sub",
+        expectedRevision: 3,
+        operationId: "unauthorized-revoke",
+      },
+      options,
+    );
+
+    expect(response.statusCode).toBe(status);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(identity.getUserByEmail).not.toHaveBeenCalled();
+    expect(identity.createUser).not.toHaveBeenCalled();
+    expect(identity.setPermanentPassword).not.toHaveBeenCalled();
+    expect(identity.markEmailVerified).not.toHaveBeenCalled();
+    expect(store.getAccess).not.toHaveBeenCalled();
+    expect(store.revokeAccess).not.toHaveBeenCalled();
+    expect(store.registerInvitation).not.toHaveBeenCalled();
+    expect(api.mail.sendInvitation).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an invalid email", { email: "not-an-email" }],
+    ["a missing expected subject", { expectedSub: null }],
+    ["an invalid expected subject", { expectedSub: { sub: "teacher-sub" } }],
+    ["a negative observed revision", { expectedRevision: -1 }],
+    ["a non-integer observed revision", { expectedRevision: 1.5 }],
+    ["a blank operation ID", { operationId: " " }],
+    ["an overlong operation ID", { operationId: "x".repeat(129) }],
+  ])("rejects %s before identity, store, or email operations", async (_label, change) => {
+    const store = makeStore();
+    const { identity } = makeIdentity();
+    const randomBytes = vi.fn(() => Buffer.alloc(32, 1));
+    const mail = { sendInvitation: vi.fn() };
+    const api = makeApi({ identity, store, mail, randomBytes });
+
+    const response = await revoke(api.handler, {
+      ...change,
+      expectedSub: "teacher-sub",
+      expectedRevision: 3,
+      operationId: "valid-revoke",
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(identity.getUserByEmail).not.toHaveBeenCalled();
+    expect(identity.createUser).not.toHaveBeenCalled();
+    expect(identity.setPermanentPassword).not.toHaveBeenCalled();
+    expect(identity.markEmailVerified).not.toHaveBeenCalled();
+    expect(store.getAccess).not.toHaveBeenCalled();
+    expect(store.revokeAccess).not.toHaveBeenCalled();
+    expect(store.registerInvitation).not.toHaveBeenCalled();
+    expect(mail.sendInvitation).not.toHaveBeenCalled();
+    expect(randomBytes).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unconfigured bot before Cognito or account-store access", async () => {
+    const store = makeStore();
+    const { identity } = makeIdentity();
+    const api = makeApi({ identity, store });
+
+    const response = await revoke(api.handler, { bot: "attacker-selected" });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(identity.getUserByEmail).not.toHaveBeenCalled();
+    expect(store.getAccess).not.toHaveBeenCalled();
+    expect(store.revokeAccess).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a missing Cognito person", null],
+    [
+      "a changed Cognito subject",
+      {
+        sub: "different-sub",
+        email: invitedEmail,
+        emailVerified: true,
+        status: "CONFIRMED",
+      },
+    ],
+  ])(
+    "rejects revocation for %s without creating or changing a Cognito identity",
+    async (_label, user) => {
+      const { identity } = makeIdentity({ user });
+      const store = makeStore();
+      const api = makeApi({ identity, store });
+
+      const response = await revoke(api.handler, {
+        expectedSub: "teacher-sub",
+        expectedRevision: 3,
+        operationId: "identity-mismatch",
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(bodyOf(response)).toMatchObject({ code: "STATE_CHANGED" });
+      expect(identity.getUserByEmail).toHaveBeenCalledExactlyOnceWith(invitedEmail);
+      expect(identity.createUser).not.toHaveBeenCalled();
+      expect(identity.setPermanentPassword).not.toHaveBeenCalled();
+      expect(identity.markEmailVerified).not.toHaveBeenCalled();
+      expect(store.revokeAccess).not.toHaveBeenCalled();
+      expect(api.mail.sendInvitation).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a Cognito email that no longer matches the requested identity", async () => {
+    const { identity } = makeIdentity({
+      user: {
+        sub: "teacher-sub",
+        email: "renamed@example.test",
+        emailVerified: true,
+        status: "CONFIRMED",
+      },
+    });
+    identity.getUserByEmail.mockResolvedValue({
+      sub: "teacher-sub",
+      email: "renamed@example.test",
+      emailVerified: true,
+      status: "CONFIRMED",
+    });
+    const store = makeStore();
+    const api = makeApi({ identity, store });
+
+    const response = await revoke(api.handler, { operationId: "email-changed" });
+
+    expect(response.statusCode).toBe(409);
+    expect(bodyOf(response)).toMatchObject({ code: "STATE_CHANGED" });
+    expect(store.revokeAccess).not.toHaveBeenCalled();
+    expect(identity.createUser).not.toHaveBeenCalled();
+    expect(identity.setPermanentPassword).not.toHaveBeenCalled();
+    expect(identity.markEmailVerified).not.toHaveBeenCalled();
+  });
+
+  it("revokes the observed Cognito subject through the selected bot store without external side effects", async () => {
+    const existingPassword = "do-not-change-this-password";
+    const { identity, state } = makeIdentity({
+      user: {
+        sub: "teacher-sub",
+        email: invitedEmail,
+        emailVerified: true,
+        status: "CONFIRMED",
+        password: existingPassword,
+      },
+    });
+    const store = makeStore({
+      getAccess: vi.fn(async () => makeAccess("teacher-sub", "active", 9)),
+      revokeAccess: vi.fn(async ({ sub, botId: selectedBot, expectedRevision, operationId }) => ({
+        access: makeAccess(sub, "revoked", expectedRevision + 1, undefined, selectedBot),
+        created: true,
+        operationId,
+      })),
+    });
+    const randomBytes = vi.fn(() => Buffer.alloc(32, 2));
+    const mail = { sendInvitation: vi.fn() };
+    const api = makeApi({ identity, store, mail, randomBytes });
+
+    const response = await revoke(api.handler, {
+      expectedSub: "teacher-sub",
+      expectedRevision: 9,
+      operationId: "revoke-observed-teacher",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(bodyOf(response)).toMatchObject({
+      botId,
+      person: { sub: "teacher-sub", email: invitedEmail },
+      access: { state: "revoked", revision: 10 },
+      operation: { id: "revoke-observed-teacher", status: "recorded" },
+    });
+    expect(JSON.stringify(bodyOf(response))).not.toMatch(/token|hash|tableName|poolId|secret/i);
+    expect(store.revokeAccess).toHaveBeenCalledExactlyOnceWith({
+      sub: "teacher-sub",
+      botId,
+      expectedRevision: 9,
+      operationId: "revoke-observed-teacher",
+    });
+    expect(state.user.password).toBe(existingPassword);
+    expect(identity.createUser).not.toHaveBeenCalled();
+    expect(identity.setPermanentPassword).not.toHaveBeenCalled();
+    expect(identity.markEmailVerified).not.toHaveBeenCalled();
+    expect(store.registerInvitation).not.toHaveBeenCalled();
+    expect(store.recordInvitationDelivery).not.toHaveBeenCalled();
+    expect(mail.sendInvitation).not.toHaveBeenCalled();
+    expect(randomBytes).not.toHaveBeenCalled();
+  });
+
+  it("can revoke access while the invitation sender is unconfigured", async () => {
+    const { identity } = makeIdentity({
+      user: { sub: "teacher-sub", email: invitedEmail, status: "CONFIRMED" },
+    });
+    const store = makeStore({
+      getAccess: vi.fn(async () => makeAccess("teacher-sub", "active", 3)),
+    });
+    const api = makeApi({ identity, store });
+    api.config.sender = null;
+
+    const response = await revoke(api.handler, { expectedRevision: 3 });
+
+    expect(response.statusCode).toBe(200);
+    expect(bodyOf(response)).toMatchObject({ access: { state: "revoked", revision: 4 } });
+    expect(store.revokeAccess).toHaveBeenCalledOnce();
+    expect(api.mail.sendInvitation).not.toHaveBeenCalled();
+    expect(identity.createUser).not.toHaveBeenCalled();
+  });
+
+  it("returns a revision conflict without adapting the revoke to newer ACCESS", async () => {
+    const conflict = Object.assign(new Error("ACCESS revision changed"), {
+      name: "StateChangedError",
+      code: "STATE_CHANGED",
+    });
+    const store = makeStore({
+      revokeAccess: vi.fn(async () => {
+        throw conflict;
+      }),
+    });
+    const { identity } = makeIdentity({
+      user: {
+        sub: "teacher-sub",
+        email: invitedEmail,
+        emailVerified: true,
+        status: "CONFIRMED",
+      },
+    });
+    const api = makeApi({ identity, store });
+
+    const response = await revoke(api.handler, {
+      expectedRevision: 6,
+      operationId: "stale-revoke",
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(bodyOf(response)).toMatchObject({ code: "STATE_CHANGED" });
+    expect(store.revokeAccess).toHaveBeenCalledOnce();
+    expect(store.revokeAccess.mock.calls[0][0]).toMatchObject({
+      expectedRevision: 6,
+      operationId: "stale-revoke",
+    });
+    expect(store.registerInvitation).not.toHaveBeenCalled();
+    expect(api.mail.sendInvitation).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 when a revoke ACK is lost and a reread cannot confirm the operation", async () => {
+    const transport = createPhase9AccountTransport();
+    transport.setItem(tableName, {
+      pk: `BOT#${botId}#USER#teacher-sub`,
+      sk: "ACCESS",
+      sub: "teacher-sub",
+      botId,
+      access: "active",
+      revision: 9,
+    });
+    const timeout = Object.assign(new Error("DynamoDB response timed out"), {
+      name: "TimeoutError",
+    });
+    const documentClient = {
+      send: vi.fn(async (command) => {
+        if (command instanceof UpdateCommand) throw timeout;
+        return transport.documentClient.send(command);
+      }),
+    };
+    const store = createAccountStoreAdapter({ documentClient, tableName, now: () => now });
+    const { identity } = makeIdentity({
+      user: {
+        sub: "teacher-sub",
+        email: invitedEmail,
+        emailVerified: true,
+        status: "CONFIRMED",
+      },
+    });
+    const mail = { sendInvitation: vi.fn() };
+    const api = makeApi({ identity, store, mail });
+
+    const response = await revoke(api.handler, {
+      expectedRevision: 9,
+      operationId: "ambiguous-revoke",
+    });
+    const current = await store.getAccess({ sub: "teacher-sub", botId });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(bodyOf(response)).toMatchObject({ code: "TRY_AGAIN" });
+    expect(current).toMatchObject({ access: "active", revision: 9 });
+    expect(
+      documentClient.send.mock.calls.filter(([command]) => command instanceof UpdateCommand),
+    ).toHaveLength(1);
+    expect(mail.sendInvitation).not.toHaveBeenCalled();
+    expect(identity.createUser).not.toHaveBeenCalled();
+    expect(identity.setPermanentPassword).not.toHaveBeenCalled();
+    expect(identity.markEmailVerified).not.toHaveBeenCalled();
+  });
+
+  it("returns an existing revoke operation without sending mail or repeating identity effects", async () => {
+    const { identity } = makeIdentity({
+      user: {
+        sub: "teacher-sub",
+        email: invitedEmail,
+        emailVerified: true,
+        status: "CONFIRMED",
+      },
+    });
+    const store = makeStore({
+      revokeAccess: vi.fn(async ({ sub, botId: selectedBot }) => ({
+        access: makeAccess(sub, "revoked", 11, undefined, selectedBot),
+        created: false,
+      })),
+    });
+    const mail = { sendInvitation: vi.fn() };
+    const api = makeApi({ identity, store, mail });
+
+    const response = await revoke(api.handler, {
+      expectedRevision: 10,
+      operationId: "same-revoke-id",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(bodyOf(response)).toMatchObject({
+      access: { state: "revoked", revision: 11 },
+      operation: { id: "same-revoke-id", status: "already_recorded" },
+    });
+    expect(store.revokeAccess).toHaveBeenCalledOnce();
+    expect(identity.createUser).not.toHaveBeenCalled();
+    expect(identity.setPermanentPassword).not.toHaveBeenCalled();
+    expect(identity.markEmailVerified).not.toHaveBeenCalled();
+    expect(mail.sendInvitation).not.toHaveBeenCalled();
+  });
+
+  it("rejects an overlong invitation operation ID before Cognito, storage, SES, or token generation", async () => {
+    const { identity } = makeIdentity();
+    const store = makeStore();
+    const randomBytes = vi.fn(() => Buffer.alloc(32, 4));
+    const mail = { sendInvitation: vi.fn() };
+    const api = makeApi({ identity, store, randomBytes, mail });
+
+    const response = await invite(api.handler, {
+      expectedSub: null,
+      expectedRevision: 0,
+      operationId: "x".repeat(129),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(identity.getUserByEmail).not.toHaveBeenCalled();
+    expect(identity.createUser).not.toHaveBeenCalled();
+    expect(store.getAccess).not.toHaveBeenCalled();
+    expect(store.registerInvitation).not.toHaveBeenCalled();
+    expect(mail.sendInvitation).not.toHaveBeenCalled();
+    expect(randomBytes).not.toHaveBeenCalled();
+  });
+
+  it("rejects an overlong operation ID in the production invitation orchestrator without effects", async () => {
+    const store = makeStore();
+    const { identity } = makeIdentity();
+    const mail = { sendInvitation: vi.fn() };
+    const randomBytes = vi.fn(() => Buffer.alloc(32, 3));
+
+    await expect(
+      provisionInvitation(
+        {
+          config: {
+            botId,
+            projectName: "Docentes",
+            siteUrl: "https://docentes.example.test/",
+            sender: "verified-sender@example.test",
+            invitationTtlMs: ttl,
+          },
+          identity,
+          store,
+          mail,
+          now: () => now,
+          randomBytes,
+        },
+        {
+          email: invitedEmail,
+          expectedSub: null,
+          expectedRevision: 0,
+          operationId: "x".repeat(129),
+        },
+      ),
+    ).rejects.toThrow();
+
+    expect(identity.getUserByEmail).not.toHaveBeenCalled();
+    expect(identity.createUser).not.toHaveBeenCalled();
+    expect(store.getAccess).not.toHaveBeenCalled();
+    expect(store.registerInvitation).not.toHaveBeenCalled();
+    expect(store.recordInvitationDelivery).not.toHaveBeenCalled();
+    expect(mail.sendInvitation).not.toHaveBeenCalled();
+    expect(randomBytes).not.toHaveBeenCalled();
+  });
+
+  it("cancels a pending invitation without granting access history or letting its link activate", async () => {
+    // This exercises the real admin/account handlers and store adapter. The transport persists
+    // writes but does not evaluate DynamoDB condition expressions.
+    const flow = makeRealFlow({ randomBytes: vi.fn(() => Buffer.alloc(32, 5)) });
+
+    const issued = await invite(flow.handler, {
+      expectedSub: null,
+      expectedRevision: 0,
+      operationId: "pending-before-cancel",
+    });
+    const oldToken = invitationToken(flow.sent[0].url);
+    const beforeCancel = await flow.store.getAccess({ sub: "teacher-sub", botId });
+    const cancelled = await revoke(flow.handler, {
+      expectedSub: "teacher-sub",
+      expectedRevision: beforeCancel.revision,
+      operationId: "cancel-first-invitation",
+    });
+    const lookup = await adminRequest(
+      flow.handler,
+      "POST",
+      `/api/admin/bots/${botId}/people/lookup`,
+      { email: invitedEmail },
+    );
+    const rejectedInspect = await flow.account(
+      event(
+        "POST",
+        "/api/account/invitations/inspect",
+        { token: oldToken },
+        { token: null, claims: null },
+      ),
+    );
+    const rejectedActivation = await flow.account(
+      event(
+        "POST",
+        "/api/account/invitations/accept",
+        { token: oldToken, password: "Unaccepted-Password-42!" },
+        { token: null, claims: null },
+      ),
+    );
+    const afterCancel = await flow.store.getAccess({ sub: "teacher-sub", botId });
+
+    expect(issued.statusCode).toBe(200);
+    expect(cancelled.statusCode).toBe(200);
+    expect(bodyOf(cancelled)).toMatchObject({ access: { state: "none", revision: 2 } });
+    expect(lookup.statusCode).toBe(200);
+    expect(bodyOf(lookup)).toMatchObject({ access: { state: "none", revision: 2 } });
+    expect(bodyOf(lookup)).not.toHaveProperty("invitation");
+    expect(rejectedInspect.statusCode).not.toBe(200);
+    expect(rejectedActivation.statusCode).not.toBe(200);
+    expect(afterCancel).toMatchObject({ access: "none", revision: 2 });
+    expect(afterCancel).not.toHaveProperty("currentInvitation");
+    expect(afterCancel).not.toHaveProperty("activationClaim");
+    expect(flow.identityState.user).toMatchObject({ status: "FORCE_CHANGE_PASSWORD" });
+    expect(flow.identityState.calls.some(([name]) => name === "setPermanentPassword")).toBe(false);
+    expect(flow.identityState.calls.some(([name]) => name === "markEmailVerified")).toBe(false);
+    expect(flow.sent).toHaveLength(1);
+  });
+
+  it("revokes, re-invites, and restores a confirmed account only after the new link is accepted", async () => {
+    const initialPassword = "preserve-existing-password";
+    let generated = 0;
+    const flow = makeRealFlow({
+      user: {
+        sub: "teacher-sub",
+        email: invitedEmail,
+        emailVerified: true,
+        status: "CONFIRMED",
+        password: initialPassword,
+      },
+      randomBytes: vi.fn(() => Buffer.alloc(32, ++generated)),
+    });
+    const issued = await invite(flow.handler, {
+      expectedSub: "teacher-sub",
+      expectedRevision: 0,
+      operationId: "initial-access-invitation",
+    });
+    const oldToken = invitationToken(flow.sent[0].url);
+    const initialAcceptance = await flow.account(
+      accountEvent(
+        "POST",
+        "/api/account/invitations/accept",
+        { token: oldToken },
+        accountToken,
+        "teacher-sub",
+      ),
+    );
+    const active = await flow.store.getAccess({ sub: "teacher-sub", botId });
+    const revoked = await revoke(flow.handler, {
+      expectedSub: "teacher-sub",
+      expectedRevision: active.revision,
+      operationId: "revoke-before-reinvite",
+    });
+    const revokedAccess = await flow.store.getAccess({ sub: "teacher-sub", botId });
+    const oldLinkReplay = await flow.account(
+      accountEvent(
+        "POST",
+        "/api/account/invitations/accept",
+        { token: oldToken },
+        accountToken,
+        "teacher-sub",
+      ),
+    );
+    const afterOldLinkReplay = await flow.store.getAccess({ sub: "teacher-sub", botId });
+    const lookupWhileRevoked = await adminRequest(
+      flow.handler,
+      "POST",
+      `/api/admin/bots/${botId}/people/lookup`,
+      { email: invitedEmail },
+    );
+    const replacement = await invite(flow.handler, {
+      expectedSub: "teacher-sub",
+      expectedRevision: revokedAccess.revision,
+      operationId: "restore-with-new-invitation",
+    });
+    const newToken = invitationToken(flow.sent[1].url);
+    const accessBeforeNewAcceptance = await flow.store.getAccess({ sub: "teacher-sub", botId });
+    const lookupWithPendingRestoration = await adminRequest(
+      flow.handler,
+      "POST",
+      `/api/admin/bots/${botId}/people/lookup`,
+      { email: invitedEmail },
+    );
+    const restored = await flow.account(
+      accountEvent(
+        "POST",
+        "/api/account/invitations/accept",
+        { token: newToken },
+        accountToken,
+        "teacher-sub",
+      ),
+    );
+    const me = await flow.account(
+      event("GET", "/api/account/me", undefined, {
+        token: accountToken,
+        claims: claims({ sub: "teacher-sub", clientId: "chat-client", groups: [] }),
+      }),
+    );
+    const finalAccess = await flow.store.getAccess({ sub: "teacher-sub", botId });
+    const oldHash = createHash("sha256").update(oldToken).digest("hex");
+    const newHash = createHash("sha256").update(newToken).digest("hex");
+    const oldInvitation = flow.transport.getItem(tableName, invitationKey(oldHash));
+    const newInvitation = flow.transport.getItem(tableName, invitationKey(newHash));
+
+    expect(issued.statusCode).toBe(200);
+    expect(initialAcceptance.statusCode).toBe(200);
+    expect(bodyOf(initialAcceptance)).toMatchObject({ status: "accepted" });
+    expect(active).toMatchObject({ access: "active" });
+    expect(revoked.statusCode).toBe(200);
+    expect(bodyOf(revoked)).toMatchObject({ access: { state: "revoked" } });
+    expect(revokedAccess).toMatchObject({ access: "revoked" });
+    expect(revokedAccess).not.toHaveProperty("currentInvitation");
+    expect(oldLinkReplay.statusCode).not.toBe(200);
+    expect(afterOldLinkReplay).toEqual(revokedAccess);
+    expect(bodyOf(lookupWhileRevoked)).toMatchObject({ access: { state: "revoked" } });
+    expect(bodyOf(lookupWhileRevoked)).not.toHaveProperty("invitation");
+    expect(replacement.statusCode).toBe(200);
+    expect(accessBeforeNewAcceptance).toMatchObject({ access: "revoked" });
+    expect(accessBeforeNewAcceptance.currentInvitation).toMatchObject({
+      hash: newHash,
+    });
+    expect(bodyOf(lookupWithPendingRestoration)).toMatchObject({
+      access: { state: "revoked" },
+      invitation: { delivery: { status: "accepted" } },
+    });
+    expect(JSON.stringify(bodyOf(lookupWithPendingRestoration))).not.toContain(newHash);
+    expect(restored.statusCode).toBe(200);
+    expect(bodyOf(restored)).toMatchObject({ status: "accepted" });
+    expect(bodyOf(me)).toMatchObject({
+      sub: "teacher-sub",
+      access: { state: "active" },
+    });
+    expect(finalAccess).toMatchObject({ access: "active", sub: "teacher-sub", botId });
+    expect(finalAccess.revision).toBeGreaterThan(accessBeforeNewAcceptance.revision);
+    expect(finalAccess).not.toHaveProperty("currentInvitation");
+    expect(oldInvitation).toMatchObject({ usedAt: new Date(now).toISOString() });
+    expect(newInvitation).toMatchObject({ usedAt: new Date(now).toISOString() });
+    expect(flow.identityState.user).toMatchObject({
+      sub: "teacher-sub",
+      email: invitedEmail,
+      emailVerified: true,
+      status: "CONFIRMED",
+      password: initialPassword,
+    });
+    expect(flow.identityState.calls.filter(([name]) => name === "createUser")).toHaveLength(0);
+    expect(
+      flow.identityState.calls.filter(([name]) => name === "setPermanentPassword"),
+    ).toHaveLength(0);
+    expect(flow.identityState.calls.filter(([name]) => name === "markEmailVerified")).toHaveLength(
+      0,
+    );
+    expect(flow.sent).toHaveLength(2);
   });
 });

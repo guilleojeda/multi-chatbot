@@ -15,6 +15,7 @@ const earlierQueryIds = [
 const fixedNow = Date.parse("2026-10-21T12:00:00.000Z");
 const caller = { sub: "teacher-123", token_use: "access" };
 const botId = "bot-aurora";
+const accountTableName = "accounts-chat-capacity";
 const modelId = "global.anthropic.claude-sonnet-4-6";
 
 const profileConfig = {
@@ -617,6 +618,7 @@ describe("native model capacity admission", () => {
     };
     const actualStore = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
       now: () => fixedNow,
     });

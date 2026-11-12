@@ -14,6 +14,7 @@ const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const historyStorePath = path.join(projectRoot, "runtime/history-store.ts");
 const conversationStorePath = path.join(projectRoot, "runtime/conversation-store.ts");
 const tableName = "conversations-aurora-dev";
+const accountTableName = "accounts-chat-history-removal-store";
 const owner = { sub: "teacher-123", botId: "bot-aurora" };
 const conversationId = "550e8400-e29b-41d4-a716-446655440000";
 const queryId = "a4bfbc9f-3699-4a93-b120-a03c0204bc67";
@@ -616,6 +617,7 @@ describe("conversation admission and terminal META updates", () => {
     });
     const store = createConversationStoreAdapter({
       documentClient: { send },
+      accountTableName,
       tableName,
       now: () => Date.parse("2026-10-24T12:00:00.000Z"),
     });
@@ -729,6 +731,7 @@ describe("conversation admission and terminal META updates", () => {
       });
       const store = createConversationStoreAdapter({
         documentClient: { send },
+        accountTableName,
         tableName,
         now: () => now,
       });

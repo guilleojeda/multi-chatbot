@@ -42,11 +42,21 @@ function installAdminRoutes(harness, behavior = {}) {
           invitation: { expiresAt: expiry, delivery: { status: "accepted", messageId: "ses-1" } },
           operation: { id: body.operationId, status: "recorded" },
         })),
+    revoke:
+      behavior.revoke ??
+      (async ({ body, path }) =>
+        jsonResponse({
+          botId: path.split("/")[4],
+          person: { sub: body.expectedSub, email: body.email },
+          access: { state: "revoked", revision: body.expectedRevision + 1 },
+          operation: { id: body.operationId, status: "recorded" },
+        })),
   };
   harness.route("GET", "/api/admin/me", handlers.me);
   harness.route("GET", "/api/admin/bots", handlers.bots);
   harness.route("POST", /^\/api\/admin\/bots\/[^/]+\/people\/lookup$/, handlers.lookup);
   harness.route("POST", /^\/api\/admin\/bots\/[^/]+\/invitations$/, handlers.invitation);
+  harness.route("POST", /^\/api\/admin\/bots\/[^/]+\/access\/revoke$/, handlers.revoke);
   return handlers;
 }
 
@@ -111,7 +121,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-describe("AdminApp: invitaciones desde la web", () => {
+describe("AdminApp: acceso desde la web", () => {
   it("arranca con configuración mínima, restaura la sesión y ofrece el catálogo sin perfil ni Runtime", async () => {
     const { harness } = await startAdmin();
 
@@ -866,5 +876,424 @@ describe("AdminApp: invitaciones desde la web", () => {
     ]);
     expect(getInput(harness, "Chatbot", "select")).toBeTruthy();
     expect(apiCalls(harness, "POST", /people\/lookup|invitations|accept/i)).toHaveLength(0);
+  });
+
+  it("revoca el acceso activo solo después de confirmar la persona y el chatbot, y evita el doble envío", async () => {
+    const email = "revocar@example.test";
+    const pendingRevoke = deferred();
+    const { harness } = await startAdmin({
+      behavior: {
+        lookup: async ({ path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: { sub: "teacher-to-revoke", email },
+            access: { state: "active", revision: 8 },
+          }),
+        revoke: async () => pendingRevoke.promise,
+      },
+    });
+
+    await search(harness, email);
+    await harness.click(getButton(harness, "Revocar"));
+    const firstConfirmation = bodyText(harness.document).toLowerCase();
+    expect(firstConfirmation).toContain(email);
+    expect(firstConfirmation).toContain("docentes");
+    expect(firstConfirmation).toContain("revoc");
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
+    await harness.click(getButton(harness, "Cancelar"));
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
+    expect(bodyText(harness.document)).toContain(email);
+    expect(bodyText(harness.document)).toMatch(/acceso activo/i);
+
+    await harness.click(getButton(harness, "Revocar"));
+    const confirmation = getButton(harness, "Confirmar revocación");
+    expect(bodyText(harness.document).toLowerCase()).toContain(email);
+    expect(bodyText(harness.document).toLowerCase()).toContain("docentes");
+    const cognitoCountBefore = harness.cognitoRequests.length;
+    await harness.click(confirmation);
+
+    const revocations = apiCalls(harness, "POST", /\/access\/revoke$/);
+    expect(revocations).toHaveLength(1);
+    expect(revocations[0]).toMatchObject({
+      path: "/api/admin/bots/docentes/access/revoke",
+      body: {
+        email,
+        expectedSub: "teacher-to-revoke",
+        expectedRevision: 8,
+      },
+    });
+    expect(revocations[0].body.operationId).toEqual(expect.any(String));
+    expect(revocations[0].body.operationId.length).toBeGreaterThan(0);
+    expect(apiCalls(harness, "POST", /\/invitations$/)).toHaveLength(0);
+    expect(harness.cognitoRequests).toHaveLength(cognitoCountBefore);
+    expect(harness.apiRequests.some(({ url }) => url.hostname !== "localhost")).toBe(false);
+
+    const pendingConfirmation = button(harness.document, "Confirmar revocación");
+    if (pendingConfirmation) {
+      expect(pendingConfirmation.disabled).toBe(true);
+      await harness.click(pendingConfirmation);
+    } else {
+      const pendingAction = button(harness.document, "Revocar");
+      expect(!pendingAction || pendingAction.disabled).toBe(true);
+    }
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(1);
+
+    pendingRevoke.resolve(
+      jsonResponse({
+        botId: "docentes",
+        person: { sub: "teacher-to-revoke", email },
+        access: { state: "revoked", revision: 9 },
+        operation: { id: revocations[0].body.operationId, status: "recorded" },
+      }),
+    );
+    await harness.settle();
+    expect(bodyText(harness.document)).toMatch(/acceso revocado/i);
+    expect(bodyText(harness.document)).not.toMatch(/acceso activo/i);
+  });
+
+  it("cancela una invitación pendiente sin convertirla en acceso revocado", async () => {
+    const email = "pendiente@example.test";
+    const { harness } = await startAdmin({
+      behavior: {
+        lookup: async ({ path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: { sub: "pending-person", email },
+            access: { state: "none", revision: 3 },
+            invitation: {
+              expiresAt: expiry,
+              delivery: { status: "accepted", messageId: "ses-pending" },
+            },
+          }),
+        revoke: async ({ body, path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: { sub: body.expectedSub, email: body.email },
+            access: { state: "none", revision: 4 },
+            operation: { id: body.operationId, status: "already_recorded" },
+          }),
+      },
+    });
+
+    await search(harness, email);
+    await harness.click(getButton(harness, "Cancelar invitación"));
+    const confirmation = bodyText(harness.document).toLowerCase();
+    expect(confirmation).toContain(email);
+    expect(confirmation).toContain("docentes");
+    expect(confirmation).toContain("cancelar invitación");
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
+    await harness.click(getButton(harness, "Confirmar cancelación"));
+
+    const [request] = apiCalls(harness, "POST", /\/access\/revoke$/);
+    expect(request).toMatchObject({
+      path: "/api/admin/bots/docentes/access/revoke",
+      body: {
+        email,
+        expectedSub: "pending-person",
+        expectedRevision: 3,
+      },
+    });
+    expect(request.body.operationId).toEqual(expect.any(String));
+    expect(apiCalls(harness, "POST", /\/invitations$/)).toHaveLength(0);
+    expect(bodyText(harness.document)).toMatch(/sin acceso/i);
+    expect(bodyText(harness.document)).not.toMatch(/acceso revocado|invitación pendiente/i);
+  });
+
+  it("ante 409 descarta la ficha vieja y exige una lectura antes de volver a decidir", async () => {
+    const email = "conflicto-revocacion@example.test";
+    let lookupCount = 0;
+    const { harness } = await startAdmin({
+      behavior: {
+        lookup: async ({ path }) => {
+          lookupCount += 1;
+          return jsonResponse({
+            botId: path.split("/")[4],
+            person: { sub: "conflict-person", email },
+            access: { state: lookupCount === 1 ? "active" : "revoked", revision: lookupCount + 5 },
+          });
+        },
+        revoke: async () => jsonResponse({ code: "STATE_CHANGED" }, 409),
+      },
+    });
+
+    await search(harness, email);
+    await harness.click(getButton(harness, "Revocar"));
+    await harness.click(getButton(harness, "Confirmar revocación"));
+    expect(status(harness.document).join(" ")).toMatch(/cambi|revis|actualiz|conflicto/i);
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(1);
+    expect(button(harness.document, "Revocar")).toBeFalsy();
+
+    await harness.click(getButton(harness, "Buscar"));
+    expect(apiCalls(harness, "POST", /\/people\/lookup$/)).toHaveLength(2);
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(1);
+    expect(bodyText(harness.document)).toMatch(/acceso revocado/i);
+    expect(button(harness.document, "Revocar")).toBeFalsy();
+  });
+
+  it.each([
+    ["503", async () => jsonResponse({ code: "TRY_AGAIN" }, 503)],
+    ["respuesta perdida", async () => Promise.reject(new TypeError("fetch failed"))],
+  ])(
+    "trata %s como resultado incierto y consulta el estado real sin repetir el POST",
+    async (_name, fail) => {
+      const email = "resultado-incierto@example.test";
+      let lookupCount = 0;
+      const { harness } = await startAdmin({
+        behavior: {
+          lookup: async ({ path }) => {
+            lookupCount += 1;
+            return jsonResponse({
+              botId: path.split("/")[4],
+              person: { sub: "uncertain-person", email },
+              access: {
+                state: lookupCount === 1 ? "active" : "revoked",
+                revision: lookupCount === 1 ? 6 : 7,
+              },
+            });
+          },
+          revoke: fail,
+        },
+      });
+
+      await search(harness, email);
+      await harness.click(getButton(harness, "Revocar"));
+      await harness.click(getButton(harness, "Confirmar revocación"));
+      const resultText = bodyText(harness.document).toLowerCase();
+      expect(resultText).toMatch(/confirm|inciert|revis|temporal|error/i);
+      expect(resultText).not.toMatch(/revocación confirmada|acceso revocado/i);
+      expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(1);
+
+      await harness.click(getButton(harness, "Buscar"));
+      expect(apiCalls(harness, "POST", /\/people\/lookup$/)).toHaveLength(2);
+      expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(1);
+      expect(bodyText(harness.document)).toMatch(/acceso revocado/i);
+    },
+  );
+
+  it("ignora una revocación tardía al cambiar de chatbot y confirma la ficha del destino nuevo", async () => {
+    const email = "mismo-email@example.test";
+    const pendingRevoke = deferred();
+    let docenteLookup = 0;
+    const { harness } = await startAdmin({
+      behavior: {
+        lookup: async ({ path }) => {
+          const botId = path.split("/")[4];
+          if (botId === "docentes") {
+            docenteLookup += 1;
+            return jsonResponse({
+              botId,
+              person: { sub: "docentes-sub", email },
+              access: { state: "active", revision: 2 },
+            });
+          }
+          return jsonResponse({
+            botId,
+            person: { sub: "robotica-sub", email },
+            access: { state: "active", revision: 11 },
+          });
+        },
+        revoke: async ({ body, path }) =>
+          body.expectedSub === "docentes-sub"
+            ? pendingRevoke.promise
+            : jsonResponse({
+                botId: path.split("/")[4],
+                person: { sub: body.expectedSub, email: body.email },
+                access: { state: "revoked", revision: body.expectedRevision + 1 },
+                operation: { id: body.operationId, status: "recorded" },
+              }),
+      },
+    });
+
+    await search(harness, email);
+    await harness.click(getButton(harness, "Revocar"));
+    await harness.click(getButton(harness, "Confirmar revocación"));
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(1);
+
+    await selectBot(harness, "robotica");
+    pendingRevoke.resolve(
+      jsonResponse({
+        botId: "docentes",
+        person: { sub: "docentes-sub", email },
+        access: { state: "revoked", revision: 3 },
+        operation: { id: "old-operation", status: "recorded" },
+      }),
+    );
+    await harness.settle();
+    expect(bodyText(harness.document)).not.toContain("Acceso revocado");
+
+    await search(harness, email);
+    expect(bodyText(harness.document)).toContain("Robótica");
+    await harness.click(getButton(harness, "Revocar"));
+    expect(bodyText(harness.document).toLowerCase()).toContain(email);
+    expect(bodyText(harness.document).toLowerCase()).toContain("robótica");
+    await harness.click(getButton(harness, "Confirmar revocación"));
+
+    const revocations = apiCalls(harness, "POST", /\/access\/revoke$/);
+    expect(revocations).toHaveLength(2);
+    expect(revocations[1]).toMatchObject({
+      path: "/api/admin/bots/robotica/access/revoke",
+      body: { email, expectedSub: "robotica-sub", expectedRevision: 11 },
+    });
+    expect(docenteLookup).toBe(1);
+  });
+
+  it("ignora una revocación tardía al cambiar el email y confirma a la persona nueva", async () => {
+    const oldEmail = "persona-anterior@example.test";
+    const newEmail = "persona-nueva@example.test";
+    const pendingRevoke = deferred();
+    const { harness } = await startAdmin({
+      behavior: {
+        lookup: async ({ body, path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: {
+              sub: body.email === oldEmail ? "old-person-sub" : "new-person-sub",
+              email: body.email,
+            },
+            access: { state: "active", revision: body.email === oldEmail ? 1 : 7 },
+          }),
+        revoke: async ({ body, path }) =>
+          body.expectedSub === "old-person-sub"
+            ? pendingRevoke.promise
+            : jsonResponse({
+                botId: path.split("/")[4],
+                person: { sub: body.expectedSub, email: body.email },
+                access: { state: "revoked", revision: body.expectedRevision + 1 },
+                operation: { id: body.operationId, status: "recorded" },
+              }),
+      },
+    });
+
+    await search(harness, oldEmail);
+    await harness.click(getButton(harness, "Revocar"));
+    await harness.click(getButton(harness, "Confirmar revocación"));
+    await harness.setValue(getInput(harness, "Email"), newEmail);
+    pendingRevoke.resolve(
+      jsonResponse({
+        botId: "docentes",
+        person: { sub: "old-person-sub", email: oldEmail },
+        access: { state: "revoked", revision: 2 },
+        operation: { id: "old-operation", status: "recorded" },
+      }),
+    );
+    await harness.settle();
+    expect(bodyText(harness.document)).not.toContain(oldEmail);
+    expect(bodyText(harness.document)).not.toContain("Acceso revocado");
+
+    await search(harness, newEmail);
+    await harness.click(getButton(harness, "Revocar"));
+    const confirmation = bodyText(harness.document).toLowerCase();
+    expect(confirmation).toContain(newEmail);
+    expect(confirmation).not.toContain(oldEmail);
+    await harness.click(getButton(harness, "Confirmar revocación"));
+    const revocations = apiCalls(harness, "POST", /\/access\/revoke$/);
+    expect(revocations).toHaveLength(2);
+    expect(revocations[1]).toMatchObject({
+      path: "/api/admin/bots/docentes/access/revoke",
+      body: { email: newEmail, expectedSub: "new-person-sub", expectedRevision: 7 },
+    });
+  });
+
+  it("descarta una revocación tardía después del logout y exige login y confirmación nuevos", async () => {
+    const oldEmail = "admin-anterior-persona@example.test";
+    const newEmail = "admin-nuevo-persona@example.test";
+    const pendingRevoke = deferred();
+    const { harness } = await startAdmin({
+      signInResult: { accessToken: "new-admin-token", idToken: "new-admin-id" },
+      behavior: {
+        lookup: async ({ body, path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: {
+              sub: body.email === oldEmail ? "old-person-sub" : "new-person-sub",
+              email: body.email,
+            },
+            access: { state: "active", revision: body.email === oldEmail ? 2 : 12 },
+          }),
+        revoke: async ({ body, path }) =>
+          body.expectedSub === "old-person-sub"
+            ? pendingRevoke.promise
+            : jsonResponse({
+                botId: path.split("/")[4],
+                person: { sub: body.expectedSub, email: body.email },
+                access: { state: "revoked", revision: body.expectedRevision + 1 },
+                operation: { id: body.operationId, status: "recorded" },
+              }),
+      },
+    });
+
+    await search(harness, oldEmail);
+    await harness.click(getButton(harness, "Revocar"));
+    await harness.click(getButton(harness, "Confirmar revocación"));
+    await harness.click(getButton(harness, "Cerrar sesión"));
+    expect(button(harness.document, "Ingresar")).toBeTruthy();
+    pendingRevoke.resolve(
+      jsonResponse({
+        botId: "docentes",
+        person: { sub: "old-person-sub", email: oldEmail },
+        access: { state: "revoked", revision: 3 },
+        operation: { id: "old-operation", status: "recorded" },
+      }),
+    );
+    await harness.settle();
+    expect(button(harness.document, "Ingresar")).toBeTruthy();
+    expect(bodyText(harness.document)).not.toContain(oldEmail);
+    expect(bodyText(harness.document)).not.toContain("Acceso revocado");
+
+    await harness.setValue(getInput(harness, "Email"), "new-admin@example.test");
+    await harness.setValue(getInput(harness, "Contraseña"), "new-admin-password");
+    await harness.click(getButton(harness, "Ingresar"));
+    await search(harness, newEmail);
+    await harness.click(getButton(harness, "Revocar"));
+    expect(bodyText(harness.document).toLowerCase()).toContain(newEmail);
+    await harness.click(getButton(harness, "Confirmar revocación"));
+
+    const revocations = apiCalls(harness, "POST", /\/access\/revoke$/);
+    expect(revocations).toHaveLength(2);
+    expect(revocations[1]).toMatchObject({
+      path: "/api/admin/bots/docentes/access/revoke",
+      body: { email: newEmail, expectedSub: "new-person-sub", expectedRevision: 12 },
+    });
+  });
+
+  it("al invitar de nuevo desde revoked conserva el estado revocado hasta que la persona acepte", async () => {
+    const email = "restituir@example.test";
+    const { harness } = await startAdmin({
+      behavior: {
+        lookup: async ({ path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: { sub: "revoked-person", email },
+            access: { state: "revoked", revision: 14 },
+          }),
+        invitation: async ({ body, path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: { sub: "revoked-person", email: body.email },
+            access: { state: "revoked", revision: 15 },
+            invitation: {
+              expiresAt: expiry,
+              delivery: { status: "accepted", messageId: "ses-reinvite" },
+            },
+            operation: { id: body.operationId, status: "recorded" },
+          }),
+      },
+    });
+
+    await search(harness, email);
+    expect(bodyText(harness.document)).toMatch(/acceso revocado/i);
+    await confirmInvitation(harness, {
+      action: "Invitar",
+      confirmation: "Confirmar invitación",
+      email,
+      projectName: "Docentes",
+    });
+
+    const body = bodyText(harness.document);
+    expect(body).toMatch(/acceso revocado/i);
+    expect(body).not.toMatch(/acceso activo/i);
+    expect(body).toMatch(/pendiente.*acept|acept.*persona|todav[ií]a no.*acceso/i);
+    expect(apiCalls(harness, "POST", /\/invitations$/)).toHaveLength(1);
+    expect(apiCalls(harness, "POST", /\/access\/revoke$/)).toHaveLength(0);
   });
 });
