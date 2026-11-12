@@ -20,6 +20,10 @@ const baseConfig = {
 };
 const defaultIdentity = { sub: "teacher-a", botId: "docentes" };
 const originalQuestion = "Prepará una actividad completa de porcentajes.";
+const zeroQuotaMessage =
+  "Llegaste al límite de uso. Para volver a consultar, debe ampliarse el cupo";
+const quotaPolicyChangedMessage =
+  "Los límites de uso cambiaron mientras preparábamos la consulta. Podés volver a enviarla";
 const accessToken = "temporary-access-token-not-for-storage";
 const idToken = "temporary-id-token-not-for-storage";
 
@@ -101,6 +105,34 @@ function snapshot(request, overrides = {}) {
     answer: "Respuesta recuperada y durable.",
     canContinue: true,
     ...overrides,
+  };
+}
+
+function quotaView({
+  dailyUsed = 0,
+  monthlyUsed = 0,
+  dailyLimit = 20,
+  monthlyLimit = 200,
+  blockedUntil = null,
+  policyRevision = "quota-policy-1",
+} = {}) {
+  const serverNow = Date.UTC(2026, 9, 21, 12);
+  return {
+    daily: {
+      used: dailyUsed,
+      limit: dailyLimit,
+      resetAt: Date.UTC(2026, 9, 22, 3),
+      period: "2026-10-21",
+    },
+    monthly: {
+      used: monthlyUsed,
+      limit: monthlyLimit,
+      resetAt: Date.UTC(2026, 10, 1, 3),
+      period: "2026-10",
+    },
+    serverNow,
+    blockedUntil,
+    policyRevision,
   };
 }
 
@@ -634,6 +666,164 @@ describe("the chat recovery journal and restored submission", () => {
     expect(html).toMatch(/role="alert"/);
   });
 
+  it("rechecks an expanded zero-limit policy on the next explicit attempt without relogin or a reused query ID", async () => {
+    let submissionCount = 0;
+    const zeroQuota = quotaView({ dailyLimit: 0, monthlyLimit: 100 });
+    const environment = createEnvironment({
+      streamHandler: (request) => {
+        submissionCount += 1;
+        if (submissionCount === 1) {
+          return sse([
+            {
+              type: "failed",
+              code: "quota_exceeded",
+              message: zeroQuotaMessage,
+              recordStatus: "not_admitted",
+              queryId: request.queryId,
+              quota: zeroQuota,
+            },
+          ]);
+        }
+        return sse([
+          {
+            type: "accepted",
+            conversationId: request.conversationId,
+            queryId: request.queryId,
+            ordinal: request.baseOrdinal + 1,
+          },
+          { type: "text", queryId: request.queryId, index: 0, text: "Consulta ampliada." },
+          { type: "completed", queryId: request.queryId },
+        ]);
+      },
+    });
+    const app = mount(environment);
+    await initialize(app);
+    const restoreCallsAfterInitialization = environment.session.restore.mock.calls.length;
+
+    expect(app.current().props.onSubmit(originalQuestion)).toBe(true);
+    await vi.waitFor(() => expect(startCalls(environment)).toHaveLength(1));
+    await vi.waitFor(async () => {
+      await app.html();
+      expect(app.current().props.state).toMatchObject({
+        queryStatus: "rejected",
+        queryErrorCode: "quota_exceeded",
+        quota: zeroQuota,
+      });
+    });
+    expect(submissionCalls(environment)).toHaveLength(1);
+
+    expect(app.current().props.onSubmit(originalQuestion)).toBe(true);
+    await vi.waitFor(() => expect(startCalls(environment)).toHaveLength(2));
+    await vi.waitFor(async () => {
+      await app.html();
+      expect(app.current().props.state).toMatchObject({
+        queryStatus: "completed",
+        queryId: startCalls(environment)[1].request.queryId,
+      });
+    });
+
+    expect(startCalls(environment)[1].request.queryId).not.toBe(
+      startCalls(environment)[0].request.queryId,
+    );
+    expect(startCalls(environment)[1].request.text).toBe(originalQuestion);
+    expect(environment.session.restore.mock.calls).toHaveLength(restoreCallsAfterInitialization);
+  });
+
+  it("keeps the draft and conversation base on a policy-change rejection, then sends a new query only after an explicit click", async () => {
+    const followUp = "Adaptala para trabajar sin decimales.";
+    const historySnapshot = {
+      version: 2,
+      conversationId: initialConversationId,
+      queryId: initialQueryId,
+      ordinal: 1,
+      status: "completed",
+      question: originalQuestion,
+      answer: "Respuesta previa durable.",
+      canContinue: true,
+    };
+    const changedQuota = quotaView({
+      dailyUsed: 15,
+      monthlyUsed: 51,
+      dailyLimit: 25,
+      monthlyLimit: 100,
+      policyRevision: "quota-policy-2",
+    });
+    let submissionCount = 0;
+    const environment = createEnvironment({
+      historySnapshot,
+      historyMeta: confirmedHistoryMeta(initialConversationId, {
+        label: originalQuestion,
+        lastOrdinal: 1,
+      }),
+      streamHandler: (request) => {
+        submissionCount += 1;
+        if (submissionCount === 1) {
+          return sse([
+            {
+              type: "failed",
+              code: "quota_policy_changed",
+              message: quotaPolicyChangedMessage,
+              recordStatus: "not_admitted",
+              queryId: request.queryId,
+              quota: changedQuota,
+            },
+          ]);
+        }
+        return sse([
+          {
+            type: "accepted",
+            conversationId: request.conversationId,
+            queryId: request.queryId,
+            ordinal: request.baseOrdinal + 1,
+          },
+          { type: "text", queryId: request.queryId, index: 0, text: "Respuesta adaptada." },
+          { type: "completed", queryId: request.queryId },
+        ]);
+      },
+    });
+    const app = mount(environment);
+    await initialize(app);
+    expect(app.current().props.onSelectConversation).toEqual(expect.any(Function));
+    await app.current().props.onSelectConversation(initialConversationId);
+    await app.flush();
+    await vi.waitFor(() =>
+      expect(app.current().props.state.history.selectedConversationId).toBe(initialConversationId),
+    );
+    const restoreCallsAfterInitialization = environment.session.restore.mock.calls.length;
+
+    expect(app.current().props.onSubmit(followUp)).toBe(true);
+    await vi.waitFor(() => expect(submissionCalls(environment)).toHaveLength(1));
+    const firstRequest = submissionCalls(environment)[0].request;
+    await vi.waitFor(async () => {
+      await app.html();
+      expect(app.current().props.state).toMatchObject({
+        queryStatus: "rejected",
+        queryId: firstRequest.queryId,
+        question: followUp,
+        draft: followUp,
+        queryErrorCode: "quota_policy_changed",
+        history: expect.objectContaining({
+          selectedConversationId: initialConversationId,
+          throughOrdinal: 1,
+        }),
+      });
+    });
+    expect(await app.html()).toContain(quotaPolicyChangedMessage);
+    expect(submissionCalls(environment)).toHaveLength(1);
+
+    expect(app.current().props.onSubmit(followUp)).toBe(true);
+    await vi.waitFor(() => expect(submissionCalls(environment)).toHaveLength(2));
+    const secondRequest = submissionCalls(environment)[1].request;
+    expect(secondRequest).toMatchObject({
+      operation: "message",
+      conversationId: initialConversationId,
+      baseOrdinal: 1,
+      text: followUp,
+    });
+    expect(secondRequest.queryId).not.toBe(firstRequest.queryId);
+    expect(environment.session.restore.mock.calls).toHaveLength(restoreCallsAfterInitialization);
+  });
+
   it("recovers a cut-before-accepted request by the same IDs without a new start, even with an incomplete profile", async () => {
     const storage = new MemorySessionStorage();
     const first = createEnvironment({
@@ -726,10 +916,12 @@ describe("the chat recovery journal and restored submission", () => {
     await initialize(restoredApp);
     await vi.waitFor(() => expect(recoverCalls(restored)).toHaveLength(1));
     expect(submissionCalls(restored)).toHaveLength(0);
+    expect(allStorageText(storage)).toContain(original.request.queryId);
 
     expect(restoredApp.current().props.onSubmit(originalQuestion)).toBe(true);
     await vi.waitFor(() => expect(startCalls(restored)).toHaveLength(1));
     expect(startCalls(restored)[0].body).toBe(original.body);
+    expect(startCalls(restored)[0].request).toEqual(original.request);
     expect(recoverCalls(restored)).toHaveLength(1);
   });
 
