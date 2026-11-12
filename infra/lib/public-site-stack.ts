@@ -13,6 +13,9 @@ import type { SharedIdentityStack } from "./shared-identity-stack.js";
 const websiteAssetPath = fileURLToPath(new URL("../../web", import.meta.url));
 
 export class PublicSiteStack extends Stack {
+  readonly distribution: cloudfront.Distribution;
+  readonly siteUrl: string;
+
   constructor(
     scope: Construct,
     id: string,
@@ -45,7 +48,7 @@ export class PublicSiteStack extends Stack {
       { protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY },
     );
 
-    const distribution = new cloudfront.Distribution(this, "WebsiteDistribution", {
+    this.distribution = new cloudfront.Distribution(this, "WebsiteDistribution", {
       defaultRootObject: "index.html",
       defaultBehavior: {
         origin: origins.S3BucketOrigin.withOriginAccessControl(websiteBucket),
@@ -75,12 +78,13 @@ export class PublicSiteStack extends Stack {
         }),
       ],
       destinationBucket: websiteBucket,
-      distribution,
+      distribution: this.distribution,
       distributionPaths: ["/*"],
     });
 
+    this.siteUrl = `https://${this.distribution.distributionDomainName}`;
     new CfnOutput(this, "PublicSiteUrl", {
-      value: `https://${distribution.distributionDomainName}`,
+      value: this.siteUrl,
       description: `Public URL for the ${environment.botId} site in ${environment.environment}.`,
     });
   }

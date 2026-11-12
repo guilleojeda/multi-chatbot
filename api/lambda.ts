@@ -40,7 +40,7 @@ const profileStore = createProfileStoreAdapter({ documentClient: dynamoClient, t
 const profileHandler = createProfileHandler({
   config: { botId, profile: siteConfig.profile },
   store: {
-    hasMember: (sub, requestedBotId) => accountStore.hasMember({ sub, botId: requestedBotId }),
+    getAccess: (input) => accountStore.getAccess(input),
     ...profileStore,
   },
   now: Date.now,

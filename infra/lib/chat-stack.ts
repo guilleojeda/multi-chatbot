@@ -170,6 +170,9 @@ export class ChatStack extends Stack {
     const inferenceProfileArn = `arn:aws:bedrock:${environment.region}:${environment.account}:inference-profile/${inferenceProfileId}`;
     const sourceModelArn = `arn:aws:bedrock:${environment.region}::foundation-model/${modelId}`;
     this.runtime = new Runtime(this, "ConversationRuntime", {
+      ...(environment.environment === "dev"
+        ? { runtimeName: `${environment.botResourcePrefix.replaceAll("-", "")}phase9` }
+        : {}),
       agentRuntimeArtifact: AgentRuntimeArtifact.fromAsset(runtimeAssetPath, {
         platform: ecrAssets.Platform.LINUX_ARM64,
       }),

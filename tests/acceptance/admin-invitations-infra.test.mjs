@@ -9,6 +9,7 @@ import {
   makeSynthesisDirectory,
   markerValue,
   onlyRecord,
+  parseJsonTemplateValue,
   readAssembly,
   readAssetFile,
   records,
@@ -168,17 +169,6 @@ function resourceActions(statements, servicePrefix) {
   return statements
     .flatMap(statementActions)
     .filter((action) => action.toLowerCase().startsWith(servicePrefix.toLowerCase()));
-}
-
-function parseJsonEnvironmentValues(variables) {
-  return Object.values(variables).flatMap((value) => {
-    if (typeof value !== "string") return [];
-    try {
-      return [JSON.parse(value)];
-    } catch {
-      return [];
-    }
-  });
 }
 
 function configuredBotIds(value) {
@@ -526,7 +516,8 @@ describe("phase 9.1 admin infrastructure acceptance", () => {
       ).toBe(true);
       expect(serializedVariables).toContain("siteUrl");
       expect(serializedVariables).toContain("botId");
-      const botIds = parseJsonEnvironmentValues(variables).flatMap(configuredBotIds);
+      const botCatalog = parseJsonTemplateValue(variables.BOT_CATALOG);
+      const botIds = configuredBotIds(botCatalog);
       expect(botIds).toEqual([expectedBotId]);
 
       const { statements } = lambdaPolicies(admin, lambda);

@@ -1,0 +1,383 @@
+import { provisionInvitation } from "./invitations.js";
+import type { AccountAccessStore, AccessRecord, InvitationRecord } from "./access.js";
+import type { InvitationUser } from "./invitations.js";
+
+type AdminStore = AccountAccessStore;
+
+type AdminBot = {
+  botId: string;
+  projectName: string;
+  siteUrl: string;
+};
+
+type AdminIdentity = {
+  getUserByEmail(email: string): Promise<InvitationUser | null>;
+  createUser(input: { email: string; messageAction: "SUPPRESS" }): Promise<InvitationUser>;
+};
+
+type AdminMail = {
+  sendInvitation(input: {
+    from: string;
+    to: string;
+    projectName: string;
+    url: string;
+    expiresAt: number;
+  }): Promise<{ messageId?: string }>;
+};
+
+type AdminConfig = {
+  clientId: string;
+  adminGroup: string;
+  sender: string | null;
+  invitationTtlMs: number;
+  bots: AdminBot[];
+};
+
+type HttpEvent = {
+  rawPath?: string;
+  headers?: Record<string, string | undefined>;
+  body?: string | null;
+  isBase64Encoded?: boolean;
+  requestContext?: {
+    http?: { method?: string; path?: string };
+    authorizer?: { jwt?: { claims?: Record<string, unknown> } };
+  };
+};
+
+type HttpResponse = {
+  statusCode: number;
+  headers: { "content-type": string; "cache-control": "no-store" };
+  body: string;
+};
+
+function response(statusCode: number, body: Record<string, unknown>): HttpResponse {
+  return {
+    statusCode,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+    body: JSON.stringify(body),
+  };
+}
+
+function normalizeEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isEmail(value: string): boolean {
+  return value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseBody(event: HttpEvent): Record<string, unknown> | null {
+  if (typeof event.body !== "string") return null;
+  try {
+    const source = event.isBase64Encoded
+      ? Buffer.from(event.body, "base64").toString("utf8")
+      : event.body;
+    const value: unknown = JSON.parse(source);
+    return isObject(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function pathFrom(event: HttpEvent): string {
+  return event.requestContext?.http?.path || event.rawPath || "";
+}
+
+function botIdFromPath(path: string, suffix: "people/lookup" | "invitations"): string | null {
+  const match = path.match(new RegExp(`^/api/admin/bots/([^/]+)/${suffix.replace("/", "\\/")}$`));
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function bearerToken(event: HttpEvent): string | null {
+  const authorization = Object.entries(event.headers || {}).find(
+    ([key]) => key.toLowerCase() === "authorization",
+  )?.[1];
+  if (typeof authorization !== "string") return null;
+  return /^Bearer\s+(\S+)$/i.exec(authorization)?.[1] ?? null;
+}
+
+function jwtPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[1].length === 0) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return isObject(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function adminSub(event: HttpEvent, config: AdminConfig): { sub: string } | HttpResponse {
+  const token = bearerToken(event);
+  const bearer = token !== null;
+  const claims = event.requestContext?.authorizer?.jwt?.claims;
+  if (
+    !bearer ||
+    !claims ||
+    typeof claims.sub !== "string" ||
+    claims.sub.length === 0 ||
+    claims.sub.trim() !== claims.sub
+  ) {
+    return response(401, { code: "UNAUTHORIZED" });
+  }
+  let groups = claims["cognito:groups"];
+  if (!Array.isArray(groups)) {
+    const payload = jwtPayload(token);
+    if (
+      !payload ||
+      payload.sub !== claims.sub ||
+      payload.client_id !== claims.client_id ||
+      payload.token_use !== claims.token_use
+    ) {
+      return response(403, { code: "FORBIDDEN" });
+    }
+    groups = payload["cognito:groups"];
+  }
+  if (
+    claims.token_use !== "access" ||
+    claims.client_id !== config.clientId ||
+    !Array.isArray(groups) ||
+    groups.some((group) => typeof group !== "string") ||
+    !groups.includes(config.adminGroup)
+  ) {
+    return response(403, { code: "FORBIDDEN" });
+  }
+  return { sub: claims.sub };
+}
+
+function publicAccess(access: AccessRecord | null, botId: string, sub: string) {
+  if (!access) return { state: "none" as const, revision: 0 };
+  if (
+    access.sub !== sub ||
+    access.botId !== botId ||
+    !["none", "active", "revoked"].includes(access.access) ||
+    !Number.isSafeInteger(access.revision) ||
+    access.revision < 0
+  ) {
+    throw new Error("Invalid access record");
+  }
+  return { state: access.access, revision: access.revision };
+}
+
+function publicInvitation(invitation: InvitationRecord, currentEmail: string) {
+  if (
+    !Number.isFinite(invitation.expiresAt) ||
+    !isEmail(normalizeEmail(invitation.email)) ||
+    !["accepted", "failed", "unconfirmed"].includes(invitation.delivery.status)
+  ) {
+    throw new Error("Invalid invitation record");
+  }
+  return {
+    expiresAt: invitation.expiresAt,
+    delivery: {
+      status: invitation.delivery.status,
+      ...(invitation.delivery.messageId ? { messageId: invitation.delivery.messageId } : {}),
+    },
+    ...(normalizeEmail(invitation.email) !== normalizeEmail(currentEmail)
+      ? { invitedEmail: invitation.email }
+      : {}),
+  };
+}
+
+function isStateChanged(error: unknown): boolean {
+  return isObject(error) && (error.code === "STATE_CHANGED" || error.name === "STATE_CHANGED");
+}
+
+function validOperationId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim() === value &&
+    value.length >= 1 &&
+    value.length <= 128 &&
+    !/[\r\n]/.test(value)
+  );
+}
+
+export function createAdminHandler(deps: {
+  config: AdminConfig;
+  stores: Record<string, AdminStore>;
+  identity: AdminIdentity;
+  mail: AdminMail;
+  now: () => number;
+  randomBytes: (size: number) => Buffer | Uint8Array;
+}) {
+  const { config, stores } = deps;
+  const bots = new Map(config.bots.map((bot) => [bot.botId, bot]));
+
+  async function lookup(botId: string, email: string): Promise<HttpResponse> {
+    const bot = bots.get(botId);
+    const store = Object.hasOwn(stores, botId) ? stores[botId] : undefined;
+    if (!bot || !store) return response(404, { code: "NOT_FOUND" });
+    const normalized = normalizeEmail(email);
+    if (!isEmail(normalized)) return response(400, { code: "INVALID_INPUT" });
+
+    const user = await deps.identity.getUserByEmail(normalized);
+    if (!user) {
+      return response(200, {
+        botId,
+        person: null,
+        access: { state: "none", revision: 0 },
+      });
+    }
+    if (
+      typeof user.sub !== "string" ||
+      user.sub.length === 0 ||
+      typeof user.email !== "string" ||
+      normalizeEmail(user.email) !== normalized
+    ) {
+      return response(409, { code: "STATE_CHANGED" });
+    }
+
+    const access = await store.getAccess({ sub: user.sub, botId });
+    const accessView = publicAccess(access, botId, user.sub);
+    let invitation: ReturnType<typeof publicInvitation> | undefined;
+    const current = access?.currentInvitation;
+    if (current) {
+      if (
+        typeof current.hash !== "string" ||
+        !/^[a-f0-9]{64}$/.test(current.hash) ||
+        !Number.isFinite(current.expiresAt)
+      ) {
+        throw new Error("Invalid current invitation pointer");
+      }
+      const record = await store.getInvitation(current.hash);
+      if (
+        !record ||
+        record.tokenHash !== current.hash ||
+        record.sub !== user.sub ||
+        record.botId !== botId ||
+        record.expiresAt !== current.expiresAt
+      ) {
+        throw new Error("Current invitation is unavailable");
+      }
+      invitation = publicInvitation(record, user.email);
+    }
+
+    return response(200, {
+      botId,
+      person: { sub: user.sub, email: user.email },
+      access: accessView,
+      ...(invitation ? { invitation } : {}),
+    });
+  }
+
+  return async (event: HttpEvent): Promise<HttpResponse> => {
+    const principal = adminSub(event, config);
+    if ("statusCode" in principal) return principal;
+
+    const method = event.requestContext?.http?.method?.toUpperCase() || "";
+    const path = pathFrom(event);
+    if (method === "GET" && path === "/api/admin/me") {
+      return response(200, { sub: principal.sub });
+    }
+    if (method === "GET" && path === "/api/admin/bots") {
+      return response(200, {
+        bots: config.bots.map(({ botId, projectName }) => ({ botId, projectName })),
+      });
+    }
+
+    const lookupBotId = method === "POST" ? botIdFromPath(path, "people/lookup") : null;
+    if (lookupBotId !== null) {
+      if (!bots.has(lookupBotId) || !Object.hasOwn(stores, lookupBotId))
+        return response(404, { code: "NOT_FOUND" });
+      const body = parseBody(event);
+      if (!body || !hasOnlyKeys(body, ["email"]) || typeof body.email !== "string") {
+        return response(400, { code: "INVALID_INPUT" });
+      }
+      try {
+        return await lookup(lookupBotId, body.email);
+      } catch {
+        return response(503, { code: "TRY_AGAIN" });
+      }
+    }
+
+    const invitationBotId = method === "POST" ? botIdFromPath(path, "invitations") : null;
+    if (invitationBotId !== null) {
+      const bot = bots.get(invitationBotId);
+      const store = Object.hasOwn(stores, invitationBotId) ? stores[invitationBotId] : undefined;
+      if (!bot || !store) return response(404, { code: "NOT_FOUND" });
+      const body = parseBody(event);
+      if (
+        !body ||
+        !hasOnlyKeys(body, ["email", "expectedSub", "expectedRevision", "operationId"]) ||
+        typeof body.email !== "string" ||
+        (body.expectedSub !== null &&
+          (typeof body.expectedSub !== "string" || body.expectedSub.length === 0)) ||
+        !Number.isSafeInteger(body.expectedRevision) ||
+        (body.expectedRevision as number) < 0 ||
+        !validOperationId(body.operationId) ||
+        !isEmail(normalizeEmail(body.email))
+      ) {
+        return response(400, { code: "INVALID_INPUT" });
+      }
+      if (typeof config.sender !== "string" || config.sender.trim() === "") {
+        return response(503, { code: "TRY_AGAIN" });
+      }
+
+      try {
+        const result = await provisionInvitation(
+          {
+            config: {
+              botId: bot.botId,
+              projectName: bot.projectName,
+              siteUrl: bot.siteUrl,
+              sender: config.sender,
+              invitationTtlMs: config.invitationTtlMs,
+            },
+            identity: deps.identity,
+            store,
+            mail: deps.mail,
+            now: deps.now,
+            randomBytes: deps.randomBytes,
+          },
+          {
+            email: body.email,
+            expectedSub: body.expectedSub,
+            expectedRevision: body.expectedRevision as number,
+            operationId: body.operationId,
+          },
+        );
+        if (result.botId !== invitationBotId) throw new Error("Invitation bot mismatch");
+        const invitation = result.invitation;
+        if (
+          invitation.botId !== invitationBotId ||
+          invitation.sub !== result.sub ||
+          (result.created && normalizeEmail(invitation.email) !== normalizeEmail(body.email))
+        ) {
+          throw new Error("Invitation record mismatch");
+        }
+        return response(200, {
+          botId: invitationBotId,
+          person: { sub: result.sub, email: normalizeEmail(body.email) },
+          access: publicAccess(result.access, invitationBotId, result.sub),
+          invitation: publicInvitation(invitation, normalizeEmail(body.email)),
+          operation: {
+            id: body.operationId,
+            status: result.created ? "recorded" : "already_recorded",
+          },
+        });
+      } catch (error) {
+        if (isStateChanged(error)) return response(409, { code: "STATE_CHANGED" });
+        return response(503, { code: "TRY_AGAIN" });
+      }
+    }
+
+    return response(404, { code: "NOT_FOUND" });
+  };
+}

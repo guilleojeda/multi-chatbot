@@ -212,7 +212,7 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
       revision: "current-revision",
       systemPrompt: "Testing public recovery.",
     },
-    accounts: { hasMember: async () => true },
+    accounts: { getAccess: async (input) => ({ ...input, access: "active", revision: 1 }) },
     profiles: { getProfile: auxiliary },
     store,
     prepareContext: auxiliary,

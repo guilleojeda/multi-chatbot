@@ -2,6 +2,7 @@ import { App } from "aws-cdk-lib";
 import { resolveEnvironment } from "../../config/project.js";
 import { siteConfig } from "../../config/site.js";
 import { AccountStack } from "../lib/account-stack.js";
+import { AdminStack } from "../lib/admin-stack.js";
 import { ChatStack } from "../lib/chat-stack.js";
 import { PublicSiteStack } from "../lib/public-site-stack.js";
 import { SharedIdentityStack } from "../lib/shared-identity-stack.js";
@@ -34,11 +35,25 @@ const chat = new ChatStack(
   identity,
   account,
 );
-new PublicSiteStack(
+const site = new PublicSiteStack(
   app,
   `${resolvedSiteEnvironment.botResourcePrefix}-site`,
   resolvedSiteEnvironment,
   identity,
   account,
   chat,
+);
+new AdminStack(
+  app,
+  `${resolvedSiteEnvironment.resourcePrefix}-admin`,
+  resolvedSiteEnvironment,
+  identity,
+  [
+    {
+      botId: siteConfig.botId,
+      projectName: siteConfig.projectName,
+      account,
+      site,
+    },
+  ],
 );

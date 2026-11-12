@@ -5,7 +5,7 @@ import { CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { SESv2Client } from "@aws-sdk/client-sesv2";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { siteConfig } from "../dist/config/site.js";
 import { projectConfig } from "../dist/config/project.js";
 import {
@@ -135,7 +135,7 @@ async function main() {
         marshallOptions: { removeUndefinedValues: true },
       },
     );
-    const sesClient = new SESv2Client({ region: options.region });
+    const sesClient = new SESv2Client({ region: options.region, maxAttempts: 1 });
     const identity = createCognitoIdentityAdapter({
       client: cognitoClient,
       userPoolId,
@@ -144,6 +144,10 @@ async function main() {
     });
     const store = createAccountStoreAdapter({ documentClient: dynamoClient, tableName });
     const mail = createSesInvitationMailer(sesClient);
+    const observedUser = await identity.getUserByEmail(options.email);
+    const observedAccess = observedUser
+      ? await store.getAccess({ sub: observedUser.sub, botId: siteConfig.botId })
+      : null;
 
     const result = await provisionInvitation(
       {
@@ -160,18 +164,33 @@ async function main() {
         now: Date.now,
         randomBytes,
       },
-      { email: options.email },
+      {
+        email: options.email,
+        operationId: randomUUID(),
+        expectedSub: observedUser?.sub || null,
+        expectedRevision: observedAccess?.revision ?? 0,
+      },
     );
 
+    const delivery = result.invitation.delivery.status;
     process.stdout.write(
       [
-        "Invitation email accepted by SES.",
+        result.created && delivery === "accepted"
+          ? "Invitation email accepted by SES."
+          : result.created
+            ? "Invitation operation recorded; delivery is not confirmed."
+            : "Invitation operation already recorded; no resend.",
+        `delivery=${delivery}`,
         `bot=${result.botId}`,
         `sub=${result.sub}`,
+        `revision=${result.access.revision}`,
         `expiresAt=${new Date(result.expiresAt).toISOString()}`,
-        ...(result.messageId ? [`messageId=${result.messageId}`] : []),
+        ...(result.invitation.delivery.messageId
+          ? [`messageId=${result.invitation.delivery.messageId}`]
+          : []),
       ].join(" ") + "\n",
     );
+    if (delivery !== "accepted") process.exitCode = 1;
   } catch (error) {
     if (error instanceof OperatorError) {
       process.stderr.write(`${error.message}\n`);

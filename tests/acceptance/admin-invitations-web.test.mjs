@@ -178,6 +178,61 @@ describe("AdminApp: invitaciones desde la web", () => {
     expect(apiCalls(harness, "GET", /^\/api\/admin\/bots$/)).toHaveLength(1);
   });
 
+  it("conserva la sesión si el refresh falla temporalmente y permite reintentar", async () => {
+    const harness = await createAdminWebHarness(AdminApp);
+    harnesses.push(harness);
+    let restoreCalls = 0;
+    let accessToken = null;
+    harness.session.accessToken.mockImplementation(() => accessToken);
+    harness.session.restore.mockImplementation(async () => {
+      restoreCalls += 1;
+      if (restoreCalls === 1) {
+        accessToken = "expired-admin-token";
+        return { accessToken, idToken: "old-id" };
+      }
+      if (restoreCalls === 2) {
+        throw Object.assign(new Error("temporary refresh failure"), {
+          code: "NETWORK_ERROR",
+          status: 503,
+        });
+      }
+      accessToken = "refreshed-admin-token";
+      return { accessToken, idToken: "new-id" };
+    });
+    harness.session.signOut.mockImplementation(async () => {
+      accessToken = null;
+    });
+    let meCalls = 0;
+    installAdminRoutes(harness, {
+      me: async () => {
+        meCalls += 1;
+        return meCalls <= 2
+          ? jsonResponse({ code: "UNAUTHORIZED" }, 401)
+          : jsonResponse({ sub: "admin-sub" });
+      },
+    });
+
+    await harness.mount();
+    expect(apiCalls(harness, "GET", /^\/api\/admin\/me$/)).toHaveLength(1);
+    expect(status(harness.document).join(" ")).toMatch(/cargar el panel|conexión/i);
+    expect(harness.session.restore).toHaveBeenCalledTimes(2);
+    expect(harness.session.signOut).not.toHaveBeenCalled();
+    expect(harness.session.accessToken()).toBe("expired-admin-token");
+
+    await harness.click(getButton(harness, "Reintentar"));
+
+    const meRequests = apiCalls(harness, "GET", /^\/api\/admin\/me$/);
+    expect(meRequests).toHaveLength(3);
+    expect(meRequests.map((request) => request.headers.get("authorization"))).toEqual([
+      "Bearer expired-admin-token",
+      "Bearer expired-admin-token",
+      "Bearer refreshed-admin-token",
+    ]);
+    expect(harness.session.restore).toHaveBeenCalledTimes(3);
+    expect(harness.session.signOut).not.toHaveBeenCalled();
+    expect(getInput(harness, "Chatbot", "select")).toBeTruthy();
+  });
+
   it("muestra falta de rol en 403 y no carga funciones administrativas detrás de la denegación", async () => {
     const { harness } = await startAdmin({
       behavior: { me: async () => jsonResponse({ code: "FORBIDDEN" }, 403) },
@@ -306,6 +361,48 @@ describe("AdminApp: invitaciones desde la web", () => {
     expect(apiCalls(harness, "POST", /\/people\/lookup$/)).toHaveLength(3);
     expect(apiCalls(harness, "POST", /\/invitations$/)).toHaveLength(1);
     expect(harness.apiRequests.some(({ path }) => /accept/i.test(path))).toBe(false);
+  });
+
+  it("explica que la invitación anterior fue a otro email y confirma el email actual para una nueva", async () => {
+    const previousEmail = "docente-anterior@example.test";
+    const currentEmail = "docente-actual@example.test";
+    const { harness } = await startAdmin({
+      behavior: {
+        lookup: async ({ path }) =>
+          jsonResponse({
+            botId: path.split("/")[4],
+            person: { sub: "same-person-sub", email: currentEmail },
+            access: { state: "none", revision: 5 },
+            invitation: {
+              expiresAt: expiry,
+              invitedEmail: previousEmail,
+              delivery: { status: "accepted", messageId: "ses-previous" },
+            },
+          }),
+      },
+    });
+
+    await search(harness, currentEmail);
+    const currentFicha = bodyText(harness.document).toLowerCase();
+    expect(currentFicha).toContain(`esta invitación se envió a ${previousEmail}`);
+    expect(currentFicha).toContain(
+      `la ficha corresponde a la cuenta encontrada con el email actual ${currentEmail}`,
+    );
+    expect(currentFicha).toContain(`una nueva invitación se enviará a ${currentEmail}`);
+
+    await harness.click(getButton(harness, "Enviar nueva invitación"));
+    const confirmation = bodyText(harness.document).toLowerCase();
+    expect(confirmation).toContain(previousEmail);
+    expect(confirmation).toContain(currentEmail);
+    expect(apiCalls(harness, "POST", /\/invitations$/)).toHaveLength(0);
+    await harness.click(getButton(harness, "Confirmar nueva invitación"));
+    const invitationRequests = apiCalls(harness, "POST", /\/invitations$/);
+    expect(invitationRequests).toHaveLength(1);
+    expect(invitationRequests[0].body).toMatchObject({
+      email: currentEmail,
+      expectedSub: "same-person-sub",
+      expectedRevision: 5,
+    });
   });
 
   it("usa IDs nuevos solo para una nueva invitación explícita; buscar de nuevo solo lee el estado", async () => {
@@ -608,6 +705,35 @@ describe("AdminApp: invitaciones desde la web", () => {
     await harness.settle();
     expect(bodyText(harness.document)).not.toContain("old-person@example.test");
     expect(bodyText(harness.document)).toContain("new-admin@example.test");
+    expect(harness.session.signIn).toHaveBeenCalledOnce();
+  });
+
+  it("ignora una solicitud de recuperación tardía después de volver e ingresar con otra identidad", async () => {
+    const pendingReset = deferred();
+    const { harness } = await startAdmin({
+      restoreResults: [null],
+      signInResult: { accessToken: "new-admin-token", idToken: "new-admin-id" },
+    });
+    harness.session.requestPasswordReset.mockImplementationOnce(() => pendingReset.promise);
+
+    await harness.click(getButton(harness, "Recuperar contraseña"));
+    await harness.setValue(getInput(harness, "Email"), "old-admin@example.test");
+    await harness.click(getButton(harness, "Enviar código"));
+    expect(harness.session.requestPasswordReset).toHaveBeenCalledWith("old-admin@example.test");
+
+    await harness.click(getButton(harness, "Volver a iniciar sesión"));
+    await harness.setValue(getInput(harness, "Email"), "new-admin@example.test");
+    await harness.setValue(getInput(harness, "Contraseña"), "new-admin-password");
+    await harness.click(getButton(harness, "Ingresar"));
+    expect(getInput(harness, "Chatbot", "select")).toBeTruthy();
+
+    pendingReset.resolve();
+    await harness.settle();
+
+    expect(bodyText(harness.document)).toContain("new-admin@example.test");
+    expect(bodyText(harness.document)).not.toContain("old-admin@example.test");
+    expect(bodyText(harness.document)).not.toContain("Código de recuperación");
+    expect(getInput(harness, "Chatbot", "select")).toBeTruthy();
     expect(harness.session.signIn).toHaveBeenCalledOnce();
   });
 });

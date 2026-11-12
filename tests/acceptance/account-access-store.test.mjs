@@ -404,6 +404,96 @@ describe("the account access DynamoDB adapter", () => {
     expect(expandedExpression(update.input, "UpdateExpression")).not.toMatch(/currentInvitation/i);
   });
 
+  it("retries release against a reissued ACCESS revision while preserving the new pointer", async () => {
+    const claimedAt = new Date(now).toISOString();
+    let reads = 0;
+    let updates = 0;
+    const conflict = Object.assign(new Error("ACCESS revision changed"), {
+      name: "ConditionalCheckFailedException",
+    });
+    const documentClient = {
+      send: vi.fn(async (command) => {
+        if (command instanceof GetCommand) {
+          reads += 1;
+          return {
+            Item: accessItem({
+              revision: reads === 1 ? 15 : 16,
+              currentInvitation: { hash: reads === 1 ? tokenHash : nextHash, expiresAt },
+              activationClaim: {
+                invitationHash: tokenHash,
+                claimedAt,
+              },
+            }),
+          };
+        }
+        if (command instanceof UpdateCommand) {
+          updates += 1;
+          if (updates === 1) throw conflict;
+          return {};
+        }
+        throw new Error(`Unexpected command ${command.constructor.name}`);
+      }),
+    };
+    const store = createAccountStoreAdapter({ documentClient, tableName, now: () => now });
+
+    await expect(store.releaseActivation({ sub, botId, tokenHash })).resolves.toBeUndefined();
+
+    const releaseUpdates = documentClient.send.mock.calls
+      .map(([command]) => command)
+      .filter((command) => command instanceof UpdateCommand);
+    expect(releaseUpdates).toHaveLength(2);
+    expect(Object.values(releaseUpdates[0].input.ExpressionAttributeValues)).toContain(15);
+    expect(Object.values(releaseUpdates[1].input.ExpressionAttributeValues)).toContain(16);
+    expect(expandedExpression(releaseUpdates[1].input, "UpdateExpression")).toMatch(/REMOVE/i);
+    expect(expandedExpression(releaseUpdates[1].input, "UpdateExpression")).not.toMatch(
+      /currentInvitation/i,
+    );
+  });
+
+  it("does not remove a new same-hash claim after an earlier release ACK was lost", async () => {
+    const oldClaimedAt = new Date(now).toISOString();
+    const newClaimedAt = new Date(now + 1_000).toISOString();
+    let updates = 0;
+    const conditionalRetryFailure = Object.assign(new Error("The previous release already won"), {
+      name: "ConditionalCheckFailedException",
+    });
+    const documentClient = {
+      send: vi.fn(async (command) => {
+        if (command instanceof GetCommand) {
+          return {
+            Item:
+              updates === 0
+                ? accessItem({
+                    revision: 15,
+                    currentInvitation: { hash: tokenHash, expiresAt },
+                    activationClaim: { invitationHash: tokenHash, claimedAt: oldClaimedAt },
+                  })
+                : accessItem({
+                    revision: 17,
+                    currentInvitation: { hash: tokenHash, expiresAt },
+                    activationClaim: { invitationHash: tokenHash, claimedAt: newClaimedAt },
+                  }),
+          };
+        }
+        if (command instanceof UpdateCommand) {
+          updates += 1;
+          throw conditionalRetryFailure;
+        }
+        throw new Error(`Unexpected command ${command.constructor.name}`);
+      }),
+    };
+    const store = createAccountStoreAdapter({ documentClient, tableName, now: () => now });
+
+    await expect(store.releaseActivation({ sub, botId, tokenHash })).resolves.toBeUndefined();
+
+    expect(updates).toBe(1);
+    const update = documentClient.send.mock.calls.find(
+      ([command]) => command instanceof UpdateCommand,
+    )[0];
+    expect(Object.values(update.input.ExpressionAttributeValues)).toContain(oldClaimedAt);
+    expect(Object.values(update.input.ExpressionAttributeValues)).not.toContain(newClaimedAt);
+  });
+
   it("consumes a valid invitation and grants ACCESS in one transaction without legacy writes", async () => {
     const access = accessItem({
       revision: 1,

@@ -122,8 +122,8 @@ function makeHandler() {
       systemPrompt: request.systemPrompt,
     },
     accounts: {
-      async hasMember() {
-        return true;
+      async getAccess(input) {
+        return { ...input, access: "active", revision: 1 };
       },
     },
     profiles: {

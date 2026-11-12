@@ -214,7 +214,7 @@ describe("scripts/invite.mjs bootstrap", () => {
         ),
       ).toBe(false);
 
-      expect(aws.sesConfigs).toEqual([{ region }]);
+      expect(aws.sesConfigs).toEqual([{ region, maxAttempts: 1 }]);
       expect(aws.sesCommands).toHaveLength(1);
       expect(aws.sesCommands[0]).toBeInstanceOf(SendEmailCommand);
       const mail = aws.sesCommands[0].input;

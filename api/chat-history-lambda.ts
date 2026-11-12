@@ -35,6 +35,5 @@ const historyStore = createHistoryStore({
 export const handler = createChatHistoryHandler({
   botId,
   store: historyStore,
-  getMembership: ({ sub, botId: requestedBotId }) =>
-    accountStore.hasMember({ sub, botId: requestedBotId }),
+  getAccess: (input) => accountStore.getAccess(input),
 });

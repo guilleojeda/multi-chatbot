@@ -385,9 +385,9 @@ function makeHarness({
             systemPrompt: "Ayudá con tareas de enseñanza usando conocimiento general.",
           },
           accounts: {
-            async hasMember(input) {
-              state.calls.push(["hasMember", clone(input)]);
-              return state.member;
+            async getAccess(input) {
+              state.calls.push(["getAccess", clone(input)]);
+              return state.member ? { ...input, access: "active", revision: 1 } : null;
             },
           },
           profiles: {
@@ -557,7 +557,7 @@ describe("the conversation Runtime handler", () => {
     const events = await request(harness);
 
     expect(terminal(events)).toMatchObject({ type: "failed", code: "access_denied" });
-    expect(harness.state.calls.map(([name]) => name)).toEqual(["hasMember"]);
+    expect(harness.state.calls.map(([name]) => name)).toEqual(["getAccess"]);
     expect(harness.state.calls[0][1]).toEqual({ sub: caller.sub, botId });
     expect(harness.state.providerCalls).toBe(0);
   });
@@ -566,31 +566,31 @@ describe("the conversation Runtime handler", () => {
     [
       "a user without current membership",
       { member: false, meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 1 } },
-      ["hasMember"],
+      ["getAccess"],
       "access_denied",
     ],
     [
       "a conversation that does not exist",
       { meta: null },
-      ["hasMember", "getMeta"],
+      ["getAccess", "getMeta"],
       "conversation_unavailable",
     ],
     [
       "another owner's conversation",
       { meta: { conversationId, sub: "another-teacher", botId, lastOrdinal: 1 } },
-      ["hasMember", "getMeta"],
+      ["getAccess", "getMeta"],
       "conversation_unavailable",
     ],
     [
       "another chatbot's conversation",
       { meta: { conversationId, sub: caller.sub, botId: "bot-cobalt", lastOrdinal: 1 } },
-      ["hasMember", "getMeta"],
+      ["getAccess", "getMeta"],
       "conversation_unavailable",
     ],
     [
       "a missing saved profile",
       { profile: null, meta: { conversationId, sub: caller.sub, botId, lastOrdinal: 1 } },
-      ["hasMember", "getMeta", "getSubmission", "getProfile"],
+      ["getAccess", "getMeta", "getSubmission", "getProfile"],
       "profile_required",
     ],
   ])(
@@ -606,7 +606,7 @@ describe("the conversation Runtime handler", () => {
         code,
       });
       const names = harness.state.calls.map(([name]) => name);
-      expect(names[0]).toBe("hasMember");
+      expect(names[0]).toBe("getAccess");
       for (const name of calls) expect(names).toContain(name);
       expect(names.includes("getProfile")).toBe(calls.includes("getProfile"));
       expect(harness.state.calls.some(([name]) => name === "readContext")).toBe(false);
@@ -627,7 +627,7 @@ describe("the conversation Runtime handler", () => {
     const events = await request(harness);
 
     expect(terminal(events)).toMatchObject({ type: "failed", code: "conversation_unavailable" });
-    expect(harness.state.calls.map(([name]) => name)).toContain("hasMember");
+    expect(harness.state.calls.map(([name]) => name)).toContain("getAccess");
     expect(harness.state.calls.map(([name]) => name)).toContain("getMeta");
     expect(harness.state.calls.map(([name]) => name)).not.toContain("getProfile");
     expect(harness.state.calls.map(([name]) => name)).not.toContain("readQuota");
@@ -652,7 +652,7 @@ describe("the conversation Runtime handler", () => {
 
       expect(terminal(events)).toMatchObject({ type: "failed" });
       const names = harness.state.calls.map(([name]) => name);
-      expect(names).toContain("hasMember");
+      expect(names).toContain("getAccess");
       expect(names).toContain("getMeta");
       expect(names).not.toContain("getProfile");
       expect(names).not.toContain("readContext");
@@ -764,7 +764,7 @@ describe("the conversation Runtime handler", () => {
     expect(terminal(events)).toMatchObject({ type: "completed", queryId });
     expect(events[0]).toMatchObject({ type: "accepted", conversationId, ordinal: 3 });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
-      "hasMember",
+      "getAccess",
       "getSubmission",
       "getMeta",
       "getProfile",
@@ -855,7 +855,7 @@ describe("the conversation Runtime handler", () => {
 
     expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
-      "hasMember",
+      "getAccess",
       "getSubmission",
       "getMeta",
       "getProfile",
@@ -874,7 +874,7 @@ describe("the conversation Runtime handler", () => {
 
     expect(terminal(events)).toMatchObject({ type: "failed", recordStatus: "not_admitted" });
     expect(harness.state.calls.map(([name]) => name)).toEqual([
-      "hasMember",
+      "getAccess",
       "getSubmission",
       "getMeta",
       "getProfile",
@@ -903,7 +903,7 @@ describe("the conversation Runtime handler", () => {
     expect(events.some(({ type }) => type === "accepted" || type === "completed")).toBe(false);
     const names = harness.state.calls.map(([name]) => name);
     for (const name of [
-      "hasMember",
+      "getAccess",
       "getMeta",
       "getSubmission",
       "getProfile",

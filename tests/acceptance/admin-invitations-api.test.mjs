@@ -781,7 +781,7 @@ describe("the public global-admin invitation API", () => {
   });
 
   it.each([
-    ["a definite rejection", "MessageRejectedException", "failed"],
+    ["a definite rejection", "MessageRejected", "failed"],
     ["a transport timeout", "TimeoutError", "unconfirmed"],
   ])("records %s distinctly and returns it on lookup", async (_label, errorName, status) => {
     const transport = createPhase9AccountTransport();

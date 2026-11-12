@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 import { accessTokenSubject } from "./auth.js";
+import {
+  isRecord,
+  type AccountAccessStore,
+  type AccessRecord,
+  type InvitationRecord,
+} from "./access.js";
 
 type AccountUser = {
   sub: string;
@@ -14,36 +20,11 @@ type Caller = {
   token_use?: string;
 };
 
-type Invitation = {
-  id: string;
-  tokenHash?: string;
-  botId: string;
-  sub: string;
-  email: string;
-  kind?: "new" | "existing";
-  expiresAt: number;
-  usedAt?: string | null;
-  reserved?: boolean;
-  reservedAt?: string | number | null;
-};
-
 type Identity = {
   getUserByEmail(email: string): Promise<AccountUser | null>;
   getCaller(accessToken: string): Promise<Caller | null>;
   setPermanentPassword(input: { sub: string; password: string }): Promise<void>;
   markEmailVerified(input: { sub: string; email: string }): Promise<void>;
-};
-
-type Store = {
-  getInvitation(tokenHash: string): Promise<Invitation | null>;
-  reserveInvitation(input: { invitationId: string; sub: string; botId: string }): Promise<boolean>;
-  releaseInvitation(input: { invitationId: string; sub: string; botId: string }): Promise<void>;
-  useInvitationAndAddMember(input: {
-    invitationId: string;
-    sub: string;
-    botId: string;
-  }): Promise<boolean>;
-  hasMember(input: { sub: string; botId: string }): Promise<boolean>;
 };
 
 type HttpEvent = {
@@ -61,7 +42,10 @@ type HttpEvent = {
 type HandlerDependencies = {
   config: { botId: string };
   identity: Identity;
-  store: Store;
+  store: Pick<
+    AccountAccessStore,
+    "getAccess" | "getInvitation" | "reserveActivation" | "releaseActivation" | "consumeInvitation"
+  >;
   now: () => number;
 };
 
@@ -81,10 +65,6 @@ function json(statusCode: number, body: Record<string, unknown>): ApiResponse {
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function readBody(event: HttpEvent): Record<string, unknown> | null {
   if (!event.body) return {};
   try {
@@ -100,13 +80,6 @@ function readBody(event: HttpEvent): Record<string, unknown> | null {
 
 function normalizedEmail(value: string): string {
   return value.trim().toLowerCase();
-}
-
-function isReserved(invitation: Invitation): boolean {
-  return (
-    invitation.reserved === true ||
-    (invitation.reservedAt !== undefined && invitation.reservedAt !== null)
-  );
 }
 
 function isInvalidPassword(error: unknown): boolean {
@@ -139,22 +112,29 @@ function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-function isInvitationShape(value: Invitation | null): value is Invitation {
+function isInvitationShape(value: InvitationRecord | null): value is InvitationRecord {
   return Boolean(
     value &&
     typeof value.id === "string" &&
-    value.id.length > 0 &&
+    value.id === value.tokenHash &&
+    /^[a-f0-9]{64}$/.test(value.tokenHash) &&
     typeof value.botId === "string" &&
     typeof value.sub === "string" &&
     value.sub.length > 0 &&
     typeof value.email === "string" &&
     value.email.trim().length > 0 &&
     typeof value.expiresAt === "number" &&
-    Number.isFinite(value.expiresAt),
+    Number.isFinite(value.expiresAt) &&
+    typeof value.operationId === "string" &&
+    value.operationId.length > 0 &&
+    ["accepted", "failed", "unconfirmed"].includes(value.delivery.status),
   );
 }
 
-function isMatchingUser(user: AccountUser | null, invitation: Invitation): user is AccountUser {
+function isMatchingUser(
+  user: AccountUser | null,
+  invitation: InvitationRecord,
+): user is AccountUser {
   return Boolean(
     user &&
     user.sub === invitation.sub &&
@@ -164,7 +144,7 @@ function isMatchingUser(user: AccountUser | null, invitation: Invitation): user 
 
 function suppliedIdentityConflicts(
   body: Record<string, unknown>,
-  invitation: Invitation,
+  invitation: InvitationRecord,
   botId: string,
 ) {
   if (Object.hasOwn(body, "sub") && body.sub !== invitation.sub) return true;
@@ -179,7 +159,10 @@ function suppliedIdentityConflicts(
   return false;
 }
 
-function hasValidCallerIdentity(caller: Caller | null, invitation: Invitation): caller is Caller {
+function hasValidCallerIdentity(
+  caller: Caller | null,
+  invitation: InvitationRecord,
+): caller is Caller {
   return Boolean(
     caller &&
     caller.token_use === "access" &&
@@ -189,11 +172,22 @@ function hasValidCallerIdentity(caller: Caller | null, invitation: Invitation): 
   );
 }
 
+function accessInvitationMatches(
+  access: AccessRecord | null,
+  invitation: InvitationRecord,
+): boolean {
+  return Boolean(
+    access?.currentInvitation?.hash === invitation.tokenHash &&
+    access.currentInvitation.expiresAt === invitation.expiresAt,
+  );
+}
+
 export function createAccountHandler({ config, identity, store, now }: HandlerDependencies) {
   async function loadInvitation(
     token: unknown,
   ): Promise<
-    { invitation: Invitation; error?: never } | { invitation?: never; error: ApiResponse }
+    | { invitation: InvitationRecord; access: AccessRecord; error?: never }
+    | { invitation?: never; access?: never; error: ApiResponse }
   > {
     if (typeof token !== "string" || token.trim().length === 0 || token.length > 4096) {
       return {
@@ -234,7 +228,16 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
         error: json(409, { code: "INVITATION_USED", message: "Esta invitación ya fue utilizada." }),
       };
     }
-    return { invitation };
+    const access = await store.getAccess({ sub: invitation.sub, botId: config.botId });
+    if (!access || !accessInvitationMatches(access, invitation)) {
+      return {
+        error: json(409, {
+          code: "INVITATION_USED",
+          message: "Esta invitación ya no está vigente.",
+        }),
+      };
+    }
+    return { invitation, access };
   }
 
   async function inspect(body: Record<string, unknown>): Promise<ApiResponse> {
@@ -257,7 +260,7 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
   async function accept(body: Record<string, unknown>, event: HttpEvent): Promise<ApiResponse> {
     const loaded = await loadInvitation(body.token);
     if (loaded.error) return loaded.error;
-    const { invitation } = loaded;
+    const { invitation, access } = loaded;
     if (suppliedIdentityConflicts(body, invitation, config.botId)) {
       return json(403, {
         code: "FORBIDDEN",
@@ -273,8 +276,8 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
       });
     }
 
-    const reservedBeforeRequest = isReserved(invitation);
-    const canSetPassword = user.status === "FORCE_CHANGE_PASSWORD" && !reservedBeforeRequest;
+    const activationClaimExists = access.activationClaim !== undefined;
+    const canSetPassword = user.status === "FORCE_CHANGE_PASSWORD" && !activationClaimExists;
     const password = typeof body.password === "string" ? body.password : undefined;
     if (
       canSetPassword &&
@@ -298,14 +301,8 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
       }
     }
 
-    if (!canSetPassword || reservedBeforeRequest) {
-      if (!accessToken) {
-        return json(409, {
-          code: "SIGN_IN_REQUIRED",
-          message: "Iniciá sesión con esta cuenta para continuar.",
-        });
-      }
-      if (!caller) {
+    if (!canSetPassword || activationClaimExists) {
+      if (!accessToken || !caller) {
         return json(409, {
           code: "SIGN_IN_REQUIRED",
           message: "Iniciá sesión con esta cuenta para continuar.",
@@ -313,11 +310,11 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
       }
     }
 
-    if (!reservedBeforeRequest) {
-      const reserved = await store.reserveInvitation({
-        invitationId: invitation.id,
+    if (canSetPassword) {
+      const reserved = await store.reserveActivation({
         sub: invitation.sub,
         botId: config.botId,
+        tokenHash: invitation.tokenHash,
       });
       if (!reserved) {
         return json(409, {
@@ -325,21 +322,27 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
           message: "Esta invitación ya está en uso. Iniciá sesión para continuar.",
         });
       }
-    }
-
-    if (canSetPassword) {
       if (password === undefined) {
+        await store.releaseActivation({
+          sub: invitation.sub,
+          botId: config.botId,
+          tokenHash: invitation.tokenHash,
+        });
         return json(400, { code: "INVALID_PASSWORD", message: "Ingresá una contraseña válida." });
       }
       try {
         await identity.setPermanentPassword({ sub: invitation.sub, password });
       } catch (error) {
         if (isInvalidPassword(error)) {
-          await store.releaseInvitation({
-            invitationId: invitation.id,
-            sub: invitation.sub,
-            botId: config.botId,
-          });
+          try {
+            await store.releaseActivation({
+              sub: invitation.sub,
+              botId: config.botId,
+              tokenHash: invitation.tokenHash,
+            });
+          } catch {
+            return safeFailure();
+          }
           return json(400, {
             code: "INVALID_PASSWORD",
             message: "La contraseña no cumple los requisitos.",
@@ -357,10 +360,10 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
       }
     }
 
-    const used = await store.useInvitationAndAddMember({
-      invitationId: invitation.id,
+    const used = await store.consumeInvitation({
       sub: invitation.sub,
       botId: config.botId,
+      tokenHash: invitation.tokenHash,
     });
     if (!used) {
       return json(409, { code: "INVITATION_USED", message: "Esta invitación ya fue utilizada." });
@@ -374,13 +377,18 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
     if (!sub) {
       return json(401, { code: "UNAUTHORIZED", message: "Iniciá sesión para continuar." });
     }
-    if (!(await store.hasMember({ sub, botId: config.botId }))) {
+    const access = await store.getAccess({ sub, botId: config.botId });
+    if (!access || access.access === "none") {
       return json(403, {
         code: "FORBIDDEN",
         message: "Esta cuenta no tiene acceso a este proyecto.",
       });
     }
-    return json(200, { sub, botId: config.botId });
+    return json(200, {
+      sub,
+      botId: config.botId,
+      access: { state: access.access, revision: access.revision },
+    });
   }
 
   return async function handler(event: HttpEvent): Promise<ApiResponse> {

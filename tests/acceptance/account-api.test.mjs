@@ -52,13 +52,15 @@ function makeHarness({
   expiresAt = fixedNow + 60_000,
   usedAt = null,
   reservation = false,
+  reissueDuringRelease = false,
+  replacementToken = "replacement-invitation-token",
   user = {
     sub: invitationSub,
     email: invitationEmail,
     emailVerified: false,
     status: "FORCE_CHANGE_PASSWORD",
   },
-  members = [],
+  accesses = [],
   callers = {
     [defaultAccessToken]: {
       sub: "user-123",
@@ -69,21 +71,50 @@ function makeHarness({
   passwordFailure,
   verificationFailure,
 } = {}) {
+  const invitationTokenHash = invitationHash(invitationToken);
+  const seededAccess = accesses.find(
+    ({ sub, botId: accessBotId }) => sub === invitationSub && accessBotId === invitationBotId,
+  );
   const state = {
     invitation: {
-      id: "invite-1",
+      id: invitationTokenHash,
+      tokenHash: invitationTokenHash,
       botId: invitationBotId,
       sub: invitationSub,
       email: invitationEmail,
       expiresAt,
       usedAt,
-      reserved: reservation,
+      operationId: "operation-1",
+      delivery: { status: "unconfirmed" },
     },
     user: { ...user },
-    members: new Set(members.map(({ sub, botId: memberBotId }) => `${sub}:${memberBotId}`)),
+    access: seededAccess
+      ? { access: "active", revision: 2, ...seededAccess }
+      : {
+          sub: invitationSub,
+          botId: invitationBotId,
+          access: "none",
+          revision: 1,
+          currentInvitation: { hash: invitationTokenHash, expiresAt },
+          ...(reservation
+            ? {
+                activationClaim: {
+                  invitationHash: invitationTokenHash,
+                  claimedAt: new Date(fixedNow).toISOString(),
+                },
+              }
+            : {}),
+        },
+    accesses: new Map(
+      accesses.map(({ sub, botId: accessBotId }) => [
+        `${sub}:${accessBotId}`,
+        { sub, botId: accessBotId, access: "active", revision: 2 },
+      ]),
+    ),
     callers: new Map(Object.entries(callers)),
     passwordFailure,
     verificationFailure,
+    reissued: false,
     calls: [],
   };
 
@@ -125,53 +156,80 @@ function makeHarness({
   const store = {
     async getInvitation(tokenHash) {
       state.calls.push(["getInvitation", tokenHash]);
-      if (tokenHash !== invitationHash(invitationToken)) return null;
+      if (tokenHash !== state.invitation.tokenHash) return null;
       return { ...state.invitation };
     },
-    async reserveInvitation({ invitationId, sub, botId: requestedBotId }) {
-      state.calls.push(["reserveInvitation", invitationId, sub, requestedBotId]);
+    async getAccess({ sub, botId: requestedBotId }) {
+      state.calls.push(["getAccess", sub, requestedBotId]);
+      if (sub !== invitationSub || requestedBotId !== invitationBotId) {
+        return state.accesses.get(`${sub}:${requestedBotId}`) || null;
+      }
+      return { ...state.access };
+    },
+    async reserveActivation({ tokenHash, sub, botId: requestedBotId }) {
+      state.calls.push(["reserveActivation", tokenHash, sub, requestedBotId]);
       if (
-        state.invitation.id !== invitationId ||
+        tokenHash !== state.invitation.tokenHash ||
         state.invitation.sub !== sub ||
         state.invitation.botId !== requestedBotId ||
         state.invitation.usedAt ||
-        state.invitation.reserved
+        state.access.activationClaim ||
+        state.access.currentInvitation?.hash !== tokenHash
       ) {
         return false;
       }
-      state.invitation.reserved = true;
+      state.access.activationClaim = {
+        invitationHash: tokenHash,
+        claimedAt: new Date(fixedNow).toISOString(),
+      };
+      state.access.revision += 1;
       return true;
     },
-    async releaseInvitation({ invitationId, sub, botId: requestedBotId }) {
-      state.calls.push(["releaseInvitation", invitationId, sub, requestedBotId]);
+    async releaseActivation({ tokenHash, sub, botId: requestedBotId }) {
+      state.calls.push(["releaseActivation", tokenHash, sub, requestedBotId]);
+      if (reissueDuringRelease && !state.reissued) {
+        state.reissued = true;
+        const nextHash = invitationHash(replacementToken);
+        const nextExpiresAt = expiresAt + 60_000;
+        state.invitation = {
+          ...state.invitation,
+          id: nextHash,
+          tokenHash: nextHash,
+          expiresAt: nextExpiresAt,
+          usedAt: null,
+        };
+        state.access.currentInvitation = { hash: nextHash, expiresAt: nextExpiresAt };
+        state.access.revision += 1;
+      }
       if (
-        state.invitation.id === invitationId &&
+        tokenHash === state.access.activationClaim?.invitationHash &&
         state.invitation.sub === sub &&
         state.invitation.botId === requestedBotId &&
         !state.invitation.usedAt
       ) {
-        state.invitation.reserved = false;
+        delete state.access.activationClaim;
+        state.access.revision += 1;
       }
     },
-    async useInvitationAndAddMember({ invitationId, sub, botId: requestedBotId }) {
-      state.calls.push(["useInvitationAndAddMember", invitationId, sub, requestedBotId]);
+    async consumeInvitation({ tokenHash, sub, botId: requestedBotId }) {
+      state.calls.push(["consumeInvitation", tokenHash, sub, requestedBotId]);
       if (
-        state.invitation.id !== invitationId ||
+        tokenHash !== state.invitation.tokenHash ||
         state.invitation.sub !== sub ||
         state.invitation.botId !== requestedBotId ||
         state.invitation.usedAt ||
-        !state.invitation.reserved
+        state.access.currentInvitation?.hash !== tokenHash
       ) {
         return false;
       }
       state.invitation.usedAt = new Date(fixedNow).toISOString();
-      state.invitation.reserved = false;
-      state.members.add(`${sub}:${requestedBotId}`);
+      state.access.access = "active";
+      state.access.revision += 1;
+      delete state.access.currentInvitation;
+      if (state.access.activationClaim?.invitationHash === tokenHash)
+        delete state.access.activationClaim;
+      state.accesses.set(`${sub}:${requestedBotId}`, { ...state.access });
       return true;
-    },
-    async hasMember({ sub, botId: requestedBotId }) {
-      state.calls.push(["hasMember", sub, requestedBotId]);
-      return state.members.has(`${sub}:${requestedBotId}`);
     },
   };
 
@@ -256,7 +314,7 @@ describe("the public account API", () => {
     expect(response.statusCode).toBe(400);
     expect(responseBody(response).code).toBe("INVALID_INVITATION");
     expect(state.user.status).toBe("FORCE_CHANGE_PASSWORD");
-    expect(state.members.size).toBe(0);
+    expect(state.access.access).toBe("none");
     expect(state.calls).not.toContainEqual(expect.arrayContaining(["setPermanentPassword"]));
   });
 
@@ -278,8 +336,8 @@ describe("the public account API", () => {
       expect(responseBody(response).code).toBe("INVALID_INVITATION");
       expect(state.user.status).toBe("FORCE_CHANGE_PASSWORD");
       expect(state.user.emailVerified).toBe(false);
-      expect(state.invitation.reserved).toBe(false);
-      expect(state.members.size).toBe(0);
+      expect(state.access.activationClaim).toBeUndefined();
+      expect(state.access.access).toBe("none");
       expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
       expect(state.calls.map(([name]) => name)).not.toContain("markEmailVerified");
     },
@@ -295,7 +353,7 @@ describe("the public account API", () => {
 
     expect(response.statusCode).toBe(410);
     expect(responseBody(response).code).toBe("INVITATION_EXPIRED");
-    expect(state.members.size).toBe(0);
+    expect(state.access.access).toBe("none");
     expect(state.calls).not.toContainEqual(expect.arrayContaining(["setPermanentPassword"]));
   });
 
@@ -309,7 +367,7 @@ describe("the public account API", () => {
 
     expect(response.statusCode).toBe(409);
     expect(responseBody(response).code).toBe("INVITATION_USED");
-    expect(state.members.size).toBe(0);
+    expect(state.access.access).toBe("none");
     expect(state.calls).not.toContainEqual(expect.arrayContaining(["setPermanentPassword"]));
   });
 
@@ -325,15 +383,45 @@ describe("the public account API", () => {
       expect(state.user.status).toBe("CONFIRMED");
       expect(state.user.password).toBe("Correct-Horse-42!");
       expect(state.user.emailVerified).toBe(true);
-      expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
+      expect(state.access.access).toBe("active");
       expect(state.calls).toContainEqual(["setPermanentPassword", "user-123", "Correct-Horse-42!"]);
       expect(state.calls).toContainEqual(["markEmailVerified", "user-123", "teacher@example.test"]);
       expect(state.calls).toContainEqual([
-        "useInvitationAndAddMember",
-        "invite-1",
+        "consumeInvitation",
+        invitationHash(defaultToken),
         "user-123",
         "bot-aurora",
       ]);
+    },
+  );
+
+  apiIt(
+    "releases its activation claim after a reissue race so the corrected invitation can finish",
+    async () => {
+      const passwordPolicyError = new Error("Password does not meet policy");
+      passwordPolicyError.name = "InvalidPasswordException";
+      const { handler, state } = makeHarness({
+        passwordFailure: passwordPolicyError,
+        reissueDuringRelease: true,
+      });
+
+      const rejected = await accept(handler, defaultToken, { password: "weak" });
+
+      expect(rejected.statusCode).toBe(400);
+      expect(responseBody(rejected).code).toBe("INVALID_PASSWORD");
+      expect(state.access.currentInvitation.hash).toBe(
+        invitationHash("replacement-invitation-token"),
+      );
+      expect(state.access.activationClaim).toBeUndefined();
+
+      const retried = await accept(handler, "replacement-invitation-token", {
+        password: "Correct-Horse-42!",
+      });
+
+      expect(retried.statusCode).toBe(200);
+      expect(state.user.password).toBe("Correct-Horse-42!");
+      expect(state.access.access).toBe("active");
+      expect(state.access.activationClaim).toBeUndefined();
     },
   );
 
@@ -350,13 +438,13 @@ describe("the public account API", () => {
       expect(responseBody(rejected).code).toBe("INVALID_PASSWORD");
       expect(state.user.status).toBe("FORCE_CHANGE_PASSWORD");
       expect(state.user.emailVerified).toBe(false);
-      expect(state.members.size).toBe(0);
-      expect(state.invitation.reserved).toBe(false);
+      expect(state.access.access).toBe("none");
+      expect(state.access.activationClaim).toBeUndefined();
 
       const retried = await accept(handler, defaultToken, { password: "Correct-Horse-42!" });
 
       expect(retried.statusCode).toBe(200);
-      expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
+      expect(state.access.access).toBe("active");
     },
   );
 
@@ -378,8 +466,10 @@ describe("the public account API", () => {
       expect(state.user.status).toBe("CONFIRMED");
       expect(state.user.password).toBe("secret-value");
       expect(state.user.emailVerified).toBe(false);
-      expect(state.invitation.reserved).toBe(true);
-      expect(state.members.size).toBe(0);
+      expect(state.access.activationClaim).toMatchObject({
+        invitationHash: invitationHash(defaultToken),
+      });
+      expect(state.access.access).toBe("none");
 
       const unauthenticatedRetry = await accept(handler, defaultToken, {
         password: "attacker-secret",
@@ -395,7 +485,7 @@ describe("the public account API", () => {
       expect(authenticatedRetry.statusCode).toBe(200);
       expect(state.user.emailVerified).toBe(true);
       expect(state.user.password).toBe("secret-value");
-      expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
+      expect(state.access.access).toBe("active");
       expect(state.calls.filter(([name]) => name === "setPermanentPassword")).toHaveLength(1);
     },
   );
@@ -416,7 +506,7 @@ describe("the public account API", () => {
       const unauthenticated = await accept(handler, defaultToken, { password: "attacker-secret" });
       expect(unauthenticated.statusCode).toBe(409);
       expect(responseBody(unauthenticated).code).toBe("SIGN_IN_REQUIRED");
-      expect(state.members.size).toBe(0);
+      expect(state.access.access).toBe("none");
       expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
 
       const accepted = await accept(
@@ -427,7 +517,7 @@ describe("the public account API", () => {
       );
 
       expect(accepted.statusCode).toBe(200);
-      expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
+      expect(state.access.access).toBe("active");
       expect(state.user.password).toBe("existing-secret");
       expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
     },
@@ -460,7 +550,7 @@ describe("the public account API", () => {
       expect(response.statusCode).toBe(200);
       expect(state.user.emailVerified).toBe(true);
       expect(state.user.password).toBe("existing-secret");
-      expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
+      expect(state.access.access).toBe("active");
       expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
     },
   );
@@ -488,7 +578,7 @@ describe("the public account API", () => {
       expect(response.statusCode).toBe(403);
       expect(state.user.status).toBe("FORCE_CHANGE_PASSWORD");
       expect(state.user.emailVerified).toBe(false);
-      expect(state.members.size).toBe(0);
+      expect(state.access.access).toBe("none");
       expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
     },
   );
@@ -515,7 +605,7 @@ describe("the public account API", () => {
     expect(responseBody(response).code).toBe("FORBIDDEN");
     expect(state.user.status).toBe("FORCE_CHANGE_PASSWORD");
     expect(state.user.emailVerified).toBe(false);
-    expect(state.members.size).toBe(0);
+    expect(state.access.access).toBe("none");
     expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
   });
 
@@ -533,7 +623,7 @@ describe("the public account API", () => {
 
     expect(response.statusCode).toBe(403);
     expect(state.user.status).toBe("FORCE_CHANGE_PASSWORD");
-    expect(state.members.size).toBe(0);
+    expect(state.access.access).toBe("none");
     expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
   });
 
@@ -556,14 +646,14 @@ describe("the public account API", () => {
       });
 
       expect(unauthenticated.statusCode).toBe(409);
-      expect(state.members.size).toBe(0);
+      expect(state.access.access).toBe("none");
       expect(state.user.password).toBe("already-set-secret");
       expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
 
       const retried = await accept(handler, defaultToken, {}, defaultAccessToken);
 
       expect(retried.statusCode).toBe(200);
-      expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
+      expect(state.access.access).toBe("active");
       expect(state.user.password).toBe("already-set-secret");
     },
   );
@@ -581,7 +671,7 @@ describe("the public account API", () => {
       expect(responses.filter(({ statusCode }) => statusCode === 200)).toHaveLength(1);
       expect(responses.filter(({ statusCode }) => statusCode !== 200)).toHaveLength(1);
       expect(state.calls.filter(([name]) => name === "setPermanentPassword")).toHaveLength(1);
-      expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
+      expect(state.access.access).toBe("active");
       expect(state.user.password).toMatch(/^(First|Second)-Password-42!$/);
     },
   );
@@ -599,7 +689,7 @@ describe("the public account API", () => {
       expect(replay.statusCode).toBe(409);
       expect(state.calls.filter(([name]) => name === "setPermanentPassword")).toHaveLength(1);
       expect(state.user.password).toBe(passwordAfterFirstUse);
-      expect(state.members).toEqual(new Set(["user-123:bot-aurora"]));
+      expect(state.access.access).toBe("active");
     },
   );
 
@@ -638,7 +728,7 @@ describe("the public account API", () => {
 
       expect(response.statusCode).toBe(403);
       expect(responseBody(response).code).toBe("FORBIDDEN");
-      expect(state.members.size).toBe(0);
+      expect(state.access.access).toBe("none");
       expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
     },
   );
@@ -650,7 +740,7 @@ describe("the public account API", () => {
 
     expect(response.statusCode).toBe(403);
     expect(responseBody(response).code).toBe("FORBIDDEN");
-    expect(state.members.size).toBe(0);
+    expect(state.access.access).toBe("none");
     expect(state.calls.map(([name]) => name)).not.toContain("setPermanentPassword");
   });
 
@@ -672,15 +762,15 @@ describe("the public account API", () => {
 
     expect(response.statusCode).toBe(401);
     expect(responseBody(response).code).toBe("UNAUTHORIZED");
-    expect(state.calls.map(([name]) => name)).not.toContain("hasMember");
+    expect(state.calls.map(([name]) => name)).not.toContain("getAccess");
     expect(state.calls.map(([name]) => name)).not.toContain("getCaller");
   });
 
   apiIt(
-    "returns the authorized member using access-token claims and server-side membership",
+    "returns the authorized account using access-token claims and server-side ACCESS",
     async () => {
       const { handler, state } = makeHarness({
-        members: [{ sub: "user-123", botId: "bot-aurora" }],
+        accesses: [{ sub: "user-123", botId: "bot-aurora" }],
       });
 
       const response = await request(handler, "GET", "/api/account/me", undefined, undefined, {
@@ -692,14 +782,15 @@ describe("the public account API", () => {
       expect(responseBody(response)).toMatchObject({
         sub: "user-123",
         botId: "bot-aurora",
+        access: { state: "active", revision: 2 },
       });
       expect(state.calls.map(([name]) => name)).not.toContain("getCaller");
     },
   );
 
-  apiIt("denies /account/me when the identity has membership only in another chatbot", async () => {
+  apiIt("denies /account/me when ACCESS exists only in another chatbot", async () => {
     const { handler, state } = makeHarness({
-      members: [{ sub: "user-123", botId: "bot-brisa" }],
+      accesses: [{ sub: "user-123", botId: "bot-brisa" }],
     });
 
     const response = await request(handler, "GET", "/api/account/me", undefined, undefined, {
@@ -708,6 +799,6 @@ describe("the public account API", () => {
     });
 
     expect(response.statusCode).toBe(403);
-    expect(state.calls).toContainEqual(["hasMember", "user-123", "bot-aurora"]);
+    expect(state.calls).toContainEqual(["getAccess", "user-123", "bot-aurora"]);
   });
 });

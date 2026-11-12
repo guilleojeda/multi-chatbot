@@ -257,6 +257,38 @@ export function sourceMarker(contents, key) {
   return match?.[1] || match?.[2];
 }
 
+// Keep JSON structure inspectable when CDK interleaves deploy-time references into a string.
+function templateStringProjection(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+
+  const joined = value["Fn::Join"];
+  if (Array.isArray(joined) && joined.length === 2) {
+    const [delimiter, parts] = joined;
+    if (typeof delimiter !== "string" || !Array.isArray(parts)) return null;
+    const projectedParts = parts.map((part) => {
+      const projection = templateStringProjection(part);
+      return projection ?? "__CDK_INTRINSIC__";
+    });
+    return projectedParts.join(delimiter);
+  }
+
+  const substituted = value["Fn::Sub"];
+  if (typeof substituted === "string") return substituted;
+  if (Array.isArray(substituted) && typeof substituted[0] === "string") return substituted[0];
+  return "__CDK_INTRINSIC__";
+}
+
+export function parseJsonTemplateValue(value) {
+  const projection = templateStringProjection(value);
+  if (projection === null) return undefined;
+  try {
+    return JSON.parse(projection);
+  } catch {
+    return undefined;
+  }
+}
+
 export function markerValue(stack, marker) {
   return records(stack, "Custom::CDKBucketDeployment")
     .flatMap(({ properties }) => properties.SourceMarkers || [])

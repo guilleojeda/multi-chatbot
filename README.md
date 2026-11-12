@@ -17,17 +17,17 @@ npm run check
 
 `npm ci` usa el lockfile del repositorio. CDK, TypeScript, Vite y las herramientas de comprobación son dependencias locales; los comandos npm no dependen de instalaciones globales de CDK.
 
-| Comando                               | Resultado                                                                                    |
-| ------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `npm run typecheck`                   | Comprueba servidor, infraestructura/configuración y TSX de navegador.                        |
-| `npm run lint`                        | ESLint sobre código y tests, incluidos TSX.                                                  |
-| `npm run format:check`                | Comprueba formato con Prettier.                                                              |
-| `npm test`                            | Compila servidor/infraestructura/web y ejecuta la aceptación con Vitest.                     |
-| `npm run test:acceptance`             | Ejecuta explícitamente la aceptación.                                                        |
-| `npm run build:runtime`               | Prepara `dist/runtime-image/` con el entry y sus dependencias, sin construir Docker.         |
-| `npm run build`                       | Compila servidor/infraestructura, prepara imagen Runtime y genera `dist/web/`.               |
-| `npm run synth -- -c environment=dev` | Sintetiza setup, identidad, cuenta, chat y sitio; requiere build web previo y admite `prod`. |
-| `npm run check`                       | Ejecuta los checks, tests, builds y síntesis usados por CI.                                  |
+| Comando                               | Resultado                                                                                          |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `npm run typecheck`                   | Comprueba servidor, infraestructura/configuración y TSX de navegador.                              |
+| `npm run lint`                        | ESLint sobre código y tests, incluidos TSX.                                                        |
+| `npm run format:check`                | Comprueba formato con Prettier.                                                                    |
+| `npm test`                            | Compila servidor/infraestructura/web y ejecuta la aceptación con Vitest.                           |
+| `npm run test:acceptance`             | Ejecuta explícitamente la aceptación.                                                              |
+| `npm run build:runtime`               | Prepara `dist/runtime-image/` con el entry y sus dependencias, sin construir Docker.               |
+| `npm run build`                       | Compila servidor/infraestructura, prepara imagen Runtime y genera `dist/web/` y `dist/admin-web/`. |
+| `npm run synth -- -c environment=dev` | Sintetiza setup, identidad, cuenta, chat y sitios docente/admin; requiere ambos builds web.        |
+| `npm run check`                       | Ejecuta los checks, tests, builds y síntesis usados por CI.                                        |
 
 Las pruebas con errores intencionales trabajan en copias y repositorios Git temporales. No necesitan credenciales AWS ni modifican el remoto real. La síntesis tampoco necesita consultas a AWS; los activos web deben estar construidos.
 
@@ -48,20 +48,35 @@ npm exec -- vite preview --config vite.config.ts --host 127.0.0.1 --port 4173 --
 
 Abrir `http://127.0.0.1:4173` y detener el servidor con Ctrl-C. La salida está en `dist/web/`. Las rutas de cuenta necesitan el `public-config.json` y la API publicados por el despliegue; el preview estático permite revisar la presentación pública. El fixture de herramientas se conserva en `tests/fixtures/web/`; sus pruebas pasan raíz y salida explícitas y no lo publican. Los tests comprueban contenido configurable, build, tipos y activos sintetizados; la carga real en teléfono y computadora comprueba montaje y presentación. Ver [comportamiento del sitio](docs/intent/public-site.md).
 
-## Invitar una cuenta de desarrollo
+## Abrir el panel administrativo de desarrollo
 
-Después del despliegue, con la sesión IAM humana vigente y el email verificado en SES `us-east-1`:
+Después del despliegue, con una sesión IAM humana autorizada en `118903272638` / `us-east-1`, obtener la URL del stack administrativo:
 
 ```sh
-npm run build:infra
-node scripts/invite.mjs --environment dev --email sxvintage@gmail.com --sender sxvintage@gmail.com
+aws cloudformation describe-stacks --region us-east-1 \
+  --stack-name multi-chatbot-dev-admin \
+  --query "Stacks[0].Outputs[?OutputKey=='AdminSiteUrl'].OutputValue | [0]" --output text
 ```
 
-La herramienta consulta los outputs de cuenta y sitio, crea o reutiliza la identidad y envía el enlace real. El enlace permite elegir contraseña y verifica ese email al aceptarlo. Una cuenta activa inicia sesión para aceptar y conserva su contraseña. La herramienta muestra metadata de envío sin imprimir el enlace ni sus tokens. Ver [configuración SES, permisos y fallos parciales](docs/intent/account.md).
+El administrador debe existir y estar activado en el pool Cognito de `dev`. La cuenta elegida como administradora inicial es `sxvintage@gmail.com`; comprobar su identidad antes de asignarla. Un operador con permisos IAM agrega esa cuenta al grupo global usando los outputs `UserPoolId` del stack `multi-chatbot-dev-identity` y `AdminGroupName` del stack `multi-chatbot-dev-admin`:
+
+```sh
+MULTICHATBOT_USER_POOL_ID="$(aws cloudformation describe-stacks --region us-east-1 \
+  --stack-name multi-chatbot-dev-identity \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue | [0]" --output text)"
+MULTICHATBOT_ADMIN_GROUP="$(aws cloudformation describe-stacks --region us-east-1 \
+  --stack-name multi-chatbot-dev-admin \
+  --query "Stacks[0].Outputs[?OutputKey=='AdminGroupName'].OutputValue | [0]" --output text)"
+aws cognito-idp admin-add-user-to-group --region us-east-1 \
+  --user-pool-id "$MULTICHATBOT_USER_POOL_ID" --username 'sxvintage@gmail.com' \
+  --group-name "$MULTICHATBOT_ADMIN_GROUP"
+```
+
+El grupo Cognito se llama `multi-chatbot-admin`. El usuario vuelve a ingresar al panel para obtener un access token administrativo; su privilegio vence con ese JWT, como máximo a los **60 minutos** de su emisión. Quitar el grupo no invalida tokens ya emitidos. El panel usa el catálogo del servidor para elegir chatbot y buscar una persona por email exacto. Invitar registra el enlace y envía correo; su aceptación concede únicamente el chatbot elegido. Un envío aceptado por SES no prueba recepción. Ver [cuenta e invitaciones](docs/intent/account.md).
 
 ## Recuperar una cuenta de desarrollo
 
-Desde el login del sitio publicado, abrir «Recuperar contraseña», ingresar el email de la cuenta activa y solicitar el código. Leer el email, completar el código y la nueva contraseña con su confirmación, y volver a ingresar. El cambio conserva la identidad y las membresías. La dirección de prueba es `sxvintage@gmail.com`; no se requiere una sesión IAM para este recorrido del usuario.
+Desde el login del sitio publicado, abrir «Recuperar contraseña», ingresar el email de la cuenta activa y solicitar el código. Leer el email, completar el código y la nueva contraseña con su confirmación, y volver a ingresar. El cambio conserva la identidad y el acceso. La dirección de prueba es `sxvintage@gmail.com`; no se requiere una sesión IAM para este recorrido del usuario.
 
 El pool dev envía el código con la identidad SES individual verificada. El aviso de solicitud es condicional y no prueba que el email exista o haya sido entregado. Producción conserva recuperación deshabilitada hasta definir y verificar su remitente. Ver [comportamiento y configuración del correo](docs/intent/account.md#recuperar-la-contraseña).
 
@@ -103,7 +118,7 @@ aws dynamodb get-item --region us-east-1 \
   --key '{"pk":{"S":"BOT#docentes"},"sk":{"S":"QUOTA#POLICY"}}'
 ```
 
-Si ya existe, el primer comando devuelve `ConditionalCheckFailedException`; leer y validar el registro existente sin sobrescribirlo. Los límites deben ser enteros no negativos y la revisión una cadena no vacía. Repetir esta preparación conserva política y consumos. Para cambiar límites, actualizar explícitamente la política con una nueva revisión, conservando los contadores; los pedidos nuevos usan el cambio. Una política ausente o inválida impide admitir sin consumir. No hay interfaz administrativa ni tarea de reinicio de cupos. Ver [contrato del chat](docs/intent/chat.md).
+Si ya existe, el primer comando devuelve `ConditionalCheckFailedException`; leer y validar el registro existente sin sobrescribirlo. Los límites deben ser enteros no negativos y la revisión una cadena no vacía. Repetir esta preparación conserva política y consumos. Para cambiar límites, actualizar explícitamente la política con una nueva revisión, conservando los contadores; los pedidos nuevos usan el cambio. Una política ausente o inválida impide admitir sin consumir. El panel de acceso no edita cupos; no hay tarea de reinicio de cupos. Ver [contrato del chat](docs/intent/chat.md).
 
 ## Cargar documentos preparados en desarrollo
 
@@ -163,8 +178,8 @@ transcribe durante la preparación externa. El índice usa Titan V2/1.024/cosine
 500 tokens/20 %; cambiar embedding/dimensión o segmentación puede exigir reindexar o recrear
 el recurso y requiere revisar esa decisión. Mantener metadatos dentro de los límites de
 KB con S3 Vectors. La carga no promete publicación instantánea o atómica; los pedidos nuevos
-capturan lo que recuperaron y los anteriores conservan sus snapshots. No hay admin temporal,
-conversor, sincronizador periódico o carga de usuarios. Ver [operación documental](docs/intent/setup.md)
+capturan lo que recuperaron y los anteriores conservan sus snapshots. No hay panel de carga
+documental, conversor, sincronizador periódico o carga de usuarios. Ver [operación documental](docs/intent/setup.md)
 y [comportamiento del chat](docs/intent/chat.md).
 
 ## CDK y entrega
@@ -182,7 +197,7 @@ npm run synth -- -c environment=dev
 npm exec -- cdk deploy --app cdk.out multi-chatbot-setup --require-approval never
 ```
 
-Estos comandos establecen únicamente la confianza inicial del setup. La identidad, la cuenta y el sitio se entregan por el pipeline. Una cuenta ya preparada se comprueba antes de repetirlos. Para sintetizar directamente, ejecutar antes `npm run build:web`; `synth` compila infraestructura pero consume la web ya construida. `npm run check` prepara ambos builds.
+Estos comandos establecen únicamente la confianza inicial del setup. La identidad, la cuenta y los sitios se entregan por el pipeline. Una cuenta ya preparada se comprueba antes de repetirlos. Para sintetizar directamente, ejecutar antes `npm run build:web` y `npm run build:web:admin`; `synth` consume ambas salidas y `npm run check` las prepara en el build normal.
 
 Las actualizaciones normales se entregan automáticamente al crear o mover un tag Git sobre un commit de `main`:
 

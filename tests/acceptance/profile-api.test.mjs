@@ -110,9 +110,9 @@ function makeHarness({
     calls: [],
   };
   const store = {
-    async hasMember(sub, botId) {
-      state.calls.push(["hasMember", sub, botId]);
-      return state.member;
+    async getAccess(input) {
+      state.calls.push(["getAccess", input.sub, input.botId]);
+      return state.member ? { ...input, access: "active", revision: 1 } : null;
     },
     async getProfile(input) {
       state.calls.push(["getProfile", clone(input)]);
@@ -186,7 +186,7 @@ describe("the profile HTTP API", () => {
     expect(response.headers).toMatchObject({ "cache-control": "no-store" });
     expect(responseBody(response)).toEqual({ sub: caller.sub, botId: "bot-aurora", profile: null });
     expect(state.calls).toEqual([
-      ["hasMember", caller.sub, "bot-aurora"],
+      ["getAccess", caller.sub, "bot-aurora"],
       ["getProfile", { sub: caller.sub, botId: "bot-aurora" }],
     ]);
   });
@@ -267,7 +267,7 @@ describe("the profile HTTP API", () => {
     });
     expect(state.profile).toEqual(expectedProfile);
     expect(state.calls).toEqual([
-      ["hasMember", caller.sub, "bot-aurora"],
+      ["getAccess", caller.sub, "bot-aurora"],
       ["putProfile", expectedProfile],
     ]);
     expect(JSON.stringify(responseBody(response))).not.toContain("PRIVATE PROMPT");
@@ -310,7 +310,7 @@ describe("the profile HTTP API", () => {
       responsePreferenceIds: payload.responsePreferenceIds,
     });
     expect(state.calls).toEqual([
-      ["hasMember", caller.sub, "bot-cobalt"],
+      ["getAccess", caller.sub, "bot-cobalt"],
       [
         "putProfile",
         expect.objectContaining({ sub: caller.sub, botId: "bot-cobalt", fields: payload.fields }),
@@ -490,9 +490,9 @@ describe("the profile HTTP API", () => {
     expect(readResponse.statusCode).toBe(200);
     expect(writeResponse.statusCode).toBe(403);
     expect(state.calls).toEqual([
-      ["hasMember", caller.sub, "bot-aurora"],
+      ["getAccess", caller.sub, "bot-aurora"],
       ["getProfile", { sub: caller.sub, botId: "bot-aurora" }],
-      ["hasMember", caller.sub, "bot-aurora"],
+      ["getAccess", caller.sub, "bot-aurora"],
     ]);
   });
 
@@ -505,7 +505,7 @@ describe("the profile HTTP API", () => {
     const response = await request(handler, method, body);
 
     expect(response.statusCode).toBe(403);
-    expect(state.calls).toEqual([["hasMember", caller.sub, "bot-aurora"]]);
+    expect(state.calls).toEqual([["getAccess", caller.sub, "bot-aurora"]]);
   });
 
   it("keeps an authenticated different user isolated from the caller's stored profile", async () => {
@@ -524,9 +524,9 @@ describe("the profile HTTP API", () => {
     expect(responseBody(writeResponse).sub).toBe(otherSub);
     expect(responseBody(writeResponse).profile.sub).toBe(otherSub);
     expect(state.calls).toEqual([
-      ["hasMember", otherSub, "bot-aurora"],
+      ["getAccess", otherSub, "bot-aurora"],
       ["getProfile", { sub: otherSub, botId: "bot-aurora" }],
-      ["hasMember", otherSub, "bot-aurora"],
+      ["getAccess", otherSub, "bot-aurora"],
       ["putProfile", expect.objectContaining({ sub: otherSub, botId: "bot-aurora" })],
     ]);
   });
@@ -565,7 +565,7 @@ describe("the profile HTTP API", () => {
 
     expect(response.statusCode).toBe(503);
     expect(JSON.stringify(responseBody(response))).not.toContain(secret);
-    expect(state.calls.map(([name]) => name)).toEqual(["hasMember", "getProfile"]);
+    expect(state.calls.map(([name]) => name)).toEqual(["getAccess", "getProfile"]);
   });
 
   it("does not report a failed write as saved or expose storage details", async () => {

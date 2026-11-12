@@ -10,6 +10,8 @@ export type PublicConfig = {
   runtimeQualifier?: string;
 };
 
+export type ApiTransportConfig = Pick<PublicConfig, "apiBaseUrl">;
+
 export type ApiError = Error & {
   code: string;
   status: number;
@@ -103,12 +105,12 @@ export async function readPublicConfig(): Promise<PublicConfig> {
   return assertPublicConfig(await response.json());
 }
 
-function apiUrl(config: PublicConfig, path: string): string {
+function apiUrl(config: ApiTransportConfig, path: string): string {
   return config.apiBaseUrl.replace(/\/+$/, "") + path;
 }
 
 export async function apiRequest(
-  config: PublicConfig,
+  config: ApiTransportConfig,
   path: string,
   options: ApiRequestOptions = {},
 ): Promise<unknown> {
@@ -157,7 +159,7 @@ export async function apiRequest(
 }
 
 export async function requestWithRefresh(
-  config: PublicConfig,
+  config: ApiTransportConfig,
   session: Session,
   path: string,
   options: AuthenticatedRequestOptions,
