@@ -221,7 +221,7 @@ afterAll(() => {
   for (const directory of synthesisDirectories) removeSynthesisDirectory(directory);
 });
 
-describe("phase 9.1 admin infrastructure acceptance", () => {
+describe("phase 9 admin infrastructure acceptance", () => {
   it.each(environments)("synthesizes one shared, bot-separated %s admin stack", (environment) => {
     const scenario = scenarioFor(environment);
     if (!scenario) return;
@@ -354,6 +354,9 @@ describe("phase 9.1 admin infrastructure acceptance", () => {
         ).toBe(true);
       }
       expect(routes.map(({ properties }) => properties.RouteKey)).toContain("GET /api/admin/bots");
+      expect(routes.map(({ properties }) => properties.RouteKey)).toContain(
+        "POST /api/admin/bots/{botId}/access/revoke",
+      );
     },
   );
 

@@ -41,6 +41,26 @@ no repiten efectos y una revisión desplazada no se aplica de nuevo. Emitir no
 activa; el canje comprueba identidad, vencimiento y puntero vigente antes de
 consumir el enlace y actualizar ACCESS en una transacción DynamoDB.
 
+ACCESS usa los estados `none`, `active` y `revoked`. Revocar o cancelar una
+invitación es una mutación CAS sobre la misma fila: retira el puntero vigente,
+incrementa la revisión y conserva la reserva de activación. El replay se liga a
+un ID de operación y no puede rebajar un estado posterior, como una nueva
+invitación o aceptación. La ficha de administración distingue éxito confirmado,
+conflicto e incertidumbre; una lectura del estado actual por sí sola no confirma
+el resultado de una mutación ambigua.
+
+La identidad común y el acceso por chatbot son fronteras distintas. Tanto
+`active` como `revoked` permiten autenticarse, consultar/actualizar el perfil y
+leer, copiar o quitar conversaciones propias visibles. Solo `active` permite
+admitir preguntas nuevas. Runtime conserva el flujo directo autenticado, pero
+incluye en la misma transacción de admisión un `ConditionCheck` de ACCESS que
+exige `state=active` y el bot/`sub` esperados. No compara la revisión: reemitir
+una invitación no debe interrumpir un permiso vigente. Si la admisión confirmó
+antes de la revocación, su transmisión y recuperación continúan; la revocación
+no cancela ni compensa una generación aceptada. Restituir requiere una nueva
+invitación aceptada por la cuenta existente, y no modifica contraseña, perfil,
+conversaciones, ocultaciones ni consumo.
+
 Cognito y DynamoDB no comparten una transacción. La reserva por persona,
 chatbot y hash evita dos cambios de contraseña simultáneos; un resultado externo
 incierto conserva la reserva y no dispara un segundo intento ciego. La

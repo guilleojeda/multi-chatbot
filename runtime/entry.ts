@@ -49,6 +49,7 @@ const profiles = createProfileStoreAdapter({ documentClient, tableName: accountT
 const store = createConversationStoreAdapter({
   documentClient,
   tableName: conversationTableName,
+  accountTableName,
 });
 const countInputTokens = createBedrockTokenCounter({ region });
 const generate = createStrandsGenerator({ region });

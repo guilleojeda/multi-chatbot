@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { GetCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { mapAccessRecord, maximumAccessRecordSizeBytes } from "../../api/access.ts";
 import { createAccountStoreAdapter } from "../../api/aws-adapters.ts";
 import { createPhase9AccountTransport } from "../support/phase9-account-transport.mjs";
 
@@ -52,6 +53,13 @@ function makeStore(send = vi.fn(async () => ({}))) {
     documentClient,
     store: createAccountStoreAdapter({ documentClient, tableName, now: () => now }),
   };
+}
+
+function callRevokeAccess(store, input) {
+  expect(typeof store.revokeAccess, "Expected the account store revokeAccess contract").toBe(
+    "function",
+  );
+  return store.revokeAccess(input);
 }
 
 function writesOf(transaction) {
@@ -121,6 +129,19 @@ describe("the account access DynamoDB adapter", () => {
     );
 
     await expect(store.getAccess({ sub, botId })).rejects.toThrow();
+  });
+
+  it("bounds ACCESS mapping to the complete supported schema and real identity key sizes", () => {
+    const unsupported = accessItem({ unsupported: "x".repeat(400 * 1024) });
+    const oversizedOperation = accessItem({
+      lastAdminOperation: { id: "x".repeat(129), kind: "revoke" },
+    });
+
+    expect(maximumAccessRecordSizeBytes({ sub, botId })).toBe(
+      798 + 2 * (Buffer.byteLength(botId, "utf8") + Buffer.byteLength(sub, "utf8")),
+    );
+    expect(mapAccessRecord(unsupported, { sub, botId })).toBeNull();
+    expect(mapAccessRecord(oversizedOperation, { sub, botId })).toBeNull();
   });
 
   it("registers INVITATION and replaces the ACCESS pointer in one CAS transaction", async () => {
@@ -575,5 +596,359 @@ describe("the account access DynamoDB adapter", () => {
     expect(updateExpression).toMatch(/REMOVE/i);
     expect(updateExpression).not.toMatch(/activationClaim/i);
     expect(JSON.stringify(accessUpdate)).not.toMatch(/MEMBER#|PENDING_INVITATION/);
+  });
+
+  it("revokes active access and removes its current invitation in one revision-guarded update", async () => {
+    const activationClaim = {
+      invitationHash: tokenHash,
+      claimedAt: new Date(now).toISOString(),
+    };
+    const current = accessItem({
+      access: "active",
+      revision: 12,
+      currentInvitation: { hash: nextHash, expiresAt },
+      activationClaim,
+      lastAdminOperation: { id: "prior-invite", kind: "invite", invitationHash: nextHash },
+    });
+    const transport = createPhase9AccountTransport();
+    transport.setItem(tableName, current);
+    transport.setItem(tableName, {
+      ...invitationKey(nextHash),
+      id: nextHash,
+      tokenHash: nextHash,
+      sub,
+      botId,
+      email: "teacher@example.test",
+      expiresAt,
+      ttl: Math.ceil(expiresAt / 1000),
+      operationId: "prior-invite",
+      delivery: { status: "accepted", messageId: "prior-message" },
+    });
+    const store = createAccountStoreAdapter({
+      documentClient: transport.documentClient,
+      tableName,
+      now: () => now,
+    });
+
+    // The transport applies UpdateExpression but ignores DynamoDB conditions.
+    // These assertions inspect the guard emitted by the production adapter.
+    const result = await callRevokeAccess(store, {
+      sub,
+      botId,
+      expectedRevision: 12,
+      operationId: "revoke-active-12",
+    });
+    const durable = await store.getAccess({ sub, botId });
+
+    expect(result).toMatchObject({
+      created: true,
+      access: {
+        sub,
+        botId,
+        access: "revoked",
+        revision: 13,
+        activationClaim,
+        lastAdminOperation: { id: "revoke-active-12", kind: "revoke" },
+      },
+    });
+    expect(result.access).not.toHaveProperty("currentInvitation");
+    expect(result.access.lastAdminOperation).toEqual({
+      id: "revoke-active-12",
+      kind: "revoke",
+    });
+    expect(durable).toEqual(result.access);
+    expect(transport.getItem(tableName, invitationKey(nextHash))).toMatchObject({
+      tokenHash: nextHash,
+      operationId: "prior-invite",
+    });
+
+    const updates = transport.commands.filter((command) => command instanceof UpdateCommand);
+    expect(updates).toHaveLength(1);
+    expect(
+      transport.commands.filter((command) => command instanceof TransactWriteCommand),
+    ).toHaveLength(0);
+    const update = updates[0].input;
+    expect(update.TableName).toBe(tableName);
+    expect(update.Key).toEqual(accessKey());
+    expect(expandedExpression(update, "ConditionExpression")).toMatch(/revision/i);
+    expect(expandedExpression(update, "ConditionExpression")).toMatch(/sub/i);
+    expect(expandedExpression(update, "ConditionExpression")).toMatch(/botId/i);
+    expect(Object.values(update.ExpressionAttributeValues || {})).toContain(12);
+    const updateExpression = expandedExpression(update, "UpdateExpression");
+    expect(updateExpression).toMatch(/access/i);
+    expect(updateExpression).toMatch(/revision/i);
+    expect(updateExpression).toMatch(/lastAdminOperation/i);
+    expect(updateExpression).toMatch(/REMOVE/i);
+    expect(updateExpression).toMatch(/currentInvitation/i);
+    expect(updateExpression).not.toMatch(/activationClaim/i);
+    expect(Object.values(update.ExpressionAttributeValues || {})).toContain("revoked");
+    expect(Object.values(update.ExpressionAttributeValues || {})).toContainEqual({
+      id: "revoke-active-12",
+      kind: "revoke",
+    });
+    expect(serializedValues(update)).not.toContain(tokenHash);
+    expect(serializedValues(update)).not.toContain(nextHash);
+    expectNoLegacyAccessKeys([
+      {
+        Key: update.Key,
+      },
+    ]);
+  });
+
+  it.each([
+    ["none", "none"],
+    ["revoked", "revoked"],
+  ])(
+    "preserves %s access state while cancelling the current invitation",
+    async (initial, expected) => {
+      const current = accessItem({
+        access: initial,
+        revision: 4,
+        currentInvitation: { hash: tokenHash, expiresAt },
+      });
+      const send = vi.fn(async (command) => {
+        if (command instanceof GetCommand) return { Item: current };
+        if (command instanceof UpdateCommand) return {};
+        throw new Error(`Unexpected DynamoDB command ${command.constructor.name}`);
+      });
+      const { store } = makeStore(send);
+
+      const result = await callRevokeAccess(store, {
+        sub,
+        botId,
+        expectedRevision: 4,
+        operationId: `cancel-${initial}-invite`,
+      });
+
+      expect(result).toMatchObject({
+        created: true,
+        access: { access: expected, revision: 5, lastAdminOperation: { kind: "revoke" } },
+      });
+      expect(result.access).not.toHaveProperty("currentInvitation");
+      expect(result.access.lastAdminOperation).toEqual({
+        id: `cancel-${initial}-invite`,
+        kind: "revoke",
+      });
+      const updates = send.mock.calls
+        .map(([command]) => command)
+        .filter((command) => command instanceof UpdateCommand);
+      expect(updates).toHaveLength(1);
+      expect(expandedExpression(updates[0].input, "UpdateExpression")).toMatch(/REMOVE/i);
+      expect(expandedExpression(updates[0].input, "UpdateExpression")).toMatch(
+        /currentInvitation/i,
+      );
+      if (initial === "none") expect(result.access.access).toBe("none");
+    },
+  );
+
+  it("returns the current durable revoke result for an unambiguous same-ID replay without writing", async () => {
+    const recorded = accessItem({
+      access: "revoked",
+      revision: 13,
+      lastAdminOperation: { id: "same-revoke", kind: "revoke" },
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) return { Item: recorded };
+      throw new Error("A revoke replay must not write");
+    });
+    const { store } = makeStore(send);
+
+    const result = await callRevokeAccess(store, {
+      sub,
+      botId,
+      expectedRevision: 12,
+      operationId: "same-revoke",
+    });
+
+    expect(result).toMatchObject({
+      created: false,
+      access: {
+        sub,
+        botId,
+        access: "revoked",
+        revision: 13,
+        lastAdminOperation: { id: "same-revoke", kind: "revoke" },
+      },
+    });
+    expect(result.access).not.toHaveProperty("pk");
+    expect(result.access).not.toHaveProperty("sk");
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0]).toBeInstanceOf(GetCommand);
+    expect(send.mock.calls[0][0].input).toMatchObject({
+      Key: accessKey(),
+      ConsistentRead: true,
+    });
+  });
+
+  it("does not replay a revoke after a later operation changed ACCESS", async () => {
+    const laterOperation = accessItem({
+      access: "revoked",
+      revision: 14,
+      currentInvitation: { hash: nextHash, expiresAt },
+      lastAdminOperation: { id: "later-invite", kind: "invite", invitationHash: nextHash },
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) return { Item: laterOperation };
+      throw new Error("A stale revoke must not write");
+    });
+    const { store } = makeStore(send);
+
+    await expect(
+      callRevokeAccess(store, {
+        sub,
+        botId,
+        expectedRevision: 13,
+        operationId: "old-revoke",
+      }),
+    ).rejects.toMatchObject({ code: "STATE_CHANGED" });
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0]).toBeInstanceOf(GetCommand);
+  });
+
+  it("does not rebase a revoke when its revision guard loses", async () => {
+    let reads = 0;
+    let updates = 0;
+    const stale = Object.assign(new Error("ACCESS revision changed"), {
+      name: "ConditionalCheckFailedException",
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) {
+        reads += 1;
+        return {
+          Item: accessItem({
+            access: "active",
+            revision: reads === 1 ? 8 : 9,
+            currentInvitation: { hash: tokenHash, expiresAt },
+          }),
+        };
+      }
+      if (command instanceof UpdateCommand) {
+        updates += 1;
+        throw stale;
+      }
+      throw new Error(`Unexpected DynamoDB command ${command.constructor.name}`);
+    });
+    const { store } = makeStore(send);
+
+    await expect(
+      callRevokeAccess(store, {
+        sub,
+        botId,
+        expectedRevision: 8,
+        operationId: "stale-revoke",
+      }),
+    ).rejects.toMatchObject({ code: "STATE_CHANGED" });
+    expect(updates).toBe(1);
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(send.mock.calls.filter(([command]) => command instanceof UpdateCommand)).toHaveLength(1);
+  });
+
+  it("confirms a lost revoke acknowledgement only when a consistent reread identifies its result", async () => {
+    const current = accessItem({
+      access: "active",
+      revision: 3,
+      currentInvitation: { hash: tokenHash, expiresAt },
+      activationClaim: {
+        invitationHash: nextHash,
+        claimedAt: new Date(now).toISOString(),
+      },
+    });
+    const transport = createPhase9AccountTransport();
+    transport.setItem(tableName, current);
+    const timeout = Object.assign(new Error("DynamoDB response timed out"), {
+      name: "TimeoutError",
+    });
+    let lost = false;
+    const documentClient = {
+      async send(command) {
+        if (command instanceof UpdateCommand && !lost) {
+          lost = true;
+          await transport.documentClient.send(command);
+          throw timeout;
+        }
+        return transport.documentClient.send(command);
+      },
+    };
+    const store = createAccountStoreAdapter({ documentClient, tableName, now: () => now });
+
+    const result = await callRevokeAccess(store, {
+      sub,
+      botId,
+      expectedRevision: 3,
+      operationId: "lost-revoke-ack",
+    });
+
+    expect(result).toMatchObject({
+      created: false,
+      access: {
+        access: "revoked",
+        revision: 4,
+        lastAdminOperation: { id: "lost-revoke-ack", kind: "revoke" },
+        activationClaim: current.activationClaim,
+      },
+    });
+    expect(result.access).not.toHaveProperty("currentInvitation");
+    expect(transport.commands.filter((command) => command instanceof UpdateCommand)).toHaveLength(
+      1,
+    );
+    expect(transport.getItem(tableName, accessKey())).toMatchObject({
+      access: "revoked",
+      revision: 4,
+    });
+  });
+
+  it("fails closed when a lost revoke acknowledgement cannot be identified by rereading ACCESS", async () => {
+    const current = accessItem({ access: "active", revision: 3 });
+    const timeout = Object.assign(new Error("DynamoDB response timed out"), {
+      name: "TimeoutError",
+    });
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand) return { Item: current };
+      if (command instanceof UpdateCommand) throw timeout;
+      throw new Error(`Unexpected DynamoDB command ${command.constructor.name}`);
+    });
+    const { store } = makeStore(send);
+
+    await expect(
+      callRevokeAccess(store, {
+        sub,
+        botId,
+        expectedRevision: 3,
+        operationId: "unconfirmed-revoke",
+      }),
+    ).rejects.toBeDefined();
+    expect(send.mock.calls.filter(([command]) => command instanceof UpdateCommand)).toHaveLength(1);
+    expect(send.mock.calls.filter(([command]) => command instanceof GetCommand)).toHaveLength(2);
+  });
+
+  it("rejects overlong operation IDs without writing ACCESS or INVITATION", async () => {
+    const send = vi.fn();
+    const { store } = makeStore(send);
+    const tooLong = "x".repeat(129);
+
+    await expect(
+      store.registerInvitation({
+        botId,
+        sub,
+        email: "teacher@example.test",
+        tokenHash,
+        expiresAt,
+        expectedRevision: 0,
+        operationId: tooLong,
+      }),
+    ).rejects.toBeDefined();
+    await expect(
+      callRevokeAccess(store, {
+        sub,
+        botId,
+        expectedRevision: 0,
+        operationId: tooLong,
+      }),
+    ).rejects.toBeDefined();
+
+    expect(
+      send.mock.calls.every(([command]) => command instanceof GetCommand),
+      "An invalid operation ID may be validated after a read, but must not write",
+    ).toBe(true);
   });
 });

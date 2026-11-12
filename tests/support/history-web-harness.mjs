@@ -125,6 +125,7 @@ export function createHistoryEnvironment({
   config = historyConfig,
   profileComplete = true,
   membershipStatus = 200,
+  accountHandler,
   session: providedSession,
   listHandler = async () => jsonResponse({ version: 1, conversations: [] }),
   metaHandler,
@@ -143,6 +144,7 @@ export function createHistoryEnvironment({
     }),
 } = {}) {
   const apiRequests = [];
+  const accountRequests = [];
   const runtimeRequests = [];
   const conversationMeta = new Map();
   const counters = { uuid: 0 };
@@ -191,14 +193,17 @@ export function createHistoryEnvironment({
     const headers = new Headers(init.headers);
     if (url === "/public-config.json") return jsonResponse(config);
     if (url === "/api/account/me") {
-      apiRequests.push({ path: "/account/me", method, headers, init });
+      const call = { path: "/account/me", method, headers, init };
+      apiRequests.push(call);
+      accountRequests.push(call);
+      if (accountHandler) return accountHandler(call);
       if (membershipStatus !== 200) {
         return jsonResponse(
           { code: membershipStatus === 403 ? "FORBIDDEN" : "UNAUTHORIZED" },
           membershipStatus,
         );
       }
-      return jsonResponse(identity);
+      return jsonResponse({ ...identity, access: { state: "active", revision: 1 } });
     }
     if (url === "/api/profile") {
       apiRequests.push({ path: "/profile", method, headers, init });
@@ -270,6 +275,7 @@ export function createHistoryEnvironment({
     config,
     session,
     apiRequests,
+    accountRequests,
     runtimeRequests,
     conversationMeta,
     fetch,

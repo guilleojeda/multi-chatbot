@@ -300,6 +300,16 @@ select:disabled {
   transform: translateY(-1px);
 }
 
+.admin-button--danger {
+  border-color: #7a382b;
+  background: #7a382b;
+}
+
+.admin-button--danger:hover:not(:disabled) {
+  border-color: #642d23;
+  background: #642d23;
+}
+
 .admin-button--quiet {
   color: #244842;
   background: transparent;
@@ -353,6 +363,13 @@ select:disabled {
   align-items: flex-start;
   gap: 1.05rem;
   padding-top: 0.25rem;
+}
+
+.admin-profile__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
 }
 
 .admin-profile__identity {
@@ -590,6 +607,16 @@ select:disabled {
 
   .admin-dialog__actions {
     flex-direction: column-reverse;
+  }
+
+  .admin-profile__actions {
+    width: 100%;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .admin-profile__actions .admin-button {
+    width: 100%;
   }
 
   .admin-dialog__actions .admin-button {

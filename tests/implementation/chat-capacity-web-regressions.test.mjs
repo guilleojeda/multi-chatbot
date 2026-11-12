@@ -187,7 +187,9 @@ describe("AccountApp capacity rejection regressions", () => {
     const fetch = vi.fn(async (input, init = {}) => {
       const url = String(input);
       if (url === "/public-config.json") return jsonResponse(config);
-      if (url === "/api/account/me") return jsonResponse(identity);
+      if (url === "/api/account/me") {
+        return jsonResponse({ ...identity, access: { state: "active", revision: 1 } });
+      }
       if (url === "/api/profile") {
         return jsonResponse({
           sub: identity.sub,
@@ -327,7 +329,9 @@ describe("AccountApp capacity rejection regressions", () => {
     const fetch = vi.fn(async (input, init = {}) => {
       const url = String(input);
       if (url === "/public-config.json") return jsonResponse(config);
-      if (url === "/api/account/me") return jsonResponse(identity);
+      if (url === "/api/account/me") {
+        return jsonResponse({ ...identity, access: { state: "active", revision: 1 } });
+      }
       if (url === "/api/profile") {
         return jsonResponse({
           sub: identity.sub,
@@ -416,7 +420,9 @@ describe("AccountApp capacity rejection regressions", () => {
     const fetch = vi.fn(async (input, init = {}) => {
       const url = String(input);
       if (url === "/public-config.json") return jsonResponse(config);
-      if (url === "/api/account/me") return jsonResponse(identity);
+      if (url === "/api/account/me") {
+        return jsonResponse({ ...identity, access: { state: "active", revision: 1 } });
+      }
       if (url === "/api/profile") {
         return jsonResponse({
           sub: identity.sub,
@@ -542,7 +548,9 @@ describe("AccountApp capacity rejection regressions", () => {
     const fetch = vi.fn(async (input, init = {}) => {
       const url = String(input);
       if (url === "/public-config.json") return jsonResponse(config);
-      if (url === "/api/account/me") return jsonResponse(identity);
+      if (url === "/api/account/me") {
+        return jsonResponse({ ...identity, access: { state: "active", revision: 1 } });
+      }
       if (url === "/api/profile") {
         return jsonResponse({
           sub: identity.sub,

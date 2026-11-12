@@ -12,10 +12,13 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { mapAccessRecord } from "../../api/access.ts";
+import { dynamoItemSize } from "../../runtime/context-storage.ts";
 
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const adapterPath = path.join(projectRoot, "runtime/conversation-store.ts");
 const tableName = "conversations-aurora-dev";
+const accountTableName = "accounts-aurora-dev";
 const owner = { sub: "teacher-123", botId: "bot-aurora" };
 const otherOwner = { sub: "teacher-456", botId: "bot-aurora" };
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
@@ -34,11 +37,12 @@ let createConversationStoreAdapter;
 function makeStore(
   send = vi.fn(async () => ({})),
   now = () => Date.parse("2026-10-22T02:30:00.000Z"),
+  options = { accountTableName },
 ) {
   const documentClient = { send };
   const store =
     typeof createConversationStoreAdapter === "function"
-      ? createConversationStoreAdapter({ documentClient, tableName, now })
+      ? createConversationStoreAdapter({ documentClient, tableName, now, ...options })
       : null;
   return { documentClient, store };
 }
@@ -183,6 +187,22 @@ function transactionCommands(documentClient) {
 
 function transactionActions(command) {
   return command.input.TransactItems;
+}
+
+function accessGuardActions(command, targetTable = accountTableName) {
+  return transactionActions(command).flatMap((action, index) =>
+    action.ConditionCheck?.TableName === targetTable ? [{ action, index }] : [],
+  );
+}
+
+function transactionCanceledAt(command, failedIndex) {
+  const cancellationReasons = transactionActions(command).map((_, index) => ({
+    Code: index === failedIndex ? "ConditionalCheckFailed" : "None",
+  }));
+  return Object.assign(new Error("controlled DynamoDB transaction cancellation"), {
+    name: "TransactionCanceledException",
+    CancellationReasons: cancellationReasons,
+  });
 }
 
 function actionPayload(action) {
@@ -682,6 +702,132 @@ describe("the DynamoDB usage and submission store adapter", () => {
     expect(commandWrites(documentClient.send.mock.calls.at(-1)[0])).toHaveLength(0);
   });
 
+  it("cannot admit a query when the account table needed by its access guard is unconfigured", async () => {
+    const send = vi.fn(async () => ({}));
+
+    await expect(async () => {
+      const { store } = makeStore(send, undefined, { accountTableName: undefined });
+      await requireMethod(store, "startTurn")(admissionInput());
+    }).rejects.toThrow();
+
+    expect(
+      send.mock.calls.flatMap(([command]) =>
+        command instanceof TransactWriteCommand ? [command] : commandWrites(command),
+      ),
+    ).toEqual([]);
+  });
+
+  it.each([
+    ["start", "startTurn", admissionInput()],
+    [
+      "continuation",
+      "continueTurn",
+      admissionInput({ operation: "message", baseOrdinal: 4, contextReferences: [] }),
+    ],
+  ])("adds one identity-scoped ACCESS condition to %s admission", async (_label, method, input) => {
+    const meta = {
+      pk: "CONV#" + conversationId,
+      sk: "META",
+      conversationId,
+      ...owner,
+      lastOrdinal: input.baseOrdinal,
+      closed: false,
+    };
+    const send = vi.fn(async (command) => {
+      if (command instanceof GetCommand && command.input.Key.sk === "META") {
+        return { Item: meta };
+      }
+      return {};
+    });
+    const { documentClient, store } = makeStore(send, undefined, { accountTableName });
+
+    await requireMethod(store, method)(input);
+
+    const [transaction] = transactionCommands(documentClient);
+    expect(transaction).toBeTruthy();
+    const guards = accessGuardActions(transaction);
+    expect(guards).toHaveLength(1);
+    const { action } = guards[0];
+    const condition = action.ConditionCheck;
+    expect(condition).toMatchObject({
+      TableName: accountTableName,
+      Key: {
+        pk: `BOT#${owner.botId}#USER#${owner.sub}`,
+        sk: "ACCESS",
+      },
+    });
+    expect(condition.ConditionExpression).toBeTruthy();
+    expect(expressionNames(condition)).toEqual(expect.arrayContaining(["access", "sub", "botId"]));
+    expect(conditionBoundValues(condition)).toEqual(
+      expect.arrayContaining(["active", owner.sub, owner.botId]),
+    );
+    expect(expressionText(condition)).not.toMatch(/revision/i);
+    expect(expressionNames(condition)).not.toContain("revision");
+    expect(Object.values(condition.ExpressionAttributeValues ?? {})).not.toContain(
+      input.quota.policyRevision,
+    );
+    expect(transactionActions(transaction).length).toBeLessThanOrEqual(100);
+    expect(
+      Buffer.byteLength(JSON.stringify(transaction.input.TransactItems), "utf8"),
+    ).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(documentClient.send.mock.calls.flatMap(([command]) => commandWrites(command))).toEqual(
+      [],
+    );
+  });
+
+  it("derives the 4 MiB ACCESS reserve from the maximum valid access record", async () => {
+    const accessRecord = {
+      pk: `BOT#${owner.botId}#USER#${owner.sub}`,
+      sk: "ACCESS",
+      ...owner,
+      access: "active",
+      revision: Number.MAX_SAFE_INTEGER,
+      currentInvitation: {
+        hash: "a".repeat(64),
+        expiresAt: 123456789012345.67,
+      },
+      activationClaim: {
+        invitationHash: "b".repeat(64),
+        claimedAt: "+275760-09-13T00:00:00.000Z",
+      },
+      lastAdminOperation: {
+        id: "界".repeat(128),
+        kind: "invite",
+        invitationHash: "c".repeat(64),
+      },
+    };
+    expect(accessRecord.lastAdminOperation.id).toHaveLength(128);
+    expect(Buffer.byteLength(accessRecord.lastAdminOperation.id, "utf8")).toBe(384);
+    expect(mapAccessRecord(accessRecord, owner)).toMatchObject({
+      sub: owner.sub,
+      botId: owner.botId,
+      access: "active",
+      revision: Number.MAX_SAFE_INTEGER,
+    });
+    const accessBytes = dynamoItemSize(accessRecord);
+    expect(accessBytes).toBe(840);
+
+    // For this fixed admission fixture the conversation-only footprint is 6,386 bytes plus
+    // question bytes. Including the complete ACCESS witness fits exactly; one more byte does not.
+    const question = "x".repeat(4_187_078);
+    expect(question.length + 6_386 + accessBytes).toBe(4 * 1024 * 1024);
+    const { store, documentClient } = makeStore(undefined, undefined, { accountTableName });
+    await requireMethod(store, "startTurn")(admissionInput({ text: question }));
+    const [transaction] = transactionCommands(documentClient);
+    expect(transactionActions(transaction).length).toBeLessThanOrEqual(100);
+    expect(accessGuardActions(transaction)).toHaveLength(1);
+
+    const { store: overLimitStore, documentClient: overLimitClient } = makeStore(
+      undefined,
+      undefined,
+      { accountTableName },
+    );
+    await expect(
+      requireMethod(overLimitStore, "startTurn")(admissionInput({ text: question + "x" })),
+    ).rejects.toMatchObject({ code: "storage_capacity_exceeded" });
+    expect(mutationCommands(overLimitClient)).toEqual([]);
+  });
+
   it("commits a multi-chunk question, references, profile, marker and both counters in one transaction", async () => {
     const largeQuestion = "á".repeat(220_000);
     const references = [
@@ -854,6 +1000,107 @@ describe("the DynamoDB usage and submission store adapter", () => {
     expect(documentClient.send.mock.calls.flatMap(([command]) => commandWrites(command))).toEqual(
       [],
     );
+  });
+
+  it("reports a failed ACCESS condition only when DynamoDB marks that condition as canceled", async () => {
+    const send = vi.fn(async (command) => {
+      if (command instanceof TransactWriteCommand) {
+        const guard = accessGuardActions(command)[0];
+        throw transactionCanceledAt(command, guard?.index ?? 0);
+      }
+      if (command instanceof GetCommand && command.input.Key.sk === "QUOTA#POLICY") {
+        return {
+          Item: {
+            ...quotaKeys().policy,
+            dailyLimit: 20,
+            monthlyLimit: 200,
+            revision: "policy-r7",
+          },
+        };
+      }
+      return {};
+    });
+    const { documentClient, store } = makeStore(send, undefined, { accountTableName });
+
+    await expect(requireMethod(store, "startTurn")(admissionInput())).rejects.toMatchObject({
+      code: "access_revoked",
+    });
+
+    expect(transactionCommands(documentClient)).toHaveLength(1);
+    expect(accessGuardActions(transactionCommands(documentClient)[0])).toHaveLength(1);
+    expect(documentClient.send.mock.calls.flatMap(([command]) => commandWrites(command))).toEqual(
+      [],
+    );
+  });
+
+  it("does not report access_revoked when DynamoDB cancels a different transaction action", async () => {
+    const send = vi.fn(async (command) => {
+      if (command instanceof TransactWriteCommand) {
+        const policyIndex = transactionActions(command).findIndex((action) => {
+          const payload = action.ConditionCheck ?? action.Update ?? action.Put;
+          return payload?.Key?.sk === "QUOTA#POLICY";
+        });
+        expect(policyIndex).toBeGreaterThanOrEqual(0);
+        throw transactionCanceledAt(command, policyIndex);
+      }
+      if (command instanceof GetCommand && command.input.Key.sk === "QUOTA#POLICY") {
+        return {
+          Item: {
+            ...quotaKeys().policy,
+            dailyLimit: 20,
+            monthlyLimit: 200,
+            revision: "policy-r7",
+          },
+        };
+      }
+      return {};
+    });
+    const { store } = makeStore(send, undefined, { accountTableName });
+
+    await expect(requireMethod(store, "startTurn")(admissionInput())).rejects.not.toMatchObject({
+      code: "access_revoked",
+    });
+  });
+
+  it("looks for the stable SEND before classifying a canceled admission as revoked", async () => {
+    let sendReads = 0;
+    const input = admissionInput();
+    const committedMarker = {
+      pk: "USER#" + owner.sub + "#BOT#" + owner.botId,
+      sk: "SEND#" + input.queryId,
+      ...owner,
+      queryId: input.queryId,
+      requestFingerprint: input.requestFingerprint,
+      operation: "start",
+      baseOrdinal: 0,
+      conversationId,
+      ordinal: 1,
+    };
+    const send = vi.fn(async (command) => {
+      if (command instanceof TransactWriteCommand) {
+        const guard = accessGuardActions(command)[0];
+        throw transactionCanceledAt(command, guard?.index ?? 0);
+      }
+      if (command instanceof GetCommand && String(command.input.Key.sk).startsWith("SEND#")) {
+        sendReads += 1;
+        return sendReads === 1 ? {} : { Item: committedMarker };
+      }
+      return {};
+    });
+    const { documentClient, store } = makeStore(send, undefined, { accountTableName });
+
+    await expect(requireMethod(store, "startTurn")(input)).rejects.toMatchObject({
+      code: "submission_exists",
+    });
+
+    expect(sendReads).toBe(2);
+    expect(transactionCommands(documentClient)).toHaveLength(1);
+    expect(accessGuardActions(transactionCommands(documentClient)[0])).toHaveLength(1);
+    expect(
+      documentClient.send.mock.calls.some(
+        ([command]) => command instanceof GetCommand && command.input.Key.sk === "QUOTA#POLICY",
+      ),
+    ).toBe(false);
   });
 
   it("reads one submission consistently by person, chatbot and stable query ID", async () => {

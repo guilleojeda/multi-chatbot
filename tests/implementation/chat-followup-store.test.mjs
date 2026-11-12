@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
 
+const accountTableName = "accounts-chat-followup-store";
 const turn = {
   sub: "teacher-123",
   botId: "bot-aurora",
@@ -80,6 +81,7 @@ describe("continuation store ownership guard", () => {
     };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
     });
 
@@ -105,6 +107,7 @@ describe("continuation store ownership guard", () => {
     };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
       now: () => turn.now,
     });
@@ -257,6 +260,7 @@ describe("continuation store ownership guard", () => {
     };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
       now: () => turn.now,
     });
@@ -355,6 +359,7 @@ describe("continuation store ownership guard", () => {
     };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
       now: () => turn.now,
     });
@@ -433,6 +438,7 @@ describe("continuation store ownership guard", () => {
       };
       const store = createConversationStoreAdapter({
         documentClient,
+        accountTableName,
         tableName: "conversations-aurora-dev",
       });
 

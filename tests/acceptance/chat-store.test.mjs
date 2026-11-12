@@ -13,6 +13,7 @@ import {
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const adapterPath = path.join(projectRoot, "runtime/conversation-store.ts");
 const tableName = "conversations-aurora-dev";
+const accountTableName = "accounts-chat-store";
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
 const owner = { sub: "teacher-123", botId: "bot-aurora" };
@@ -38,7 +39,7 @@ function makeStore(
   const documentClient = { send };
   const store =
     typeof createConversationStoreAdapter === "function"
-      ? createConversationStoreAdapter({ documentClient, tableName, now })
+      ? createConversationStoreAdapter({ documentClient, accountTableName, tableName, now })
       : null;
   return { documentClient, store };
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { accessTokenSubject } from "./auth.js";
 import {
+  isValidOperationId,
   isRecord,
   type AccountAccessStore,
   type AccessRecord,
@@ -125,8 +126,7 @@ function isInvitationShape(value: InvitationRecord | null): value is InvitationR
     value.email.trim().length > 0 &&
     typeof value.expiresAt === "number" &&
     Number.isFinite(value.expiresAt) &&
-    typeof value.operationId === "string" &&
-    value.operationId.length > 0 &&
+    isValidOperationId(value.operationId) &&
     ["accepted", "failed", "unconfirmed"].includes(value.delivery.status),
   );
 }
@@ -378,7 +378,7 @@ export function createAccountHandler({ config, identity, store, now }: HandlerDe
       return json(401, { code: "UNAUTHORIZED", message: "Iniciá sesión para continuar." });
     }
     const access = await store.getAccess({ sub, botId: config.botId });
-    if (!access || access.access === "none") {
+    if (access?.access !== "active" && access?.access !== "revoked") {
       return json(403, {
         code: "FORBIDDEN",
         message: "Esta cuenta no tiene acceso a este proyecto.",

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createConversationStoreAdapter } from "../../runtime/conversation-store.ts";
 
+const accountTableName = "accounts-chat-context-references";
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryIds = [
   "a4bfbc9f-3699-4e93-b120-a03c0204bc67",
@@ -162,6 +163,7 @@ function summaryContextHarness(sourceOrdinal) {
   };
   const store = createConversationStoreAdapter({
     documentClient,
+    accountTableName,
     tableName: "conversations-aurora-dev",
   });
   return { documentClient, store };
@@ -172,6 +174,7 @@ describe("conversation context references", () => {
     const documentClient = { send: vi.fn(async () => ({})) };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
       now: () => now,
     });
@@ -260,6 +263,7 @@ describe("conversation context references", () => {
     };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
       now: () => now,
     });
@@ -322,6 +326,7 @@ describe("conversation context references", () => {
     };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
       now: () => now,
     });
@@ -360,6 +365,7 @@ describe("conversation context references", () => {
     };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
       now: () => currentNow,
     });
@@ -418,6 +424,7 @@ describe("conversation context references", () => {
     };
     const store = createConversationStoreAdapter({
       documentClient,
+      accountTableName,
       tableName: "conversations-aurora-dev",
     });
 

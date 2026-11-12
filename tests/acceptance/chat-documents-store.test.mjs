@@ -7,6 +7,7 @@ import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dyn
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const adapterPath = path.join(projectRoot, "runtime/conversation-store.ts");
 const tableName = "conversations-aurora-dev";
+const accountTableName = "accounts-chat-documents-store";
 const conversationId = "c90fdf5e-2c77-4a9f-b851-5e16aa52d4b9";
 const queryId = "a4bfbc9f-3699-4e93-b120-a03c0204bc67";
 const continuationId = "fcdd5a71-b6db-4ad9-a2c3-934cb56fe749";
@@ -56,7 +57,12 @@ function makeStore() {
   return {
     documentClient,
     records,
-    store: createConversationStoreAdapter({ documentClient, tableName, now: () => now }),
+    store: createConversationStoreAdapter({
+      documentClient,
+      accountTableName,
+      tableName,
+      now: () => now,
+    }),
   };
 }
 

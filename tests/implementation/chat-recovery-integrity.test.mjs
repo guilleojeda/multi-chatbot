@@ -16,6 +16,7 @@ const requestFingerprint = createHash("sha256")
   .update(JSON.stringify(["message", conversationId, 7, text]))
   .digest("hex");
 const resultDeadlineAt = now + 60_000;
+const accountTableName = "account-recovery-integrity";
 const documentContext = {
   knowledgeBaseId: "kb-recovery-integrity",
   query: "saved recovery context",
@@ -38,7 +39,14 @@ function keyOf(key) {
   return `${key.pk}\u0000${key.sk}`;
 }
 
-function createHarness({ status, phase, answer = "", answerCount = 0, answerComplete } = {}) {
+function createHarness({
+  status,
+  phase,
+  answer = "",
+  answerCount = 0,
+  answerComplete,
+  access = "active",
+} = {}) {
   const rows = new Map();
   const put = (item) => rows.set(keyOf(item), structuredClone(item));
   const meta = {
@@ -199,6 +207,7 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
   const store = createConversationStoreAdapter({
     documentClient,
     tableName: "conversation-recovery-integrity",
+    accountTableName,
     now: () => now,
   });
   const auxiliary = vi.fn(() => {
@@ -212,7 +221,7 @@ function createHarness({ status, phase, answer = "", answerCount = 0, answerComp
       revision: "current-revision",
       systemPrompt: "Testing public recovery.",
     },
-    accounts: { getAccess: async (input) => ({ ...input, access: "active", revision: 1 }) },
+    accounts: { getAccess: async (input) => ({ ...input, access, revision: 1 }) },
     profiles: { getProfile: auxiliary },
     store,
     prepareContext: auxiliary,
@@ -349,6 +358,60 @@ describe("public Runtime submission recovery integrity", () => {
         question: text,
         answer: answer ?? "",
       });
+      expect(harness.auxiliary).not.toHaveBeenCalled();
+      expect(
+        harness.sentCommands.every(
+          (command) => command instanceof GetCommand || command instanceof QueryCommand,
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it.each([
+    {
+      status: "completed",
+      phase: "complete",
+      answer: "Saved answer.",
+      answerCount: 1,
+      answerComplete: true,
+    },
+    { status: "in_progress", phase: "admitted", answerComplete: false },
+    {
+      status: "in_progress",
+      phase: "invocation_claimed",
+      answer: "Saved prefix.",
+      answerCount: 1,
+      answerComplete: false,
+    },
+    { status: "failed", phase: "failed", answerComplete: false },
+  ])(
+    "lets a revoked owner recover an admitted $status/$phase result without auxiliary work",
+    async ({ status, phase, answer, answerCount, answerComplete }) => {
+      const harness = createHarness({
+        status,
+        phase,
+        answer,
+        answerCount,
+        answerComplete,
+        access: "revoked",
+      });
+
+      const recovered = await harness.handler(recoverRequest, harness.context);
+      const repeated = await publicValue(
+        await harness.handler(repeatedMessageRequest, harness.context),
+      );
+
+      for (const result of [recovered, ...(Array.isArray(repeated) ? repeated : [repeated])]) {
+        expect(result).toMatchObject({
+          version: 2,
+          conversationId,
+          queryId,
+          ordinal: 8,
+          status,
+          question: text,
+          answer: answer ?? "",
+        });
+      }
       expect(harness.auxiliary).not.toHaveBeenCalled();
       expect(
         harness.sentCommands.every(
