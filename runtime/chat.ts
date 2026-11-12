@@ -1,4 +1,5 @@
 import { accessTokenSubject } from "../api/auth.js";
+import type { AccessRecord } from "../api/access.js";
 import { createHash, randomUUID } from "node:crypto";
 import { isStoredProfile, type ProfileConfig, type StoredProfile } from "../config/profile.js";
 import type {
@@ -66,7 +67,7 @@ type AsyncTaskRegistry = {
 
 type ChatDependencies = {
   config: ChatConfig;
-  accounts: { hasMember(input: { sub: string; botId: string }): Promise<boolean> };
+  accounts: { getAccess(input: { sub: string; botId: string }): Promise<AccessRecord | null> };
   profiles: ProfileStore;
   store: ConversationStore;
   prepareContext(
@@ -693,7 +694,8 @@ export function createChatHandler(dependencies: ChatDependencies) {
     }
 
     try {
-      if (!(await accounts.hasMember({ sub, botId: config.botId }))) {
+      const access = await accounts.getAccess({ sub, botId: config.botId });
+      if (access?.access !== "active") {
         return failureResponse(request, safeFailure("access_denied", "not_admitted"));
       }
     } catch {
