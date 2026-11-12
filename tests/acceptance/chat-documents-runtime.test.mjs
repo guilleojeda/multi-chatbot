@@ -161,8 +161,8 @@ describe("document preparation in the conversation Runtime", () => {
 
     const names = harness.state.calls.map(([name]) => name);
     const position = (name) => names.indexOf(name);
-    expect(position("hasMember")).toBeGreaterThanOrEqual(0);
-    expect(position("getProfile")).toBeGreaterThan(position("hasMember"));
+    expect(position("getAccess")).toBeGreaterThanOrEqual(0);
+    expect(position("getProfile")).toBeGreaterThan(position("getAccess"));
     expect(position("readQuota")).toBeGreaterThan(position("getProfile"));
     expect(position("prepareDocuments")).toBeGreaterThan(position("readQuota"));
     expect(position("countInputTokens")).toBeGreaterThan(position("prepareDocuments"));

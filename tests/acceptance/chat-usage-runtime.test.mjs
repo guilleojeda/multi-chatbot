@@ -298,10 +298,10 @@ function makeHarness({
       systemPrompt: "Ayudá con tareas de enseñanza.",
     },
     accounts: {
-      async hasMember(input) {
-        state.calls.push(["hasMember", clone(input)]);
+      async getAccess(input) {
+        state.calls.push(["getAccess", clone(input)]);
         if (membershipFailure) throw membershipFailure;
-        return member;
+        return member ? { ...input, access: "active", revision: 1 } : null;
       },
     },
     profiles: {
@@ -482,7 +482,7 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
         queryId,
         recordStatus: "unconfirmed",
       });
-      expect(callNames(harness.state)).toEqual(["hasMember"]);
+      expect(callNames(harness.state)).toEqual(["getAccess"]);
       expect(harness.store.getSubmission).not.toHaveBeenCalled();
       expect(harness.store.getMeta).not.toHaveBeenCalled();
       expect(harness.store.readQuota).not.toHaveBeenCalled();
@@ -513,7 +513,7 @@ describe("usage admission and submission recovery in the Runtime handler", () =>
         queryId,
         recordStatus: "unconfirmed",
       });
-      expect(callNames(harness.state)).toEqual(["hasMember", "getSubmission"]);
+      expect(callNames(harness.state)).toEqual(["getAccess", "getSubmission"]);
       expect(harness.store.getSubmission).toHaveBeenCalledTimes(1);
       expect(harness.store.getMeta).not.toHaveBeenCalled();
       expect(harness.store.readQuota).not.toHaveBeenCalled();

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import {
   AdminGetUserCommand,
   AdminSetUserPasswordCommand,
@@ -14,6 +15,7 @@ const changedEmail = "unproved@example.test";
 const userSub = "invited-user-123";
 const botId = "bot-aurora";
 const invitationToken = "token-from-the-invitation-link";
+const invitationHash = createHash("sha256").update(invitationToken).digest("hex");
 const accessToken = `header.${Buffer.from(
   JSON.stringify({
     iss: "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_testpool",
@@ -41,8 +43,26 @@ async function acceptDuringConcurrentEmailChange(kind) {
     password: kind === "new" ? null : "password-set-before-interruption",
   };
   const sentCommands = [];
-  const memberships = new Set();
-  let invitationReserved = kind === "partial";
+  const access = {
+    sub: userSub,
+    botId,
+    access: "none",
+    revision: 1,
+    currentInvitation: { hash: invitationHash, expiresAt: 2_000_000 },
+    ...(kind === "partial"
+      ? { activationClaim: { invitationHash, claimedAt: "2026-10-28T00:00:00.000Z" } }
+      : {}),
+  };
+  const invitation = {
+    id: invitationHash,
+    tokenHash: invitationHash,
+    sub: userSub,
+    email: invitedEmail,
+    botId,
+    expiresAt: 2_000_000,
+    operationId: "operation-1",
+    delivery: { status: "unconfirmed" },
+  };
 
   const client = {
     async send(command) {
@@ -109,32 +129,52 @@ async function acceptDuringConcurrentEmailChange(kind) {
     now: () => 1_000_000,
   });
   const store = {
-    async getInvitation() {
-      return {
-        id: "invitation-123",
-        sub: userSub,
-        email: invitedEmail,
-        botId,
-        expiresAt: 2_000_000,
-        ...(kind === "partial" ? { reservedAt: "2026-10-28T00:00:00.000Z" } : {}),
+    async getInvitation(tokenHash) {
+      return tokenHash === invitationHash ? { ...invitation } : null;
+    },
+    async getAccess({ sub, botId: requestedBotId }) {
+      return sub === userSub && requestedBotId === botId ? { ...access } : null;
+    },
+    async reserveActivation({ sub, botId: requestedBotId, tokenHash }) {
+      if (
+        sub !== userSub ||
+        requestedBotId !== botId ||
+        tokenHash !== invitationHash ||
+        access.activationClaim
+      )
+        return false;
+      access.activationClaim = {
+        invitationHash,
+        claimedAt: new Date(1_000_000).toISOString(),
       };
-    },
-    async reserveInvitation({ sub, botId: requestedBotId }) {
-      if (sub !== userSub || requestedBotId !== botId || invitationReserved) return false;
-      invitationReserved = true;
+      access.revision += 1;
       return true;
     },
-    async releaseInvitation() {
-      invitationReserved = false;
+    async releaseActivation({ sub, botId: requestedBotId, tokenHash }) {
+      if (
+        sub === userSub &&
+        requestedBotId === botId &&
+        access.activationClaim?.invitationHash === tokenHash
+      ) {
+        delete access.activationClaim;
+        access.revision += 1;
+      }
     },
-    async useInvitationAndAddMember({ sub, botId: requestedBotId }) {
-      if (sub !== userSub || requestedBotId !== botId || !invitationReserved) return false;
-      memberships.add(`${requestedBotId}:${sub}`);
-      invitationReserved = false;
+    async consumeInvitation({ sub, botId: requestedBotId, tokenHash }) {
+      if (
+        sub !== userSub ||
+        requestedBotId !== botId ||
+        tokenHash !== invitationHash ||
+        invitation.usedAt ||
+        access.currentInvitation?.hash !== tokenHash
+      )
+        return false;
+      invitation.usedAt = new Date(1_000_000).toISOString();
+      access.access = "active";
+      access.revision += 1;
+      delete access.currentInvitation;
+      if (access.activationClaim?.invitationHash === tokenHash) delete access.activationClaim;
       return true;
-    },
-    async hasMember({ sub, botId: requestedBotId }) {
-      return memberships.has(`${requestedBotId}:${sub}`);
     },
   };
   const handler = createAccountHandler({
@@ -155,7 +195,7 @@ async function acceptDuringConcurrentEmailChange(kind) {
     }),
   });
 
-  return { response, user, memberships, sentCommands };
+  return { response, user, access, sentCommands };
 }
 
 describe("email verification while accepting invitations", () => {
@@ -169,7 +209,7 @@ describe("email verification while accepting invitations", () => {
       expect(result.user.email).toBe(invitedEmail);
       expect(result.user.emailVerified).toBe(true);
       expect(result.user.status).toBe("CONFIRMED");
-      expect(result.memberships).toEqual(new Set([`${botId}:${userSub}`]));
+      expect(result.access.access).toBe("active");
       if (kind === "new") {
         expect(result.user.password).toBe("Correct-Horse-42!");
         expect(

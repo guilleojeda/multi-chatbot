@@ -5,10 +5,11 @@ import {
   type ProfileDocument,
   type StoredProfile,
 } from "../config/profile.js";
+import type { AccessRecord } from "./access.js";
 import { accessTokenSubject } from "./auth.js";
 
 type ProfileStore = {
-  hasMember(sub: string, botId: string): Promise<boolean>;
+  getAccess(input: { sub: string; botId: string }): Promise<AccessRecord | null>;
   getProfile(input: { sub: string; botId: string }): Promise<StoredProfile | null>;
   putProfile(profile: ProfileDocument): Promise<void>;
 };
@@ -93,7 +94,8 @@ export function createProfileHandler({ config, store, now }: ProfileHandlerDepen
     if (!sub) {
       return json(401, { code: "UNAUTHORIZED", message: "Iniciá sesión para continuar." });
     }
-    if (!(await store.hasMember(sub, config.botId))) {
+    const access = await store.getAccess({ sub, botId: config.botId });
+    if (access?.access !== "active") {
       return json(403, {
         code: "FORBIDDEN",
         message: "Esta cuenta no tiene acceso a este proyecto.",

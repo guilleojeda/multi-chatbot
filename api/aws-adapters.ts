@@ -11,9 +11,20 @@ import {
   TransactWriteCommand,
   UpdateCommand,
   type DynamoDBDocumentClient,
-  type TransactWriteCommandInput,
 } from "@aws-sdk/lib-dynamodb";
 import { SendEmailCommand, type SESv2Client } from "@aws-sdk/client-sesv2";
+import {
+  mapAccessRecord,
+  mapInvitationRecord,
+  StateChangedError,
+  type AccessRecord,
+  type ActivationInput,
+  type InvitationDelivery,
+  type InvitationRecord,
+  type RecordInvitationDeliveryInput,
+  type RegisterInvitationInput,
+  type RegisterInvitationResult,
+} from "./access.js";
 import type { InvitationUser } from "./invitations.js";
 
 type CognitoUser = {
@@ -21,18 +32,6 @@ type CognitoUser = {
   email: string;
   emailVerified: boolean;
   status?: string;
-};
-
-type DbInvitation = {
-  id: string;
-  tokenHash: string;
-  botId: string;
-  sub: string;
-  email: string;
-  kind?: "new" | "existing";
-  expiresAt: number;
-  usedAt?: string | null;
-  reservedAt?: string | number | null;
 };
 
 type TableOptions = { tableName: string; now?: () => number };
@@ -189,38 +188,12 @@ function inviteKey(tokenHash: string) {
   return { pk: `INVITE#${tokenHash}`, sk: "INVITATION" };
 }
 
-function memberKey(botId: string, sub: string) {
-  return { pk: `BOT#${botId}`, sk: `MEMBER#${sub}` };
+function accessKey(botId: string, sub: string) {
+  return { pk: `BOT#${botId}#USER#${sub}`, sk: "ACCESS" };
 }
 
-function pendingKey(botId: string, sub: string) {
-  return { pk: `BOT#${botId}#USER#${sub}`, sk: "PENDING_INVITATION" };
-}
-
-function mapInvitation(value: Record<string, unknown> | undefined): DbInvitation | null {
-  if (
-    !value ||
-    typeof value.tokenHash !== "string" ||
-    typeof value.botId !== "string" ||
-    typeof value.sub !== "string" ||
-    typeof value.email !== "string" ||
-    typeof value.expiresAt !== "number"
-  ) {
-    return null;
-  }
-  return {
-    id: typeof value.id === "string" ? value.id : value.tokenHash,
-    tokenHash: value.tokenHash,
-    botId: value.botId,
-    sub: value.sub,
-    email: value.email,
-    ...(value.kind === "new" || value.kind === "existing" ? { kind: value.kind } : {}),
-    expiresAt: value.expiresAt,
-    ...(typeof value.usedAt === "string" ? { usedAt: value.usedAt } : {}),
-    ...(typeof value.reservedAt === "string" || typeof value.reservedAt === "number"
-      ? { reservedAt: value.reservedAt }
-      : {}),
-  };
+function sameDelivery(left: InvitationDelivery, right: InvitationDelivery): boolean {
+  return left.status === right.status && left.messageId === right.messageId;
 }
 
 function conditionalFailure(error: unknown): boolean {
@@ -237,19 +210,19 @@ function transactionCanceled(error: unknown): error is Record<string, unknown> {
   return (error as { name?: unknown }).name === "TransactionCanceledException";
 }
 
-function invitationConditionFailed(error: Record<string, unknown>): boolean {
+function transactionConditionFailed(error: Record<string, unknown>, index: number): boolean {
   const reasons = error.CancellationReasons;
-  const first = Array.isArray(reasons) ? reasons[0] : undefined;
+  const reason = Array.isArray(reasons) ? reasons[index] : undefined;
   return (
-    typeof first === "object" &&
-    first !== null &&
-    "Code" in first &&
-    (first as { Code?: unknown }).Code === "ConditionalCheckFailed"
+    typeof reason === "object" &&
+    reason !== null &&
+    "Code" in reason &&
+    (reason as { Code?: unknown }).Code === "ConditionalCheckFailed"
   );
 }
 
-function hasCancellationReasons(error: Record<string, unknown>): boolean {
-  return Array.isArray(error.CancellationReasons) && error.CancellationReasons.length > 0;
+function cancellationReasons(error: Record<string, unknown>): unknown[] | null {
+  return Array.isArray(error.CancellationReasons) ? error.CancellationReasons : null;
 }
 
 export function createAccountStoreAdapter({
@@ -259,221 +232,424 @@ export function createAccountStoreAdapter({
 }: {
   documentClient: DynamoDBDocumentClient;
 } & TableOptions) {
-  return {
-    async getInvitation(tokenHash: string): Promise<DbInvitation | null> {
-      const result = await documentClient.send(
-        new GetCommand({ TableName: tableName, Key: inviteKey(tokenHash), ConsistentRead: true }),
-      );
-      return mapInvitation(result.Item);
-    },
+  async function getAccess(input: { sub: string; botId: string }): Promise<AccessRecord | null> {
+    const result = await documentClient.send(
+      new GetCommand({
+        TableName: tableName,
+        Key: accessKey(input.botId, input.sub),
+        ConsistentRead: true,
+      }),
+    );
+    if (!result.Item) return null;
+    const access = mapAccessRecord(result.Item, input);
+    if (!access) throw new Error("Stored account access record is invalid.");
+    return access;
+  }
 
-    async reserveInvitation(input: {
-      invitationId: string;
-      sub: string;
-      botId: string;
-    }): Promise<boolean> {
-      try {
-        await documentClient.send(
-          new UpdateCommand({
+  async function getInvitation(tokenHash: string): Promise<InvitationRecord | null> {
+    const result = await documentClient.send(
+      new GetCommand({ TableName: tableName, Key: inviteKey(tokenHash), ConsistentRead: true }),
+    );
+    if (!result.Item) return null;
+    const invitation = mapInvitationRecord(result.Item);
+    if (!invitation || invitation.tokenHash !== tokenHash)
+      throw new Error("Stored invitation record is invalid.");
+    return invitation;
+  }
+
+  async function readReplay(
+    input: RegisterInvitationInput,
+    access: AccessRecord | null,
+  ): Promise<RegisterInvitationResult | null> {
+    if (!access) return null;
+    const operation = access.lastAdminOperation;
+    if (!operation || operation.id !== input.operationId) return null;
+    const invitation = await getInvitation(operation.invitationHash);
+    if (
+      !invitation ||
+      invitation.operationId !== input.operationId ||
+      invitation.botId !== input.botId ||
+      invitation.sub !== input.sub
+    ) {
+      throw new StateChangedError("The prior invitation operation can no longer be confirmed.");
+    }
+    return { access, invitation, created: false };
+  }
+
+  async function registerInvitation(
+    input: RegisterInvitationInput,
+  ): Promise<RegisterInvitationResult> {
+    const identity = { sub: input.sub, botId: input.botId };
+    const access = await getAccess(identity);
+    const replay = await readReplay(input, access);
+    if (replay) return replay;
+    const revision = access?.revision ?? 0;
+    if (revision !== input.expectedRevision) throw new StateChangedError();
+
+    const invitation: InvitationRecord = {
+      id: input.tokenHash,
+      tokenHash: input.tokenHash,
+      botId: input.botId,
+      sub: input.sub,
+      email: input.email,
+      expiresAt: input.expiresAt,
+      operationId: input.operationId,
+      delivery: { status: "unconfirmed" },
+    };
+    const nextRevision = revision + 1;
+    const createdAccess: AccessRecord = {
+      ...(access ?? { sub: input.sub, botId: input.botId, access: "none" as const }),
+      revision: nextRevision,
+      currentInvitation: { hash: input.tokenHash, expiresAt: input.expiresAt },
+      lastAdminOperation: {
+        id: input.operationId,
+        kind: "invite",
+        invitationHash: input.tokenHash,
+      },
+    };
+    const invitationPut = {
+      Put: {
+        TableName: tableName,
+        Item: {
+          ...inviteKey(input.tokenHash),
+          ...invitation,
+          ttl: Math.ceil(input.expiresAt / 1000),
+        },
+        ConditionExpression: "attribute_not_exists(pk)",
+      },
+    };
+    const accessWrite = access
+      ? {
+          Update: {
             TableName: tableName,
-            Key: inviteKey(input.invitationId),
-            UpdateExpression: "SET #reservedAt = :reservedAt",
+            Key: accessKey(input.botId, input.sub),
+            UpdateExpression:
+              "SET #currentInvitation = :currentInvitation, #revision = :nextRevision, #lastAdminOperation = :lastAdminOperation",
             ConditionExpression:
-              "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND attribute_not_exists(usedAt) AND attribute_not_exists(#reservedAt)",
+              "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND #revision = :expectedRevision",
             ExpressionAttributeNames: {
-              "#reservedAt": "reservedAt",
+              "#currentInvitation": "currentInvitation",
+              "#revision": "revision",
+              "#lastAdminOperation": "lastAdminOperation",
               "#sub": "sub",
               "#botId": "botId",
             },
             ExpressionAttributeValues: {
-              ":reservedAt": new Date(now()).toISOString(),
+              ":currentInvitation": { hash: input.tokenHash, expiresAt: input.expiresAt },
+              ":nextRevision": nextRevision,
+              ":lastAdminOperation": {
+                id: input.operationId,
+                kind: "invite",
+                invitationHash: input.tokenHash,
+              },
               ":sub": input.sub,
               ":botId": input.botId,
+              ":expectedRevision": input.expectedRevision,
             },
-          }),
-        );
-        return true;
-      } catch (error) {
-        if (conditionalFailure(error)) return false;
-        throw error;
-      }
-    },
+          },
+        }
+      : {
+          Put: {
+            TableName: tableName,
+            Item: {
+              ...accessKey(input.botId, input.sub),
+              sub: input.sub,
+              botId: input.botId,
+              access: "none",
+              revision: nextRevision,
+              currentInvitation: { hash: input.tokenHash, expiresAt: input.expiresAt },
+              lastAdminOperation: {
+                id: input.operationId,
+                kind: "invite",
+                invitationHash: input.tokenHash,
+              },
+            },
+            ConditionExpression: "attribute_not_exists(pk)",
+          },
+        };
 
-    async releaseInvitation(input: {
-      invitationId: string;
-      sub: string;
-      botId: string;
-    }): Promise<void> {
+    try {
+      await documentClient.send(
+        new TransactWriteCommand({ TransactItems: [invitationPut, accessWrite] }),
+      );
+      return { access: createdAccess, invitation, created: true };
+    } catch (error) {
+      const canceled = transactionCanceled(error);
+      const reasons = canceled ? cancellationReasons(error) : null;
+      if (canceled && reasons && transactionConditionFailed(error, 1)) {
+        const current = await getAccess(identity);
+        const committedReplay = await readReplay(input, current);
+        if (committedReplay) return committedReplay;
+        throw new StateChangedError();
+      }
+
+      try {
+        const current = await getAccess(identity);
+        const committedReplay = await readReplay(input, current);
+        if (committedReplay) return committedReplay;
+        if ((current?.revision ?? 0) !== input.expectedRevision) throw new StateChangedError();
+      } catch (reconcileError) {
+        if (reconcileError instanceof StateChangedError) throw reconcileError;
+      }
+      throw error;
+    }
+  }
+
+  async function recordInvitationDelivery(input: RecordInvitationDeliveryInput): Promise<void> {
+    try {
+      await documentClient.send(
+        new UpdateCommand({
+          TableName: tableName,
+          Key: inviteKey(input.tokenHash),
+          UpdateExpression: "SET #delivery = :delivery",
+          ConditionExpression:
+            "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND #operationId = :operationId AND #delivery.#status = :unconfirmed",
+          ExpressionAttributeNames: {
+            "#sub": "sub",
+            "#botId": "botId",
+            "#operationId": "operationId",
+            "#delivery": "delivery",
+            "#status": "status",
+          },
+          ExpressionAttributeValues: {
+            ":sub": input.sub,
+            ":botId": input.botId,
+            ":operationId": input.operationId,
+            ":unconfirmed": "unconfirmed",
+            ":delivery": input.delivery,
+          },
+        }),
+      );
+    } catch (error) {
+      if (!conditionalFailure(error)) throw error;
+      const existing = await getInvitation(input.tokenHash);
+      if (
+        existing?.sub === input.sub &&
+        existing.botId === input.botId &&
+        existing.operationId === input.operationId &&
+        sameDelivery(existing.delivery, input.delivery)
+      ) {
+        return;
+      }
+      throw new StateChangedError("Invitation delivery status no longer matches this operation.");
+    }
+  }
+
+  async function reserveActivation(input: ActivationInput): Promise<boolean> {
+    const access = await getAccess({ sub: input.sub, botId: input.botId });
+    const currentInvitation = access?.currentInvitation;
+    const timestamp = now();
+    if (
+      !access ||
+      !currentInvitation ||
+      currentInvitation.hash !== input.tokenHash ||
+      currentInvitation.expiresAt <= timestamp ||
+      access.activationClaim
+    ) {
+      return false;
+    }
+
+    try {
+      await documentClient.send(
+        new UpdateCommand({
+          TableName: tableName,
+          Key: accessKey(input.botId, input.sub),
+          UpdateExpression: "SET #activationClaim = :claim, #revision = :nextRevision",
+          ConditionExpression:
+            "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND #revision = :revision AND #currentInvitation.#hash = :tokenHash AND #currentInvitation.#expiresAt > :now AND attribute_not_exists(#activationClaim)",
+          ExpressionAttributeNames: {
+            "#activationClaim": "activationClaim",
+            "#revision": "revision",
+            "#sub": "sub",
+            "#botId": "botId",
+            "#currentInvitation": "currentInvitation",
+            "#hash": "hash",
+            "#expiresAt": "expiresAt",
+          },
+          ExpressionAttributeValues: {
+            ":claim": {
+              invitationHash: input.tokenHash,
+              claimedAt: new Date(timestamp).toISOString(),
+            },
+            ":revision": access.revision,
+            ":nextRevision": access.revision + 1,
+            ":sub": input.sub,
+            ":botId": input.botId,
+            ":tokenHash": input.tokenHash,
+            ":now": timestamp,
+          },
+        }),
+      );
+      return true;
+    } catch (error) {
+      if (conditionalFailure(error)) return false;
+      throw error;
+    }
+  }
+
+  async function releaseActivation(input: ActivationInput): Promise<void> {
+    let access = await getAccess({ sub: input.sub, botId: input.botId });
+    const claimedAt = access?.activationClaim?.claimedAt;
+    while (
+      access?.activationClaim?.invitationHash === input.tokenHash &&
+      access.activationClaim.claimedAt === claimedAt
+    ) {
       try {
         await documentClient.send(
           new UpdateCommand({
             TableName: tableName,
-            Key: inviteKey(input.invitationId),
-            UpdateExpression: "REMOVE #reservedAt",
+            Key: accessKey(input.botId, input.sub),
+            UpdateExpression: "SET #revision = :nextRevision REMOVE #activationClaim",
             ConditionExpression:
-              "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND attribute_not_exists(usedAt)",
+              "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND #revision = :revision AND #activationClaim.#invitationHash = :tokenHash AND #activationClaim.#claimedAt = :claimedAt",
             ExpressionAttributeNames: {
-              "#reservedAt": "reservedAt",
+              "#revision": "revision",
+              "#activationClaim": "activationClaim",
               "#sub": "sub",
               "#botId": "botId",
+              "#invitationHash": "invitationHash",
+              "#claimedAt": "claimedAt",
             },
-            ExpressionAttributeValues: { ":sub": input.sub, ":botId": input.botId },
+            ExpressionAttributeValues: {
+              ":revision": access.revision,
+              ":nextRevision": access.revision + 1,
+              ":sub": input.sub,
+              ":botId": input.botId,
+              ":tokenHash": input.tokenHash,
+              ":claimedAt": claimedAt,
+            },
           }),
         );
+        return;
       } catch (error) {
-        if (conditionalFailure(error)) return;
-        throw error;
-      }
-    },
-
-    async useInvitationAndAddMember(input: {
-      invitationId: string;
-      sub: string;
-      botId: string;
-    }): Promise<boolean> {
-      const usedAt = new Date(now()).toISOString();
-      try {
-        await documentClient.send(
-          new TransactWriteCommand({
-            TransactItems: [
-              {
-                Update: {
-                  TableName: tableName,
-                  Key: inviteKey(input.invitationId),
-                  UpdateExpression: "SET usedAt = :usedAt REMOVE reservedAt",
-                  ConditionExpression:
-                    "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND attribute_exists(reservedAt) AND attribute_not_exists(usedAt)",
-                  ExpressionAttributeNames: { "#sub": "sub", "#botId": "botId" },
-                  ExpressionAttributeValues: {
-                    ":sub": input.sub,
-                    ":botId": input.botId,
-                    ":usedAt": usedAt,
-                  },
-                },
-              },
-              {
-                Put: {
-                  TableName: tableName,
-                  Item: {
-                    ...memberKey(input.botId, input.sub),
-                    sub: input.sub,
-                    botId: input.botId,
-                  },
-                  ConditionExpression:
-                    "attribute_not_exists(pk) OR (#sub = :sub AND #botId = :botId)",
-                  ExpressionAttributeNames: { "#sub": "sub", "#botId": "botId" },
-                  ExpressionAttributeValues: {
-                    ":sub": input.sub,
-                    ":botId": input.botId,
-                  },
-                },
-              },
-            ],
-          }),
-        );
-        return true;
-      } catch (error) {
-        if (transactionCanceled(error)) {
-          if (invitationConditionFailed(error)) return false;
-          if (!hasCancellationReasons(error)) {
-            try {
-              const current = await documentClient.send(
-                new GetCommand({
-                  TableName: tableName,
-                  Key: inviteKey(input.invitationId),
-                  ConsistentRead: true,
-                }),
-              );
-              const invitation = mapInvitation(current.Item);
-              if (
-                invitation?.usedAt &&
-                invitation.sub === input.sub &&
-                invitation.botId === input.botId
-              ) {
-                return false;
-              }
-            } catch {
-              throw error;
-            }
-          }
+        if (conditionalFailure(error)) {
+          access = await getAccess({ sub: input.sub, botId: input.botId });
+          continue;
+        }
+        const current = await getAccess({ sub: input.sub, botId: input.botId });
+        if (
+          current?.activationClaim?.invitationHash !== input.tokenHash ||
+          current.activationClaim.claimedAt !== claimedAt
+        ) {
+          return;
         }
         throw error;
       }
-    },
+    }
+  }
 
-    async hasMember(input: { sub: string; botId: string }): Promise<boolean> {
-      const result = await documentClient.send(
-        new GetCommand({
-          TableName: tableName,
-          Key: memberKey(input.botId, input.sub),
-          ConsistentRead: true,
-        }),
-      );
-      return result.Item?.sub === input.sub && result.Item?.botId === input.botId;
-    },
+  async function consumeInvitation(input: ActivationInput): Promise<boolean> {
+    const [access, invitation] = await Promise.all([
+      getAccess({ sub: input.sub, botId: input.botId }),
+      getInvitation(input.tokenHash),
+    ]);
+    const currentInvitation = access?.currentInvitation;
+    const timestamp = now();
+    if (
+      !access ||
+      !currentInvitation ||
+      currentInvitation.hash !== input.tokenHash ||
+      !invitation ||
+      invitation.sub !== input.sub ||
+      invitation.botId !== input.botId ||
+      invitation.expiresAt !== currentInvitation.expiresAt ||
+      currentInvitation.expiresAt <= timestamp ||
+      invitation.usedAt
+    ) {
+      return false;
+    }
 
-    async replacePendingInvitation(input: {
-      botId: string;
-      sub: string;
-      email: string;
-      kind: "new" | "existing";
-      tokenHash: string;
-      expiresAt: number;
-    }): Promise<void> {
-      const pointerKey = pendingKey(input.botId, input.sub);
-      const pointer = await documentClient.send(
-        new GetCommand({ TableName: tableName, Key: pointerKey, ConsistentRead: true }),
-      );
-      const previousTokenHash = pointer.Item?.tokenHash;
-      if (previousTokenHash !== undefined && typeof previousTokenHash !== "string") {
-        throw new Error("Stored pending invitation pointer is invalid.");
-      }
-
-      const transactItems: NonNullable<TransactWriteCommandInput["TransactItems"]> = [];
-      if (previousTokenHash) {
-        transactItems.push({ Delete: { TableName: tableName, Key: inviteKey(previousTokenHash) } });
-      }
-      transactItems.push({
-        Put: {
-          TableName: tableName,
-          Item: {
-            ...inviteKey(input.tokenHash),
-            id: input.tokenHash,
-            tokenHash: input.tokenHash,
-            botId: input.botId,
-            sub: input.sub,
-            email: input.email,
-            kind: input.kind,
-            expiresAt: input.expiresAt,
-            ttl: Math.ceil(input.expiresAt / 1000),
-          },
-          ConditionExpression: "attribute_not_exists(pk)",
+    const claimed = access.activationClaim?.invitationHash === input.tokenHash;
+    const invitationUpdate = {
+      Update: {
+        TableName: tableName,
+        Key: inviteKey(input.tokenHash),
+        UpdateExpression: "SET #usedAt = :usedAt",
+        ConditionExpression:
+          "attribute_exists(pk) AND #id = :tokenHash AND #tokenHash = :tokenHash AND #sub = :sub AND #botId = :botId AND #expiresAt > :now AND attribute_not_exists(#usedAt)",
+        ExpressionAttributeNames: {
+          "#id": "id",
+          "#tokenHash": "tokenHash",
+          "#sub": "sub",
+          "#botId": "botId",
+          "#expiresAt": "expiresAt",
+          "#usedAt": "usedAt",
         },
-      });
-      transactItems.push({
-        Put: {
-          TableName: tableName,
-          Item: {
-            ...pointerKey,
-            botId: input.botId,
-            sub: input.sub,
-            tokenHash: input.tokenHash,
-            updatedAt: new Date(now()).toISOString(),
-            ttl: Math.ceil(input.expiresAt / 1000),
-          },
-          ConditionExpression: previousTokenHash
-            ? "#tokenHash = :previousTokenHash"
-            : "attribute_not_exists(pk)",
-          ...(previousTokenHash
-            ? {
-                ExpressionAttributeNames: { "#tokenHash": "tokenHash" },
-                ExpressionAttributeValues: { ":previousTokenHash": previousTokenHash },
-              }
-            : {}),
+        ExpressionAttributeValues: {
+          ":usedAt": new Date(timestamp).toISOString(),
+          ":tokenHash": input.tokenHash,
+          ":sub": input.sub,
+          ":botId": input.botId,
+          ":now": timestamp,
         },
-      });
-      await documentClient.send(new TransactWriteCommand({ TransactItems: transactItems }));
-    },
+      },
+    };
+    const accessUpdate = {
+      Update: {
+        TableName: tableName,
+        Key: accessKey(input.botId, input.sub),
+        UpdateExpression: claimed
+          ? "SET #access = :active, #revision = :nextRevision REMOVE #currentInvitation, #activationClaim"
+          : "SET #access = :active, #revision = :nextRevision REMOVE #currentInvitation",
+        ConditionExpression:
+          "attribute_exists(pk) AND #sub = :sub AND #botId = :botId AND #revision = :revision AND #currentInvitation.#hash = :tokenHash AND #currentInvitation.#expiresAt > :now",
+        ExpressionAttributeNames: {
+          "#access": "access",
+          "#revision": "revision",
+          "#currentInvitation": "currentInvitation",
+          "#hash": "hash",
+          "#expiresAt": "expiresAt",
+          "#sub": "sub",
+          "#botId": "botId",
+          ...(claimed ? { "#activationClaim": "activationClaim" } : {}),
+        },
+        ExpressionAttributeValues: {
+          ":active": "active",
+          ":nextRevision": access.revision + 1,
+          ":revision": access.revision,
+          ":sub": input.sub,
+          ":botId": input.botId,
+          ":tokenHash": input.tokenHash,
+          ":now": timestamp,
+        },
+      },
+    };
+
+    try {
+      await documentClient.send(
+        new TransactWriteCommand({ TransactItems: [invitationUpdate, accessUpdate] }),
+      );
+      return true;
+    } catch (error) {
+      if (transactionCanceled(error)) {
+        const reasons = cancellationReasons(error);
+        if (
+          reasons &&
+          (transactionConditionFailed(error, 0) || transactionConditionFailed(error, 1))
+        )
+          return false;
+        if (!reasons) {
+          try {
+            const current = await getInvitation(input.tokenHash);
+            if (current?.usedAt && current.sub === input.sub && current.botId === input.botId)
+              return false;
+          } catch {
+            throw error;
+          }
+        }
+      }
+      throw error;
+    }
+  }
+
+  return {
+    getAccess,
+    getInvitation,
+    registerInvitation,
+    recordInvitationDelivery,
+    reserveActivation,
+    releaseActivation,
+    consumeInvitation,
   };
 }
 

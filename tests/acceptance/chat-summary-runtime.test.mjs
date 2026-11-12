@@ -143,7 +143,7 @@ describe("prepared summary context in the conversation Runtime", () => {
     expect(input.profileSnapshot).toMatchObject({ sub: caller.sub, botId });
     expect(context.references).toEqual(references);
     const order = app.state.calls.map(([name]) => name);
-    for (const prior of ["hasMember", "getMeta", "getProfile", "readContext", "readQuota"]) {
+    for (const prior of ["getAccess", "getMeta", "getProfile", "readContext", "readQuota"]) {
       expect(order.indexOf(prior)).toBeLessThan(order.indexOf("prepareContext"));
     }
     expect(order.indexOf("prepareContext")).toBeLessThan(order.indexOf("prepareDocuments"));

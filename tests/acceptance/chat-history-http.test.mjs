@@ -60,20 +60,20 @@ function makeHarness({
     readTurns: vi.fn(async () => turnsResult),
     readText: vi.fn(async () => textResult),
   };
-  const getMembership = vi.fn(async (scope) => {
-    if (!scope || typeof scope !== "object") throw new Error("membership scope must be explicit");
-    return member;
+  const getAccess = vi.fn(async (scope) => {
+    if (!scope || typeof scope !== "object") throw new Error("access scope must be explicit");
+    return member ? { ...scope, access: "active", revision: 1 } : null;
   });
   const handler =
     typeof createChatHistoryHandler === "function"
       ? createChatHistoryHandler({
           botId: bot,
           store,
-          getMembership,
+          getAccess,
           now: () => Date.parse("2026-10-24T12:00:00.000Z"),
         })
       : null;
-  return { handler, store, getMembership };
+  return { handler, store, getAccess };
 }
 
 function noPrivateFields(value) {
@@ -108,7 +108,7 @@ describe("the public chat history HTTP API", () => {
   });
 
   it("lists only explicit public fields and binds the request to the access-token subject", async () => {
-    const { handler, store, getMembership } = makeHarness({
+    const { handler, store, getAccess } = makeHarness({
       listResult: {
         version: 1,
         conversations: [
@@ -156,7 +156,7 @@ describe("the public chat history HTTP API", () => {
       ],
       nextCursor: "opaque-next-page",
     });
-    expect(getMembership).toHaveBeenCalledWith({ sub, botId });
+    expect(getAccess).toHaveBeenCalledWith({ sub, botId });
     expect(store.listConversations).toHaveBeenCalledWith({
       sub,
       botId,
@@ -169,7 +169,7 @@ describe("the public chat history HTTP API", () => {
   });
 
   it("reads a paginated turn page without requiring a profile", async () => {
-    const { handler, store, getMembership } = makeHarness({
+    const { handler, store, getAccess } = makeHarness({
       turnsResult: {
         version: 1,
         conversationId,
@@ -222,7 +222,7 @@ describe("the public chat history HTTP API", () => {
       ],
       nextCursor: "older-turns",
     });
-    expect(getMembership).toHaveBeenCalledWith({ sub, botId });
+    expect(getAccess).toHaveBeenCalledWith({ sub, botId });
     expect(store.readTurns).toHaveBeenCalledWith({
       sub,
       botId,
@@ -298,24 +298,24 @@ describe("the public chat history HTTP API", () => {
     ["a token without a subject", { token_use: "access" }],
     ["an empty subject", { sub: "", token_use: "access" }],
   ])("rejects %s before membership or history reads", async (_label, claims) => {
-    const { handler, store, getMembership } = makeHarness();
+    const { handler, store, getAccess } = makeHarness();
 
     const response = await handler(event("GET", "/api/chat/conversations", { claims }));
 
     expect(response.statusCode).toBe(401);
-    expect(getMembership).not.toHaveBeenCalled();
+    expect(getAccess).not.toHaveBeenCalled();
     expect(store.listConversations).not.toHaveBeenCalled();
     expect(store.readTurns).not.toHaveBeenCalled();
     expect(store.readText).not.toHaveBeenCalled();
   });
 
   it("checks current chatbot membership before reading a known conversation", async () => {
-    const { handler, store, getMembership } = makeHarness({ member: false });
+    const { handler, store, getAccess } = makeHarness({ member: false });
 
     const response = await handler(event("GET", `/api/chat/conversations/${conversationId}/turns`));
 
     expect(response.statusCode).toBe(403);
-    expect(getMembership).toHaveBeenCalledWith({ sub, botId });
+    expect(getAccess).toHaveBeenCalledWith({ sub, botId });
     expect(store.listConversations).not.toHaveBeenCalled();
     expect(store.readTurns).not.toHaveBeenCalled();
     expect(store.readText).not.toHaveBeenCalled();

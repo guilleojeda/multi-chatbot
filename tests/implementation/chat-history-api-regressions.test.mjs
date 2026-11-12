@@ -17,7 +17,7 @@ function makeHandler(turnsResult) {
   const handler = createChatHistoryHandler({
     botId,
     store,
-    getMembership: async () => true,
+    getAccess: async () => ({ access: "active", revision: 1 }),
     now: () => Date.parse("2026-10-25T12:00:00.000Z"),
   });
   return { handler, store };
@@ -181,7 +181,7 @@ describe("conversation META verification failures", () => {
       const handler = createChatHistoryHandler({
         botId,
         store,
-        getMembership: async () => true,
+        getAccess: async () => ({ access: "active", revision: 1 }),
       });
 
       const response = await handler(metaEvent());
@@ -275,7 +275,7 @@ describe("completed assistant text integrity regressions", () => {
     const handler = createChatHistoryHandler({
       botId,
       store: createHistoryStore({ documentClient, tableName: "history-test", botId }),
-      getMembership: async () => true,
+      getAccess: async () => ({ access: "active", revision: 1 }),
       now: Date.now,
     });
     return { handler, documentClient };

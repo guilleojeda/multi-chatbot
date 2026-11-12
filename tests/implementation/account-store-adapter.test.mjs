@@ -1,17 +1,31 @@
 import { describe, expect, it, vi } from "vitest";
-import { GetCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createAccountStoreAdapter } from "../../api/aws-adapters.ts";
 
-const input = { invitationId: "token-hash", sub: "user-123", botId: "bot-aurora" };
-const item = {
-  pk: "INVITE#token-hash",
-  sk: "INVITATION",
-  id: "token-hash",
-  tokenHash: "token-hash",
+const now = 1_800_000_000_000;
+const tokenHash = "a".repeat(64);
+const input = { tokenHash, sub: "user-123", botId: "bot-aurora" };
+const accessKey = { pk: "BOT#bot-aurora#USER#user-123", sk: "ACCESS" };
+const invitationKey = { pk: `INVITE#${tokenHash}`, sk: "INVITATION" };
+const access = {
+  ...accessKey,
+  sub: input.sub,
+  botId: input.botId,
+  access: "none",
+  revision: 2,
+  currentInvitation: { hash: tokenHash, expiresAt: now + 60_000 },
+  activationClaim: { invitationHash: tokenHash, claimedAt: new Date(now - 1).toISOString() },
+};
+const invitation = {
+  ...invitationKey,
+  id: tokenHash,
+  tokenHash,
   botId: input.botId,
   sub: input.sub,
   email: "teacher@example.test",
-  expiresAt: 1_800_000_000_000,
+  expiresAt: now + 60_000,
+  operationId: "operation-1",
+  delivery: { status: "unconfirmed" },
 };
 
 function transactionCanceled(cancellationReasons) {
@@ -32,47 +46,64 @@ function makeStore(responses) {
     store: createAccountStoreAdapter({
       documentClient,
       tableName: "account-table",
-      now: () => 1_800_000_000_000,
+      now: () => now,
     }),
   };
 }
 
 describe("the DynamoDB account store adapter", () => {
-  it("recognizes an already-used invitation after a transaction cancellation without reasons", async () => {
+  it("recognizes a consumed invitation after a transaction cancellation without reasons", async () => {
     const cancellation = transactionCanceled(undefined);
     const { documentClient, store } = makeStore([
+      { Item: access },
+      { Item: invitation },
       cancellation,
-      { Item: { ...item, usedAt: "2026-10-16T12:00:00.000Z" } },
+      { Item: { ...invitation, usedAt: new Date(now - 1).toISOString() } },
     ]);
 
-    await expect(store.useInvitationAndAddMember(input)).resolves.toBe(false);
+    await expect(store.consumeInvitation(input)).resolves.toBe(false);
 
-    expect(documentClient.send).toHaveBeenCalledTimes(2);
-    const followUpRead = documentClient.send.mock.calls[1][0];
-    expect(followUpRead).toBeInstanceOf(GetCommand);
-    expect(followUpRead.input).toMatchObject({
+    expect(documentClient.send).toHaveBeenCalledTimes(4);
+    const commands = documentClient.send.mock.calls.map(([command]) => command);
+    expect(commands[2]).toBeInstanceOf(TransactWriteCommand);
+    expect(commands[3]).toBeInstanceOf(GetCommand);
+    expect(commands[3].input).toMatchObject({
       TableName: "account-table",
-      Key: { pk: "INVITE#token-hash", sk: "INVITATION" },
+      Key: invitationKey,
       ConsistentRead: true,
     });
   });
 
-  it("does not report an unknown transaction cancellation as an invitation conflict", async () => {
+  it("does not report an unknown transaction cancellation as a consumed invitation", async () => {
     const cancellation = transactionCanceled(undefined);
-    const { documentClient, store } = makeStore([cancellation, { Item: item }]);
+    const { documentClient, store } = makeStore([
+      { Item: access },
+      { Item: invitation },
+      cancellation,
+      { Item: invitation },
+    ]);
 
-    await expect(store.useInvitationAndAddMember(input)).rejects.toBe(cancellation);
-    expect(documentClient.send).toHaveBeenCalledTimes(2);
+    await expect(store.consumeInvitation(input)).rejects.toBe(cancellation);
+    expect(documentClient.send).toHaveBeenCalledTimes(4);
   });
 
-  it("does not convert a membership condition failure into an invitation conflict", async () => {
+  it("recognizes a conditional ACCESS conflict without writing another grant", async () => {
     const cancellation = transactionCanceled([
       { Code: "None" },
       { Code: "ConditionalCheckFailed" },
     ]);
-    const { documentClient, store } = makeStore([cancellation]);
+    const { documentClient, store } = makeStore([
+      { Item: access },
+      { Item: invitation },
+      cancellation,
+    ]);
 
-    await expect(store.useInvitationAndAddMember(input)).rejects.toBe(cancellation);
-    expect(documentClient.send).toHaveBeenCalledTimes(1);
+    await expect(store.consumeInvitation(input)).resolves.toBe(false);
+    const transaction = documentClient.send.mock.calls[2][0];
+    expect(transaction).toBeInstanceOf(TransactWriteCommand);
+    const writes = transaction.input.TransactItems.flatMap((operation) => Object.values(operation));
+    expect(writes).toHaveLength(2);
+    expect(writes.every((write) => write.TableName === "account-table")).toBe(true);
+    expect(JSON.stringify(writes)).not.toMatch(/MEMBER#|PENDING_INVITATION/);
   });
 });

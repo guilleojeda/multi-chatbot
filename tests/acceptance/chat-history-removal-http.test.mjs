@@ -56,14 +56,16 @@ function harness({ member = true, hideResult, metaResult } = {}) {
         },
     ),
   };
-  const getMembership = vi.fn(async () => member);
+  const getAccess = vi.fn(async ({ sub, botId }) =>
+    member ? { sub, botId, access: "active", revision: 1 } : null,
+  );
   const handler = createChatHistoryHandler({
     botId,
     store,
-    getMembership,
+    getAccess,
     now: () => Date.parse(hiddenAt),
   });
-  return { handler, store, getMembership };
+  return { handler, store, getAccess };
 }
 
 function body(response) {
@@ -82,7 +84,7 @@ function expectNoStorageCalls(store) {
 
 describe("removing a conversation through the public HTTP API", () => {
   it("confirms the owner's hide with a server result and an explicit output whitelist", async () => {
-    const { handler, store, getMembership } = harness({
+    const { handler, store, getAccess } = harness({
       hideResult: { version: 1, conversationId, hiddenAt, ...privateFields },
     });
     const request = event("POST", hidePath, {
@@ -95,9 +97,9 @@ describe("removing a conversation through the public HTTP API", () => {
     expect(response.statusCode).toBe(200);
     expect(body(response)).toEqual({ version: 1, conversationId, hiddenAt });
     expect(response.headers["cache-control"]).toMatch(/no-store/);
-    expect(getMembership).toHaveBeenCalledExactlyOnceWith({ sub, botId });
+    expect(getAccess).toHaveBeenCalledExactlyOnceWith({ sub, botId });
     expect(store.hideConversation).toHaveBeenCalledExactlyOnceWith(scope);
-    expect(getMembership.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(getAccess.mock.invocationCallOrder[0]).toBeLessThan(
       store.hideConversation.mock.invocationCallOrder[0],
     );
     expect(store.readConversationMeta).not.toHaveBeenCalled();
@@ -144,10 +146,10 @@ describe("removing a conversation through the public HTTP API", () => {
     ["POST", hidePath, "hideConversation"],
     ["GET", metaPath, "readConversationMeta"],
   ])("rejects unauthenticated %s before storage", async (method, route) => {
-    const { handler, store, getMembership } = harness();
+    const { handler, store, getAccess } = harness();
     const response = await handler(event(method, route, { claims: {} }));
     expect(response.statusCode).toBe(401);
-    expect(getMembership).not.toHaveBeenCalled();
+    expect(getAccess).not.toHaveBeenCalled();
     expectNoStorageCalls(store);
   });
 
@@ -155,10 +157,10 @@ describe("removing a conversation through the public HTTP API", () => {
     ["POST", hidePath],
     ["GET", metaPath],
   ])("rejects an ID token for %s before membership or storage", async (method, route) => {
-    const { handler, store, getMembership } = harness();
+    const { handler, store, getAccess } = harness();
     const response = await handler(event(method, route, { claims: { sub, token_use: "id" } }));
     expect(response.statusCode).toBe(401);
-    expect(getMembership).not.toHaveBeenCalled();
+    expect(getAccess).not.toHaveBeenCalled();
     expectNoStorageCalls(store);
   });
 
@@ -183,8 +185,8 @@ describe("removing a conversation through the public HTTP API", () => {
   });
 
   it("does not mutate when membership verification is unavailable", async () => {
-    const { handler, store, getMembership } = harness();
-    getMembership.mockRejectedValueOnce(new Error("private membership outage"));
+    const { handler, store, getAccess } = harness();
+    getAccess.mockRejectedValueOnce(new Error("private membership outage"));
     const response = await handler(event("POST", hidePath));
     expect(response.statusCode).toBe(503);
     expect(response.body).not.toContain("private membership outage");

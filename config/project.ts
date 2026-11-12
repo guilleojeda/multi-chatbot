@@ -7,6 +7,14 @@ export const projectConfig = {
   initialModelId: "anthropic.claude-sonnet-4-6",
 } as const;
 
+export const adminConfig = {
+  groupName: "multi-chatbot-admin",
+  invitationSenderByEnvironment: {
+    dev: "sxvintage@gmail.com",
+    prod: undefined,
+  },
+} as const;
+
 export const documentConfig = {
   preparedDocumentsPrefix: "prepared/",
   embeddingModelId: "amazon.titan-embed-text-v2:0",

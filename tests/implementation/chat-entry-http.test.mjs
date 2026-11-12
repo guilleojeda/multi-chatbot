@@ -316,7 +316,11 @@ async function makeServer({ detached = false, useRuntimeEntryConfig = false } = 
         revision: "revision-123",
         systemPrompt: "Ayudá con tareas de enseñanza usando conocimiento general.",
       },
-      accounts: { async hasMember() { return true; } },
+      accounts: {
+        async getAccess(input) {
+          return { ...input, access: "active", revision: 1 };
+        },
+      },
       profiles: { async getProfile() { return profile; } },
       store,
       prepareContext,

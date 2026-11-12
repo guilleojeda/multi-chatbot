@@ -122,8 +122,8 @@ function makeHarness({
       systemPrompt: "Ayudá con tareas de enseñanza usando conocimiento general.",
     },
     accounts: {
-      async hasMember() {
-        return true;
+      async getAccess(input) {
+        return { ...input, access: "active", revision: 1 };
       },
     },
     profiles: {

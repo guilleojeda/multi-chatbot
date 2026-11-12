@@ -1,4 +1,5 @@
 import { accessTokenSubject } from "./auth.js";
+import type { AccessRecord } from "./access.js";
 
 type QueryParameters = Record<string, string | undefined>;
 
@@ -34,7 +35,7 @@ type ChatHistoryStore = {
 type HistoryHandlerDependencies = {
   botId: string;
   store: ChatHistoryStore;
-  getMembership(input: { sub: string; botId: string }): Promise<boolean>;
+  getAccess(input: { sub: string; botId: string }): Promise<AccessRecord | null>;
 };
 
 type HttpEvent = {
@@ -386,11 +387,7 @@ function storeErrorResponse(error: unknown): ApiResponse {
   }
 }
 
-export function createChatHistoryHandler({
-  botId,
-  store,
-  getMembership,
-}: HistoryHandlerDependencies) {
+export function createChatHistoryHandler({ botId, store, getAccess }: HistoryHandlerDependencies) {
   return async function handler(event: HttpEvent): Promise<ApiResponse> {
     const method = event.requestContext?.http?.method?.toUpperCase() || "";
     const path = event.requestContext?.http?.path || event.rawPath || "";
@@ -465,9 +462,9 @@ export function createChatHistoryHandler({
           : { kind: "list", input };
     }
 
-    let member: boolean;
+    let access: AccessRecord | null;
     try {
-      member = await getMembership({ sub, botId });
+      access = await getAccess({ sub, botId });
     } catch {
       return errorResponse(
         503,
@@ -475,7 +472,7 @@ export function createChatHistoryHandler({
         "No pudimos cargar el historial. Intentá de nuevo.",
       );
     }
-    if (!member)
+    if (access?.access !== "active")
       return errorResponse(403, "FORBIDDEN", "Esta cuenta no tiene acceso a este proyecto.");
 
     try {

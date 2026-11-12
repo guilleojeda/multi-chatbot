@@ -321,9 +321,9 @@ function makeHarness(options = {}) {
       systemPrompt: "Ayudá con tareas de enseñanza usando conocimiento general.",
     },
     accounts: {
-      async hasMember(input) {
-        state.calls.push(["hasMember", clone(input)]);
-        return true;
+      async getAccess(input) {
+        state.calls.push(["getAccess", clone(input)]);
+        return { ...input, access: "active", revision: 1 };
       },
     },
     profiles: {

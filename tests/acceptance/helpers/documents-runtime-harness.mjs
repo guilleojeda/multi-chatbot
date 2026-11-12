@@ -323,9 +323,9 @@ export function makeRuntimeHarness(
         "Ayudá con tareas de enseñanza usando documentos del proyecto y conocimiento general.",
     },
     accounts: {
-      async hasMember(input) {
-        state.calls.push(["hasMember", clone(input)]);
-        return state.member;
+      async getAccess(input) {
+        state.calls.push(["getAccess", clone(input)]);
+        return state.member ? { ...input, access: "active", revision: 1 } : null;
       },
     },
     profiles: {
