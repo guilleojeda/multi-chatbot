@@ -32,6 +32,7 @@ import {
 } from "./context-storage.js";
 import { createHistoryLabel, createHistoryOrder } from "./history-projection.js";
 import { maxDynamoTextChunkBytes, splitUtf8Text } from "./text.js";
+import { parseQuotaPolicy } from "../config/quota-policy.js";
 
 type ChunkRole = "user" | "assistant";
 type TextChunk = { index: number; text: string };
@@ -902,29 +903,6 @@ export function createConversationStoreAdapter(input: {
       throw new Error("Quota usage record is invalid; refusing admission.");
     }
     return Number(item.used);
-  }
-
-  function validPolicy(item: Record<string, unknown> | undefined): {
-    dailyLimit: number;
-    monthlyLimit: number;
-    revision: string;
-  } {
-    if (
-      !item ||
-      !Number.isSafeInteger(item.dailyLimit) ||
-      Number(item.dailyLimit) < 0 ||
-      !Number.isSafeInteger(item.monthlyLimit) ||
-      Number(item.monthlyLimit) < 0 ||
-      typeof item.revision !== "string" ||
-      item.revision.trim().length === 0
-    ) {
-      throw new Error("Quota policy is missing or invalid; refusing new submissions.");
-    }
-    return {
-      dailyLimit: Number(item.dailyLimit),
-      monthlyLimit: Number(item.monthlyLimit),
-      revision: item.revision,
-    };
   }
 
   function chunkItem(chunk: {
@@ -2380,7 +2358,7 @@ export function createConversationStoreAdapter(input: {
         getItem(dailyKey),
         getItem(monthlyKey),
       ]);
-      const policy = validPolicy(policyItem);
+      const policy = parseQuotaPolicy(policyItem);
       const dailyUsed = validCounter(dailyItem);
       const monthlyUsed = validCounter(monthlyItem);
       const daily: QuotaView["daily"] = {

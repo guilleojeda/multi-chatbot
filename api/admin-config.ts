@@ -8,6 +8,7 @@ export type AdminLambdaBot = {
   botId: string;
   projectName: string;
   accountTableName: string;
+  conversationTableName: string;
   clientId: string;
   siteUrl: string;
 };
@@ -51,7 +52,8 @@ function parseCatalog(source: string): AdminLambdaBot[] {
 
   const bots: AdminLambdaBot[] = [];
   const botIds = new Set<string>();
-  const tables = new Set<string>();
+  const accountTables = new Set<string>();
+  const conversationTables = new Set<string>();
   for (const value of parsed) {
     if (
       !isObject(value) ||
@@ -85,15 +87,30 @@ function parseCatalog(source: string): AdminLambdaBot[] {
         "BOT_CATALOG chatbot URLs must be HTTPS origins without credentials, query, or fragment.",
       );
     }
-    if (botIds.has(value.botId) || tables.has(value.accountTableName)) {
-      throw new Error("BOT_CATALOG chatbot IDs and account tables must be unique.");
+    if (
+      typeof value.conversationTableName !== "string" ||
+      value.conversationTableName.trim() === ""
+    ) {
+      throw new Error("BOT_CATALOG contains an invalid chatbot entry.");
+    }
+    const conversationTableName = value.conversationTableName.trim();
+    if (
+      botIds.has(value.botId) ||
+      accountTables.has(value.accountTableName) ||
+      conversationTables.has(conversationTableName)
+    ) {
+      throw new Error(
+        "BOT_CATALOG chatbot IDs, account tables, and conversation tables must be unique.",
+      );
     }
     botIds.add(value.botId);
-    tables.add(value.accountTableName);
+    accountTables.add(value.accountTableName);
+    conversationTables.add(conversationTableName);
     bots.push({
       botId: value.botId,
       projectName: value.projectName.trim(),
       accountTableName: value.accountTableName.trim(),
+      conversationTableName,
       clientId: value.clientId.trim(),
       siteUrl: site.toString(),
     });

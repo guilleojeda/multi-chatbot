@@ -6,6 +6,8 @@ import {
   type InvitationRecord,
 } from "./access.js";
 import type { InvitationUser } from "./invitations.js";
+import type { QuotaPolicy } from "../config/quota-policy.js";
+import type { QuotaPolicyReader } from "./quota-policy-store.js";
 
 type AdminStore = AccountAccessStore;
 
@@ -101,7 +103,7 @@ function pathFrom(event: HttpEvent): string {
 
 function botIdFromPath(
   path: string,
-  suffix: "people/lookup" | "invitations" | "access/revoke",
+  suffix: "people/lookup" | "invitations" | "access/revoke" | "quota",
 ): string | null {
   const match = path.match(new RegExp(`^/api/admin/bots/([^/]+)/${suffix.replace("/", "\\/")}$`));
   if (!match) return null;
@@ -210,12 +212,14 @@ function isStateChanged(error: unknown): boolean {
 export function createAdminHandler(deps: {
   config: AdminConfig;
   stores: Record<string, AdminStore>;
+  quotaReaders?: Record<string, QuotaPolicyReader>;
   identity: AdminIdentity;
   mail: AdminMail;
   now: () => number;
   randomBytes: (size: number) => Buffer | Uint8Array;
 }) {
   const { config, stores } = deps;
+  const quotaReaders = deps.quotaReaders || {};
   const bots = new Map(config.bots.map((bot) => [bot.botId, bot]));
 
   async function lookup(botId: string, email: string): Promise<HttpResponse> {
@@ -288,6 +292,21 @@ export function createAdminHandler(deps: {
       return response(200, {
         bots: config.bots.map(({ botId, projectName }) => ({ botId, projectName })),
       });
+    }
+
+    const quotaBotId = method === "GET" ? botIdFromPath(path, "quota") : null;
+    if (quotaBotId !== null) {
+      if (!bots.has(quotaBotId)) return response(404, { code: "NOT_FOUND" });
+      const readPolicy = Object.hasOwn(quotaReaders, quotaBotId)
+        ? quotaReaders[quotaBotId]
+        : undefined;
+      if (!readPolicy) return response(503, { code: "QUOTA_UNAVAILABLE" });
+      try {
+        const policy: QuotaPolicy = await readPolicy();
+        return response(200, { botId: quotaBotId, policy });
+      } catch {
+        return response(503, { code: "QUOTA_UNAVAILABLE" });
+      }
     }
 
     const lookupBotId = method === "POST" ? botIdFromPath(path, "people/lookup") : null;

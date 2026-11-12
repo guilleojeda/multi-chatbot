@@ -8,6 +8,7 @@ const catalog = JSON.stringify([
     botId: "docentes",
     projectName: "Docentes",
     accountTableName: "account-docentes",
+    conversationTableName: "chat-docentes",
     clientId: "chat-client",
     siteUrl: "https://docentes.example.test/",
   },
@@ -123,6 +124,7 @@ describe("administrative Lambda configuration", () => {
         botId: "docentes",
         projectName: "Docentes",
         accountTableName: "account-docentes",
+        conversationTableName: "chat-docentes",
         clientId: "chat-client",
         siteUrl: "https://docentes.example.test/",
       },
@@ -150,6 +152,39 @@ describe("administrative Lambda configuration", () => {
     expect(() => parseAdminLambdaConfig(environment({ BOT_CATALOG: duplicateCatalog }))).toThrow(
       /must be unique/,
     );
+  });
+
+  it.each([
+    [
+      "missing",
+      (bot) => {
+        const copy = { ...bot };
+        delete copy.conversationTableName;
+        return copy;
+      },
+    ],
+    ["blank", (bot) => ({ ...bot, conversationTableName: "  " })],
+  ])("rejects a %s conversation table name", (_label, change) => {
+    const invalidCatalog = JSON.stringify([change(JSON.parse(catalog)[0])]);
+
+    expect(() => parseAdminLambdaConfig(environment({ BOT_CATALOG: invalidCatalog }))).toThrow(
+      /invalid chatbot entry/,
+    );
+  });
+
+  it("rejects a conversation table shared by distinct chatbot entries", () => {
+    const duplicateConversationTable = JSON.stringify([
+      JSON.parse(catalog)[0],
+      {
+        ...JSON.parse(catalog)[0],
+        botId: "otro-chatbot",
+        projectName: "Otro chatbot",
+        accountTableName: "account-otro-chatbot",
+      },
+    ]);
+    expect(() =>
+      parseAdminLambdaConfig(environment({ BOT_CATALOG: duplicateConversationTable })),
+    ).toThrow(/must be unique/);
   });
 
   it("fails invitations closed before identity, store, mail, or randomness without a sender", async () => {
