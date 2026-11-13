@@ -1,10 +1,12 @@
+import { parseDocumentAdminResources, type DocumentAdminBotResources } from "./document-config.js";
+
 const INVITATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function adminSesClientOptions(region: string) {
   return { region, maxAttempts: 1 };
 }
 
-export type AdminLambdaBot = {
+export type AdminLambdaBot = DocumentAdminBotResources & {
   botId: string;
   projectName: string;
   accountTableName: string;
@@ -21,6 +23,10 @@ export type AdminLambdaConfig = {
   sender: string | null;
   invitationTtlMs: number;
   bots: AdminLambdaBot[];
+};
+
+type AdminLambdaIdentityBot = Omit<AdminLambdaBot, keyof DocumentAdminBotResources> & {
+  botId: string;
 };
 
 function required(environment: NodeJS.ProcessEnv, name: string): string {
@@ -50,7 +56,7 @@ function parseCatalog(source: string): AdminLambdaBot[] {
     throw new Error("BOT_CATALOG must contain at least one chatbot.");
   }
 
-  const bots: AdminLambdaBot[] = [];
+  const bots: AdminLambdaIdentityBot[] = [];
   const botIds = new Set<string>();
   const accountTables = new Set<string>();
   const conversationTables = new Set<string>();
@@ -115,7 +121,14 @@ function parseCatalog(source: string): AdminLambdaBot[] {
       siteUrl: site.toString(),
     });
   }
-  return bots;
+  const documentResources = new Map(
+    parseDocumentAdminResources(parsed).map((resource) => [resource.botId, resource]),
+  );
+  return bots.map((bot) => {
+    const resources = documentResources.get(bot.botId);
+    if (!resources) throw new Error("BOT_CATALOG contains invalid document resources.");
+    return { ...bot, ...resources };
+  });
 }
 
 export function parseAdminLambdaConfig(

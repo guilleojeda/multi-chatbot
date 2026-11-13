@@ -48,6 +48,60 @@ El formulario congela los parámetros al enviar y evita doble clic.400 conserva 
 
 Los cambios se aplican al próximo envío nuevo, también con chat y Runtime abiertos, sin borrar o recalcular consumo ni cancelar admitidos. Consultar no escribe o consulta cuentas individuales. Bot, sección y sesión delimitan las respuestas, incluso si reingresa la misma persona; el borrador no se persiste en storage. **Acceso** conserva búsqueda, invitación y revocación bajo la misma selección de chatbot. Ver [admisión y cupos](chat.md#envíos-y-cupos).
 
+## Administrar documentos
+
+Documentos comparte el selector de chatbot, el cliente Cognito y la autorización global del panel.
+No requiere buscar una persona ni concede acceso docente al administrador. La API comprueba el
+cliente/grupo vigentes y resuelve los recursos del bot/ambiente desde el catálogo servidor; el
+navegador no elige buckets, tablas, índices o KB.
+
+La lista muestra los documentos vigentes y sus resultados. Cargar o reemplazar acepta un archivo
+preparado de hasta 50.000.000 bytes en TXT, Markdown, HTML, DOC/DOCX, CSV, XLS/XLSX o PDF. TXT,
+Markdown y HTML requieren UTF-8 no vacío. El parser textual de Bedrock procesa los binarios;
+no hay OCR, conversión, editor, sidecars o aprobación editorial. La información relevante de
+imágenes se prepara fuera del panel.
+
+La misma acción recibe el archivo e inicia su procesamiento. El navegador calcula SHA-256 y usa
+un POST S3 firmado para un destino temporal exacto, con checksum/tamaño/tipo y permiso breve
+acotados. No envía su token Cognito a S3. El archivo recibido queda fuera de la fuente ingerida;
+solo el ejecutor puede promoverlo a la revisión preparada. Después del inicio confirmado, el
+procesamiento continúa al cerrar el panel. Antes de enviarlo se puede cancelar; cerrar durante
+la transferencia puede requerir volver a elegir el archivo.
+
+Las cuatro rutas bajo `/api/admin/bots/{botId}` son GET `/documents`, POST `/document-operations`,
+POST `/document-operations/{id}/start` y GET `/document-operations/{id}`. Son autenticadas y
+no-store. La intención usa un ID estable y, para documentos existentes, la revisión observada.
+Un replay reconocido conserva su resultado; un ID con otra intención o una revisión desplazada
+produce conflicto. Consultar no vuelve a ejecutar efectos. Un 201 de intención o un 202 de inicio
+no significa publicación exitosa. Los permisos de recepción solo se devuelven al solicitarlos;
+la lista, los resultados y la configuración pública no exponen claves o URIs internas.
+
+Hay un solo cambio activo por bot. Reemplazar conserva la identidad lógica y usa una clave nueva
+por revisión; retirar requiere confirmación y afecta búsquedas futuras tras el procesamiento y
+la propagación. Cambiar bot, sección o sesión descarta callbacks anteriores y detiene el sondeo
+local, sin cancelar una operación remota aceptada. El panel sondea mientras está visible y la
+operación sigue activa; al volver recupera el estado servidor. Las acciones en curso quedan
+bloqueadas para evitar otro cambio simultáneo.
+
+Un resultado positivo distingue procesamiento y propagación: «Procesamiento completado. Los
+cambios pueden tardar unos minutos en aparecer en el chat». Una baja confirmada informa:
+«Retirada procesada. El chat puede tardar unos minutos en reflejar el cambio. Las respuestas
+anteriores se conservan». No se promete publicación instantánea, corte atómico o rollback.
+
+Si copiar la revisión nueva funcionó pero no se retiró una fuente anterior, el estado conserva
+ambas claves y explica el resultado parcial. No admite otro reemplazo de ese documento mientras
+haya limpieza pendiente. Tras un fallo definitivo, reprocesar limpia las pendientes y sincroniza
+la fuente confirmada sin volver a subirla; retirar elimina la actual y sus pendientes. Si el
+borrado ya se confirmó pero falló la sincronización de una retirada, el documento sigue visible
+con error y un nuevo intento conserva las URIs que debe observar, sin reconstruir los borrados.
+La fila retirada solo deja de ser vigente después de confirmar el resultado de baja.
+
+Un efecto o resultado incierto conserva la reserva y pide consultar/reconciliar antes de otro
+cambio. No vence por reloj ni tiene botón para forzar liberación. Las operaciones administrativas
+no modifican acceso, perfil, límites, consumo, originales o snapshots de consultas. Repetir o
+recuperar un envío admitido no vuelve a buscar documentos ni a generar. El contexto histórico
+de un hilo puede recordar fuentes retiradas; se distingue de evidencia documental vigente.
+
 ## Recuperar la contraseña
 
 Desde el login, «Recuperar contraseña» abre `/#/recover`. Una cuenta ya activada y con email verificado puede solicitar un código mediante `ForgotPassword`. El código llega por email y se ingresa junto con una nueva contraseña y su confirmación; `ConfirmForgotPassword` establece el cambio. No se crea otra cuenta ni se alteran el email, el `sub`, las invitaciones o el estado ACCESS. Una cuenta que todavía no activó su invitación debe completar ese recorrido.

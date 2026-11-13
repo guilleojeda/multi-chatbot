@@ -145,8 +145,25 @@ describe("summary preparation infrastructure acceptance", () => {
     });
 
     const tables = resourceEntries(template, "AWS::DynamoDB::Table");
-    expect(tables, "summary versions must stay in the existing conversation table").toHaveLength(1);
-    expect(tables[0]?.[0]).toBe("ConversationTable75C14D21");
+    expect(tables, "the conversation and document-state tables stay separate").toHaveLength(2);
+    const conversationTable = tables.find(
+      ([logicalId]) => logicalId === "ConversationTable75C14D21",
+    );
+    expect(
+      conversationTable,
+      "summary versions stay in the existing conversation table",
+    ).toBeDefined();
+    const documentTables = tables.filter(
+      ([logicalId]) => logicalId !== "ConversationTable75C14D21",
+    );
+    expect(documentTables, "ChatStack adds one separate document-state table").toHaveLength(1);
+    if (!conversationTable || documentTables.length !== 1) return;
+    expect(
+      Object.values(template.Outputs || {}).some((output) =>
+        JSON.stringify(output.Value || {}).includes(documentTables[0][0]),
+      ),
+      "the server can resolve its document-state table name",
+    ).toBe(true);
     const persistentChatResourceTypes = new Set([
       "AWS::DynamoDB::Table",
       "AWS::BedrockAgentCore::Runtime",
@@ -164,6 +181,7 @@ describe("summary preparation infrastructure acceptance", () => {
     ).toEqual(
       [
         "ConversationTable75C14D21",
+        documentTables[0][0],
         "DocumentsDocumentBucket897CB1F9",
         "DocumentsVectorBucket9B83E6D0",
         "DocumentsVectorIndexD1E04ED4",

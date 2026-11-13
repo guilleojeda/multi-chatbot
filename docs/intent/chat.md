@@ -30,6 +30,15 @@ Todo pedido nuevo añade un conteo y una inferencia auxiliar de reformulación a
 
 Un fallo de búsqueda o reformulación devuelve `documents_unavailable` antes de admitir: conserva borrador, cuerpo y `queryId` para reintento explícito, sin consumo ni fallback silencioso. No se confunde con ausencia de resultados. Antes de afirmar un rechazo se relee el marcador para resolver un posible ganador compatible; si no se puede confirmar, queda `unconfirmed`. Dos intentos concurrentes pueden duplicar preparación facturable antes de admitir; la transacción y el permiso durable mantienen una sola respuesta final y un consumo. Repetir o recuperar un admitido no repite búsqueda, reformulación, conteo ni generación.
 
+Las fuentes se administran en la sección Documentos del panel común: cargar, reemplazar y
+retirar sincronizan la KB del bot/ambiente. El procesamiento exitoso publica directamente y
+puede preceder unos minutos a la propagación de Retrieve. Runtime conserva su recorrido actual,
+sin leer el catálogo administrativo o aplicar un filtro de revisiones nuevo en cada consulta.
+Una preparación ya iniciada puede conservar sus fuentes; un envío admitido fija su snapshot.
+Reemplazar o retirar no modifica preguntas/respuestas anteriores ni repite generación o consumo.
+El historial y los resúmenes pueden recordar contenido anterior, sin convertirlo en fuente vigente.
+Ver [administración documental](account.md#administrar-documentos).
+
 ## Envíos y cupos
 
 El navegador llama por HTTPS directamente a AgentCore Runtime con el access token Cognito. El autorizador administrado valida el JWT del cliente del bot y su uso de acceso; el servidor comprueba ACCESS y la propiedad antes de devolver registros. `none` no concede acceso. `revoked` mantiene lectura de los envíos propios ya admitidos, pero prohíbe nuevos pedidos; `active` permite ambas cosas. Conocer un identificador o compartir una sesión Runtime no concede acceso a datos ajenos. El navegador no aporta identidad, perfil, modelo ni historial confiables.

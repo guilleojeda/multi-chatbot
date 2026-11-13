@@ -31,6 +31,16 @@ const environments = ["dev", "prod"];
 const scenarios = new Map();
 const synthesisDirectories = [];
 
+function runtimeConversationTable(chat) {
+  const runtime = onlyRecord(chat, "AWS::BedrockAgentCore::Runtime");
+  const tableReference = runtime.properties.EnvironmentVariables?.CONVERSATION_TABLE_NAME;
+  const matches = records(chat, "AWS::DynamoDB::Table").filter(({ logicalId }) =>
+    sameStackReference(tableReference, logicalId),
+  );
+  expect(matches, "Runtime's configured conversation table remains in ChatStack").toHaveLength(1);
+  return matches[0];
+}
+
 function scenarioFor(environment) {
   const scenario = scenarios.get(environment);
   expect(scenario, `expected the ${environment} synthesis result`).toBeDefined();
@@ -118,16 +128,22 @@ function cachingIsDisabled(stack, behavior) {
 function applicationLambda(scenario) {
   const lambdas = records(scenario.admin, "AWS::Lambda::Function");
   const integrations = records(scenario.admin, "AWS::ApiGatewayV2::Integration");
-  const backendLambdas = lambdas.filter(({ logicalId }) =>
-    integrations.some(({ properties }) =>
-      referencesResource(
-        properties.IntegrationUri,
-        scenario.admin,
-        scenario.admin,
-        { logicalId },
-        scenario.assembly,
+  const backendLambdas = lambdas.filter(
+    ({ logicalId, properties }) =>
+      Boolean(
+        properties.Environment?.Variables?.BOT_CATALOG &&
+        properties.Environment?.Variables?.USER_POOL_ID &&
+        properties.Environment?.Variables?.ADMIN_CLIENT_ID,
+      ) &&
+      integrations.some(({ properties: integration }) =>
+        referencesResource(
+          integration.IntegrationUri,
+          scenario.admin,
+          scenario.admin,
+          { logicalId },
+          scenario.assembly,
+        ),
       ),
-    ),
   );
   expect(backendLambdas, "the HTTP API integrates with one application Lambda").toHaveLength(1);
   return backendLambdas[0];
@@ -268,14 +284,14 @@ describe("phase 9 admin infrastructure acceptance", () => {
     expect(records(admin, "AWS::ApiGatewayV2::Api")).toHaveLength(1);
     expect(records(admin, "AWS::Lambda::Function").length).toBeGreaterThan(0);
     expect(applicationLambda(scenario)).toBeDefined();
-    expect(records(admin, "AWS::S3::Bucket")).toHaveLength(1);
+    expect(records(admin, "AWS::S3::Bucket")).toHaveLength(2);
     expect(records(admin, "AWS::CloudFront::Distribution")).toHaveLength(1);
     expect(records(admin, "AWS::BedrockAgentCore::Runtime")).toHaveLength(0);
     expect(records(admin, "AWS::DynamoDB::Table")).toHaveLength(0);
 
     expect(records(account, "AWS::Cognito::UserPool")).toHaveLength(0);
     expect(records(account, "AWS::Cognito::UserPoolClient")).toHaveLength(1);
-    expect(records(chat, "AWS::DynamoDB::Table")).toHaveLength(1);
+    expect(records(chat, "AWS::DynamoDB::Table")).toHaveLength(2);
     expect(records(site, "AWS::CloudFront::Distribution")).toHaveLength(1);
     expect(dependencies(assembly, admin)).toContain(identity.id);
     expect(dependencies(assembly, admin)).toContain(account.id);
@@ -409,9 +425,38 @@ describe("phase 9 admin infrastructure acceptance", () => {
       if (!scenario) return;
 
       const { assembly, admin, identity, site } = scenario;
-      const bucket = onlyRecord(admin, "AWS::S3::Bucket");
       const distribution = onlyRecord(admin, "AWS::CloudFront::Distribution");
       const originAccess = onlyRecord(admin, "AWS::CloudFront::OriginAccessControl");
+      const deployments = records(admin, "Custom::CDKBucketDeployment");
+      expect(deployments.length).toBeGreaterThan(0);
+      const deploymentWithConfig = deployments.find(({ properties }) =>
+        resourceAssets(assembly, admin, properties).some((asset) =>
+          asset.files.some(
+            ({ relativePath }) => pathBaseName(relativePath) === "public-config.json",
+          ),
+        ),
+      );
+      expect(
+        deploymentWithConfig,
+        "the admin app and its runtime config are staged by this stack",
+      ).toBeDefined();
+      const websiteBuckets = deploymentWithConfig
+        ? records(admin, "AWS::S3::Bucket").filter(({ logicalId }) =>
+            referencesResource(
+              deploymentWithConfig.properties.DestinationBucketName,
+              admin,
+              admin,
+              { logicalId },
+              assembly,
+            ),
+          )
+        : [];
+      expect(
+        websiteBuckets,
+        "the public config deploys to the private website bucket",
+      ).toHaveLength(1);
+      const bucket = websiteBuckets[0];
+      if (!bucket || !deploymentWithConfig) return;
       const distributionConfig = distribution.properties.DistributionConfig;
       const origins = distributionConfig?.Origins || [];
       const s3Origin = origins.find(({ OriginAccessControlId }) =>
@@ -436,8 +481,10 @@ describe("phase 9 admin infrastructure acceptance", () => {
         RestrictPublicBuckets: true,
       });
 
-      const bucketPolicies = records(admin, "AWS::S3::BucketPolicy");
-      expect(bucketPolicies).toHaveLength(1);
+      const bucketPolicies = records(admin, "AWS::S3::BucketPolicy").filter(({ properties }) =>
+        referencesResource(properties.Bucket, admin, admin, bucket, assembly),
+      );
+      expect(bucketPolicies, "the public website has one attached bucket policy").toHaveLength(1);
       const statements = bucketPolicies[0].properties.PolicyDocument?.Statement || [];
       expect(
         statements.some((statement) =>
@@ -464,19 +511,6 @@ describe("phase 9 admin infrastructure acceptance", () => {
       const api = onlyRecord(admin, "AWS::ApiGatewayV2::Api");
       expect(referencesResource(apiOrigin?.DomainName, admin, admin, api, assembly)).toBe(true);
 
-      const deployments = records(admin, "Custom::CDKBucketDeployment");
-      expect(deployments.length).toBeGreaterThan(0);
-      const deploymentWithConfig = deployments.find(({ properties }) =>
-        resourceAssets(assembly, admin, properties).some((asset) =>
-          asset.files.some(
-            ({ relativePath }) => pathBaseName(relativePath) === "public-config.json",
-          ),
-        ),
-      );
-      expect(
-        deploymentWithConfig,
-        "the admin app and its runtime config are staged by this stack",
-      ).toBeDefined();
       const configFile = deploymentWithConfig && publicConfigAsset(scenario, deploymentWithConfig);
       const deploymentAssets = deploymentWithConfig
         ? resourceAssets(assembly, admin, deploymentWithConfig.properties)
@@ -529,7 +563,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
   );
 
   it.each(environments)(
-    "limits the %s admin Lambda to account, pool, and configured invitation email access",
+    "preserves scoped account, quota, invitation, and document-state access in %s",
     (environment) => {
       const scenario = scenarioFor(environment);
       if (!scenario) return;
@@ -543,7 +577,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
       ).toBe(true);
       const pool = onlyRecord(identity, "AWS::Cognito::UserPool");
       const accountTable = onlyRecord(account, "AWS::DynamoDB::Table");
-      const conversationTable = onlyRecord(chat, "AWS::DynamoDB::Table");
+      const conversationTable = runtimeConversationTable(chat);
       const accountClient = onlyRecord(account, "AWS::Cognito::UserPoolClient");
       const siteDistribution = onlyRecord(site, "AWS::CloudFront::Distribution");
       const variables = lambda.properties.Environment?.Variables || {};
@@ -574,6 +608,13 @@ describe("phase 9 admin infrastructure acceptance", () => {
         referencesResource(variables.BOT_CATALOG, admin, chat, conversationTable, assembly),
         "the internal server catalog selects the docentes conversation table from this environment's ChatStack",
       ).toBe(true);
+      const documentTables = records(chat, "AWS::DynamoDB::Table").filter(
+        ({ logicalId }) =>
+          logicalId !== conversationTable.logicalId &&
+          referencesResource(variables.BOT_CATALOG, admin, chat, { logicalId }, assembly),
+      );
+      expect(documentTables, "the document catalog uses a separate table").toHaveLength(1);
+      const documentTable = documentTables[0];
 
       const { statements } = lambdaPolicies(admin, lambda);
       const dynamoStatements = statements.filter(
@@ -581,6 +622,7 @@ describe("phase 9 admin infrastructure acceptance", () => {
       );
       expect(dynamoStatements.length).toBeGreaterThan(0);
       const quotaReadStatements = [];
+      const documentDynamoStatements = [];
       const accountDynamoActions = [];
       for (const statement of dynamoStatements) {
         const resources = statementResources(statement);
@@ -591,6 +633,24 @@ describe("phase 9 admin infrastructure acceptance", () => {
           );
         if (accountOnly) {
           accountDynamoActions.push(...statementActions(statement));
+          continue;
+        }
+
+        const documentOnly =
+          resources.length > 0 &&
+          resources.every((resource) =>
+            referencesResource(resource, admin, chat, documentTable, assembly),
+          );
+        if (documentOnly) {
+          expect(resources).toHaveLength(1);
+          expect(
+            isExactTableResource(resources[0], documentTable, admin, chat, assembly),
+            "document-operation access is scoped to its exact per-bot table",
+          ).toBe(true);
+          expect(
+            statementActions(statement).some((action) => action.toLowerCase() === "dynamodb:scan"),
+          ).toBe(false);
+          documentDynamoStatements.push(statement);
           continue;
         }
 
@@ -611,6 +671,10 @@ describe("phase 9 admin infrastructure acceptance", () => {
         quotaReadStatements.some((statement) => statement.Effect === "Allow"),
         "a narrowly conditioned quota policy read/write grant must be allowed",
       ).toBe(true);
+      expect(
+        documentDynamoStatements.length,
+        "document operations use their own table grants, separate from conversation quota grants",
+      ).toBeGreaterThan(0);
       expect([...new Set(quotaReadStatements.flatMap(statementActions))].sort()).toEqual([
         "dynamodb:GetItem",
         "dynamodb:UpdateItem",
@@ -687,8 +751,8 @@ describe("phase 9 admin infrastructure acceptance", () => {
     const prodAdminClient = onlyRecord(prod.admin, "AWS::Cognito::UserPoolClient");
     const devTable = onlyRecord(dev.account, "AWS::DynamoDB::Table");
     const prodTable = onlyRecord(prod.account, "AWS::DynamoDB::Table");
-    const devConversationTable = onlyRecord(dev.chat, "AWS::DynamoDB::Table");
-    const prodConversationTable = onlyRecord(prod.chat, "AWS::DynamoDB::Table");
+    const devConversationTable = runtimeConversationTable(dev.chat);
+    const prodConversationTable = runtimeConversationTable(prod.chat);
     const devLambda = applicationLambda(dev);
     const prodLambda = applicationLambda(prod);
 

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { ArnFormat, CfnOutput, RemovalPolicy, Stack, Tags } from "aws-cdk-lib";
 import * as bedrock from "aws-cdk-lib/aws-bedrock";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3vectors from "aws-cdk-lib/aws-s3vectors";
@@ -19,6 +20,7 @@ function documentBucketName(environment: ResolvedBotEnvironment): string {
 
 export class DocumentInfrastructure extends Construct {
   readonly documentBucket: s3.Bucket;
+  readonly documentTable: dynamodb.Table;
   readonly preparedDocumentsPrefix = documentConfig.preparedDocumentsPrefix;
   readonly vectorBucket: s3vectors.CfnVectorBucket;
   readonly vectorIndex: s3vectors.CfnIndex;
@@ -41,6 +43,14 @@ export class DocumentInfrastructure extends Construct {
       removalPolicy: RemovalPolicy.RETAIN,
     });
     Tags.of(this.documentBucket).add("botId", environment.botId);
+
+    this.documentTable = new dynamodb.Table(this, "DocumentTable", {
+      tableName: `${environment.botResourcePrefix}-documents`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    });
+    Tags.of(this.documentTable).add("botId", environment.botId);
 
     this.vectorBucket = new s3vectors.CfnVectorBucket(this, "VectorBucket", {
       vectorBucketName,
@@ -184,6 +194,10 @@ export class DocumentInfrastructure extends Construct {
     new CfnOutput(this, "DocumentBucketName", {
       value: this.documentBucket.bucketName,
       description: "Private S3 bucket for prepared chatbot documents.",
+    });
+    new CfnOutput(this, "DocumentTableName", {
+      value: this.documentTable.tableName,
+      description: "Per-chatbot table for document identities and operations.",
     });
     new CfnOutput(this, "PreparedDocumentsPrefix", {
       value: this.preparedDocumentsPrefix,

@@ -13,6 +13,8 @@ import {
   type QuotaPolicy,
 } from "../config/quota-policy.js";
 import type { QuotaPolicyReader, QuotaPolicyWriter } from "./quota-policy-store.js";
+import { DOCUMENT_MAX_BYTES, isDocumentAction, validateDocumentFile } from "../config/documents.js";
+import type { DocumentAdministration } from "./document-administration.js";
 
 type AdminStore = AccountAccessStore;
 
@@ -50,6 +52,7 @@ type HttpEvent = {
   headers?: Record<string, string | undefined>;
   body?: string | null;
   isBase64Encoded?: boolean;
+  queryStringParameters?: Record<string, string | undefined> | null;
   requestContext?: {
     http?: { method?: string; path?: string };
     authorizer?: { jwt?: { claims?: Record<string, unknown> } };
@@ -108,6 +111,132 @@ function exactKeys(value: Record<string, unknown>, expected: string[]): boolean 
 
 function pathFrom(event: HttpEvent): string {
   return event.requestContext?.http?.path || event.rawPath || "";
+}
+
+function documentRoute(
+  path: string,
+):
+  | { botId: string; kind: "list" }
+  | { botId: string; kind: "create" }
+  | { botId: string; kind: "start" | "get"; operationId: string }
+  | null {
+  const match = path.match(
+    /^\/api\/admin\/bots\/([^/]+)\/(documents|document-operations(?:\/([^/]+)(?:\/(start))?)?)$/,
+  );
+  if (!match) return null;
+  let botId: string;
+  try {
+    botId = decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+  if (match[2] === "documents") return { botId, kind: "list" };
+  if (match[2] === "document-operations") return { botId, kind: "create" };
+  let operationId: string;
+  try {
+    operationId = decodeURIComponent(match[3]);
+  } catch {
+    return null;
+  }
+  return match[4] ? { botId, kind: "start", operationId } : { botId, kind: "get", operationId };
+}
+
+function documentErrorResponse(error: unknown): HttpResponse {
+  const value = isObject(error) ? error : {};
+  const code = typeof value.code === "string" ? value.code : "DOCUMENTS_UNAVAILABLE";
+  const statusCode =
+    code === "INVALID_INPUT"
+      ? 400
+      : code === "FILE_TOO_LARGE"
+        ? 413
+        : code === "NOT_FOUND"
+          ? 404
+          : ["STATE_CHANGED", "DOCUMENT_OPERATION_ACTIVE", "UPLOAD_NOT_READY"].includes(code)
+            ? 409
+            : code === "UNAUTHORIZED"
+              ? 401
+              : 503;
+  return response(statusCode, {
+    code,
+    ...(Array.isArray(value.fields) ? { fields: value.fields } : {}),
+  });
+}
+
+function tokenExpiresAt(event: HttpEvent, now: () => number): number | null {
+  const claim = event.requestContext?.authorizer?.jwt?.claims?.exp;
+  const exp =
+    typeof claim === "number"
+      ? claim
+      : typeof claim === "string" && /^\d+$/.test(claim)
+        ? Number(claim)
+        : Number.NaN;
+  if (!Number.isSafeInteger(exp) || exp <= 0) return null;
+  const expiresAt = exp * 1000;
+  return Number.isSafeInteger(expiresAt) && expiresAt > now() ? expiresAt : null;
+}
+
+function documentIntentBody(body: Record<string, unknown> | null):
+  | {
+      operationId: string;
+      action: "upload" | "replace" | "withdraw" | "reprocess";
+      file?: { name: string; sizeBytes: number; sha256: string };
+      documentId?: string;
+      expectedRevision?: string;
+    }
+  | HttpResponse {
+  if (!body || !isDocumentAction(body.action)) return response(400, { code: "INVALID_INPUT" });
+  const action = body.action;
+  const upload = action === "upload" || action === "replace";
+  const expectedKeys =
+    action === "upload"
+      ? ["operationId", "action", "file"]
+      : upload
+        ? ["operationId", "action", "documentId", "expectedRevision", "file"]
+        : ["operationId", "action", "documentId", "expectedRevision"];
+  if (!exactKeys(body, expectedKeys) || !isValidOperationId(body.operationId)) {
+    return response(400, { code: "INVALID_INPUT" });
+  }
+  let documentId: string | undefined;
+  let expectedRevision: string | undefined;
+  if (action !== "upload") {
+    if (
+      typeof body.documentId !== "string" ||
+      body.documentId.length < 1 ||
+      body.documentId.length > 128 ||
+      body.documentId.trim() !== body.documentId ||
+      typeof body.expectedRevision !== "string" ||
+      body.expectedRevision.length < 1 ||
+      body.expectedRevision.length > 128 ||
+      body.expectedRevision.trim() !== body.expectedRevision
+    ) {
+      return response(400, { code: "INVALID_INPUT" });
+    }
+    documentId = body.documentId;
+    expectedRevision = body.expectedRevision;
+  }
+  if (!upload) {
+    return { operationId: body.operationId, action, documentId, expectedRevision };
+  }
+  if (!isObject(body.file) || !exactKeys(body.file, ["name", "sizeBytes", "sha256"])) {
+    return response(400, { code: "INVALID_INPUT", fields: ["file"] });
+  }
+  const fields = validateDocumentFile(body.file);
+  if (
+    typeof body.file.sizeBytes === "number" &&
+    Number.isSafeInteger(body.file.sizeBytes) &&
+    body.file.sizeBytes > DOCUMENT_MAX_BYTES
+  ) {
+    return response(413, { code: "FILE_TOO_LARGE", fields: ["file"] });
+  }
+  if (fields.length > 0) return response(400, { code: "INVALID_INPUT", fields });
+  const file = body.file as { name: string; sizeBytes: number; sha256: string };
+  return {
+    operationId: body.operationId,
+    action,
+    ...(documentId ? { documentId } : {}),
+    ...(expectedRevision ? { expectedRevision } : {}),
+    file,
+  };
 }
 
 function botIdFromPath(
@@ -240,6 +369,7 @@ function quotaPutFields(body: Record<string, unknown> | null): string[] {
 export function createAdminHandler(deps: {
   config: AdminConfig;
   stores: Record<string, AdminStore>;
+  documentAdministrations?: Record<string, DocumentAdministration>;
   quotaReaders?: Record<string, QuotaPolicyReader>;
   quotaWriters?: Record<string, QuotaPolicyWriter>;
   identity: AdminIdentity;
@@ -250,6 +380,7 @@ export function createAdminHandler(deps: {
   const { config, stores } = deps;
   const quotaReaders = deps.quotaReaders || {};
   const quotaWriters = deps.quotaWriters || {};
+  const documentAdministrations = deps.documentAdministrations || {};
   const bots = new Map(config.bots.map((bot) => [bot.botId, bot]));
 
   async function lookup(botId: string, email: string): Promise<HttpResponse> {
@@ -322,6 +453,74 @@ export function createAdminHandler(deps: {
       return response(200, {
         bots: config.bots.map(({ botId, projectName }) => ({ botId, projectName })),
       });
+    }
+
+    const documentsRoute = documentRoute(path);
+    if (documentsRoute) {
+      if (!bots.has(documentsRoute.botId)) return response(404, { code: "NOT_FOUND" });
+      const administration = Object.hasOwn(documentAdministrations, documentsRoute.botId)
+        ? documentAdministrations[documentsRoute.botId]
+        : undefined;
+      if (!administration) return response(503, { code: "DOCUMENTS_UNAVAILABLE" });
+      try {
+        if (documentsRoute.kind === "list") {
+          if (method !== "GET") return response(404, { code: "NOT_FOUND" });
+          const cursor = event.queryStringParameters?.cursor ?? null;
+          const listing = await administration.list({ cursor, actorSub: principal.sub });
+          return response(200, {
+            botId: documentsRoute.botId,
+            ...(listing as unknown as Record<string, unknown>),
+          });
+        }
+        if (documentsRoute.kind === "create") {
+          if (method !== "POST") return response(404, { code: "NOT_FOUND" });
+          const parsed = documentIntentBody(parseBody(event));
+          if ("statusCode" in parsed) return parsed;
+          const expiresAt = tokenExpiresAt(event, deps.now);
+          if (!expiresAt) return response(401, { code: "UNAUTHORIZED" });
+          const result = await administration.createIntent({
+            ...parsed,
+            actorSub: principal.sub,
+            tokenExpiresAt: expiresAt,
+          });
+          return response(201, {
+            botId: documentsRoute.botId,
+            ...(result as unknown as Record<string, unknown>),
+          });
+        }
+        if (documentsRoute.kind === "start") {
+          if (method !== "POST") return response(404, { code: "NOT_FOUND" });
+          if (typeof event.body === "string" && event.body.trim() !== "") {
+            const body = parseBody(event);
+            if (!body || !exactKeys(body, [])) return response(400, { code: "INVALID_INPUT" });
+          }
+          const result = await administration.start({
+            operationId: documentsRoute.operationId,
+            actorSub: principal.sub,
+          });
+          if (!result.startConfirmed) {
+            return response(503, {
+              botId: documentsRoute.botId,
+              operation: result.operation,
+              code: "DOCUMENT_OPERATION_UNCONFIRMED",
+            });
+          }
+          const terminal =
+            result.operation.status === "completed" || result.operation.status === "failed";
+          return response(terminal ? 200 : 202, {
+            botId: documentsRoute.botId,
+            operation: result.operation,
+          });
+        }
+        if (method !== "GET") return response(404, { code: "NOT_FOUND" });
+        const result = await administration.get({
+          operationId: documentsRoute.operationId,
+          actorSub: principal.sub,
+        });
+        return response(200, { botId: documentsRoute.botId, ...result });
+      } catch (error) {
+        return documentErrorResponse(error);
+      }
     }
 
     const quotaBotId = method === "GET" || method === "PUT" ? botIdFromPath(path, "quota") : null;

@@ -11,6 +11,14 @@ const catalog = JSON.stringify([
     conversationTableName: "chat-docentes",
     clientId: "chat-client",
     siteUrl: "https://docentes.example.test/",
+    documentTableName: "documents-docentes",
+    uploadBucketName: "incoming-docentes",
+    documentBucketName: "prepared-docentes",
+    incomingPrefix: "incoming/",
+    preparedPrefix: "prepared/",
+    knowledgeBaseId: "knowledge-base-id",
+    dataSourceId: "data-source-id",
+    stateMachineArn: "arn:aws:states:us-east-1:118903272638:stateMachine:docentes-admin-documents",
   },
 ]);
 
@@ -127,6 +135,15 @@ describe("administrative Lambda configuration", () => {
         conversationTableName: "chat-docentes",
         clientId: "chat-client",
         siteUrl: "https://docentes.example.test/",
+        documentTableName: "documents-docentes",
+        uploadBucketName: "incoming-docentes",
+        documentBucketName: "prepared-docentes",
+        incomingPrefix: "incoming/",
+        preparedPrefix: "prepared/",
+        knowledgeBaseId: "knowledge-base-id",
+        dataSourceId: "data-source-id",
+        stateMachineArn:
+          "arn:aws:states:us-east-1:118903272638:stateMachine:docentes-admin-documents",
       },
     ]);
   });

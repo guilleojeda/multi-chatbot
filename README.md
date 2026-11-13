@@ -74,7 +74,7 @@ aws cognito-idp admin-add-user-to-group --region us-east-1 \
 
 El grupo Cognito se llama `multi-chatbot-admin`. El usuario vuelve a ingresar al panel para obtener un access token administrativo; su privilegio vence con ese JWT, como máximo a los **60 minutos** de su emisión. Quitar el grupo no invalida tokens ya emitidos. El panel usa el catálogo del servidor para elegir chatbot y buscar una persona por email exacto. Invitar registra el enlace y envía correo; su aceptación concede únicamente el chatbot elegido. Un envío aceptado por SES no prueba recepción. El panel también permite revocar acceso o cancelar una invitación pendiente para el chatbot seleccionado. La revocación bloquea nuevos pedidos, pero conserva cuenta, perfil, conversaciones, datos ocultos y consumo; una generación ya admitida puede terminar. Una nueva invitación no restituye acceso hasta que la persona la acepta con su cuenta y contraseña existentes. Si una operación queda incierta, vuelve a consultar la ficha; no la marques como exitosa por el estado actual ni repitas la mutación automáticamente. Ver [cuenta e invitaciones](docs/intent/account.md).
 
-La selección de chatbot es común a **Acceso** y **Cuotas**. En Cuotas, el administrador consulta y edita los límites diarios y mensuales por persona sin ingresar un email. **Guardar límites** aplica ambos valores al próximo envío nuevo, también en sesiones abiertas, conservando el consumo y los envíos admitidos. Cero bloquea nuevas consultas hasta ampliar el cupo. **Actualizar límites**, recargar o volver a ingresar consultan el estado vigente. Un conflicto o guardado incierto exige esa lectura y una nueva decisión; consultar valores coincidentes no confirma la autoría del intento anterior. Ver [administración de cuotas](docs/intent/account.md#administrar-cuotas).
+La selección de chatbot es común a **Acceso**, **Cuotas** y **Documentos**. En Cuotas, el administrador consulta y edita los límites diarios y mensuales por persona sin ingresar un email. **Guardar límites** aplica ambos valores al próximo envío nuevo, también en sesiones abiertas, conservando el consumo y los envíos admitidos. Cero bloquea nuevas consultas hasta ampliar el cupo. **Actualizar límites**, recargar o volver a ingresar consultan el estado vigente. Un conflicto o guardado incierto exige esa lectura y una nueva decisión; consultar valores coincidentes no confirma la autoría del intento anterior. Ver [administración de cuotas](docs/intent/account.md#administrar-cuotas).
 
 ## Recuperar una cuenta de desarrollo
 
@@ -124,10 +124,41 @@ Si ya existe, el primer comando devuelve `ConditionalCheckFailedException`; leer
 
 ## Cargar documentos preparados en desarrollo
 
-Los documentos se preparan fuera de la aplicación. El equipo técnico publica texto UTF-8 ya
-revisado en el prefijo del bucket documental; no se usa el bucket web. El stack de chat emite
-outputs que contienen `DocumentBucketName`, `PreparedDocumentsPrefix`, `KnowledgeBaseId` y
-`DocumentDataSourceId` en sus claves. CDK añade el prefijo del construct y un hash a esas claves:
+Abrir el [panel administrativo](#abrir-el-panel-administrativo-de-desarrollo), seleccionar
+el chatbot y entrar a **Documentos**. No hace falta buscar una persona ni tener acceso docente
+para administrar sus fuentes.
+
+1. Elegir un archivo preparado y pulsar **Cargar y procesar**. Se admite un archivo de hasta
+   **50.000.000 bytes** en `.txt`, `.md`, `.html`, `.doc`, `.docx`, `.csv`, `.xls`, `.xlsx` o `.pdf`.
+   TXT, Markdown y HTML deben ser UTF-8 con texto no vacío. La información relevante de imágenes
+   se prepara y transcribe fuera de la aplicación; el panel no incluye OCR, conversión o edición.
+2. Esperar la confirmación de inicio. Desde ese momento se puede cerrar el panel y volver a
+   consultar el resultado: el procesamiento continúa en el servidor. Una transferencia recibida
+   o una solicitud aceptada todavía no significan procesamiento completado.
+3. Para cambiar un documento, usar **Reemplazar**, elegir su nuevo archivo y procesarlo. La acción
+   usa la revisión observada; ante conflicto, volver a leer y decidir de nuevo. No se publica una
+   segunda identidad lógica para el mismo documento.
+4. Para quitarlo de búsquedas futuras, usar **Retirar** y confirmar. La retirada conserva preguntas,
+   respuestas, originales y snapshots anteriores. No cambia el consumo ni vuelve a generar respuestas.
+
+El procesamiento exitoso publica directamente, sin aprobación editorial posterior. El mensaje
+**Procesamiento completado** advierte que el chat puede tardar unos minutos en reflejarlo.
+Comprobar contenido reconocible en una consulta nueva después de la propagación; un hilo anterior
+puede conservar información histórica que no es evidencia documental actual.
+
+Solo puede haber un cambio activo por chatbot. Un fallo muestra su paso y explicación disponible;
+no promete restaurar el corpus anterior. **Reintentar procesamiento** usa la fuente ya recibida y
+resuelve la limpieza pendiente sin otra transferencia. Si falló una retirada, el nuevo intento
+continúa esa retirada. Un resultado incierto requiere consultar el estado; no se libera por tiempo
+ni se repiten escrituras ciegamente. La recuperación técnica de un efecto incierto se coordina con
+el único ejecutor, sin iniciar otro escritor en paralelo.
+
+### Observación y recuperación técnica
+
+Con una sesión IAM autorizada, verificar cuenta `118903272638`, región `us-east-1` y tags de
+`dev/docentes` antes de operar. Los outputs del stack de chat incluyen `DocumentBucketName`,
+`PreparedDocumentsPrefix`, `DocumentTableName`, `KnowledgeBaseId` y `DocumentDataSourceId`;
+CDK añade el prefijo del construct y un hash a las claves de output:
 
 ```sh
 aws sts get-caller-identity --query Account --output text
@@ -135,54 +166,31 @@ aws cloudformation describe-stacks --region us-east-1 \
   --stack-name multi-chatbot-dev-docentes-chat --query 'Stacks[0].Outputs'
 ```
 
-Verificar la cuenta `118903272638` y usar exclusivamente los outputs de `dev/docentes`.
-Con una AWS CLI v2 vigente, completar estas variables con esos valores, sin credenciales:
+El receipt documental registra la operación y su ejecución/job conocidos. Observar la ejecución
+Standard y su job original antes de resolver una incertidumbre. El timeout de seguimiento no
+prueba que un efecto remoto haya terminado. No se usa CLI como segunda vía ordinaria de carga
+ni se modifican fuentes en paralelo con el panel.
+
+Para comprobar una operación conocida, usar sus identificadores internos y la KB del mismo bot:
 
 ```sh
-CHAT_DOCUMENT_BUCKET='<DocumentBucketName>'
-CHAT_DOCUMENT_PREFIX='<PreparedDocumentsPrefix>'
 CHAT_KB_ID='<KnowledgeBaseId>'
 CHAT_DATA_SOURCE_ID='<DocumentDataSourceId>'
-```
-
-Cuando no hay corpus real, las tres fuentes sintéticas identificadas permiten comprobar
-integración. Este comando solo añade los `.txt` bajo `fixtures/`; no borra otros objetos:
-
-```sh
-aws s3 sync tests/fixtures/documents/ \
-  "s3://${CHAT_DOCUMENT_BUCKET}/${CHAT_DOCUMENT_PREFIX}fixtures/" \
-  --region us-east-1 --exclude '*' --include '*.txt'
-aws bedrock-agent start-ingestion-job --region us-east-1 \
-  --knowledge-base-id "$CHAT_KB_ID" --data-source-id "$CHAT_DATA_SOURCE_ID"
-```
-
-Conservar el `ingestionJobId` devuelto y consultar su estado y razones de fallo:
-
-```sh
 CHAT_INGESTION_JOB_ID='<ingestionJobId>'
 aws bedrock-agent get-ingestion-job --region us-east-1 \
   --knowledge-base-id "$CHAT_KB_ID" --data-source-id "$CHAT_DATA_SOURCE_ID" \
   --ingestion-job-id "$CHAT_INGESTION_JOB_ID"
 aws bedrock-agent-runtime retrieve --region us-east-1 \
   --knowledge-base-id "$CHAT_KB_ID" \
-  --retrieval-query '{"text":"Experiencia de condensación de Ladera en el aula"}' \
+  --retrieval-query '{"text":"un concepto reconocible del documento cargado"}' \
   --retrieval-configuration '{"vectorSearchConfiguration":{"numberOfResults":5,"overrideSearchType":"SEMANTIC"}}'
 ```
 
-`COMPLETE` no acredita por sí solo que el contenido ya esté recuperable. Comprobar textos
-reconocibles en Retrieve y después preguntar, crear material y seguir el hilo desde la UI real.
-Guardar revisión/hashes de las fuentes y correlacionar queryId, revisión y snapshot interno.
-Las fuentes de prueba no prueban calidad sobre el corpus real ni habilitan el piloto.
-
-Para documentos reales, cargar solo el contenido preparado autorizado y observar la ingestión
-del mismo modo. El parser predeterminado es textual: la información relevante de imágenes se
-transcribe durante la preparación externa. El índice usa Titan V2/1.024/cosine y segmentación
-500 tokens/20 %; cambiar embedding/dimensión o segmentación puede exigir reindexar o recrear
-el recurso y requiere revisar esa decisión. Mantener metadatos dentro de los límites de
-KB con S3 Vectors. La carga no promete publicación instantánea o atómica; los pedidos nuevos
-capturan lo que recuperaron y los anteriores conservan sus snapshots. No hay panel de carga
-documental, conversor, sincronizador periódico o carga de usuarios. Ver [operación documental](docs/intent/setup.md)
-y [comportamiento del chat](docs/intent/chat.md).
+`COMPLETE` solo no acredita disponibilidad inmediata. Correlacionar documento/revisión, fuente,
+ejecución/job y snapshot de la consulta. Las fuentes sintéticas identificadas bajo
+`tests/fixtures/documents` permiten comprobar integración; no acreditan calidad sobre el corpus
+real ni habilitan el piloto. Ver [administración documental](docs/intent/account.md#administrar-documentos),
+[operación y permisos](docs/intent/setup.md) y [comportamiento del chat](docs/intent/chat.md).
 
 ## CDK y entrega
 
