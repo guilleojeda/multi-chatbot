@@ -1132,18 +1132,28 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
     expect(uploadRequests(harness)).toHaveLength(0);
   });
 
-  it("rechaza una extensión no aprobada sin crear intención ni transferencia", async () => {
-    const harness = await startAdmin();
-    await openDocuments(harness);
-    await submitFile(harness, makeFile(harness, "respaldo.json", "{}", "application/json"), {
-      expectIntent: false,
-    });
+  it.each([
+    [
+      "una extensión no aprobada",
+      "respaldo.json",
+      "{}",
+      "application/json",
+      /formato|tipo de archivo|extensión/i,
+    ],
+    ["un archivo vacío", "Empty.txt", "", "text/plain", /vacío|contenido/i],
+  ])(
+    "rechaza %s sin crear intención ni transferencia",
+    async (_caseName, name, contents, type, message) => {
+      const harness = await startAdmin();
+      await openDocuments(harness);
+      await submitFile(harness, makeFile(harness, name, contents, type), { expectIntent: false });
 
-    await waitForText(harness, /formato|tipo de archivo|extensión/i);
-    expect(documentCalls(harness, "POST", /\/document-operations$/)).toHaveLength(0);
-    expect(uploadRequests(harness)).toHaveLength(0);
-    expect(status(harness.document).join(" ")).toMatch(/formato|tipo de archivo|extensión/i);
-  });
+      await waitForText(harness, message);
+      expect(documentCalls(harness, "POST", /\/document-operations$/)).toHaveLength(0);
+      expect(uploadRequests(harness)).toHaveLength(0);
+      expect(status(harness.document).join(" ")).toMatch(message);
+    },
+  );
 
   it("mantiene el mismo operationId, hash y cuerpo al reintentar una intención incierta", async () => {
     let creates = 0;
