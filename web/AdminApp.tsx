@@ -1994,11 +1994,15 @@ export function AdminApp({ getSession }: AdminAppProps) {
                 <button
                   className="admin-button admin-quota__refresh"
                   type="button"
-                  disabled={!selectedBotId}
-                  aria-disabled={quotaView.kind === "loading" && quotaView.botId === selectedBotId}
+                  disabled={!selectedBotId || quotaSavePending}
+                  aria-disabled={
+                    quotaSavePending ||
+                    (quotaView.kind === "loading" && quotaView.botId === selectedBotId)
+                  }
                   onClick={() => {
                     if (
                       selectedBotId &&
+                      !quotaSavePending &&
                       !(quotaView.kind === "loading" && quotaView.botId === selectedBotId)
                     ) {
                       void loadQuota(selectedBotId);

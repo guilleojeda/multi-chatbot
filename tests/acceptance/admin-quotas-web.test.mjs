@@ -713,6 +713,93 @@ describe("AdminApp: consulta de cuotas desde la web", () => {
     expect(status(harness.document).join(" ")).toMatch(/guardad|confirmad|actualizad/i);
   });
 
+  it("bloquea Actualizar durante PUT, procesa el 200 y permite refrescar después", async () => {
+    const pendingSave = deferred();
+    let reads = 0;
+    const harness = await startQuotaAdmin({
+      quota: async ({ path }) => {
+        reads += 1;
+        return reads === 1
+          ? policyResponse(path.split("/")[4], 8, 30, "pending-base")
+          : policyResponse(path.split("/")[4], 11, 33, "after-save-refresh");
+      },
+      saveQuota: async () => pendingSave.promise,
+    });
+
+    await openSection(harness, "Cuotas");
+    const daily = getQuotaInput(harness, "Consultas por día");
+    const monthly = getQuotaInput(harness, "Consultas por mes");
+    await harness.setValue(daily, "17");
+    await harness.setValue(monthly, "42");
+    await harness.click(getButton(harness, "Guardar límites"));
+    expect(quotaPutCalls(harness)).toHaveLength(1);
+    expect(getButton(harness, "Actualizar límites").disabled).toBe(true);
+    expect(daily.disabled).toBe(true);
+    expect(monthly.disabled).toBe(true);
+    expect(getButton(harness, "Guardar límites").disabled).toBe(true);
+    expect(getCancelDraftButton(harness).disabled).toBe(true);
+
+    await harness.click(getButton(harness, "Actualizar límites"));
+    expect(quotaCalls(harness)).toHaveLength(1);
+
+    pendingSave.resolve(saveResponse("docentes", 17, 42, "saved-revision"));
+    await harness.settle();
+    expect(quotaCalls(harness)).toHaveLength(1);
+    expectQuotaDraft(harness, 17, 42);
+    expect(status(harness.document).join(" ")).toMatch(/guardad|confirmad|actualizad/i);
+    expect(getButton(harness, "Actualizar límites").disabled).toBe(false);
+    expect(daily.disabled).toBe(false);
+    expect(monthly.disabled).toBe(false);
+    expect(getButton(harness, "Cancelar").disabled).toBe(false);
+
+    await harness.click(getButton(harness, "Actualizar límites"));
+    await harness.settle();
+    expect(quotaCalls(harness)).toHaveLength(2);
+    expectQuotaDraft(harness, 11, 33);
+  });
+
+  it("conserva la incertidumbre 503 y exige Actualizar después de un PUT pendiente", async () => {
+    const pendingSave = deferred();
+    let reads = 0;
+    const harness = await startQuotaAdmin({
+      quota: async ({ path }) => {
+        reads += 1;
+        return policyResponse(
+          path.split("/")[4],
+          reads === 1 ? 8 : 11,
+          reads === 1 ? 30 : 33,
+          reads === 1 ? "uncertain-base" : "uncertain-refreshed",
+        );
+      },
+      saveQuota: async () => pendingSave.promise,
+    });
+
+    await openSection(harness, "Cuotas");
+    await harness.setValue(getQuotaInput(harness, "Consultas por día"), "17");
+    await harness.click(getButton(harness, "Guardar límites"));
+    expect(quotaPutCalls(harness)).toHaveLength(1);
+    expect(getButton(harness, "Actualizar límites").disabled).toBe(true);
+    expect(getQuotaInput(harness, "Consultas por día").disabled).toBe(true);
+    expect(getButton(harness, "Guardar límites").disabled).toBe(true);
+    expect(getCancelDraftButton(harness).disabled).toBe(true);
+
+    await harness.click(getButton(harness, "Actualizar límites"));
+    expect(quotaCalls(harness)).toHaveLength(1);
+    expect(quotaPutCalls(harness)).toHaveLength(1);
+
+    pendingSave.resolve(jsonResponse({ code: "SAVE_UNCONFIRMED" }, 503));
+    await harness.settle();
+    expect(alertText(harness.document)).toMatch(/No pudimos confirmar el guardado/i);
+    expect(getButton(harness, "Actualizar límites").disabled).toBe(false);
+    expect(quotaCalls(harness)).toHaveLength(1);
+    expect(getButton(harness, "Guardar límites").disabled).toBe(true);
+
+    await harness.click(getButton(harness, "Actualizar límites"));
+    await harness.settle();
+    expect(quotaCalls(harness)).toHaveLength(2);
+    expectQuotaDraft(harness, 11, 33);
+  });
+
   it("consume el éxito del contrato de PUT y luego vuelve a leer el estado con un GET explícito", async () => {
     // The API acceptance owns persistence; this case proves the UI transport and response contract.
     let reads = 0;
