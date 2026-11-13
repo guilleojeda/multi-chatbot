@@ -36,6 +36,19 @@ function onlyRecord(template, type, message = `expected one ${type}`) {
   return matches[0];
 }
 
+function conversationTable(template, stackName) {
+  const runtime = onlyRecord(template, "AWS::BedrockAgentCore::Runtime");
+  const reference = runtime.properties.EnvironmentVariables?.CONVERSATION_TABLE_NAME;
+  const matches = records(template, "AWS::DynamoDB::Table").filter((table) =>
+    referencesStackResource(reference, table, template, stackName),
+  );
+  expect(matches, "Runtime must continue selecting the existing conversation table").toHaveLength(
+    1,
+  );
+  expect(matches[0]?.logicalId).toBe(expectedConversationTableId);
+  return matches[0];
+}
+
 function actions(statement) {
   return Array.isArray(statement.Action) ? statement.Action : [statement.Action];
 }
@@ -264,7 +277,9 @@ function assertHistoryInfrastructure(
 ) {
   const { chatTemplate, accountTemplate, siteTemplate, identityTemplate } = templates;
   const runtime = onlyRecord(chatTemplate, "AWS::BedrockAgentCore::Runtime");
-  const table = onlyRecord(chatTemplate, "AWS::DynamoDB::Table");
+  const table = conversationTable(chatTemplate, chatStackName);
+  const chatTables = records(chatTemplate, "AWS::DynamoDB::Table");
+  const documentTables = chatTables.filter(({ logicalId }) => logicalId !== table.logicalId);
   const api = onlyRecord(accountTemplate, "AWS::ApiGatewayV2::Api");
   const accountTable = onlyRecord(accountTemplate, "AWS::DynamoDB::Table");
   const pool = onlyRecord(identityTemplate, "AWS::Cognito::UserPool");
@@ -274,7 +289,11 @@ function assertHistoryInfrastructure(
   expect(table.logicalId).toBe(expectedConversationTableId);
   expect(records(chatTemplate, "AWS::ApiGatewayV2::Api")).toHaveLength(0);
   expect(records(chatTemplate, "AWS::Cognito::UserPool")).toHaveLength(0);
-  expect(records(chatTemplate, "AWS::DynamoDB::Table")).toHaveLength(1);
+  expect(chatTables).toHaveLength(2);
+  expect(documentTables, "the document-state table stays separate from conversations").toHaveLength(
+    1,
+  );
+  expect(documentTables[0]?.properties.TableName).not.toEqual(table.properties.TableName);
   expect(records(accountTemplate, "AWS::ApiGatewayV2::Api")).toHaveLength(1);
   expect(historyHandler.properties.Runtime).toBe("nodejs24.x");
   expect(historyHandler.properties.Environment?.Variables).toMatchObject({ BOT_ID: botId });
@@ -542,7 +561,7 @@ describe("chat history infrastructure template acceptance", () => {
         scenario,
       );
       onlyRecord(templates.chatTemplate, "AWS::BedrockAgentCore::Runtime");
-      const table = onlyRecord(templates.chatTemplate, "AWS::DynamoDB::Table");
+      const table = conversationTable(templates.chatTemplate, bot.chatStackName);
       const api = onlyRecord(templates.accountTemplate, "AWS::ApiGatewayV2::Api");
       const client = onlyRecord(templates.accountTemplate, "AWS::Cognito::UserPoolClient");
       const pool = onlyRecord(templates.identityTemplate, "AWS::Cognito::UserPool");
@@ -571,7 +590,7 @@ describe("chat history infrastructure template acceptance", () => {
       if (!bot) return undefined;
       const templates = scenarioTemplates(scenario, bot);
       if (!templates) return undefined;
-      const table = onlyRecord(templates.chatTemplate, "AWS::DynamoDB::Table");
+      const table = conversationTable(templates.chatTemplate, bot.chatStackName);
       const runtime = onlyRecord(templates.chatTemplate, "AWS::BedrockAgentCore::Runtime");
       const handler = historyFunction(templates.chatTemplate);
       const api = onlyRecord(templates.accountTemplate, "AWS::ApiGatewayV2::Api");
@@ -618,17 +637,15 @@ describe("chat history infrastructure template acceptance", () => {
       expect(
         configuration.handler.properties.Environment?.Variables?.CONVERSATION_TABLE_NAME,
       ).toBeDefined();
-      const historyIndex = onlyRecord(
+      const table = conversationTable(
         configuration.templates.chatTemplate,
-        "AWS::DynamoDB::Table",
-      ).properties.GlobalSecondaryIndexes?.find(
+        configuration.stack.chatStackName,
+      );
+      const historyIndex = table.properties.GlobalSecondaryIndexes?.find(
         ({ IndexName }) => IndexName === "ConversationHistory",
       );
       expect(historyIndex).toBeDefined();
-      expectTagged(
-        onlyRecord(configuration.templates.chatTemplate, "AWS::DynamoDB::Table"),
-        configuration.environment,
-      );
+      expectTagged(table, configuration.environment);
     }
   });
 });

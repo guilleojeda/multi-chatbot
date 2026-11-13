@@ -1,7 +1,9 @@
-import { randomBytes as secureRandomBytes } from "node:crypto";
+import { randomBytes as secureRandomBytes, randomUUID } from "node:crypto";
 import { CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { S3Client } from "@aws-sdk/client-s3";
 import { SESv2Client } from "@aws-sdk/client-sesv2";
+import { SFNClient } from "@aws-sdk/client-sfn";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { createAdminHandler } from "./admin.js";
 import { adminSesClientOptions, parseAdminLambdaConfig } from "./admin-config.js";
@@ -11,9 +13,18 @@ import {
   createSesInvitationMailer,
 } from "./aws-adapters.js";
 import { createQuotaPolicyReader, createQuotaPolicyWriter } from "./quota-policy-store.js";
+import { createDocumentAdministration } from "./document-administration.js";
+import {
+  createDocumentExecution,
+  createDocumentObjects,
+  createDocumentUploadSigner,
+} from "./document-aws-adapters.js";
+import { createDocumentStore } from "./document-store.js";
 
 const runtimeConfig = parseAdminLambdaConfig();
 const identityClient = new CognitoIdentityProviderClient({ region: runtimeConfig.region });
+const s3Client = new S3Client({ region: runtimeConfig.region, maxAttempts: 2 });
+const sfnClient = new SFNClient({ region: runtimeConfig.region, maxAttempts: 1 });
 const dynamoClient = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: runtimeConfig.region }),
   {
@@ -42,6 +53,34 @@ const quotaWriters = Object.fromEntries(
     createQuotaPolicyWriter(dynamoClient, bot.conversationTableName, bot.botId),
   ]),
 );
+const documentObjects = createDocumentObjects({ s3Client });
+const documentUploadSigner = createDocumentUploadSigner({ s3Client, now: Date.now });
+const documentAdministrations = Object.fromEntries(
+  runtimeConfig.bots.map((bot) => [
+    bot.botId,
+    createDocumentAdministration({
+      botId: bot.botId,
+      store: createDocumentStore({
+        documentClient: dynamoClient,
+        tableName: bot.documentTableName,
+        botId: bot.botId,
+        now: Date.now,
+      }),
+      uploadBucketName: bot.uploadBucketName,
+      documentBucketName: bot.documentBucketName,
+      incomingPrefix: bot.incomingPrefix,
+      preparedPrefix: bot.preparedPrefix,
+      uploadSigner: documentUploadSigner,
+      objects: documentObjects,
+      execution: createDocumentExecution({
+        sfnClient,
+        stateMachineArn: bot.stateMachineArn,
+      }),
+      now: Date.now,
+      randomUUID,
+    }),
+  ]),
+);
 
 export const handler = createAdminHandler({
   config: {
@@ -58,6 +97,7 @@ export const handler = createAdminHandler({
   stores,
   quotaReaders,
   quotaWriters,
+  documentAdministrations,
   identity: createCognitoIdentityAdapter({
     client: identityClient,
     userPoolId: runtimeConfig.userPoolId,

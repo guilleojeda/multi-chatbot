@@ -1,6 +1,7 @@
 import { requestWithRefresh } from "./api";
 import type { Session } from "./session";
 import { parseQuotaPolicy, type QuotaPolicy } from "../config/quota-policy";
+import type { DocumentAction, DocumentFileInput } from "../config/documents";
 
 export type AdminPublicConfig = {
   environment: string;
@@ -13,6 +14,15 @@ export type AdminPublicConfig = {
 export type AdminRequestOptions = {
   method?: "GET" | "POST" | "PUT";
   body?: unknown;
+  signal?: AbortSignal;
+};
+
+export type DocumentIntentBody = {
+  operationId: string;
+  action: DocumentAction;
+  documentId?: string;
+  expectedRevision?: string;
+  file?: DocumentFileInput;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -79,4 +89,46 @@ export async function adminRequest(
   isActive: () => boolean,
 ): Promise<unknown> {
   return requestWithRefresh(config, session, path, options, isActive);
+}
+
+export function documentAdministrations(
+  config: AdminPublicConfig,
+  session: Session,
+  botId: string,
+  isActive: () => boolean,
+) {
+  const basePath = `/admin/bots/${encodeURIComponent(botId)}`;
+  return {
+    list(cursor?: string | null, signal?: AbortSignal) {
+      const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+      return adminRequest(config, session, `${basePath}/documents${query}`, { signal }, isActive);
+    },
+    createIntent(body: DocumentIntentBody) {
+      return adminRequest(
+        config,
+        session,
+        `${basePath}/document-operations`,
+        { method: "POST", body },
+        isActive,
+      );
+    },
+    start(operationId: string) {
+      return adminRequest(
+        config,
+        session,
+        `${basePath}/document-operations/${encodeURIComponent(operationId)}/start`,
+        { method: "POST", body: {} },
+        isActive,
+      );
+    },
+    get(operationId: string, signal?: AbortSignal) {
+      return adminRequest(
+        config,
+        session,
+        `${basePath}/document-operations/${encodeURIComponent(operationId)}`,
+        { signal },
+        isActive,
+      );
+    },
+  };
 }

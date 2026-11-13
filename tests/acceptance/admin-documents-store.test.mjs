@@ -281,7 +281,45 @@ describe("document DynamoDB store acceptance", () => {
   });
 
   it("reserves the bot only when a reprocess still sees the expected document revision", async () => {
-    const recorder = phase11CommandRecorder(async () => ({}));
+    const operation = {
+      pk: `BOT#${phase11BotId}`,
+      sk: `OPERATION#${operationId}`,
+      ...phase11Operation({
+        operationId,
+        documentId,
+        action: "reprocess",
+        status: "pending_start",
+        revision: "revision-0",
+        expectedRevision: "revision-0",
+      }),
+    };
+    const document = {
+      pk: `BOT#${phase11BotId}`,
+      sk: `DOCUMENT#${documentId}`,
+      documentId,
+      state: "active",
+      revision: "revision-0",
+      updatedAt: phase11Now,
+      source: {
+        status: "confirmed",
+        bucket: "prepared-docentes",
+        key: "prepared/document-1/revision-0/lesson.txt",
+        uri: "s3://prepared-docentes/prepared/document-1/revision-0/lesson.txt",
+        sizeBytes: 20,
+        sha256: "a".repeat(64),
+      },
+      pendingRemovalKeys: [],
+    };
+    const recorder = phase11CommandRecorder(async (command) => {
+      if (command instanceof GetCommand) {
+        if (command.input.Key.sk === `OPERATION#${operationId}`) return { Item: operation };
+        if (command.input.Key.sk === `DOCUMENT#${documentId}`) return { Item: document };
+        if (command.input.Key.sk === "CONTROL") {
+          return { Item: { pk: `BOT#${phase11BotId}`, sk: "CONTROL" } };
+        }
+      }
+      return {};
+    });
     const createDocumentStore = await loadStore();
     const store = createDocumentStore({
       documentClient: recorder.documentClient,
@@ -297,7 +335,7 @@ describe("document DynamoDB store acceptance", () => {
       action: "reprocess",
       expectedRevision: "revision-0",
       executionName: "docentes-operation-1",
-      executionInput: { ...executionInput, step: "start-ingestion" },
+      executionInput: { ...executionInput, step: "promote" },
     });
 
     const transaction = transactionOf(recorder.commands);
@@ -311,13 +349,40 @@ describe("document DynamoDB store acceptance", () => {
     expect(expressions).toMatch(/attribute_not_exists|operationId|owner/i);
     expect(expressions).toContain("revision-0");
     expect(serialized).toContain("docentes-operation-1");
-    expect(serialized).toContain(JSON.stringify({ ...executionInput, step: "start-ingestion" }));
+    expect(serialized).toContain(JSON.stringify({ ...executionInput, step: "promote" }));
     expect(serialized).not.toContain("expiresAt");
     expect(JSON.stringify(transaction.input)).toContain(`BOT#${phase11BotId}`);
+    const operationUpdate = writes.find((write) =>
+      JSON.stringify(write.Key).includes(`OPERATION#${operationId}`),
+    );
+    const documentUpdate = writes.find((write) =>
+      JSON.stringify(write.Key).includes(`DOCUMENT#${documentId}`),
+    );
+    expect(operationUpdate.UpdateExpression).not.toContain("candidateKey");
+    expect(JSON.stringify(operationUpdate.ExpressionAttributeValues)).not.toContain('"candidate"');
+    expect(documentUpdate.ConditionExpression).toContain("#source.#sourceStatus");
   });
 
   it("stores a new upload's candidate key before the worker can promote the object", async () => {
-    const recorder = phase11CommandRecorder(async () => ({}));
+    const operation = {
+      pk: `BOT#${phase11BotId}`,
+      sk: `OPERATION#${operationId}`,
+      ...phase11Operation({
+        operationId,
+        documentId,
+        action: "upload",
+        status: "awaiting_upload",
+      }),
+    };
+    const recorder = phase11CommandRecorder(async (command) => {
+      if (command instanceof GetCommand) {
+        if (command.input.Key.sk === `OPERATION#${operationId}`) return { Item: operation };
+        if (command.input.Key.sk === "CONTROL") {
+          return { Item: { pk: `BOT#${phase11BotId}`, sk: "CONTROL" } };
+        }
+      }
+      return {};
+    });
     const createDocumentStore = await loadStore();
     const store = createDocumentStore({
       documentClient: recorder.documentClient,
@@ -344,6 +409,73 @@ describe("document DynamoDB store acceptance", () => {
     expect(writes.map(conditionSummary).join("\n")).toMatch(/attribute_not_exists|revision/i);
   });
 
+  it("guards a replace reservation against pending removals that appear after the read", async () => {
+    const operation = {
+      pk: `BOT#${phase11BotId}`,
+      sk: `OPERATION#${operationId}`,
+      ...phase11Operation({
+        operationId,
+        documentId,
+        action: "replace",
+        status: "awaiting_upload",
+        expectedRevision: "revision-0",
+      }),
+    };
+    const document = {
+      pk: `BOT#${phase11BotId}`,
+      sk: `DOCUMENT#${documentId}`,
+      documentId,
+      state: "active",
+      revision: "revision-0",
+      updatedAt: phase11Now,
+      source: {
+        status: "confirmed",
+        bucket: "prepared-docentes",
+        key: "prepared/document-1/revision-0/lesson.txt",
+        uri: "s3://prepared-docentes/prepared/document-1/revision-0/lesson.txt",
+        sizeBytes: 20,
+        sha256: "a".repeat(64),
+      },
+      pendingRemovalKeys: [],
+    };
+    const recorder = phase11CommandRecorder(async (command) => {
+      if (command instanceof GetCommand) {
+        if (command.input.Key.sk === `OPERATION#${operationId}`) return { Item: operation };
+        if (command.input.Key.sk === `DOCUMENT#${documentId}`) return { Item: document };
+        if (command.input.Key.sk === "CONTROL") {
+          return { Item: { pk: `BOT#${phase11BotId}`, sk: "CONTROL" } };
+        }
+      }
+      return {};
+    });
+    const createDocumentStore = await loadStore();
+    const store = createDocumentStore({
+      documentClient: recorder.documentClient,
+      tableName,
+      botId: phase11BotId,
+      now: () => phase11Now,
+    });
+
+    await store.reserveOperation({
+      operationId,
+      documentId,
+      action: "replace",
+      expectedRevision: "revision-0",
+      candidateRevision: "revision-1",
+      candidateKey: "prepared/document-1/revision-1/lesson.txt",
+      executionName: "docentes-operation-1",
+      executionInput: { botId: phase11BotId, operationId, step: "validate" },
+    });
+
+    const transaction = transactionOf(recorder.commands);
+    const documentUpdate = transactWrites(transaction).find((write) =>
+      JSON.stringify(write.Key).includes(`DOCUMENT#${documentId}`),
+    );
+    expect(documentUpdate.ConditionExpression).toContain("size(#pendingKeys)");
+    expect(documentUpdate.ConditionExpression).toContain("attribute_not_exists(#pendingKeys)");
+    expect(documentUpdate.ExpressionAttributeValues[":emptyList"]).toBe(0);
+  });
+
   it("records source:null without marking the document withdrawn before sync confirmation", async () => {
     const operationId = "withdraw-7";
     const documentKey = { pk: `BOT#${phase11BotId}`, sk: `DOCUMENT#${documentId}` };
@@ -355,12 +487,14 @@ describe("document DynamoDB store acceptance", () => {
       action: "withdraw",
       status: "processing",
       revision: "revision-3",
+      updatedAt: phase11Now,
     };
     const document = {
       ...documentKey,
       documentId,
       state: "active",
       revision: "revision-3",
+      updatedAt: phase11Now,
       source: { bucket: "prepared-docentes", key: "prepared/document-1/revision-3/lesson.txt" },
       pendingRemovalKeys: ["prepared/document-1/revision-2/old.txt"],
       name: "lesson.txt",
@@ -427,12 +561,14 @@ describe("document DynamoDB store acceptance", () => {
       status: "processing",
       revision: "revision-8",
       sourceUrisToObserve: ["s3://prepared-docentes/prepared/document-1/revision-8/current.txt"],
+      updatedAt: phase11Now,
     };
     const document = {
       ...documentKey,
       documentId,
       state: "active",
       revision: "revision-8",
+      updatedAt: phase11Now,
       source: null,
       pendingRemovalKeys: [],
       name: "lesson.txt",
@@ -487,7 +623,8 @@ describe("document DynamoDB store acceptance", () => {
     expect(writes.some((write) => write.kind === "Delete")).toBe(false);
     expect(JSON.stringify(documentWrite)).toContain("withdrawn");
     expect(JSON.stringify(documentWrite)).toContain("revision-8");
-    expect(JSON.stringify(documentWrite)).toContain(`OPERATION#${operationId}`);
+    expect(documentWrite.ExpressionAttributeNames["#last"]).toBe("lastOperationId");
+    expect(documentWrite.ExpressionAttributeValues[":last"]).toBe(operationId);
   });
 
   it("retains the removal receipt and active row when the withdrawal sync fails", async () => {
@@ -502,6 +639,7 @@ describe("document DynamoDB store acceptance", () => {
       status: "processing",
       revision: "revision-9",
       sourceUrisToObserve: [uri],
+      updatedAt: phase11Now,
     };
     const document = {
       pk: `BOT#${phase11BotId}`,
@@ -509,6 +647,7 @@ describe("document DynamoDB store acceptance", () => {
       documentId,
       state: "active",
       revision: "revision-9",
+      updatedAt: phase11Now,
       source: null,
       pendingRemovalKeys: [],
       name: "lesson.txt",
@@ -580,6 +719,8 @@ describe("document DynamoDB store acceptance", () => {
       action: "withdraw",
       status: "pending_start",
       expectedRevision: "revision-9",
+      revision: "revision-9",
+      updatedAt: phase11Now,
     };
     const document = {
       pk: `BOT#${phase11BotId}`,
@@ -587,6 +728,7 @@ describe("document DynamoDB store acceptance", () => {
       documentId,
       state: "active",
       revision: "revision-9",
+      updatedAt: phase11Now,
       pendingRemovalKeys: [],
     };
     const control = { pk: `BOT#${phase11BotId}`, sk: "CONTROL" };
@@ -638,7 +780,54 @@ describe("document DynamoDB store acceptance", () => {
   });
 
   it("releases the reservation only with a condition for the operation that still owns CONTROL", async () => {
-    const recorder = phase11CommandRecorder(async () => ({}));
+    const operation = {
+      pk: `BOT#${phase11BotId}`,
+      sk: `OPERATION#${operationId}`,
+      operationId,
+      documentId,
+      action: "upload",
+      status: "processing",
+      revision: "revision-1",
+      ownerOperationId: operationId,
+      updatedAt: phase11Now,
+    };
+    const document = {
+      pk: `BOT#${phase11BotId}`,
+      sk: `DOCUMENT#${documentId}`,
+      documentId,
+      state: "active",
+      name: "lesson.txt",
+      sizeBytes: 20,
+      revision: "revision-1",
+      updatedAt: phase11Now,
+      source: {
+        status: "confirmed",
+        bucket: "prepared-docentes",
+        key: "prepared/document-1/revision-1/lesson.txt",
+        uri: "s3://prepared-docentes/prepared/document-1/revision-1/lesson.txt",
+        sizeBytes: 20,
+        sha256: "a".repeat(64),
+      },
+      pendingRemovalKeys: [],
+      ownerOperationId: operationId,
+    };
+    const control = {
+      pk: `BOT#${phase11BotId}`,
+      sk: "CONTROL",
+      activeOperationId: operationId,
+    };
+    const recorder = phase11CommandRecorder(async (command) => {
+      if (command instanceof GetCommand) {
+        const rows = {
+          CONTROL: control,
+          [`OPERATION#${operationId}`]: operation,
+          [`DOCUMENT#${documentId}`]: document,
+        };
+        const Item = rows[command.input.Key.sk];
+        return Item ? { Item } : {};
+      }
+      return {};
+    });
     const createDocumentStore = await loadStore();
     const store = createDocumentStore({
       documentClient: recorder.documentClient,
@@ -658,5 +847,47 @@ describe("document DynamoDB store acceptance", () => {
     expect(writes.map(conditionSummary).join("\n")).toMatch(/operation-1/);
     expect(JSON.stringify(writes)).toContain("CONTROL");
     expect(JSON.stringify(writes)).toContain(`OPERATION#${operationId}`);
+  });
+
+  it("rejects a late operation update unless the same operation still owns CONTROL and is nonterminal", async () => {
+    const recorder = phase11CommandRecorder(async (command) => {
+      if (command instanceof TransactWriteCommand) {
+        throw Object.assign(new Error("The operation is no longer active"), {
+          name: "TransactionCanceledException",
+          CancellationReasons: [
+            { Code: "ConditionalCheckFailed" },
+            { Code: "ConditionalCheckFailed" },
+          ],
+        });
+      }
+      return {};
+    });
+    const createDocumentStore = await loadStore();
+    const store = createDocumentStore({
+      documentClient: recorder.documentClient,
+      tableName,
+      botId: phase11BotId,
+      now: () => phase11Now,
+    });
+
+    const applied = await store.updateOperation({
+      operationId,
+      patch: { status: "processing", executionArn: "late-execution-arn" },
+    });
+
+    expect(applied).toBe(false);
+    const transaction = transactionOf(recorder.commands);
+    const writes = transactWrites(transaction);
+    const ownerCheck = writes.find((write) => JSON.stringify(write.Key).includes("CONTROL"));
+    const operationUpdate = writes.find((write) =>
+      JSON.stringify(write.Key).includes(`OPERATION#${operationId}`),
+    );
+    expect(ownerCheck.ConditionExpression).toContain("activeOperationId");
+    expect(JSON.stringify(ownerCheck.ExpressionAttributeValues)).toContain(operationId);
+    expect(operationUpdate.ConditionExpression).toMatch(/completed/);
+    expect(operationUpdate.ConditionExpression).toMatch(/failed/);
+    expect(JSON.stringify(operationUpdate.ExpressionAttributeValues)).toContain(
+      "late-execution-arn",
+    );
   });
 });

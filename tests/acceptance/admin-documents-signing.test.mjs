@@ -99,16 +99,82 @@ describe("the production S3 POST signer", () => {
             condition[2] === input.sizeBytes,
         ),
       ).toBe(true);
-      expect(Date.parse(policy.expiration)).toBe(credentialExpiresAt);
-      expect(upload.expiresAt).toBe(credentialExpiresAt);
+      expect(Date.parse(policy.expiration)).toBeLessThanOrEqual(credentialExpiresAt);
+      expect(Date.parse(policy.expiration)).toBeGreaterThanOrEqual(credentialExpiresAt - 5_000);
+      expect(upload.expiresAt).toBe(Date.parse(policy.expiration));
 
       const tokenLimited = await signer.createPost({
         ...input,
         key: `${input.key}.token-limited`,
         expiresAt: phase11Now + 30_000,
       });
-      expect(Date.parse(parsePolicy(tokenLimited).expiration)).toBe(phase11Now + 30_000);
-      expect(tokenLimited.expiresAt).toBe(phase11Now + 30_000);
+      expect(Date.parse(parsePolicy(tokenLimited).expiration)).toBeLessThanOrEqual(
+        phase11Now + 30_000,
+      );
+      expect(Date.parse(parsePolicy(tokenLimited).expiration)).toBeGreaterThanOrEqual(
+        phase11Now + 25_000,
+      );
+      expect(tokenLimited.expiresAt).toBe(Date.parse(parsePolicy(tokenLimited).expiration));
+    } finally {
+      await s3Client?.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it("accounts for credential-provider delay before the SDK creates the policy expiration", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(phase11Now));
+    let s3Client;
+    try {
+      const { createDocumentUploadSigner, S3Client } = await loadSignerFactory();
+      const credentialExpiresAt = phase11Now + 10 * 60_000;
+      let providerCalls = 0;
+      s3Client = new S3Client({
+        region: "us-east-1",
+        credentials: async () => {
+          providerCalls += 1;
+          if (providerCalls === 1) vi.setSystemTime(new Date(phase11Now + 3_000));
+          return {
+            accessKeyId: "AKIATESTDOCUMENTS",
+            secretAccessKey: "synthetic-test-secret",
+            sessionToken: "synthetic-session-token",
+            expiration: new Date(credentialExpiresAt),
+          };
+        },
+      });
+      const signer = createDocumentUploadSigner({ s3Client, now: () => Date.now() });
+      const fileBytes = Buffer.from("Delayed credential resolution", "utf8");
+      const sha256 = createHash("sha256").update(fileBytes).digest("hex");
+      const upload = await signer.createPost({
+        bucket: "temporary-docentes",
+        key: "incoming/operation-2/lesson.txt",
+        name: "lesson.txt",
+        sizeBytes: fileBytes.byteLength,
+        sha256,
+        contentType: "text/plain",
+        expiresAt: phase11Now + 120_000,
+      });
+
+      const expiration = Date.parse(parsePolicy(upload).expiration);
+      expect(providerCalls).toBeGreaterThanOrEqual(1);
+      expect(expiration).toBeLessThanOrEqual(phase11Now + 120_000);
+      expect(expiration).toBeGreaterThanOrEqual(phase11Now + 115_000);
+      expect(upload.expiresAt).toBe(expiration);
+
+      const maxAgeStart = Date.now();
+      const capped = await signer.createPost({
+        bucket: "temporary-docentes",
+        key: "incoming/operation-2/long-policy.txt",
+        name: "long-policy.txt",
+        sizeBytes: fileBytes.byteLength,
+        sha256,
+        contentType: "text/plain",
+        expiresAt: phase11Now + 10 * 60_000,
+      });
+      const cappedExpiration = Date.parse(parsePolicy(capped).expiration);
+      expect(cappedExpiration).toBeLessThanOrEqual(maxAgeStart + 5 * 60_000);
+      expect(cappedExpiration).toBeGreaterThanOrEqual(maxAgeStart + 295_000);
+      expect(capped.expiresAt).toBe(cappedExpiration);
     } finally {
       await s3Client?.destroy();
       vi.useRealTimers();

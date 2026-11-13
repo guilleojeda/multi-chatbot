@@ -13,6 +13,10 @@ import {
 
 const pathFor = (suffix) => `/api/admin/bots/${phase11BotId}/${suffix}`;
 const tokenExpiresAt = phase11Now + 60_000;
+const uploadKeyFor = (operationId, name) =>
+  `incoming/${createHash("sha256").update(operationId).digest("hex")}/${createHash("sha256")
+    .update(name)
+    .digest("hex")}.${name.toLowerCase().split(".").at(-1)}`;
 
 function makeApi(documentAdministrations, { bots = [phase11BotId] } = {}) {
   const configuredBots = bots.map((botId) => ({
@@ -193,11 +197,14 @@ describe("document intention acceptance through the real admin composition", () 
         created: true,
         operation: phase11Operation({
           operationId: input.operationId,
+          documentId: input.documentId,
           action: input.action,
+          revision: input.candidateRevision,
+          file: input.file,
           uploadKey: input.uploadKey,
         }),
       })),
-      getOperation: vi.fn(),
+      getOperation: vi.fn(async () => null),
       getDocument: vi.fn(async ({ documentId }) =>
         documentId === "document-1"
           ? {
@@ -220,7 +227,7 @@ describe("document intention acceptance through the real admin composition", () 
       reserveOperation: vi.fn(),
       recordSource: vi.fn(),
       recordIngestionJob: vi.fn(),
-      updateOperation: vi.fn(),
+      updateOperation: vi.fn(async () => true),
       finishOperation: vi.fn(),
     };
     const uploadSigner = {
@@ -255,7 +262,7 @@ describe("document intention acceptance through the real admin composition", () 
     );
     const signerInput = uploadSigner.createPost.mock.calls[0]?.[0];
 
-    expect(accepted.statusCode).toBe(201);
+    expect(accepted.statusCode, accepted.body).toBe(201);
     expect(store.createIntent).toHaveBeenCalledOnce();
     expect(uploadSigner.createPost).toHaveBeenCalledOnce();
     expect(signerInput).toMatchObject({
@@ -361,7 +368,7 @@ describe("document intention acceptance through the real admin composition", () 
       stage: "upload",
       revision: "candidate-10",
       file: { name: "lesson.txt", sizeBytes: fileBytes.byteLength, sha256: digest },
-      uploadKey: "incoming/start-10/lesson.txt",
+      uploadKey: uploadKeyFor("start-10", "lesson.txt"),
     });
     let storedOperation = structuredClone(operation);
     const store = {
@@ -380,7 +387,7 @@ describe("document intention acceptance through the real admin composition", () 
       }),
       recordSource: vi.fn(),
       recordIngestionJob: vi.fn(),
-      updateOperation: vi.fn(),
+      updateOperation: vi.fn(async () => true),
       finishOperation: vi.fn(),
     };
     let receipt = null;
@@ -476,7 +483,7 @@ describe("document intention acceptance through the real admin composition", () 
     expect(phase11ResponseBody(replay).operation.status).toBe("processing");
     expect(objects.head).toHaveBeenCalledWith({
       bucket: "temporary-docentes",
-      key: "incoming/start-10/lesson.txt",
+      key: operation.uploadKey,
     });
     expect(store.reserveOperation).toHaveBeenCalled();
     expect(execution.start).toHaveBeenCalled();
@@ -589,6 +596,7 @@ describe("document intention acceptance through the real admin composition", () 
       status: "pending_start",
       stage: "source",
       revision: "revision-current",
+      expectedRevision: "revision-current",
     });
     const pendingWithdrawalOperation = phase11Operation({
       operationId: "withdraw-pending",
@@ -628,7 +636,7 @@ describe("document intention acceptance through the real admin composition", () 
       })),
       recordSource: vi.fn(),
       recordIngestionJob: vi.fn(),
-      updateOperation: vi.fn(),
+      updateOperation: vi.fn(async () => true),
       finishOperation: vi.fn(),
     };
     const uploadSigner = {
@@ -680,7 +688,7 @@ describe("document intention acceptance through the real admin composition", () 
         action: "replace",
         documentId: "document-current",
         expectedRevision: "revision-current",
-        file: replacementBody.file,
+        file: expect.objectContaining(replacementBody.file),
       }),
     );
     expect(uploadSigner.createPost).toHaveBeenCalledOnce();
@@ -849,5 +857,282 @@ describe("document intention acceptance through the real admin composition", () 
     expect(store.createIntent).toHaveBeenCalledTimes(writesBeforeInvalid);
     expect(uploadSigner.createPost).toHaveBeenCalledOnce();
     expect(objects.head).not.toHaveBeenCalled();
+  });
+
+  it("preserves caller document and expected revision when replaying an existing operation ID", async () => {
+    const existing = phase11Operation({
+      operationId: "replace-replay",
+      action: "replace",
+      documentId: "document-original",
+      revision: "revision-candidate",
+      expectedRevision: "revision-1",
+      status: "awaiting_upload",
+      stage: "upload",
+      file: { name: "lesson.txt", sizeBytes: 12, sha256: "a".repeat(64) },
+      uploadKey: "incoming/receipt-original.txt",
+    });
+    const store = {
+      listDocuments: vi.fn(),
+      getOperation: vi.fn(async () => existing),
+      getDocument: vi.fn(),
+      createIntent: vi.fn(async () => ({ created: false, operation: existing })),
+      reserveOperation: vi.fn(),
+      recordSource: vi.fn(),
+      recordIngestionJob: vi.fn(),
+      updateOperation: vi.fn(async () => true),
+      finishOperation: vi.fn(),
+    };
+    const createDocumentAdministration = await loadDocumentAdministration();
+    const service = createDocumentAdministration({
+      botId: phase11BotId,
+      store,
+      uploadBucketName: "temporary-docentes",
+      documentBucketName: "prepared-docentes",
+      incomingPrefix: "incoming/",
+      preparedPrefix: "prepared/",
+      uploadSigner: {
+        createPost: vi.fn(async (input) => ({
+          url: "https://s3.example.test/",
+          fields: { key: input.key },
+          expiresAt: input.expiresAt,
+        })),
+      },
+      objects: { head: vi.fn() },
+      execution: { start: vi.fn(), get: vi.fn() },
+      now: () => phase11Now,
+      randomUUID: vi.fn(() => "unused-revision"),
+    });
+
+    await service.createIntent({
+      operationId: "replace-replay",
+      action: "replace",
+      documentId: "document-new-request",
+      expectedRevision: "revision-2",
+      file: { name: "lesson.txt", sizeBytes: 12, sha256: "a".repeat(64) },
+      actorSub: "admin-sub",
+      tokenExpiresAt,
+    });
+
+    expect(store.createIntent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operationId: "replace-replay",
+        action: "replace",
+        documentId: "document-new-request",
+        expectedRevision: "revision-2",
+      }),
+    );
+  });
+
+  it("projects an unavailable or terminal Step Functions execution as unconfirmed without changing the receipt", async () => {
+    const operation = phase11Operation({
+      operationId: "execution-observation-1",
+      action: "upload",
+      status: "processing",
+      stage: "validation",
+      executionName: "doc-1",
+      executionInput: {
+        botId: phase11BotId,
+        operationId: "execution-observation-1",
+        step: "validate",
+      },
+    });
+    const store = {
+      listDocuments: vi.fn(),
+      getOperation: vi.fn(async () => operation),
+      getDocument: vi.fn(),
+      createIntent: vi.fn(),
+      reserveOperation: vi.fn(),
+      recordSource: vi.fn(),
+      recordIngestionJob: vi.fn(),
+      updateOperation: vi.fn(),
+      finishOperation: vi.fn(),
+    };
+    const execution = {
+      start: vi.fn(),
+      get: vi.fn(async () => ({
+        executionArn: "arn:example:execution:doc-1",
+        status: "TIMED_OUT",
+        input: JSON.stringify(operation.executionInput),
+      })),
+    };
+    const createDocumentAdministration = await loadDocumentAdministration();
+    const service = createDocumentAdministration({
+      botId: phase11BotId,
+      store,
+      uploadBucketName: "temporary-docentes",
+      documentBucketName: "prepared-docentes",
+      incomingPrefix: "incoming/",
+      preparedPrefix: "prepared/",
+      uploadSigner: { createPost: vi.fn() },
+      objects: { head: vi.fn() },
+      execution,
+      now: () => phase11Now,
+      randomUUID: vi.fn(),
+    });
+    const handler = makeApi({ [phase11BotId]: service });
+
+    const response = await handler(
+      phase11AdminEvent({
+        method: "GET",
+        path: pathFor("document-operations/execution-observation-1"),
+      }),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(phase11ResponseBody(response).operation.status).toBe("unconfirmed");
+    expect(execution.get).toHaveBeenCalledWith({ name: "doc-1" });
+    expect(execution.start).not.toHaveBeenCalled();
+    expect(store.updateOperation).not.toHaveBeenCalled();
+    expect(store.finishOperation).not.toHaveBeenCalled();
+  });
+
+  it("allows only an explicit start to reuse the same identity after Describe confirms absence", async () => {
+    const operation = phase11Operation({
+      operationId: "execution-observation-2",
+      action: "upload",
+      status: "processing",
+      stage: "validation",
+      executionName: "doc-2",
+      executionInput: {
+        botId: phase11BotId,
+        operationId: "execution-observation-2",
+        step: "validate",
+      },
+    });
+    const store = {
+      listDocuments: vi.fn(),
+      getOperation: vi.fn(async () => operation),
+      getDocument: vi.fn(),
+      createIntent: vi.fn(),
+      reserveOperation: vi.fn(),
+      recordSource: vi.fn(),
+      recordIngestionJob: vi.fn(),
+      updateOperation: vi.fn(async () => true),
+      finishOperation: vi.fn(),
+    };
+    const execution = {
+      get: vi.fn(async () => null),
+      start: vi.fn(async () => ({ executionArn: "arn:example:execution:doc-2" })),
+    };
+    const createDocumentAdministration = await loadDocumentAdministration();
+    const service = createDocumentAdministration({
+      botId: phase11BotId,
+      store,
+      uploadBucketName: "temporary-docentes",
+      documentBucketName: "prepared-docentes",
+      incomingPrefix: "incoming/",
+      preparedPrefix: "prepared/",
+      uploadSigner: { createPost: vi.fn() },
+      objects: { head: vi.fn() },
+      execution,
+      now: () => phase11Now,
+      randomUUID: vi.fn(),
+    });
+    const handler = makeApi({ [phase11BotId]: service });
+
+    const read = await handler(
+      phase11AdminEvent({
+        method: "GET",
+        path: pathFor("document-operations/execution-observation-2"),
+      }),
+    );
+    expect(phase11ResponseBody(read).operation.status).toBe("pending_start");
+    expect(execution.start).not.toHaveBeenCalled();
+
+    const started = await handler(
+      phase11AdminEvent({
+        method: "POST",
+        path: pathFor("document-operations/execution-observation-2/start"),
+        body: {},
+      }),
+    );
+
+    expect(started.statusCode).toBe(202);
+    expect(execution.start).toHaveBeenCalledWith({
+      name: "doc-2",
+      input: operation.executionInput,
+    });
+    expect(store.reserveOperation).not.toHaveBeenCalled();
+    expect(store.updateOperation).toHaveBeenCalledWith({
+      operationId: operation.operationId,
+      patch: { executionArn: "arn:example:execution:doc-2", status: "processing" },
+    });
+  });
+
+  it("does not start an execution when reservation reports a concurrent terminal result", async () => {
+    const pending = phase11Operation({
+      operationId: "terminal-race",
+      action: "withdraw",
+      status: "pending_start",
+      stage: "source",
+      documentId: "document-terminal-race",
+      revision: "revision-1",
+      expectedRevision: "revision-1",
+    });
+    const completed = phase11Operation({
+      ...pending,
+      status: "completed",
+      stage: "result",
+    });
+    const store = {
+      listDocuments: vi.fn(),
+      getOperation: vi.fn(async () => pending),
+      getDocument: vi.fn(async () => ({
+        documentId: pending.documentId,
+        state: "active",
+        name: "lesson.txt",
+        sizeBytes: 12,
+        revision: pending.revision,
+        updatedAt: phase11Now,
+        source: {
+          status: "confirmed",
+          bucket: "prepared-docentes",
+          key: "prepared/document-terminal-race/revision-1/lesson.txt",
+          uri: "s3://prepared-docentes/prepared/document-terminal-race/revision-1/lesson.txt",
+          sizeBytes: 12,
+          sha256: "a".repeat(64),
+        },
+        pendingRemovalKeys: [],
+      })),
+      createIntent: vi.fn(),
+      reserveOperation: vi.fn(async () => ({ reserved: false, operation: completed })),
+      recordSource: vi.fn(),
+      recordIngestionJob: vi.fn(),
+      updateOperation: vi.fn(),
+      finishOperation: vi.fn(),
+    };
+    const execution = {
+      start: vi.fn(),
+      get: vi.fn(),
+    };
+    const createDocumentAdministration = await loadDocumentAdministration();
+    const service = createDocumentAdministration({
+      botId: phase11BotId,
+      store,
+      uploadBucketName: "temporary-docentes",
+      documentBucketName: "prepared-docentes",
+      incomingPrefix: "incoming/",
+      preparedPrefix: "prepared/",
+      uploadSigner: { createPost: vi.fn() },
+      objects: { head: vi.fn() },
+      execution,
+      now: () => phase11Now,
+      randomUUID: vi.fn(),
+    });
+    const handler = makeApi({ [phase11BotId]: service });
+
+    const response = await handler(
+      phase11AdminEvent({
+        method: "POST",
+        path: pathFor("document-operations/terminal-race/start"),
+        body: {},
+      }),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(phase11ResponseBody(response).operation.status).toBe("completed");
+    expect(store.reserveOperation).toHaveBeenCalledOnce();
+    expect(execution.start).not.toHaveBeenCalled();
+    expect(execution.get).not.toHaveBeenCalled();
   });
 });

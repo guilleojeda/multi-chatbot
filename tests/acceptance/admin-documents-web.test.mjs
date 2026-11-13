@@ -402,6 +402,17 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
     const harness = await startAdmin({
       fakeTimers: true,
       behavior: {
+        start: async ({ path }) =>
+          jsonResponse(
+            {
+              botId: botFromPath(path),
+              operation: operationView(path.split("/")[6], "upload", {
+                status: "completed",
+                stage: "result",
+              }),
+            },
+            202,
+          ),
         readOperation: async ({ path }) => {
           reads += 1;
           const operationId = path.split("/").at(-1);
@@ -921,6 +932,12 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
       expect(status(harness.document).join(" ")).toMatch(
         /no se pudo|no pudimos confirmar|inciert/i,
       );
+      if (operationStatus === "unconfirmed") {
+        expect(bodyText(harness.document)).toContain("Resultado sin confirmar");
+        expect(bodyText(harness.document)).not.toMatch(
+          /Retirando documento|Actualizando la fuente/,
+        );
+      }
       expect(bodyText(harness.document)).not.toContain("Retirada procesada");
       expect(bodyText(harness.document)).not.toMatch(/restaurad|revertid|rollback/i);
       expect(documentCalls(harness, "POST", /\/document-operations$/)).toHaveLength(1);
@@ -1223,6 +1240,10 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
 
     const [intent] = documentCalls(harness, "POST", /\/document-operations$/);
     const startsBeforeExplicitRetry = documentCalls(harness, "POST", /\/start$/);
+    expect(bodyText(harness.document)).toContain("Pendiente de inicio");
+    expect(bodyText(harness.document)).not.toMatch(
+      /Actualizando la fuente|Procesando el contenido/,
+    );
     expect(startsBeforeExplicitRetry).toHaveLength(1);
     expect(startsBeforeExplicitRetry[0].path).toContain(intent.body.operationId);
     expect(uploadRequests(harness)).toHaveLength(1);
@@ -1308,12 +1329,14 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
   it("bloquea doble envío durante la misma operación y vuelve a habilitar el formulario al terminar", async () => {
     const pendingCreate = deferred();
     let creates = 0;
+    let submittedIntent;
     let reads = 0;
     const harness = await startAdmin({
       fakeTimers: true,
       behavior: {
-        create: async () => {
+        create: async ({ body }) => {
           creates += 1;
+          submittedIntent = body;
           return pendingCreate.promise;
         },
         readOperation: async ({ path }) => {
@@ -1344,11 +1367,15 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
       jsonResponse(
         {
           botId: "docentes",
-          operation: operationView("stable-operation", "upload", {
+          operation: operationView(submittedIntent.operationId, "upload", {
             status: "awaiting_upload",
             stage: "upload",
           }),
-          upload: uploadTicket("stable-operation", file.name, sha256("contenido de envío")),
+          upload: uploadTicket(
+            submittedIntent.operationId,
+            file.name,
+            sha256("contenido de envío"),
+          ),
         },
         201,
       ),
@@ -1748,6 +1775,42 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
       /old-operation|podés salir|procesamiento completado/i,
     );
     expect(getSectionControl(harness, "Cuotas").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("aborta una lectura documental al cerrar la sección y descarta su respuesta tardía", async () => {
+    const pendingList = deferred();
+    let lists = 0;
+    const harness = await startAdmin({
+      behavior: {
+        list: async ({ path }) => {
+          lists += 1;
+          if (lists === 1) return pendingList.promise;
+          return listView(botFromPath(path), {
+            documents: [documentView({ name: "Documento vigente.pdf" })],
+          });
+        },
+      },
+    });
+    await openDocuments(harness);
+    await waitForRequest(harness, "GET", /\/documents$/);
+    const firstRead = documentCalls(harness, "GET", /\/documents$/)[0];
+    expect(firstRead.signal).toMatchObject({ aborted: false });
+    expect(typeof firstRead.signal.addEventListener).toBe("function");
+
+    await openSection(harness, "Acceso");
+    expect(firstRead.signal.aborted).toBe(true);
+    pendingList.resolve(
+      listView("docentes", {
+        documents: [documentView({ name: "Respuesta tardía.pdf" })],
+      }),
+    );
+    await harness.settle();
+    await openDocuments(harness);
+    await waitForRequest(harness, "GET", /\/documents$/, 2);
+    await waitForText(harness, /Documento vigente\.pdf/);
+
+    expect(bodyText(harness.document)).not.toContain("Respuesta tardía.pdf");
+    expect(documentCalls(harness, "GET", /\/documents$/)).toHaveLength(2);
   });
 
   it("descarta el callback de otro bot sin sobrescribir los documentos seleccionados", async () => {

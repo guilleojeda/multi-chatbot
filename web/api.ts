@@ -22,11 +22,13 @@ export type ApiRequestOptions = {
   method?: "GET" | "POST" | "PUT";
   body?: unknown;
   accessToken?: string | null;
+  signal?: AbortSignal;
 };
 
 export type AuthenticatedRequestOptions = {
   method?: "GET" | "POST" | "PUT";
   body?: unknown;
+  signal?: AbortSignal;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -124,9 +126,13 @@ export async function apiRequest(
       method: options.method || "GET",
       headers,
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+      ...(options.signal ? { signal: options.signal } : {}),
       cache: "no-store",
     });
   } catch {
+    if (options.signal?.aborted) {
+      throw Object.assign(new Error("API request aborted"), { code: "ABORTED", status: 0 });
+    }
     throw Object.assign(new Error("API unavailable"), { code: "NETWORK_ERROR", status: 0 });
   }
 
@@ -173,7 +179,7 @@ export async function requestWithRefresh(
     return await apiRequest(config, path, { ...options, accessToken });
   } catch (error) {
     const firstError = asApiError(error);
-    if (firstError.status !== 401 || !isActive()) throw firstError;
+    if (options.signal?.aborted || firstError.status !== 401 || !isActive()) throw firstError;
 
     let refreshed;
     try {
@@ -182,7 +188,7 @@ export async function requestWithRefresh(
       if (!isActive()) throw firstError;
       throw asApiError(refreshError);
     }
-    if (!isActive()) throw firstError;
+    if (options.signal?.aborted || !isActive()) throw firstError;
     if (!refreshed) throw firstError;
     accessToken = refreshed.accessToken;
     return apiRequest(config, path, { ...options, accessToken });

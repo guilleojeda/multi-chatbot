@@ -128,16 +128,22 @@ function cachingIsDisabled(stack, behavior) {
 function applicationLambda(scenario) {
   const lambdas = records(scenario.admin, "AWS::Lambda::Function");
   const integrations = records(scenario.admin, "AWS::ApiGatewayV2::Integration");
-  const backendLambdas = lambdas.filter(({ logicalId }) =>
-    integrations.some(({ properties }) =>
-      referencesResource(
-        properties.IntegrationUri,
-        scenario.admin,
-        scenario.admin,
-        { logicalId },
-        scenario.assembly,
+  const backendLambdas = lambdas.filter(
+    ({ logicalId, properties }) =>
+      Boolean(
+        properties.Environment?.Variables?.BOT_CATALOG &&
+        properties.Environment?.Variables?.USER_POOL_ID &&
+        properties.Environment?.Variables?.ADMIN_CLIENT_ID,
+      ) &&
+      integrations.some(({ properties: integration }) =>
+        referencesResource(
+          integration.IntegrationUri,
+          scenario.admin,
+          scenario.admin,
+          { logicalId },
+          scenario.assembly,
+        ),
       ),
-    ),
   );
   expect(backendLambdas, "the HTTP API integrates with one application Lambda").toHaveLength(1);
   return backendLambdas[0];
@@ -419,9 +425,38 @@ describe("phase 9 admin infrastructure acceptance", () => {
       if (!scenario) return;
 
       const { assembly, admin, identity, site } = scenario;
-      const bucket = onlyRecord(admin, "AWS::S3::Bucket");
       const distribution = onlyRecord(admin, "AWS::CloudFront::Distribution");
       const originAccess = onlyRecord(admin, "AWS::CloudFront::OriginAccessControl");
+      const deployments = records(admin, "Custom::CDKBucketDeployment");
+      expect(deployments.length).toBeGreaterThan(0);
+      const deploymentWithConfig = deployments.find(({ properties }) =>
+        resourceAssets(assembly, admin, properties).some((asset) =>
+          asset.files.some(
+            ({ relativePath }) => pathBaseName(relativePath) === "public-config.json",
+          ),
+        ),
+      );
+      expect(
+        deploymentWithConfig,
+        "the admin app and its runtime config are staged by this stack",
+      ).toBeDefined();
+      const websiteBuckets = deploymentWithConfig
+        ? records(admin, "AWS::S3::Bucket").filter(({ logicalId }) =>
+            referencesResource(
+              deploymentWithConfig.properties.DestinationBucketName,
+              admin,
+              admin,
+              { logicalId },
+              assembly,
+            ),
+          )
+        : [];
+      expect(
+        websiteBuckets,
+        "the public config deploys to the private website bucket",
+      ).toHaveLength(1);
+      const bucket = websiteBuckets[0];
+      if (!bucket || !deploymentWithConfig) return;
       const distributionConfig = distribution.properties.DistributionConfig;
       const origins = distributionConfig?.Origins || [];
       const s3Origin = origins.find(({ OriginAccessControlId }) =>
@@ -446,8 +481,10 @@ describe("phase 9 admin infrastructure acceptance", () => {
         RestrictPublicBuckets: true,
       });
 
-      const bucketPolicies = records(admin, "AWS::S3::BucketPolicy");
-      expect(bucketPolicies).toHaveLength(1);
+      const bucketPolicies = records(admin, "AWS::S3::BucketPolicy").filter(({ properties }) =>
+        referencesResource(properties.Bucket, admin, admin, bucket, assembly),
+      );
+      expect(bucketPolicies, "the public website has one attached bucket policy").toHaveLength(1);
       const statements = bucketPolicies[0].properties.PolicyDocument?.Statement || [];
       expect(
         statements.some((statement) =>
@@ -474,19 +511,6 @@ describe("phase 9 admin infrastructure acceptance", () => {
       const api = onlyRecord(admin, "AWS::ApiGatewayV2::Api");
       expect(referencesResource(apiOrigin?.DomainName, admin, admin, api, assembly)).toBe(true);
 
-      const deployments = records(admin, "Custom::CDKBucketDeployment");
-      expect(deployments.length).toBeGreaterThan(0);
-      const deploymentWithConfig = deployments.find(({ properties }) =>
-        resourceAssets(assembly, admin, properties).some((asset) =>
-          asset.files.some(
-            ({ relativePath }) => pathBaseName(relativePath) === "public-config.json",
-          ),
-        ),
-      );
-      expect(
-        deploymentWithConfig,
-        "the admin app and its runtime config are staged by this stack",
-      ).toBeDefined();
       const configFile = deploymentWithConfig && publicConfigAsset(scenario, deploymentWithConfig);
       const deploymentAssets = deploymentWithConfig
         ? resourceAssets(assembly, admin, deploymentWithConfig.properties)

@@ -18,6 +18,12 @@ const textBytes = Buffer.from("The lesson closes with an individual reflection.\
 const replacementBytes = Buffer.from("The lesson closes with a group reflection.\n", "utf8");
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const s3Checksum = (bytes) => Buffer.from(sha256(bytes), "hex").toString("base64");
+const uploadKeyFor = (operationId, name) => {
+  const extension = name.split(".").at(-1).toLowerCase();
+  return `incoming/${sha256(Buffer.from(operationId, "utf8"))}/${sha256(Buffer.from(name, "utf8"))}.${extension}`;
+};
+const uploadKey = uploadKeyFor(operationId, "lesson.txt");
+const replacementUploadKey = uploadKeyFor("replace-1", "lesson-b.txt");
 const oldSource = {
   bucket: documentBucketName,
   key: "prepared/document-1/revision-1/lesson-a.txt",
@@ -47,7 +53,8 @@ function uploadOperation(overrides = {}) {
       sha256: sha256(textBytes),
       contentType: "text/plain",
     },
-    uploadKey: "incoming/operation-1/lesson.txt",
+    uploadKey,
+    candidateKey: expectedKey,
     ...overrides,
   });
 }
@@ -65,7 +72,7 @@ function replaceOperation(overrides = {}) {
       sha256: sha256(replacementBytes),
       contentType: "text/plain",
     },
-    uploadKey: "incoming/replace-1/lesson-b.txt",
+    uploadKey: replacementUploadKey,
     candidateKey: replacementSource.key,
     ...overrides,
   });
@@ -194,6 +201,8 @@ function makeStore({ operation = uploadOperation(), document = null, overrides =
     finishOperation: vi.fn(async (input) => {
       calls.push(["finishOperation", input]);
       if (input.outcome) currentOperation.outcome = input.outcome;
+      if (input.operation) currentOperation = structuredClone(input.operation);
+      else if (input.outcome) currentOperation.status = input.outcome;
       return true;
     }),
     ...overrides,
@@ -287,16 +296,16 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
 
     expect(objects.head).toHaveBeenCalledWith({
       bucket: uploadBucketName,
-      key: "incoming/operation-1/lesson.txt",
+      key: uploadKey,
     });
     expect(objects.get).toHaveBeenCalledWith({
       bucket: uploadBucketName,
-      key: "incoming/operation-1/lesson.txt",
+      key: uploadKey,
     });
     expect(objects.copy).toHaveBeenCalledWith(
       expect.objectContaining({
         sourceBucket: uploadBucketName,
-        sourceKey: "incoming/operation-1/lesson.txt",
+        sourceKey: uploadKey,
         destinationBucket: documentBucketName,
         destinationKey: expectedKey,
       }),
@@ -332,7 +341,7 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
     expect(objects.copy).toHaveBeenCalledWith(
       expect.objectContaining({
         sourceBucket: uploadBucketName,
-        sourceKey: "incoming/replace-1/lesson-b.txt",
+        sourceKey: replacementUploadKey,
         destinationBucket: documentBucketName,
         destinationKey: replacementSource.key,
       }),
@@ -360,7 +369,8 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
     expect(store.recordSource.mock.invocationCallOrder.at(-1)).toBeLessThan(
       ingestion.start.mock.invocationCallOrder[0],
     );
-    await run(worker, "observe-ingestion", "replace-1");
+    const observed = await run(worker, "observe-ingestion", "replace-1");
+    expect(observed).toMatchObject({ status: "completed" });
     const completed = await run(worker, "finish", "replace-1");
     expect(completed).toMatchObject({ status: "completed" });
     expect(ingestion.getDocument).toHaveBeenCalledWith({
@@ -433,6 +443,10 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
     expect(objects.copy.mock.invocationCallOrder[0]).toBeLessThan(
       objects.delete.mock.invocationCallOrder[0],
     );
+    expect(ingestion.start).not.toHaveBeenCalled();
+
+    const retried = await run(worker, "start-ingestion", "replace-1");
+    expect(retried).toMatchObject({ status: "failed" });
     expect(ingestion.start).not.toHaveBeenCalled();
   });
 
@@ -977,6 +991,46 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
     );
   });
 
+  it.each([
+    ["a busy Knowledge Base", "ConflictException"],
+    ["a lost StartIngestionJob acknowledgement", "TimeoutError"],
+  ])(
+    "waits and retries after %s with the same persisted idempotency token",
+    async (_label, errorName) => {
+      const start = vi
+        .fn()
+        .mockRejectedValueOnce(
+          Object.assign(new Error("Ingestion start was not confirmed"), { name: errorName }),
+        )
+        .mockResolvedValueOnce({ jobId: "ingestion-job-1" });
+      const ingestion = makeIngestion({ start });
+      const { worker, store } = await makeWorkerContext({
+        operation: confirmedUploadOperation(),
+        document: confirmedDocument(),
+        ingestion,
+      });
+      store.updateOperation.mockRejectedValueOnce(
+        Object.assign(new Error("DynamoDB acknowledgement was lost"), { name: "TimeoutError" }),
+      );
+      store.recordIngestionJob.mockRejectedValueOnce(
+        Object.assign(new Error("DynamoDB acknowledgement was lost"), { name: "TimeoutError" }),
+      );
+
+      await expect(run(worker, "start-ingestion")).resolves.toMatchObject({ status: "waiting" });
+      const persisted = await store.getOperation({ operationId });
+      expect(persisted.ingestionClientToken).toMatch(/^[a-f0-9]{64}$/);
+      await expect(run(worker, "start-ingestion")).resolves.toMatchObject({ status: "ready" });
+
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(start.mock.calls[0][0].clientToken).toBe(start.mock.calls[1][0].clientToken);
+      expect(store.recordIngestionJob).toHaveBeenCalledTimes(2);
+      expect(store.recordIngestionJob.mock.calls.map(([input]) => input)).toEqual([
+        { operationId, jobId: "ingestion-job-1" },
+        { operationId, jobId: "ingestion-job-1" },
+      ]);
+    },
+  );
+
   it("reprocesses a confirmed source without copying the file or invoking a model", async () => {
     const operation = phase11Operation({
       operationId: "reprocess-1",
@@ -990,17 +1044,23 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
         bucket: documentBucketName,
         key: expectedKey,
         uri: expectedUri,
+        sizeBytes: textBytes.byteLength,
         sha256: sha256(textBytes),
       },
     });
     const document = {
       documentId,
       name: "lesson.txt",
+      sizeBytes: textBytes.byteLength,
       revision,
+      state: "active",
+      pendingRemovalKeys: [],
       source: {
+        status: "confirmed",
         bucket: documentBucketName,
         key: expectedKey,
         uri: expectedUri,
+        sizeBytes: textBytes.byteLength,
         sha256: sha256(textBytes),
       },
     };

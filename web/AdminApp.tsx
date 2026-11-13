@@ -14,6 +14,7 @@ import {
   readAdminPublicConfig,
   type AdminPublicConfig,
 } from "./admin-api";
+import { AdminDocuments } from "./AdminDocuments";
 import { asApiError } from "./api";
 import type { Session } from "./session";
 import "./admin-style.css";
@@ -43,7 +44,7 @@ type AdminProfile = {
   invitation?: { expiresAt: number; delivery: Delivery; invitedEmail?: string };
 };
 type Message = { kind: "status" | "error"; text: string };
-type AdminSection = "access" | "quotas";
+type AdminSection = "access" | "quotas" | "documents";
 type QuotaField = "dailyLimit" | "monthlyLimit";
 type QuotaDraft = { dailyLimit: string; monthlyLimit: string };
 type QuotaView =
@@ -1369,6 +1370,8 @@ export function AdminApp({ getSession }: AdminAppProps) {
   };
 
   const selectedBot = bots.find((bot) => bot.botId === selectedBotId);
+  const documentsSession = sessionRef.current;
+  const documentsIdentityTicket = identityEpochRef.current;
   const canInvite = Boolean(
     profile && profile.access.state !== "active" && profile.botId === selectedBotId,
   );
@@ -1728,6 +1731,15 @@ export function AdminApp({ getSession }: AdminAppProps) {
                 >
                   Cuotas
                 </button>
+                <button
+                  className="admin-section-nav__button"
+                  type="button"
+                  aria-pressed={activeSection === "documents"}
+                  disabled={!selectedBotId}
+                  onClick={() => changeSection("documents")}
+                >
+                  Documentos
+                </button>
               </nav>
             </div>
 
@@ -1872,7 +1884,7 @@ export function AdminApp({ getSession }: AdminAppProps) {
                   )}
                 </section>
               </div>
-            ) : (
+            ) : activeSection === "quotas" ? (
               <section className="admin-card admin-quota-card" aria-labelledby="admin-quota-title">
                 <div className="admin-card__heading">
                   <span className="admin-step">03</span>
@@ -2012,7 +2024,27 @@ export function AdminApp({ getSession }: AdminAppProps) {
                   Actualizar límites
                 </button>
               </section>
-            )}
+            ) : null}
+            {activeSection === "documents" && selectedBot && config && documentsSession ? (
+              <AdminDocuments
+                key={`${selectedBot.botId}:${adminSub}:${adminEmail}`}
+                botId={selectedBot.botId}
+                projectName={selectedBot.projectName}
+                config={config}
+                session={documentsSession}
+                onAuthorizationError={(status) => {
+                  if (!documentsSession) return;
+                  leaveSession(
+                    documentsSession,
+                    documentsIdentityTicket,
+                    status === 403 ? "forbidden" : "login",
+                    status === 403
+                      ? "Esta cuenta ya no tiene permiso de administrador. La sesión se cerró."
+                      : "La sesión venció. Iniciá sesión nuevamente.",
+                  );
+                }}
+              />
+            ) : null}
             <footer className="admin-footer">
               <span>Administración compartida · {config?.environment}</span>
               {activeSection === "access" ? (

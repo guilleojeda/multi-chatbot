@@ -176,8 +176,17 @@ function routeRecords(admin, pathAndMethod) {
 
 function apiHandler(scenario) {
   const lambdas = records(scenario.admin, "AWS::Lambda::Function");
+  const candidates = lambdas.filter(({ properties }) => {
+    const variables = properties.Environment?.Variables || {};
+    return Boolean(
+      variables.BOT_CATALOG &&
+      variables.USER_POOL_ID &&
+      variables.ADMIN_CLIENT_ID &&
+      variables.ADMIN_GROUP,
+    );
+  });
   const integrations = records(scenario.admin, "AWS::ApiGatewayV2::Integration");
-  const matches = lambdas.filter(({ logicalId }) =>
+  const matches = candidates.filter(({ logicalId }) =>
     integrations.some(({ properties }) =>
       referencesResource(
         properties.IntegrationUri,
@@ -367,7 +376,15 @@ function reachable(definition, fromName, toName) {
 }
 
 function workerTaskPayload(state) {
-  const payload = state.Parameters?.Payload || state.Arguments?.Payload;
+  const directPayload = state.Parameters || state.Arguments;
+  const payload =
+    state.Parameters?.Payload ||
+    state.Arguments?.Payload ||
+    (directPayload &&
+    typeof directPayload === "object" &&
+    Object.keys(directPayload).some((key) => ["botId", "botId.$"].includes(key))
+      ? directPayload
+      : undefined);
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
   const normalized = Object.fromEntries(
     Object.entries(payload).map(([key, value]) => [key.replace(/\.\$$/, ""), value]),
@@ -607,6 +624,30 @@ describe("phase 11.1 document administration infrastructure acceptance", () => {
           assembly,
         ),
         "the docentes catalog entry selects its own AdminStack receipt bucket",
+      ).toBe(true);
+      const receiptPolicies = records(admin, "AWS::S3::BucketPolicy").filter(({ properties }) =>
+        referencesResource(properties.Bucket, admin, admin, receipt, assembly),
+      );
+      expect(receiptPolicies, "the temporary receipt bucket has its own HTTPS policy").toHaveLength(
+        1,
+      );
+      const receiptPolicyStatements =
+        receiptPolicies[0]?.properties.PolicyDocument?.Statement || [];
+      expect(receiptPolicyStatements.length).toBeGreaterThan(0);
+      expect(
+        receiptPolicyStatements.every((statement) => statement.Effect === "Deny"),
+        "the receipt policy grants no public access",
+      ).toBe(true);
+      expect(
+        receiptPolicyStatements.some((statement) => {
+          const secureTransport = statement.Condition?.Bool?.["aws:SecureTransport"];
+          return (
+            statement.Effect === "Deny" &&
+            (secureTransport === "false" || secureTransport === false) &&
+            referencesResource(statement.Resource, admin, admin, receipt, assembly)
+          );
+        }),
+        "the receipt bucket rejects insecure transport",
       ).toBe(true);
       expect(
         catalogEntryReferences(
@@ -1003,6 +1044,7 @@ describe("phase 11.1 document administration infrastructure acceptance", () => {
       ).toHaveLength(1);
       return {
         scenario,
+        botId,
         ...bot,
         environment,
         bucket,
@@ -1035,7 +1077,6 @@ describe("phase 11.1 document administration infrastructure acceptance", () => {
       receipt,
       knowledgeBase,
       dataSource,
-      catalog,
       catalogParsed,
       catalogEntry,
     } of configs) {
@@ -1045,7 +1086,7 @@ describe("phase 11.1 document administration infrastructure acceptance", () => {
       expect(worker, `${scenario.environment} has a document worker`).toBeDefined();
       if (!worker) continue;
       const workerStatements = roleStatements(scenario, worker);
-      expect(stringIncludes(catalog, botId)).toBe(true);
+      expect(catalogEntry?.botId).toBe(botId);
       expect(
         catalogEntryReferences(
           catalogEntry,

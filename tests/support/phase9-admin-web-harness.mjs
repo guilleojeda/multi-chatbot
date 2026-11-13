@@ -143,6 +143,7 @@ export async function createAdminWebHarness(
       headers,
       body: parseJsonBody(init.body),
       rawBody: init.body,
+      signal: init.signal,
     };
     apiRequests.push(request);
     const route = routes.find(

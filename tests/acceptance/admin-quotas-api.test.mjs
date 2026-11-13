@@ -4,6 +4,18 @@ const botId = "docentes";
 const conversationTableName = "chat-docentes";
 const policyKey = { pk: `BOT#${botId}`, sk: "QUOTA#POLICY" };
 const policyPath = `/api/admin/bots/${botId}/quota`;
+function documentResourcesFor(targetBotId) {
+  return {
+    documentTableName: `documents-${targetBotId}`,
+    uploadBucketName: `incoming-${targetBotId}`,
+    documentBucketName: `prepared-${targetBotId}`,
+    incomingPrefix: "incoming/",
+    preparedPrefix: "prepared/",
+    knowledgeBaseId: `knowledge-base-${targetBotId}`,
+    dataSourceId: `data-source-${targetBotId}`,
+    stateMachineArn: `arn:aws:states:us-east-1:118903272638:stateMachine:${targetBotId}-admin-documents`,
+  };
+}
 const defaultBot = {
   botId,
   projectName: "Docentes",
@@ -11,6 +23,7 @@ const defaultBot = {
   conversationTableName,
   clientId: "chat-client",
   siteUrl: "https://docentes.example.test/",
+  ...documentResourcesFor(botId),
 };
 const adminClaims = {
   sub: "admin-sub",
@@ -424,6 +437,7 @@ describe("administrative quota GET API", () => {
       conversationTableName: "chat-matematica",
       clientId: "matematica-client",
       siteUrl: "https://matematica.example.test/",
+      ...documentResourcesFor("matematica"),
     };
     const harness = await loadAdminLambda({
       bots: [defaultBot, secondBot],
@@ -942,6 +956,7 @@ describe("administrative quota PUT API", () => {
       conversationTableName: "chat-matematica",
       clientId: "matematica-client",
       siteUrl: "https://matematica.example.test/",
+      ...documentResourcesFor("matematica"),
     };
     const harness = await loadAdminLambda({
       bots: [defaultBot, secondBot],
