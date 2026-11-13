@@ -45,6 +45,7 @@ type UploadReceipt = {
   ticket: DocumentUploadView;
   file: File;
 };
+type DocumentFileIssue = "DOCUMENT_TOO_LARGE" | "DOCUMENT_EMPTY" | "INVALID_DOCUMENT_NAME";
 
 const acceptedExtensions = Object.keys(DOCUMENT_CONTENT_TYPES)
   .map((extension) => `.${extension}`)
@@ -162,6 +163,34 @@ async function sha256(file: File): Promise<string> {
 function formatFileSize(sizeBytes: number): string {
   if (sizeBytes < 1_000_000) return `${sizeBytes.toLocaleString("es-AR")} bytes`;
   return `${(sizeBytes / 1_000_000).toLocaleString("es-AR", { maximumFractionDigits: 1 })} MB`;
+}
+
+function documentFileIssue(file: File): DocumentFileIssue | null {
+  if (file.size > DOCUMENT_MAX_BYTES) return "DOCUMENT_TOO_LARGE";
+  const invalidFields = validateDocumentFile({
+    name: file.name,
+    sizeBytes: file.size,
+    sha256: "0".repeat(64),
+  });
+  if (invalidFields.includes("name")) return "INVALID_DOCUMENT_NAME";
+  if (invalidFields.includes("sizeBytes")) return "DOCUMENT_EMPTY";
+  return null;
+}
+
+function documentFileIssueMessage(issue: DocumentFileIssue): string {
+  if (issue === "DOCUMENT_TOO_LARGE") {
+    return "El archivo supera el límite de 50.000.000 bytes (50 MB). Elegí un archivo más pequeño.";
+  }
+  if (issue === "DOCUMENT_EMPTY") return "El archivo está vacío. Elegí un archivo con contenido.";
+  return "El formato del archivo no está admitido. Elegí TXT, MD, HTML, DOC, DOCX, CSV, XLS, XLSX o PDF.";
+}
+
+function isDocumentFileIssue(value: unknown): value is DocumentFileIssue {
+  return (
+    value === "DOCUMENT_TOO_LARGE" ||
+    value === "DOCUMENT_EMPTY" ||
+    value === "INVALID_DOCUMENT_NAME"
+  );
 }
 
 function errorStatus(error: unknown): number {
@@ -472,16 +501,8 @@ export function AdminDocuments({
     try {
       if (!requestBody) {
         if (!pending.file) throw new Error("INVALID_RESPONSE");
-        if (pending.file.size > DOCUMENT_MAX_BYTES) {
-          throw new Error("DOCUMENT_TOO_LARGE");
-        }
-        const errors = validateDocumentFile({
-          name: pending.file.name,
-          sizeBytes: pending.file.size,
-          sha256: "0".repeat(64),
-        });
-        if (errors.includes("name")) throw new Error("INVALID_DOCUMENT_NAME");
-        if (errors.includes("sizeBytes")) throw new Error("INVALID_DOCUMENT_SIZE");
+        const fileIssue = documentFileIssue(pending.file);
+        if (fileIssue) throw new Error(fileIssue);
         const digest = await sha256(pending.file);
         const file = { name: pending.file.name, sizeBytes: pending.file.size, sha256: digest };
         const body: DocumentIntentBody = pending.target
@@ -532,17 +553,8 @@ export function AdminDocuments({
       const code = errorCode(error);
       const status = errorStatus(error);
       markAuthorizationFailure(error);
-      if (error instanceof Error && error.message === "DOCUMENT_TOO_LARGE") {
-        setNotice({
-          kind: "error",
-          text: "El archivo supera el límite de 50.000.000 bytes (50 MB). Elegí un archivo más pequeño.",
-        });
-        setPending(null);
-      } else if (error instanceof Error && error.message === "INVALID_DOCUMENT_NAME") {
-        setNotice({
-          kind: "error",
-          text: "El formato del archivo no está admitido. Elegí TXT, MD, HTML, DOC, DOCX, CSV, XLS, XLSX o PDF.",
-        });
+      if (error instanceof Error && isDocumentFileIssue(error.message)) {
+        setNotice({ kind: "error", text: documentFileIssueMessage(error.message) });
         setPending(null);
       } else if (error instanceof Error && error.message === "INVALID_RESPONSE") {
         setPending(null);
@@ -691,23 +703,9 @@ export function AdminDocuments({
   const beginFileOperation = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (actionLocked || !selectedFile) return;
-    const errors = validateDocumentFile({
-      name: selectedFile.name,
-      sizeBytes: selectedFile.size,
-      sha256: "0".repeat(64),
-    });
-    if (selectedFile.size > DOCUMENT_MAX_BYTES) {
-      setNotice({
-        kind: "error",
-        text: "El archivo supera el límite de 50.000.000 bytes (50 MB). Elegí un archivo más pequeño.",
-      });
-      return;
-    }
-    if (errors.length > 0) {
-      setNotice({
-        kind: "error",
-        text: "El formato del archivo no está admitido. Elegí TXT, MD, HTML, DOC, DOCX, CSV, XLS, XLSX o PDF.",
-      });
+    const fileIssue = documentFileIssue(selectedFile);
+    if (fileIssue) {
+      setNotice({ kind: "error", text: documentFileIssueMessage(fileIssue) });
       return;
     }
     const pending: PendingIntent = {
