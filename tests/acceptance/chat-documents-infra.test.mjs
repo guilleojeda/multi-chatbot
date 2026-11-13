@@ -10,7 +10,6 @@ import { SharedIdentityStack } from "../../dist/infra/lib/shared-identity-stack.
 
 const temporaryDirectories = new Set();
 const scenarioCache = new Map();
-const expectedConversationTableId = "ConversationTable75C14D21";
 
 afterAll(() => {
   for (const directory of temporaryDirectories) {
@@ -31,6 +30,16 @@ function records(template, type) {
 function onlyRecord(template, type, message = `expected one ${type}`) {
   const matches = records(template, type);
   expect(matches, message).toHaveLength(1);
+  return matches[0];
+}
+
+function conversationTable(template) {
+  const runtime = onlyRecord(template, "AWS::BedrockAgentCore::Runtime");
+  const tableReference = runtime.properties.EnvironmentVariables?.CONVERSATION_TABLE_NAME;
+  const matches = records(template, "AWS::DynamoDB::Table").filter(({ logicalId }) =>
+    referencesResource(tableReference, logicalId),
+  );
+  expect(matches, "Runtime's configured conversation table remains in ChatStack").toHaveLength(1);
   return matches[0];
 }
 
@@ -284,7 +293,7 @@ describe("chat documents infrastructure template acceptance", () => {
       const { chatTemplate, accountTemplate, identityTemplate, siteTemplate } = templates;
 
       const runtime = onlyRecord(chatTemplate, "AWS::BedrockAgentCore::Runtime");
-      const conversationTable = onlyRecord(chatTemplate, "AWS::DynamoDB::Table");
+      const conversation = conversationTable(chatTemplate);
       const documentBucket = onlyRecord(chatTemplate, "AWS::S3::Bucket");
       const vectorBucket = onlyRecord(chatTemplate, "AWS::S3Vectors::VectorBucket");
       const vectorIndex = onlyRecord(chatTemplate, "AWS::S3Vectors::Index");
@@ -295,7 +304,7 @@ describe("chat documents infrastructure template acceptance", () => {
       const accountClient = onlyRecord(accountTemplate, "AWS::Cognito::UserPoolClient");
 
       // Keep one correctly wired Runtime and the existing conversation table.
-      expect(conversationTable.logicalId).toBe(expectedConversationTableId);
+      expect(conversation.logicalId).toBe("ConversationTable75C14D21");
       expect(documentBucket.logicalId).not.toBe(webBucket.logicalId);
       expect(documentBucket.properties.WebsiteConfiguration).toBeUndefined();
       expect(documentBucket.properties.PublicAccessBlockConfiguration).toMatchObject({
@@ -528,7 +537,7 @@ describe("chat documents infrastructure template acceptance", () => {
         botId,
         stackName: bot.chatStackName,
         runtime: onlyRecord(template, "AWS::BedrockAgentCore::Runtime"),
-        table: onlyRecord(template, "AWS::DynamoDB::Table"),
+        table: conversationTable(template),
         documentBucket: onlyRecord(template, "AWS::S3::Bucket"),
         vectorBucket: onlyRecord(template, "AWS::S3Vectors::VectorBucket"),
         vectorIndex: onlyRecord(template, "AWS::S3Vectors::Index"),

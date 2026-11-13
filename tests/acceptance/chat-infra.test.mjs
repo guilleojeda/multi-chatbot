@@ -36,6 +36,16 @@ function onlyRecord(template, type, message = `expected one ${type}`) {
   return matches[0];
 }
 
+function runtimeConversationTable(template) {
+  const runtime = onlyRecord(template, "AWS::BedrockAgentCore::Runtime");
+  const tableReference = runtime.properties.EnvironmentVariables?.CONVERSATION_TABLE_NAME;
+  const matches = records(template, "AWS::DynamoDB::Table").filter(({ logicalId }) =>
+    referencesResource(tableReference, logicalId),
+  );
+  expect(matches, "Runtime's configured conversation table remains in ChatStack").toHaveLength(1);
+  return matches[0];
+}
+
 function actions(statement) {
   return Array.isArray(statement.Action) ? statement.Action : [statement.Action];
 }
@@ -408,7 +418,7 @@ describe("chat infrastructure acceptance", () => {
       if (!chatTemplate || !accountTemplate || !identityTemplate) return;
 
       const runtime = onlyRecord(chatTemplate, "AWS::BedrockAgentCore::Runtime");
-      const conversationTable = onlyRecord(chatTemplate, "AWS::DynamoDB::Table");
+      const conversationTable = runtimeConversationTable(chatTemplate);
       const properties = runtime.properties;
       const authorizer = properties.AuthorizerConfiguration?.CustomJWTAuthorizer;
       const accountClient = onlyRecord(accountTemplate, "AWS::Cognito::UserPoolClient");
@@ -493,7 +503,7 @@ describe("chat infrastructure acceptance", () => {
       expect(records(chatTemplate, "AWS::ApiGatewayV2::Api")).toHaveLength(0);
       expect(records(chatTemplate, "AWS::Lambda::Function")).toHaveLength(1);
       expect(records(chatTemplate, "AWS::CloudFront::Distribution")).toHaveLength(0);
-      expect(records(chatTemplate, "AWS::DynamoDB::Table")).toHaveLength(1);
+      expect(records(chatTemplate, "AWS::DynamoDB::Table")).toHaveLength(2);
       expect(records(accountTemplate, "AWS::ApiGatewayV2::Api")).toHaveLength(1);
       expect(records(accountTemplate, "AWS::Lambda::Function")).toHaveLength(1);
       expect(records(accountTemplate, "AWS::DynamoDB::Table")).toHaveLength(1);
@@ -528,7 +538,7 @@ describe("chat infrastructure acceptance", () => {
         (statement) => matchingActions([statement], "dynamodb:").length > 0,
       );
       const accountTable = onlyRecord(accountTemplate, "AWS::DynamoDB::Table");
-      const conversationTable = onlyRecord(chatTemplate, "AWS::DynamoDB::Table");
+      const conversationTable = runtimeConversationTable(chatTemplate);
       const accountReads = dynamoStatements.filter((statement) =>
         referencesExportedOutput(
           statement.Resource,
@@ -811,7 +821,7 @@ describe("chat infrastructure acceptance", () => {
       if (!template) return undefined;
       return {
         runtime: onlyRecord(template, "AWS::BedrockAgentCore::Runtime"),
-        table: onlyRecord(template, "AWS::DynamoDB::Table"),
+        table: runtimeConversationTable(template),
         config: runtimeConfig(dev, bot),
       };
     });
@@ -819,7 +829,7 @@ describe("chat infrastructure acceptance", () => {
     expect(prodTemplate).toBeDefined();
     if (!prodTemplate) return;
     const prodRuntime = onlyRecord(prodTemplate, "AWS::BedrockAgentCore::Runtime");
-    const prodTable = onlyRecord(prodTemplate, "AWS::DynamoDB::Table");
+    const prodTable = runtimeConversationTable(prodTemplate);
 
     const names = [
       ...recordsByBot.flatMap((record) => [record?.table.properties.TableName]),

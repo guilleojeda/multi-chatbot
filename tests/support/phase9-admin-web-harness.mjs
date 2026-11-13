@@ -1,5 +1,6 @@
 import React, { act } from "react";
 import { JSDOM } from "jsdom";
+import { webcrypto } from "node:crypto";
 import { vi } from "vitest";
 import { createSession } from "../../web/session.ts";
 
@@ -48,6 +49,10 @@ export function jsonResponse(value, status = 200) {
   });
 }
 
+function parseJsonBody(body) {
+  return typeof body === "string" && body.trim() ? JSON.parse(body) : undefined;
+}
+
 function makeSession({
   restoreResults = [null],
   signInResult = { accessToken: "admin-access", idToken: "admin-id" },
@@ -87,6 +92,10 @@ export async function createAdminWebHarness(
     pretendToBeVisual: true,
   });
   const document = dom.window.document;
+  Object.defineProperty(dom.window.crypto, "subtle", {
+    configurable: true,
+    value: webcrypto.subtle,
+  });
   const adminStorage = new AdminMemoryStorage();
   if (!useRealSession) adminStorage.setItem("auth-refresh", "admin-refresh-token");
   Object.defineProperty(dom.window, "sessionStorage", { configurable: true, value: adminStorage });
@@ -100,6 +109,8 @@ export async function createAdminWebHarness(
   vi.stubGlobal("document", document);
   vi.stubGlobal("HTMLElement", dom.window.HTMLElement);
   vi.stubGlobal("navigator", dom.window.navigator);
+  vi.stubGlobal("File", dom.window.File);
+  vi.stubGlobal("FormData", dom.window.FormData);
   vi.stubGlobal("sessionStorage", adminStorage);
 
   const fetch = vi.fn(async (input, init = {}) => {
@@ -116,7 +127,7 @@ export async function createAdminWebHarness(
         operation: target.split(".").at(-1) ?? "",
         target,
         headers,
-        body: typeof init.body === "string" ? JSON.parse(init.body) : undefined,
+        body: parseJsonBody(init.body),
       };
       cognitoRequests.push(request);
       const route = cognitoRoutes.get(target);
@@ -127,14 +138,17 @@ export async function createAdminWebHarness(
     const request = {
       method,
       path: url.pathname,
+      hostname: url.hostname,
       url,
       headers,
-      body: typeof init.body === "string" ? JSON.parse(init.body) : undefined,
+      body: parseJsonBody(init.body),
+      rawBody: init.body,
     };
     apiRequests.push(request);
     const route = routes.find(
       (candidate) =>
         candidate.method === method &&
+        (candidate.hostname === undefined || candidate.hostname === request.hostname) &&
         (typeof candidate.path === "string"
           ? candidate.path === request.path
           : candidate.path.test(request.path)),
@@ -167,8 +181,8 @@ export async function createAdminWebHarness(
     apiRequests,
     cognitoRequests,
     adminStorage,
-    route(method, path, handler) {
-      routes.push({ method: method.toUpperCase(), path, handler });
+    route(method, path, handler, { hostname } = {}) {
+      routes.push({ method: method.toUpperCase(), path, hostname, handler });
     },
     cognito(operation, handler) {
       cognitoRoutes.set(`AWSCognitoIdentityProviderService.${operation}`, handler);
@@ -203,6 +217,45 @@ export async function createAdminWebHarness(
         element.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
         for (let step = 0; step < 2; step += 1) await Promise.resolve();
       });
+    },
+    async setFiles(element, files) {
+      if (!element) throw new Error("Expected a visible, accessible file input");
+      const fileList = [...files];
+      fileList.item = (index) => fileList[index] ?? null;
+      Object.defineProperty(element, "files", {
+        configurable: true,
+        value: fileList,
+      });
+      await act(async () => {
+        element.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        for (let step = 0; step < 2; step += 1) await Promise.resolve();
+      });
+    },
+    useFakeTimers() {
+      vi.useFakeTimers();
+      dom.window.setTimeout = (...args) => globalThis.setTimeout(...args);
+      dom.window.clearTimeout = (...args) => globalThis.clearTimeout(...args);
+      dom.window.setInterval = (...args) => globalThis.setInterval(...args);
+      dom.window.clearInterval = (...args) => globalThis.clearInterval(...args);
+      dom.window.requestAnimationFrame = (callback) => globalThis.setTimeout(callback, 16);
+      dom.window.cancelAnimationFrame = (timer) => globalThis.clearTimeout(timer);
+    },
+    async advanceTimers(milliseconds) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(milliseconds);
+        for (let step = 0; step < 10; step += 1) await Promise.resolve();
+      });
+    },
+    setVisibility(visibilityState) {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        value: visibilityState,
+      });
+      Object.defineProperty(document, "hidden", {
+        configurable: true,
+        value: visibilityState === "hidden",
+      });
+      document.dispatchEvent(new dom.window.Event("visibilitychange"));
     },
     async dispose() {
       await act(async () => root.unmount());
