@@ -495,7 +495,10 @@ export function AdminDocuments({
     mutationRef.current = true;
     if (mountedRef.current) {
       setBusy(true);
-      setNotice({ kind: "status", text: "Calculando la huella del archivo…" });
+      setNotice({
+        kind: "status",
+        text: pending.file ? "Calculando la huella del archivo…" : "Preparando la operación…",
+      });
     }
     let requestBody = pending.body;
     try {
