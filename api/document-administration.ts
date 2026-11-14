@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   DOCUMENT_MAX_BYTES,
   documentContentTypeForName,
+  isValidDocumentFileName,
   validateDocumentFile,
   type DocumentAction,
   type DocumentErrorView,
@@ -115,7 +116,10 @@ function updatedAt(value: number | string): string {
   return new Date(time).toISOString();
 }
 
-function publicOperation(operation: DocumentOperationRecord): DocumentOperationView {
+function publicOperation(
+  operation: DocumentOperationRecord,
+  documentName?: string,
+): DocumentOperationView {
   if (
     typeof operation.operationId !== "string" ||
     typeof operation.documentId !== "string" ||
@@ -135,6 +139,13 @@ function publicOperation(operation: DocumentOperationRecord): DocumentOperationV
   ) {
     throw errorWithCode("DOCUMENTS_UNAVAILABLE", "The operation record is invalid.");
   }
+  const operationDocumentName = operation.file?.name ?? documentName;
+  if (
+    (operation.file && operation.action !== "upload" && operation.action !== "replace") ||
+    (operationDocumentName !== undefined && !isValidDocumentFileName(operationDocumentName))
+  ) {
+    throw errorWithCode("DOCUMENTS_UNAVAILABLE", "The operation record is invalid.");
+  }
   const error = operation.error && isRecord(operation.error) ? operation.error : undefined;
   const errorView: DocumentErrorView | undefined =
     error && typeof error.code === "string" && typeof error.message === "string"
@@ -144,6 +155,7 @@ function publicOperation(operation: DocumentOperationRecord): DocumentOperationV
     operationId: operation.operationId,
     documentId: operation.documentId,
     action: operation.action,
+    ...(operationDocumentName !== undefined ? { documentName: operationDocumentName } : {}),
     status: operation.status,
     stage: operation.stage,
     revision: operation.revision,
@@ -204,18 +216,6 @@ function sourceUrisFor(document: DocumentRecord, documentBucketName: string): st
     uris.push(key.startsWith("s3://") ? key : uriFor(documentBucketName, key));
   }
   return [...new Set(uris)];
-}
-
-function operationResponse(
-  botId: string,
-  operation: DocumentOperationRecord,
-  upload?: DocumentUploadView,
-): DocumentOperationResponse {
-  return {
-    botId,
-    operation: publicOperation(operation),
-    ...(upload ? { upload } : {}),
-  };
 }
 
 function sameExecutionInput(
@@ -333,6 +333,28 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
     return { kind: "contradictory" };
   }
 
+  async function publicOperationView(
+    operation: DocumentOperationRecord,
+    knownDocument?: DocumentRecord | null,
+  ): Promise<DocumentOperationView> {
+    let documentName = operation.file?.name;
+    if (
+      documentName === undefined &&
+      operation.action !== "upload" &&
+      operation.status !== "completed" &&
+      operation.status !== "failed"
+    ) {
+      let document = knownDocument;
+      if (document === undefined) {
+        document = await store.getDocument({ documentId: operation.documentId }).catch(() => {
+          throw errorWithCode("DOCUMENTS_UNAVAILABLE", "The document record is unavailable.");
+        });
+      }
+      documentName = document?.name;
+    }
+    return publicOperation(operation, documentName);
+  }
+
   function projectExecution(
     operation: DocumentOperationRecord,
     observation: ExecutionObservation,
@@ -385,8 +407,22 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
             .filter((document) => document.state === "active")
             .map(publicDocument),
           nextCursor: page.nextCursor,
-          activeOperation: activeOperation ? publicOperation(activeOperation) : null,
-          lastOperation: page.lastOperation ? publicOperation(page.lastOperation) : null,
+          activeOperation: activeOperation
+            ? await publicOperationView(
+                activeOperation,
+                page.documents.find(
+                  (document) => document.documentId === activeOperation.documentId,
+                ),
+              )
+            : null,
+          lastOperation: page.lastOperation
+            ? await publicOperationView(
+                page.lastOperation,
+                page.documents.find(
+                  (document) => document.documentId === page.lastOperation?.documentId,
+                ),
+              )
+            : null,
         };
       } catch (error) {
         if (isRecord(error) && error.code === "INVALID_INPUT") throw error;
@@ -520,7 +556,11 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
         result.operation.action === "upload" || result.operation.action === "replace"
           ? await signIntent(result.operation, tokenExpiresAt)
           : undefined;
-      return operationResponse(botId, result.operation, upload);
+      return {
+        botId,
+        operation: await publicOperationView(result.operation, document ?? undefined),
+        ...(upload ? { upload } : {}),
+      };
     },
 
     async start({ operationId }) {
@@ -531,7 +571,7 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
       });
       if (!operation) throw errorWithCode("NOT_FOUND", "The operation was not found.");
       if (operation.status === "completed" || operation.status === "failed") {
-        return { operation: publicOperation(operation), startConfirmed: true };
+        return { operation: await publicOperationView(operation), startConfirmed: true };
       }
 
       const uploadAction = operation.action === "upload" || operation.action === "replace";
@@ -564,7 +604,7 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
 
       if (operation.status === "unconfirmed") {
         return {
-          operation: publicOperation(
+          operation: await publicOperationView(
             projectExecution(operation, await observeExecution(operation)),
           ),
           startConfirmed: false,
@@ -574,7 +614,7 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
         const observation = await observeExecution(operation);
         if (observation.kind === "running") {
           return {
-            operation: publicOperation(projectExecution(operation, observation)),
+            operation: await publicOperationView(projectExecution(operation, observation)),
             startConfirmed: true,
           };
         }
@@ -584,12 +624,12 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
           observation.kind === "contradictory"
         ) {
           return {
-            operation: publicOperation(projectExecution(operation, observation)),
+            operation: await publicOperationView(projectExecution(operation, observation)),
             startConfirmed: false,
           };
         }
         if (!operation.executionName || !operation.executionInput) {
-          return { operation: publicOperation(operation), startConfirmed: false };
+          return { operation: await publicOperationView(operation), startConfirmed: false };
         }
         // Reuse the durable name and exact input after an ambiguous acknowledgement.
         try {
@@ -599,7 +639,9 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
           });
           if (started.status && started.status !== "RUNNING") {
             return {
-              operation: publicOperation(projectExecution(operation, { kind: "terminal" })),
+              operation: await publicOperationView(
+                projectExecution(operation, { kind: "terminal" }),
+              ),
               startConfirmed: false,
             };
           }
@@ -611,10 +653,12 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
             if (!saved) {
               const current = await store.getOperation({ operationId }).catch(() => null);
               if (current && (current.status === "completed" || current.status === "failed")) {
-                return { operation: publicOperation(current), startConfirmed: true };
+                return { operation: await publicOperationView(current), startConfirmed: true };
               }
               return {
-                operation: publicOperation(projectExecution(operation, { kind: "unavailable" })),
+                operation: await publicOperationView(
+                  projectExecution(operation, { kind: "unavailable" }),
+                ),
                 startConfirmed: false,
               };
             }
@@ -625,17 +669,17 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
               error: undefined,
             };
           }
-          return { operation: publicOperation(operation), startConfirmed: true };
+          return { operation: await publicOperationView(operation), startConfirmed: true };
         } catch {
           const recovered = await observeExecution(operation);
           if (recovered.kind === "running") {
             return {
-              operation: publicOperation(projectExecution(operation, recovered)),
+              operation: await publicOperationView(projectExecution(operation, recovered)),
               startConfirmed: true,
             };
           }
           return {
-            operation: publicOperation(projectExecution(operation, recovered)),
+            operation: await publicOperationView(projectExecution(operation, recovered)),
             startConfirmed: false,
           };
         }
@@ -694,11 +738,14 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
       operation = reservation.operation;
       if (!reservation.reserved) {
         if (operation.status === "completed" || operation.status === "failed") {
-          return { operation: publicOperation(operation), startConfirmed: true };
+          return {
+            operation: await publicOperationView(operation, document),
+            startConfirmed: true,
+          };
         }
         const observed = await observeExecution(operation);
         return {
-          operation: publicOperation(projectExecution(operation, observed)),
+          operation: await publicOperationView(projectExecution(operation, observed), document),
           startConfirmed: operation.status === "processing" && observed.kind === "running",
         };
       }
@@ -706,7 +753,10 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
         const started = await execution.start({ name: executionName, input: executionInput });
         if (started.status && started.status !== "RUNNING") {
           return {
-            operation: publicOperation(projectExecution(operation, { kind: "terminal" })),
+            operation: await publicOperationView(
+              projectExecution(operation, { kind: "terminal" }),
+              document,
+            ),
             startConfirmed: false,
           };
         }
@@ -718,16 +768,25 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
           if (!saved) {
             const current = await store.getOperation({ operationId }).catch(() => null);
             if (current && (current.status === "completed" || current.status === "failed")) {
-              return { operation: publicOperation(current), startConfirmed: true };
+              return {
+                operation: await publicOperationView(current, document),
+                startConfirmed: true,
+              };
             }
             return {
-              operation: publicOperation(projectExecution(operation, { kind: "unavailable" })),
+              operation: await publicOperationView(
+                projectExecution(operation, { kind: "unavailable" }),
+                document,
+              ),
               startConfirmed: false,
             };
           }
           operation = { ...operation, executionArn: started.executionArn };
         }
-        return { operation: publicOperation(operation), startConfirmed: true };
+        return {
+          operation: await publicOperationView(operation, document),
+          startConfirmed: true,
+        };
       } catch {
         const recovered = await observeExecution(operation);
         if (recovered.kind === "running") {
@@ -740,12 +799,12 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
               .catch(() => false);
           }
           return {
-            operation: publicOperation(projectExecution(operation, recovered)),
+            operation: await publicOperationView(projectExecution(operation, recovered), document),
             startConfirmed: true,
           };
         }
         return {
-          operation: publicOperation(projectExecution(operation, recovered)),
+          operation: await publicOperationView(projectExecution(operation, recovered), document),
           startConfirmed: false,
         };
       }
@@ -762,7 +821,7 @@ export function createDocumentAdministration(options: CreateOptions): DocumentAd
         operation.status === "processing" || operation.status === "unconfirmed"
           ? projectExecution(operation, await observeExecution(operation))
           : operation;
-      return { operation: publicOperation(projected) };
+      return { operation: await publicOperationView(projected) };
     },
   };
 }

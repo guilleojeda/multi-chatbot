@@ -817,6 +817,10 @@ export function AdminDocuments({
 
   const activeOperation =
     list?.activeOperation ?? (operation && !isTerminal(operation) ? operation : null);
+  const activeOperationDocumentName = activeOperation
+    ? (activeOperation.documentName ??
+      list?.documents.find((document) => document.documentId === activeOperation.documentId)?.name)
+    : undefined;
   const locked = busy || Boolean(pendingIntent) || Boolean(activeOperation);
   const activeOperationHeading = activeOperation
     ? activeOperation.status === "awaiting_upload"
@@ -976,6 +980,9 @@ export function AdminDocuments({
       {activeOperation ? (
         <div className="admin-documents__active" role="status">
           <strong>{activeOperationHeading}</strong>
+          {activeOperationDocumentName ? (
+            <span>Documento: {activeOperationDocumentName}</span>
+          ) : null}
           {activeOperationStage ? <span>{activeOperationStage}</span> : null}
           <p>{activeOperationDetail}</p>
         </div>
