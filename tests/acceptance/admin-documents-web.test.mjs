@@ -144,6 +144,7 @@ function documentView(overrides = {}) {
     revision: "revision-1",
     updatedAt: "2026-11-13T12:00:00.000Z",
     canReplace: true,
+    canRetry: false,
     processing: { status: "completed", operationId: "operation-1" },
     ...overrides,
   };
@@ -982,7 +983,25 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
                 })
               : failedWithdraw;
           return listView(botFromPath(path), {
-            documents: [],
+            documents:
+              retryStatus === "completed"
+                ? []
+                : [
+                    documentView({
+                      documentId: "document-a",
+                      name: "A retirada.txt",
+                      revision: "revision-current",
+                      canRetry: true,
+                      processing: {
+                        status: "failed",
+                        operationId: "failed-withdraw",
+                        error: {
+                          code: "INGESTION_FAILED",
+                          message: "La fuente ya se retiró; falta completar la sincronización.",
+                        },
+                      },
+                    }),
+                  ],
             activeOperation:
               startConfirmed && retryStatus !== "completed"
                 ? operationView(retryIntent.operationId, "withdraw", {
@@ -1024,6 +1043,12 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
           );
         },
         readOperation: async ({ path }) => {
+          if (path.endsWith("/failed-withdraw")) {
+            return jsonResponse({
+              botId: botFromPath(path),
+              operation: failedWithdraw,
+            });
+          }
           reads += 1;
           retryStatus = reads >= 2 ? "completed" : "processing";
           return jsonResponse({
@@ -1513,6 +1538,7 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
             documents: [
               documentView({
                 canReplace: retryCompleted,
+                canRetry: !retryCompleted,
                 processing: {
                   ...(retryCompleted
                     ? { status: "completed", operationId: reprocessOperationId }
@@ -1603,6 +1629,7 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
                 documentId: "document-b",
                 name: "Fuente parcial.pdf",
                 canReplace: false,
+                canRetry: true,
                 processing: {
                   status: "failed",
                   operationId: "previous-failure",
@@ -1975,5 +2002,429 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
     expect(bodyText(harness.document)).toMatch(/no pudimos|inválid|actualizar|reintentar/i);
     expect(status(harness.document).join(" ")).toMatch(/no pudimos|inválid|actualizar|reintentar/i);
     expect(bodyText(harness.document)).not.toContain("Procesamiento completado");
+  });
+
+  it("reintenta A con su recibo aunque B sea la última operación del bot", async () => {
+    let retryOperationId = "";
+    let retryReads = 0;
+    const failedA = operationView("failed-A", "replace", {
+      documentId: "document-a",
+      revision: "revision-a",
+      status: "failed",
+      stage: "source",
+      canRetry: true,
+      error: { code: "INGESTION_FAILED", message: "A necesita reproceso." },
+    });
+    const completedB = operationView("completed-B", "upload", {
+      documentId: "document-b",
+      revision: "revision-b",
+      status: "completed",
+      stage: "result",
+    });
+    const harness = await startAdmin({
+      fakeTimers: true,
+      behavior: {
+        list: async ({ path }) =>
+          listView(botFromPath(path), {
+            documents: [
+              documentView({
+                documentId: "document-a",
+                name: "A.txt",
+                revision: "revision-a",
+                canRetry: true,
+                processing: {
+                  status: retryReads > 1 ? "completed" : "failed",
+                  operationId: retryReads > 1 ? retryOperationId : "failed-A",
+                  ...(retryReads > 1
+                    ? {}
+                    : { error: { code: "INGESTION_FAILED", message: "A necesita reproceso." } }),
+                },
+              }),
+              documentView({
+                documentId: "document-b",
+                name: "B.txt",
+                revision: "revision-b",
+              }),
+            ],
+            lastOperation: completedB,
+          }),
+        readOperation: async ({ path }) => {
+          const operationId = path.split("/").at(-1);
+          if (operationId === "failed-A") {
+            return jsonResponse({ botId: botFromPath(path), operation: failedA });
+          }
+          retryReads += 1;
+          return jsonResponse({
+            botId: botFromPath(path),
+            operation: operationView(operationId, "reprocess", {
+              documentId: "document-a",
+              revision: "revision-a",
+              status: retryReads > 1 ? "completed" : "processing",
+              stage: retryReads > 1 ? "result" : "ingestion",
+            }),
+          });
+        },
+        create: async ({ body, path }) => {
+          retryOperationId = body.operationId;
+          return jsonResponse(
+            {
+              botId: botFromPath(path),
+              operation: operationView(body.operationId, "reprocess", {
+                documentId: body.documentId,
+                revision: "revision-a",
+                status: "pending_start",
+                stage: "source",
+              }),
+            },
+            201,
+          );
+        },
+        start: async ({ path }) =>
+          jsonResponse(
+            {
+              botId: botFromPath(path),
+              operation: operationView(path.split("/")[6], "reprocess", {
+                documentId: "document-a",
+                revision: "revision-a",
+              }),
+            },
+            202,
+          ),
+      },
+    });
+
+    await openDocuments(harness);
+    await waitForText(harness, /A necesita reproceso/);
+    await harness.click(getDocumentAction(harness, "Reintentar procesamiento", "A.txt"));
+    await waitForRequest(harness, "GET", /\/document-operations\/failed-A$/);
+    await waitForRequest(harness, "POST", /\/document-operations$/);
+    await waitForRequest(harness, "POST", /\/start$/);
+
+    const [intent] = documentCalls(harness, "POST", /\/document-operations$/);
+    expect(intent.body).toEqual({
+      operationId: expect.any(String),
+      action: "reprocess",
+      documentId: "document-a",
+      expectedRevision: "revision-a",
+    });
+    expect(documentCalls(harness, "GET", /\/document-operations\/failed-A$/)).toHaveLength(1);
+    expect(documentCalls(harness, "POST", /\/start$/)).toHaveLength(1);
+    expect(uploadRequests(harness)).toHaveLength(0);
+  });
+
+  it("no anuncia continuidad durante una subida pendiente y empieza solo tras su ACK", async () => {
+    const pendingUpload = deferred();
+    let uploadAcknowledged = false;
+    const harness = await startAdmin({
+      fakeTimers: true,
+      behavior: {
+        upload: async () => {
+          const response = await pendingUpload.promise;
+          uploadAcknowledged = response.ok;
+          return response;
+        },
+        readOperation: async ({ path }) =>
+          jsonResponse({
+            botId: botFromPath(path),
+            operation: operationView(path.split("/").at(-1), "upload", {
+              status: uploadAcknowledged ? "completed" : "awaiting_upload",
+              stage: uploadAcknowledged ? "result" : "upload",
+            }),
+          }),
+      },
+    });
+    await openDocuments(harness);
+    await submitFile(harness, makeFile(harness, "Lento.txt", "contenido"));
+    await waitFor(() => expect(uploadRequests(harness)).toHaveLength(1));
+    expect(documentCalls(harness, "POST", /\/start$/)).toHaveLength(0);
+
+    await harness.advanceTimers(operationPollIntervalMs);
+    await waitForRequest(harness, "GET", /\/document-operations\/[^/]+$/);
+    expect(documentCalls(harness, "POST", /\/start$/)).toHaveLength(0);
+    expect(bodyText(harness.document)).toContain(
+      "El servidor espera la carga del archivo. El procesamiento todavía no empezó.",
+    );
+    expect(bodyText(harness.document)).not.toContain(
+      "El procesamiento está en curso. Podés salir; continuará en el servidor.",
+    );
+
+    pendingUpload.resolve(new Response(null, { status: 204 }));
+    await waitForRequest(harness, "POST", /\/start$/);
+    await waitForText(harness, /Procesamiento completado/);
+    expect(documentCalls(harness, "POST", /\/start$/)).toHaveLength(1);
+  });
+
+  it("renueva un permiso vencido por la misma intención de reemplazo y completa una sola vez", async () => {
+    const contents = "contenido que mantiene el mismo hash";
+    let createCalls = 0;
+    let uploadCalls = 0;
+    let startCalls = 0;
+    const tickets = [];
+    const bodies = [];
+    const harness = await startAdmin({
+      fakeTimers: true,
+      behavior: {
+        list: async ({ path }) =>
+          listView(botFromPath(path), {
+            documents: [
+              documentView({
+                documentId: "document-a",
+                name: "A.txt",
+                revision: "revision-a",
+              }),
+            ],
+          }),
+        create: async ({ body, path }) => {
+          createCalls += 1;
+          bodies.push(body);
+          const base = uploadTicket(body.operationId, body.file.name, body.file.sha256);
+          const ticket = {
+            ...base,
+            url: `https://${uploadHost}/bucket?signature=grant-${createCalls}`,
+            fields: {
+              ...base.fields,
+              policy: `policy-${createCalls}`,
+              "x-amz-signature": `signature-${createCalls}`,
+            },
+          };
+          tickets.push(ticket);
+          return jsonResponse(
+            {
+              botId: botFromPath(path),
+              operation: operationView(body.operationId, "replace", {
+                documentId: body.documentId,
+                revision: "candidate-revision",
+                status: "awaiting_upload",
+                stage: "upload",
+              }),
+              upload: ticket,
+            },
+            201,
+          );
+        },
+        upload: async () => {
+          uploadCalls += 1;
+          return new Response(null, { status: uploadCalls === 1 ? 403 : 204 });
+        },
+        start: async ({ path }) => {
+          startCalls += 1;
+          return jsonResponse(
+            {
+              botId: botFromPath(path),
+              operation: operationView(path.split("/")[6], "replace", {
+                documentId: "document-a",
+                revision: "candidate-revision",
+              }),
+            },
+            202,
+          );
+        },
+        readOperation: async ({ path }) =>
+          jsonResponse({
+            botId: botFromPath(path),
+            operation: operationView(path.split("/").at(-1), "replace", {
+              documentId: "document-a",
+              revision: "candidate-revision",
+              status: startCalls > 0 ? "completed" : "awaiting_upload",
+              stage: startCalls > 0 ? "result" : "upload",
+            }),
+          }),
+      },
+    });
+    const file = makeFile(harness, "A-reemplazo.txt", contents);
+
+    await openDocuments(harness);
+    await harness.click(getDocumentAction(harness, "Reemplazar", "A.txt"));
+    await chooseFile(harness, file);
+    await harness.click(getButton(harness, "Reemplazar y procesar"));
+    await waitForRequest(harness, "POST", /\/document-operations$/);
+    await waitFor(() => expect(uploadRequests(harness)).toHaveLength(1));
+    await waitFor(() => expect(button(harness.document, "Reintentar subida")).toBeTruthy());
+
+    await harness.advanceTimers(61_000);
+    expect(tickets[0].expiresAt).toBeLessThanOrEqual(Date.now());
+    await harness.click(getButton(harness, "Reintentar subida"));
+    await waitForRequest(harness, "POST", /\/document-operations$/, 2);
+    await waitFor(() => expect(uploadRequests(harness)).toHaveLength(2));
+    await waitForRequest(harness, "POST", /\/start$/);
+    await waitForText(harness, /Procesamiento completado/);
+
+    expect(createCalls).toBe(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[0]).toEqual({
+      operationId: expect.any(String),
+      action: "replace",
+      documentId: "document-a",
+      expectedRevision: "revision-a",
+      file: { name: file.name, sizeBytes: file.size, sha256: sha256(contents) },
+    });
+    const uploads = uploadRequests(harness);
+    expect(uploads.map((request) => request.url.searchParams.get("signature"))).toEqual([
+      "grant-1",
+      "grant-2",
+    ]);
+    expect(uploads.map((request) => Object.fromEntries(request.rawBody.entries()).policy)).toEqual([
+      "policy-1",
+      "policy-2",
+    ]);
+    expect(documentCalls(harness, "POST", /\/start$/)).toHaveLength(1);
+    expect(documentCalls(harness, "GET", /\/document-operations\/[^/]+$/).length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it.each([
+    ["conflicto", 409, "STATE_CHANGED", [...adminTokens], /el documento cambió/i],
+    [
+      "autorización",
+      401,
+      "UNAUTHORIZED",
+      [...adminTokens, null],
+      /sesión venció|iniciá sesión nuevamente/i,
+    ],
+  ])(
+    "no sube ni inicia si la renovación falla por %s",
+    async (name, statusCode, code, restoreResults, message) => {
+      let createCalls = 0;
+      const harness = await startAdmin({
+        restoreResults,
+        behavior: {
+          create: async ({ body, path }) => {
+            createCalls += 1;
+            if (createCalls > 1) return jsonResponse({ code }, statusCode);
+            return jsonResponse(
+              {
+                botId: botFromPath(path),
+                operation: operationView(body.operationId, "upload", {
+                  status: "awaiting_upload",
+                  stage: "upload",
+                }),
+                upload: uploadTicket(body.operationId, body.file.name, body.file.sha256),
+              },
+              201,
+            );
+          },
+          upload: async () => new Response(null, { status: 403 }),
+        },
+      });
+      await openDocuments(harness);
+      await submitFile(harness, makeFile(harness, `${name}.txt`, "mismo archivo"));
+      await waitFor(() => expect(button(harness.document, "Reintentar subida")).toBeTruthy());
+      await harness.click(getButton(harness, "Reintentar subida"));
+      await waitFor(() => expect(createCalls).toBeGreaterThanOrEqual(2));
+
+      expect(uploadRequests(harness)).toHaveLength(1);
+      expect(documentCalls(harness, "POST", /\/start$/)).toHaveLength(0);
+      expect(bodyText(harness.document)).not.toContain("Procesamiento completado");
+      expect(bodyText(harness.document)).toMatch(message);
+    },
+  );
+
+  it("recupera un inicio que otra sesión confirmó durante la subida fallida, sin repetir efectos", async () => {
+    let creates = 0;
+    let starts = 0;
+    const intentBodies = [];
+    let operationId = "";
+    const harness = await startAdmin({
+      behavior: {
+        create: async ({ body, path }) => {
+          creates += 1;
+          intentBodies.push(body);
+          operationId = body.operationId;
+          return jsonResponse(
+            {
+              botId: botFromPath(path),
+              operation: operationView(body.operationId, "upload", {
+                status: creates === 1 ? "awaiting_upload" : "processing",
+                stage: creates === 1 ? "upload" : "ingestion",
+              }),
+              ...(creates === 1
+                ? { upload: uploadTicket(body.operationId, body.file.name, body.file.sha256) }
+                : {}),
+            },
+            201,
+          );
+        },
+        upload: async () => new Response(null, { status: 403 }),
+        start: async ({ path }) => {
+          starts += 1;
+          return jsonResponse(
+            {
+              botId: botFromPath(path),
+              operation: operationView(path.split("/")[6], "upload"),
+            },
+            202,
+          );
+        },
+        readOperation: async ({ path }) =>
+          jsonResponse({
+            botId: botFromPath(path),
+            operation: operationView(path.split("/").at(-1), "upload", {
+              status: "processing",
+              stage: "ingestion",
+            }),
+          }),
+      },
+    });
+    await openDocuments(harness);
+    await submitFile(harness, makeFile(harness, "Ya iniciado.txt", "contenido"));
+    await waitFor(() => expect(button(harness.document, "Reintentar subida")).toBeTruthy());
+    await harness.click(getButton(harness, "Reintentar subida"));
+    await waitForRequest(harness, "POST", /\/document-operations$/, 2);
+    await waitForRequest(harness, "GET", new RegExp(`/document-operations/${operationId}$`));
+
+    expect(intentBodies[1]).toEqual(intentBodies[0]);
+    expect(uploadRequests(harness)).toHaveLength(1);
+    expect(starts).toBe(0);
+    expect(documentCalls(harness, "POST", /\/start$/)).toHaveLength(0);
+    expect(bodyText(harness.document)).toContain(
+      "El procesamiento está en curso. Podés salir; continuará en el servidor.",
+    );
+    expect(bodyText(harness.document)).not.toContain("Procesamiento completado");
+  });
+
+  it("descarta el recibo tardío de una fila al salir de Documentos", async () => {
+    const pendingRead = deferred();
+    const failed = operationView("failed-row", "replace", {
+      documentId: "document-a",
+      revision: "revision-a",
+      status: "failed",
+      canRetry: true,
+      error: { code: "INGESTION_FAILED", message: "A necesita reproceso." },
+    });
+    const harness = await startAdmin({
+      behavior: {
+        list: async ({ path }) =>
+          listView(botFromPath(path), {
+            documents: [
+              documentView({
+                documentId: "document-a",
+                name: "A.txt",
+                revision: "revision-a",
+                canRetry: true,
+                processing: {
+                  status: "failed",
+                  operationId: "failed-row",
+                  error: failed.error,
+                },
+              }),
+            ],
+          }),
+        readOperation: async ({ path }) =>
+          path.endsWith("/failed-row")
+            ? pendingRead.promise
+            : jsonResponse({ botId: botFromPath(path), operation: failed }),
+      },
+    });
+    await openDocuments(harness);
+    await harness.click(getDocumentAction(harness, "Reintentar procesamiento", "A.txt"));
+    await waitForRequest(harness, "GET", /\/document-operations\/failed-row$/);
+    await harness.click(getSectionControl(harness, "Cuotas"));
+    pendingRead.resolve(jsonResponse({ botId: "docentes", operation: failed }));
+    await harness.settle();
+
+    expect(documentCalls(harness, "POST", /\/document-operations$/)).toHaveLength(0);
+    expect(documentCalls(harness, "POST", /\/start$/)).toHaveLength(0);
+    expect(uploadRequests(harness)).toHaveLength(0);
   });
 });

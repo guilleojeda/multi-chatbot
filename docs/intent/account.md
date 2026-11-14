@@ -76,6 +76,10 @@ produce conflicto. Consultar no vuelve a ejecutar efectos. Un 201 de intención 
 no significa publicación exitosa. Los permisos de recepción solo se devuelven al solicitarlos;
 la lista, los resultados y la configuración pública no exponen claves o URIs internas.
 
+Si vence el permiso de recepción después de una transferencia fallida, reintentar obtiene otro
+permiso para la misma intención y el mismo archivo. La recepción pendiente nunca anuncia que
+el procesamiento continuará por sí solo: esa continuidad requiere inicio confirmado.
+
 Hay un solo cambio activo por bot. Reemplazar conserva la identidad lógica y usa una clave nueva
 por revisión; retirar requiere confirmación y afecta búsquedas futuras tras el procesamiento y
 la propagación. Cambiar bot, sección o sesión descarta callbacks anteriores y detiene el sondeo
@@ -95,6 +99,12 @@ la fuente confirmada sin volver a subirla; retirar elimina la actual y sus pendi
 borrado ya se confirmó pero falló la sincronización de una retirada, el documento sigue visible
 con error y un nuevo intento conserva las URIs que debe observar, sin reconstruir los borrados.
 La fila retirada solo deja de ser vigente después de confirmar el resultado de baja.
+
+El reintento corresponde al fallo de cada documento, aunque después se haya operado sobre otro.
+Su recibo determina si corresponde reprocesar o volver a intentar una retirada. Los diagnósticos
+de ingestión conservan categorías reconocidas y cantidades disponibles, sin publicar los motivos
+crudos del proveedor, nombres o URIs. Una causa desconocida no se presenta como un error de
+formato o acceso confirmado.
 
 Un efecto o resultado incierto conserva la reserva y pide consultar/reconciliar antes de otro
 cambio. No vence por reloj ni tiene botón para forzar liberación. Las operaciones administrativas

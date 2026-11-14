@@ -192,6 +192,7 @@ function publicDocument(document: DocumentRecord): DocumentView {
       document.state === "active" &&
       document.pendingRemovalKeys.length === 0 &&
       document.canReplace !== false,
+    canRetry: document.canRetry === true,
     processing: {
       status: processing.status,
       operationId: processing.operationId,

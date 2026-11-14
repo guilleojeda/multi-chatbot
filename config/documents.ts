@@ -49,6 +49,7 @@ export type DocumentView = {
   revision: string;
   updatedAt: string;
   canReplace: boolean;
+  canRetry: boolean;
   processing: {
     status: DocumentProcessingStatus;
     operationId: string;
@@ -198,6 +199,7 @@ export function parseDocumentView(value: unknown): DocumentView | null {
     typeof value.updatedAt !== "string" ||
     !Number.isFinite(Date.parse(value.updatedAt)) ||
     typeof value.canReplace !== "boolean" ||
+    typeof value.canRetry !== "boolean" ||
     !isRecord(value.processing) ||
     !isProcessingStatus(value.processing.status) ||
     typeof value.processing.operationId !== "string" ||
@@ -212,6 +214,7 @@ export function parseDocumentView(value: unknown): DocumentView | null {
     revision: value.revision,
     updatedAt: value.updatedAt,
     canReplace: value.canReplace,
+    canRetry: value.canRetry,
     processing: {
       status: value.processing.status,
       operationId: value.processing.operationId,
