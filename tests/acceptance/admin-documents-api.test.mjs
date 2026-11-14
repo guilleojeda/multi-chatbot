@@ -193,7 +193,24 @@ describe("document intention acceptance through the real admin composition", () 
     const createDocumentAdministration = await loadDocumentAdministration();
     const store = {
       listDocuments: vi.fn(async () => ({
-        documents: [],
+        documents: [
+          {
+            documentId: "failed-document",
+            state: "active",
+            name: "lesson-failed.txt",
+            sizeBytes: 12,
+            revision: "revision-failed",
+            updatedAt: phase11Now,
+            source: null,
+            pendingRemovalKeys: [],
+            canRetry: true,
+            processing: {
+              status: "failed",
+              operationId: "failed-A",
+              error: { code: "INGESTION_FAILED", message: "La fuente requiere reproceso." },
+            },
+          },
+        ],
         nextCursor: "next-page",
         activeOperation: phase11Operation({
           operationId: "reprocess-active",
@@ -293,9 +310,18 @@ describe("document intention acceptance through the real admin composition", () 
     expect(signerInput.key.split("/")).not.toContain("..");
     expect(phase11ResponseBody(accepted).upload.fields.key).toBe(signerInput.key);
 
+    const readsBeforeList = store.getOperation.mock.calls.length;
     const listing = await handler(phase11AdminEvent({ method: "GET", path: pathFor("documents") }));
     expect(listing.statusCode).toBe(200);
-    expect(phase11ResponseBody(listing).documents).toEqual([]);
+    expect(phase11ResponseBody(listing).documents).toMatchObject([
+      {
+        documentId: "failed-document",
+        canRetry: true,
+        processing: { status: "failed", operationId: "failed-A" },
+      },
+    ]);
+    expect(phase11ResponseBody(listing).documents[0]).not.toHaveProperty("source");
+    expect(store.getOperation).toHaveBeenCalledTimes(readsBeforeList);
     expect(phase11ResponseBody(listing).nextCursor).toBe("next-page");
     expect(phase11ResponseBody(listing).activeOperation).toMatchObject({
       action: "reprocess",

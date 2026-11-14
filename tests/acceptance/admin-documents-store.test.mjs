@@ -80,8 +80,13 @@ describe("document DynamoDB store acceptance", () => {
       revision: "revision-1",
       pendingRemovalKeys: [],
       canReplace: true,
+      canRetry: true,
       updatedAt: phase11Now,
-      processing: { status: "completed", operationId },
+      processing: {
+        status: "failed",
+        operationId,
+        error: { code: "INGESTION_FAILED", message: "Retry is available." },
+      },
     };
     const recorder = phase11CommandRecorder(async (command) => {
       if (command instanceof QueryCommand) {
@@ -112,6 +117,10 @@ describe("document DynamoDB store acceptance", () => {
     expect(JSON.stringify(query.input.ExpressionAttributeValues)).toContain("DOCUMENT#");
     expect(query.input.Limit).toBe(1);
     expect(page.documents).toMatchObject([{ documentId, name: "lesson.txt", sizeBytes: 20 }]);
+    expect(page.documents[0]).toMatchObject({
+      canRetry: true,
+      processing: { status: "failed", operationId },
+    });
     expect(typeof page.documents[0].updatedAt).toBe("string");
     expect(typeof page.nextCursor).toBe("string");
     expect(page.documents[0]).not.toHaveProperty("sourceUri");

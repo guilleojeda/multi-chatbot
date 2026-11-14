@@ -75,6 +75,8 @@ type Ingestion = {
   }): Promise<{ status: IngestionDocumentStatus; sourceUri: string } | null>;
 };
 
+type IngestionJob = NonNullable<Awaited<ReturnType<Ingestion["get"]>>>;
+
 type WorkerResources = Pick<
   DocumentBotResources,
   | "botId"
@@ -127,6 +129,55 @@ const SAFE_ERRORS = {
     message: "El estado documental cambió y la operación no pudo continuar.",
   },
 } as const;
+
+function ingestionFailureError(job: IngestionJob): { code: string; message: string } {
+  const reasons = Array.isArray(job.failureReasons)
+    ? job.failureReasons.filter((reason): reason is string => typeof reason === "string")
+    : [];
+  const extractionFailure = reasons.some((reason) =>
+    /could not be parsed|could not be extracted|unable to extract|unsupported (?:file )?format|not (?:in|a) (?:a )?supported format|properly formatted/i.test(
+      reason,
+    ),
+  );
+  const accessFailure = reasons.some((reason) =>
+    /access denied|permission denied|not authorized|unauthori[sz]ed|unable to access|failed to access|could not access/i.test(
+      reason,
+    ),
+  );
+  const failureCount = job.statistics?.numberOfDocumentsFailed;
+  const knownFailureCount =
+    typeof failureCount === "number" && Number.isSafeInteger(failureCount) && failureCount >= 0
+      ? failureCount
+      : undefined;
+  const countMessage =
+    knownFailureCount === undefined ? "" : ` Documentos con error: ${knownFailureCount}.`;
+
+  if (extractionFailure) {
+    return {
+      code: SAFE_ERRORS.ingestionFailed.code,
+      message:
+        "La sincronización no pudo extraer o interpretar el contenido de uno o más archivos preparados. Revisá su formato y contenido; reemplazalos si hace falta antes de reintentar el procesamiento." +
+        countMessage,
+    };
+  }
+  if (accessFailure) {
+    return {
+      code: SAFE_ERRORS.ingestionFailed.code,
+      message:
+        "La sincronización no pudo acceder a la fuente. Solicitá una revisión técnica antes de reintentar el procesamiento." +
+        countMessage,
+    };
+  }
+  if (reasons.length > 0 || knownFailureCount !== undefined) {
+    return {
+      code: SAFE_ERRORS.ingestionFailed.code,
+      message:
+        "La sincronización falló. No se pudo clasificar la causa; solicitá una revisión técnica antes de reintentar el procesamiento." +
+        countMessage,
+    };
+  }
+  return SAFE_ERRORS.ingestionFailed;
+}
 
 class InvalidDocumentError extends Error {}
 
@@ -915,13 +966,13 @@ export function createDocumentWorker({
       return { status: "unconfirmed", error: SAFE_ERRORS.observationUnconfirmed };
     }
     if (job.status === "FAILED" || job.status === "STOPPED") {
-      return { status: "failed", error: SAFE_ERRORS.ingestionFailed };
+      return { status: "failed", error: ingestionFailureError(job) };
     }
     if (!job.statistics || !Number.isInteger(job.statistics.numberOfDocumentsFailed)) {
       return { status: "unconfirmed", error: SAFE_ERRORS.observationUnconfirmed };
     }
     if (job.statistics.numberOfDocumentsFailed !== 0) {
-      return { status: "failed", error: SAFE_ERRORS.ingestionFailed };
+      return { status: "failed", error: ingestionFailureError(job) };
     }
 
     const uris =

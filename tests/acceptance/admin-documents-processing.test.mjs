@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
+import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { describe, expect, it, vi } from "vitest";
 import {
   phase11BotId,
@@ -280,6 +281,96 @@ async function makeWorkerWithStore({
     ingestion,
     now: () => phase11Now,
   });
+}
+
+async function makeWorkerWithDynamoStore({ operation, document, ingestion }) {
+  const tableName = "documents-docentes";
+  const partition = `BOT#${phase11BotId}`;
+  const rows = new Map(
+    [
+      {
+        pk: partition,
+        sk: `OPERATION#${operation.operationId}`,
+        botId: phase11BotId,
+        ...operation,
+      },
+      { pk: partition, sk: `DOCUMENT#${document.documentId}`, botId: phase11BotId, ...document },
+      {
+        pk: partition,
+        sk: "CONTROL",
+        botId: phase11BotId,
+        activeOperationId: operation.operationId,
+      },
+    ].map((row) => [`${row.pk}\u0000${row.sk}`, row]),
+  );
+  const rowKey = (key) => `${key.pk}\u0000${key.sk}`;
+  const applyUpdate = (update) => {
+    const row = rows.get(rowKey(update.Key));
+    if (!row) throw new Error(`Missing test row ${update.Key.sk}`);
+    const names = update.ExpressionAttributeNames || {};
+    const values = update.ExpressionAttributeValues || {};
+    const resolveName = (name) => names[name] || name;
+    const [setClause = "", removeClause = ""] = update.UpdateExpression.split(" REMOVE ");
+    for (const assignment of setClause
+      .replace(/^SET\s+/, "")
+      .split(", ")
+      .filter(Boolean)) {
+      const [name, value] = assignment.split(" = ");
+      row[resolveName(name)] = structuredClone(values[value]);
+    }
+    for (const name of removeClause.split(", ").filter(Boolean)) delete row[resolveName(name)];
+  };
+  const documentClient = {
+    async send(command) {
+      if (command instanceof GetCommand) {
+        const item = rows.get(rowKey(command.input.Key));
+        return item ? { Item: structuredClone(item) } : {};
+      }
+      if (command instanceof QueryCommand) {
+        return {
+          Items: [...rows.values()]
+            .filter(
+              (row) =>
+                row.pk === command.input.ExpressionAttributeValues[":pk"] &&
+                row.sk.startsWith(command.input.ExpressionAttributeValues[":prefix"]),
+            )
+            .sort((left, right) => left.sk.localeCompare(right.sk))
+            .map((row) => structuredClone(row)),
+        };
+      }
+      if (command instanceof TransactWriteCommand) {
+        const updates = command.input.TransactItems.flatMap((item) =>
+          item.Update ? [item.Update] : [],
+        );
+        for (const update of updates) {
+          const row = rows.get(rowKey(update.Key));
+          if (!row) throw new Error(`Missing test row ${update.Key.sk}`);
+          const values = update.ExpressionAttributeValues || {};
+          const names = update.ExpressionAttributeNames || {};
+          const ownerField = names["#owner"];
+          if (ownerField && row[ownerField] !== values[":owner"]) {
+            throw new Error(`Unexpected test owner for ${update.Key.sk}`);
+          }
+          const activeField = names["#active"];
+          if (activeField && row[activeField] !== values[":owner"]) {
+            throw new Error(`Unexpected active test owner for ${update.Key.sk}`);
+          }
+        }
+        updates.forEach(applyUpdate);
+        return {};
+      }
+      throw new Error(`Unexpected test command: ${command.constructor.name}`);
+    },
+  };
+  const { createDocumentStore } = await import("../../api/document-store.ts");
+  const store = createDocumentStore({
+    documentClient,
+    tableName,
+    botId: phase11BotId,
+    now: () => phase11Now,
+  });
+  const worker = await makeWorkerWithStore({ store, ingestion });
+  return { worker, store };
 }
 
 function run(worker, step, opId = operationId) {
@@ -890,6 +981,146 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
     );
   });
 
+  it("persists a bounded extraction diagnosis from the Bedrock failure reason through the real store and CONTROL read path", async () => {
+    const rawReason =
+      "Ignored 1 files as the content could not be parsed. Check that the document is properly formatted. Then retry your request. [Files: s3://prepared-docentes/prepared/document-1/revision-1/Locked.pdf]. Call to Customer Source did not succeed.";
+    const ingestion = makeIngestion({
+      get: vi.fn(async () => ({
+        status: "COMPLETE",
+        statistics: { numberOfDocumentsFailed: 1 },
+        failureReasons: [JSON.stringify([rawReason])],
+      })),
+    });
+    const { worker, store } = await makeWorkerWithDynamoStore({
+      operation: {
+        ...confirmedUploadOperation({ stage: "ingestion", ingestionJobId: "ingestion-job-1" }),
+        ownerOperationId: operationId,
+      },
+      document: { ...confirmedDocument(), ownerOperationId: operationId, updatedAt: phase11Now },
+      ingestion,
+    });
+
+    const result = await run(worker, "finish");
+    const persistedOperation = await store.getOperation({ operationId });
+    const page = await store.listDocuments({ cursor: null, limit: 10 });
+
+    expect(result).toMatchObject({ status: "failed", error: { code: "INGESTION_FAILED" } });
+    expect(result.error.message).toMatch(/extraer o interpretar/i);
+    expect(result.error.message).toMatch(/archivos preparados/i);
+    expect(result.error.message).toMatch(/Revisá/i);
+    expect(result.error.message).toMatch(/reemplazalos si hace falta antes de reintentar/i);
+    expect(result.error.message).toContain("Documentos con error: 1.");
+    expect(result.error.message).not.toMatch(/\bjob\b/i);
+    expect(result.error.message).not.toMatch(
+      /Locked\.pdf|s3:\/\/|Customer Source|could not be parsed/i,
+    );
+    expect(result.error.message).not.toMatch(/cifrad|encrypted/i);
+    expect(persistedOperation).toMatchObject({
+      status: "failed",
+      canRetry: true,
+      error: result.error,
+    });
+    expect(page.activeOperation).toBeNull();
+    expect(page.lastOperation).toMatchObject({
+      operationId,
+      status: "failed",
+      error: result.error,
+    });
+    expect(page.documents[0].processing).toMatchObject({
+      status: "failed",
+      operationId,
+      error: result.error,
+    });
+    expect(JSON.stringify({ persistedOperation, page })).not.toContain(rawReason);
+    expect(JSON.stringify({ persistedOperation, page })).not.toContain("Locked.pdf");
+  });
+
+  it.each([
+    [
+      "access failure",
+      "Access denied while reading s3://private-bucket/private/name.pdf",
+      1,
+      /(?=.*revisión técnica)(?=.*Documentos con error: 1)(?=.*Solicitá)/i,
+      /s3:\/\/|private-bucket|Access denied/i,
+    ],
+    [
+      "encrypted-only cause",
+      "The source document is encrypted and cannot be processed",
+      1,
+      /(?=.*no se pudo clasificar la causa)(?=.*Documentos con error: 1)(?=.*solicitá)/i,
+      /encrypted|cifrad|extraer|formato/i,
+    ],
+    [
+      "unknown adversarial cause",
+      "TOKEN=secret <script>alert(1)</script> s3://private-bucket/name.pdf",
+      2,
+      /(?=.*Documentos con error: 2)(?=.*causa)(?=.*solicitá)/i,
+      /TOKEN|secret|<script>|s3:\/\/|private-bucket/i,
+    ],
+  ])(
+    "classifies %s without copying provider text into the stored diagnostic",
+    async (_label, failureReason, failureCount, expectedMessage, forbiddenMessage) => {
+      const ingestion = makeIngestion({
+        get: vi.fn(async () => ({
+          status: "COMPLETE",
+          statistics: { numberOfDocumentsFailed: failureCount },
+          failureReasons: [failureReason],
+        })),
+      });
+      const { worker, store } = await makeWorkerContext({
+        operation: confirmedUploadOperation({
+          stage: "ingestion",
+          ingestionJobId: "ingestion-job-1",
+        }),
+        document: confirmedDocument(),
+        ingestion,
+      });
+
+      const result = await run(worker, "finish");
+      const persistedOperation = await store.getOperation({ operationId });
+
+      expect(result).toMatchObject({ status: "failed", error: { code: "INGESTION_FAILED" } });
+      expect(result.error.message).toMatch(expectedMessage);
+      expect(result.error.message).not.toMatch(forbiddenMessage);
+      expect(persistedOperation.error).toEqual(result.error);
+      expect(store.finishOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          outcome: "failed",
+          operation: expect.objectContaining({ canRetry: true, error: result.error }),
+        }),
+      );
+    },
+  );
+
+  it("keeps the existing generic ingestion error when a terminal failed job has no failure statistics or reasons", async () => {
+    const ingestion = makeIngestion({
+      get: vi.fn(async () => ({ status: "FAILED" })),
+    });
+    const { worker, store } = await makeWorkerContext({
+      operation: confirmedUploadOperation({
+        stage: "ingestion",
+        ingestionJobId: "ingestion-job-1",
+      }),
+      document: confirmedDocument(),
+      ingestion,
+    });
+
+    const result = await run(worker, "finish");
+    const persistedOperation = await store.getOperation({ operationId });
+
+    expect(result).toEqual({
+      status: "failed",
+      error: {
+        code: "INGESTION_FAILED",
+        message:
+          "La Knowledge Base no pudo procesar el documento. Puedes reintentar el procesamiento.",
+      },
+    });
+    expect(persistedOperation.error).toEqual(result.error);
+    expect(persistedOperation.canRetry).toBe(true);
+    expect(store.finishOperation).toHaveBeenCalledOnce();
+  });
+
   it.each([
     [
       "partial",
@@ -914,10 +1145,15 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
     ],
     [
       "corrupt document",
-      { status: "COMPLETE", statistics: { numberOfDocumentsFailed: 0 } },
+      {
+        status: "COMPLETE",
+        statistics: { numberOfDocumentsFailed: 0 },
+        failureReasons: ["The content could not be parsed."],
+      },
       { status: "FAILED", sourceUri: expectedUri },
       "failed",
       true,
+      "La Knowledge Base no pudo procesar el documento. Puedes reintentar el procesamiento.",
     ],
     [
       "missing document status",
@@ -935,7 +1171,14 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
     ],
   ])(
     "classifies %s ingestion observations and keeps uncertain ownership reserved",
-    async (_label, job, indexedDocument, expectedStatus, releasesReservation) => {
+    async (
+      _label,
+      job,
+      indexedDocument,
+      expectedStatus,
+      releasesReservation,
+      expectedErrorMessage,
+    ) => {
       const ingestion = makeIngestion({
         get: vi.fn(async () => job),
         getDocument: vi.fn(async () => indexedDocument),
@@ -951,6 +1194,9 @@ describe("document worker acceptance with controlled S3 and Bedrock boundaries",
       const result = await run(worker, "finish");
 
       expect(result).toMatchObject({ status: expectedStatus });
+      if (expectedErrorMessage) {
+        expect(result.error).toEqual({ code: "INGESTION_FAILED", message: expectedErrorMessage });
+      }
       if (releasesReservation) {
         expect(store.finishOperation).toHaveBeenCalledOnce();
         expect(store.finishOperation.mock.calls[0][0].outcome).toBe("failed");

@@ -44,6 +44,7 @@ type UploadReceipt = {
   operation: DocumentOperationView;
   ticket: DocumentUploadView;
   file: File;
+  body: DocumentIntentBody;
 };
 type DocumentFileIssue = "DOCUMENT_TOO_LARGE" | "DOCUMENT_EMPTY" | "INVALID_DOCUMENT_NAME";
 
@@ -59,6 +60,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isTerminal(operation: DocumentOperationView | null): boolean {
   return operation?.status === "completed" || operation?.status === "failed";
+}
+
+function retryActionFor(action: DocumentAction): "withdraw" | "reprocess" {
+  switch (action) {
+    case "withdraw":
+      return "withdraw";
+    case "upload":
+    case "replace":
+    case "reprocess":
+      return "reprocess";
+  }
 }
 
 function operationNotice(operation: DocumentOperationView): Notice {
@@ -81,6 +93,12 @@ function operationNotice(operation: DocumentOperationView): Notice {
     return {
       kind: "status",
       text: "El servidor confirmó que falta iniciar el procesamiento. Podés reintentar el inicio.",
+    };
+  }
+  if (operation.status === "awaiting_upload") {
+    return {
+      kind: "status",
+      text: "El servidor espera la carga del archivo. El procesamiento todavía no empezó.",
     };
   }
   if (operation.status === "unconfirmed") {
@@ -256,6 +274,7 @@ export function AdminDocuments({
   const mountedRef = useRef(false);
   const mutationRef = useRef(false);
   const listEpochRef = useRef(0);
+  const listRef = useRef<DocumentListView | null>(null);
   const hasLoadedListRef = useRef(false);
   const operationReadEpochRef = useRef(0);
   const readAbortRef = useRef<AbortController | null>(null);
@@ -296,12 +315,15 @@ export function AdminDocuments({
   const applyList = (next: DocumentListView, append: boolean) => {
     if (!mountedRef.current) return;
     hasLoadedListRef.current = true;
-    setList((current) => {
-      if (!append || !current) return next;
+    const current = listRef.current;
+    let updated = next;
+    if (append && current) {
       const merged = new Map(current.documents.map((item) => [item.documentId, item]));
       for (const item of next.documents) merged.set(item.documentId, item);
-      return { ...next, documents: [...merged.values()] };
-    });
+      updated = { ...next, documents: [...merged.values()] };
+    }
+    listRef.current = updated;
+    setList(updated);
     const nextOperation = next.activeOperation ?? next.lastOperation;
     if (next.activeOperation) {
       setCurrentOperation(next.activeOperation);
@@ -546,7 +568,7 @@ export function AdminDocuments({
         if (!isRecord(request) || request.upload === undefined) throw new Error("INVALID_RESPONSE");
         if (!pending.file) throw new Error("INVALID_RESPONSE");
         const ticket = uploadTicket(request.upload);
-        const receipt = { operation: operationView, ticket, file: pending.file };
+        const receipt = { operation: operationView, ticket, file: pending.file, body: currentBody };
         setReceipt(receipt);
         await transferFile(receipt);
       } else {
@@ -691,7 +713,50 @@ export function AdminDocuments({
     mutationRef.current = true;
     setBusy(true);
     try {
-      await transferFile(receipt);
+      const value = await api.createIntent(receipt.body);
+      const renewedOperation = operationResponse(
+        value,
+        botId,
+        receipt.operation.operationId,
+        receipt.operation.action,
+        receipt.operation.documentId,
+      );
+      if (renewedOperation.status !== "awaiting_upload") {
+        setReceipt(null);
+        setCurrentOperation(renewedOperation);
+        if (isTerminal(renewedOperation)) applyTerminalNotice(renewedOperation);
+        else await readOperation(renewedOperation.operationId, renewedOperation.action);
+        return;
+      }
+      if (
+        renewedOperation.revision !== receipt.operation.revision ||
+        !isRecord(value) ||
+        value.upload === undefined
+      ) {
+        throw new Error("INVALID_RESPONSE");
+      }
+      const renewedReceipt: UploadReceipt = {
+        operation: renewedOperation,
+        ticket: uploadTicket(value.upload),
+        file: receipt.file,
+        body: receipt.body,
+      };
+      setReceipt(renewedReceipt);
+      setCurrentOperation(renewedOperation);
+      await transferFile(renewedReceipt);
+    } catch (error) {
+      markAuthorizationFailure(error);
+      if (errorStatus(error) === 409 || errorCode(error) === "STATE_CHANGED") {
+        if (mountedRef.current) await readList();
+        setNotice(
+          errorNotice(
+            error,
+            "El documento cambió. Actualizamos la lista antes de volver a intentar la carga.",
+          ),
+        );
+      } else {
+        setNotice(errorNotice(error, "No pudimos renovar el permiso para subir el mismo archivo."));
+      }
     } finally {
       mutationRef.current = false;
       if (mountedRef.current) setBusy(false);
@@ -764,30 +829,111 @@ export function AdminDocuments({
   };
 
   const retryFailedOperation = async (document?: DocumentView) => {
+    if (actionLocked || mutationRef.current) return;
+    if (document) {
+      const initial = listRef.current?.documents.find(
+        (item) => item.documentId === document.documentId,
+      );
+      if (
+        !initial ||
+        !initial.canRetry ||
+        initial.processing.status !== "failed" ||
+        initial.processing.operationId !== document.processing.operationId ||
+        initial.revision !== document.revision
+      ) {
+        return;
+      }
+
+      mutationRef.current = true;
+      setBusy(true);
+      setNotice({ kind: "status", text: "Consultando el resultado para preparar el reintento…" });
+      const readTicket = ++operationReadEpochRef.current;
+      try {
+        const value = await api.get(initial.processing.operationId);
+        if (!mountedRef.current || readTicket !== operationReadEpochRef.current) return;
+        const current = listRef.current?.documents.find(
+          (item) => item.documentId === initial.documentId,
+        );
+        if (
+          !current ||
+          !current.canRetry ||
+          current.processing.status !== "failed" ||
+          current.processing.operationId !== initial.processing.operationId ||
+          current.revision !== initial.revision
+        ) {
+          if (mountedRef.current) await readList();
+          setNotice({
+            kind: "error",
+            text: "El documento cambió. Actualizamos la lista; revisá la revisión vigente antes de reintentar.",
+          });
+          return;
+        }
+        const failed = operationResponse(
+          value,
+          botId,
+          current.processing.operationId,
+          undefined,
+          current.documentId,
+        );
+        if (
+          failed.status !== "failed" ||
+          !failed.canRetry ||
+          failed.revision !== current.revision
+        ) {
+          if (mountedRef.current) await readList();
+          setNotice({
+            kind: "error",
+            text: "El resultado ya no admite un reintento con esta revisión. Actualizamos la lista.",
+          });
+          return;
+        }
+
+        const action = retryActionFor(failed.action);
+        const operationId = makeOperationId();
+        const pending: PendingIntent = {
+          operationId,
+          file: null,
+          body: {
+            operationId,
+            action,
+            documentId: current.documentId,
+            expectedRevision: current.revision,
+          },
+          target: null,
+        };
+        mutationRef.current = false;
+        setBusy(false);
+        setPending(pending);
+        await prepareIntent(pending);
+      } catch (error) {
+        markAuthorizationFailure(error);
+        if (errorStatus(error) === 409 || errorCode(error) === "STATE_CHANGED") {
+          if (mountedRef.current) await readList();
+        }
+        setNotice(errorNotice(error, "No pudimos confirmar el resultado que se va a reintentar."));
+      } finally {
+        if (mutationRef.current) {
+          mutationRef.current = false;
+          if (mountedRef.current) setBusy(false);
+        }
+      }
+      return;
+    }
+
     const failed =
       list?.lastOperation?.status === "failed"
         ? list.lastOperation
         : operation?.status === "failed"
           ? operation
           : null;
-    if (!failed?.canRetry || actionLocked) return;
-    if (failed.action === "withdraw") {
-      const target =
-        document ?? list?.documents.find((item) => item.documentId === failed.documentId);
-      await beginNonFileOperation(
-        "withdraw",
-        failed.documentId,
-        target?.revision ?? failed.revision,
-      );
+    if (!failed?.canRetry) return;
+    const target = listRef.current?.documents.find((item) => item.documentId === failed.documentId);
+    if (target) {
+      await retryFailedOperation(target);
       return;
     }
-    const target =
-      document ?? list?.documents.find((item) => item.documentId === failed.documentId);
-    await beginNonFileOperation(
-      "reprocess",
-      target?.documentId ?? failed.documentId,
-      target?.revision ?? failed.revision,
-    );
+    const action = retryActionFor(failed.action);
+    await beginNonFileOperation(action, failed.documentId, failed.revision);
   };
 
   const confirmWithdraw = async (target: DocumentView) => {
@@ -835,7 +981,7 @@ export function AdminDocuments({
     : "";
   const activeOperationDetail = activeOperation
     ? activeOperation.status === "awaiting_upload"
-      ? "El archivo todavía se está transfiriendo. La operación no empezó."
+      ? "El servidor espera la carga del archivo. El procesamiento todavía no empezó."
       : activeOperation.status === "pending_start"
         ? "El servidor confirmó que la ejecución todavía no empezó."
         : activeOperation.status === "unconfirmed"
@@ -1013,9 +1159,8 @@ export function AdminDocuments({
         {items.length > 0 ? (
           <ul className="admin-documents__items">
             {items.map((item) => {
-              const matchingOperation = last?.documentId === item.documentId ? last : null;
               const failed = item.processing.status === "failed";
-              const retryAvailable = Boolean(matchingOperation?.canRetry && failed);
+              const retryAvailable = Boolean(item.canRetry && failed);
               const rowProcessing = activeOperation?.documentId === item.documentId;
               return (
                 <li className="admin-documents__item" key={item.documentId}>
