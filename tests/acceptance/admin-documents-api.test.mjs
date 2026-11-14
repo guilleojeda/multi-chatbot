@@ -192,7 +192,18 @@ describe("document intention acceptance through the real admin composition", () 
   it("validates declared file details and signs the server-selected incoming destination", async () => {
     const createDocumentAdministration = await loadDocumentAdministration();
     const store = {
-      listDocuments: vi.fn(async () => ({ documents: [], nextCursor: null })),
+      listDocuments: vi.fn(async () => ({
+        documents: [],
+        nextCursor: "next-page",
+        activeOperation: phase11Operation({
+          operationId: "reprocess-active",
+          documentId: "document-1",
+          action: "reprocess",
+          status: "pending_start",
+          stage: "source",
+        }),
+        lastOperation: null,
+      })),
       createIntent: vi.fn(async (input) => ({
         created: true,
         operation: phase11Operation({
@@ -263,6 +274,7 @@ describe("document intention acceptance through the real admin composition", () 
     const signerInput = uploadSigner.createPost.mock.calls[0]?.[0];
 
     expect(accepted.statusCode, accepted.body).toBe(201);
+    expect(phase11ResponseBody(accepted).operation.documentName).toBe("Lesson notes.txt");
     expect(store.createIntent).toHaveBeenCalledOnce();
     expect(uploadSigner.createPost).toHaveBeenCalledOnce();
     expect(signerInput).toMatchObject({
@@ -280,6 +292,16 @@ describe("document intention acceptance through the real admin composition", () 
     expect(signerInput.key).toMatch(/^incoming\//);
     expect(signerInput.key.split("/")).not.toContain("..");
     expect(phase11ResponseBody(accepted).upload.fields.key).toBe(signerInput.key);
+
+    const listing = await handler(phase11AdminEvent({ method: "GET", path: pathFor("documents") }));
+    expect(listing.statusCode).toBe(200);
+    expect(phase11ResponseBody(listing).documents).toEqual([]);
+    expect(phase11ResponseBody(listing).nextCursor).toBe("next-page");
+    expect(phase11ResponseBody(listing).activeOperation).toMatchObject({
+      action: "reprocess",
+      documentId: "document-1",
+      documentName: "lesson.txt",
+    });
 
     const formats = ["txt", "md", "html", "doc", "docx", "csv", "xls", "xlsx", "pdf"];
     for (const extension of formats) {

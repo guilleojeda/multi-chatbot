@@ -33,6 +33,7 @@ export type DocumentOperationView = {
   operationId: string;
   documentId: string;
   action: DocumentAction;
+  documentName?: string;
   status: DocumentOperationStatus;
   stage: DocumentOperationStage;
   revision: string;
@@ -90,21 +91,25 @@ export function isUtf8TextDocument(name: string): boolean {
   return extension === "txt" || extension === "md" || extension === "html";
 }
 
+export function isValidDocumentFileName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 255 &&
+    new TextEncoder().encode(value).byteLength <= 255 &&
+    value.trim() === value &&
+    !/[\\/\u0000-\u001f\u007f]/.test(value) &&
+    value !== "." &&
+    value !== ".." &&
+    documentContentTypeForName(value) !== null
+  );
+}
+
 export function validateDocumentFile(value: unknown): string[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return ["file"];
   const file = value as Record<string, unknown>;
   const fields: string[] = [];
-  if (
-    typeof file.name !== "string" ||
-    file.name.length === 0 ||
-    file.name.length > 255 ||
-    new TextEncoder().encode(file.name).byteLength > 255 ||
-    file.name.trim() !== file.name ||
-    /[\\/\u0000-\u001f\u007f]/.test(file.name) ||
-    file.name === "." ||
-    file.name === ".." ||
-    !documentContentTypeForName(file.name)
-  ) {
+  if (!isValidDocumentFileName(file.name)) {
     fields.push("name");
   }
   if (!Number.isSafeInteger(file.sizeBytes) || (file.sizeBytes as number) < 1) {
@@ -159,6 +164,7 @@ export function parseDocumentOperationView(value: unknown): DocumentOperationVie
     !isDocumentAction(value.action) ||
     !isDocumentOperationStatus(value.status) ||
     !isDocumentOperationStage(value.stage) ||
+    (value.documentName !== undefined && !isValidDocumentFileName(value.documentName)) ||
     typeof value.revision !== "string" ||
     typeof value.updatedAt !== "string" ||
     !Number.isFinite(Date.parse(value.updatedAt)) ||
@@ -171,6 +177,7 @@ export function parseDocumentOperationView(value: unknown): DocumentOperationVie
     operationId: value.operationId,
     documentId: value.documentId,
     action: value.action,
+    ...(value.documentName !== undefined ? { documentName: value.documentName } : {}),
     status: value.status,
     stage: value.stage,
     revision: value.revision,

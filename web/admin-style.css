@@ -345,7 +345,9 @@ select:disabled {
 }
 
 .admin-documents__active span {
+  min-width: 0;
   color: #49645f;
+  overflow-wrap: anywhere;
 }
 
 .admin-documents__list-heading {

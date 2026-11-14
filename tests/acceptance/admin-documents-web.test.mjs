@@ -1559,6 +1559,9 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
     await waitForPollRequest(harness, /\/document-operations\/[^/]+$/);
     await harness.settle();
     expect(bodyText(harness.document)).toMatch(/procesando|en curso/i);
+    expect(harness.document.querySelector(".admin-documents__active").textContent).toContain(
+      "Guía preparada.txt",
+    );
     expect(bodyText(harness.document)).not.toContain("Procesamiento completado");
     await waitForPollText(harness, /Procesamiento completado/);
     await waitFor(() => expect(completedListReads).toBeGreaterThan(0));
@@ -1886,6 +1889,8 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
     let lists = 0;
     const sharedActiveOperation = operationView("reload-operation", "upload", {
       status: "processing",
+      stage: "validation",
+      documentName: "Guía en validación.txt",
     });
     const behavior = {
       list: async ({ path }) => {
@@ -1904,6 +1909,10 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
     await waitForText(reloaded, /reload-operation|procesando|en curso/i);
 
     expect(lists).toBe(2);
+    expect(reloaded.document.querySelector('input[type="file"]').value).toBe("");
+    expect(reloaded.document.querySelector(".admin-documents__active").textContent).toContain(
+      "Guía en validación.txt",
+    );
     expect(bodyText(reloaded.document)).toMatch(/reload-operation|procesando|en curso/i);
     expect(documentCalls(reloaded, "POST", /document-operations$/)).toHaveLength(0);
     expect(documentCalls(reloaded, "POST", /\/start$/)).toHaveLength(0);
@@ -1927,18 +1936,35 @@ describe("AdminApp: administración documental desde la web (11.1)", () => {
     expect(bodyText(harness.document)).not.toMatch(/documento publicado|procesamiento completado/i);
   });
 
-  it("descarta una respuesta de operación con bot u operationId ajeno", async () => {
+  it.each([
+    [
+      "bot u operationId ajenos",
+      async () =>
+        jsonResponse({
+          botId: "robotica",
+          operation: operationView("someone-elses-operation", "upload", {
+            status: "completed",
+            stage: "result",
+          }),
+        }),
+    ],
+    [
+      "un nombre de documento inválido",
+      async ({ path }) =>
+        jsonResponse({
+          botId: botFromPath(path),
+          operation: operationView(path.split("/").at(-1), "upload", {
+            status: "completed",
+            stage: "result",
+            documentName: "../fuera-del-documento.txt",
+          }),
+        }),
+    ],
+  ])("descarta una respuesta de operación con %s", async (_caseName, readOperation) => {
     const harness = await startAdmin({
       fakeTimers: true,
       behavior: {
-        readOperation: async () =>
-          jsonResponse({
-            botId: "robotica",
-            operation: operationView("someone-elses-operation", "upload", {
-              status: "completed",
-              stage: "result",
-            }),
-          }),
+        readOperation,
       },
     });
     await openDocuments(harness);
