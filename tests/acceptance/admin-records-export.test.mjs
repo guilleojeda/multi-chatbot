@@ -594,11 +594,7 @@ describe("admin record export worker acceptance", () => {
       harness.indexRequests[0].input.ExpressionAttributeValues ?? {},
     ).filter((value) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value));
     expect(dateValues).toContain("2026-10-25T03:00:00.000Z");
-    expect(
-      dateValues.some(
-        (value) => value === "2026-10-26T02:59:59.999Z" || value === "2026-10-26T03:00:00.000Z",
-      ),
-    ).toBe(true);
+    expect(dateValues).toContain("2026-10-25T18:00:30.000Z");
     expect(harness.database.get(`CONV#${conversationId}`, "META").hiddenAt).toBe(
       "2026-10-25T18:00:10.000Z",
     );

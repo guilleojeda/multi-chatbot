@@ -239,7 +239,7 @@ async function startRecordsAdmin({ behavior = {}, fakeTimers = true } = {}) {
           botId: botFromPath(path),
           exportId: path.split("/")[7],
           url: "https://downloads.example.test/signed.csv?token=private",
-          expiresAt: Date.parse("2026-11-16T02:02:00.000Z"),
+          expiresAt: "2026-11-16T02:02:00.000Z",
         })),
   );
   await harness.mount();
@@ -521,7 +521,7 @@ describe("administrative conversation records", () => {
             conversationCount: 2,
             rowCount: 3,
             bytes: 163,
-            expiresAt: Date.parse("2026-11-17T02:00:00.000Z"),
+            expiresAt: "2026-11-17T02:00:00.000Z",
           });
         },
       },
@@ -591,6 +591,59 @@ describe("administrative conversation records", () => {
       ),
     ).toBe(false);
     expect(exportDownloadRequests(harness)).toHaveLength(1);
+  });
+
+  it("does not start a late native download after the admin session ends", async () => {
+    const pendingDownload = deferred();
+    const harness = await startRecordsAdmin({
+      behavior: {
+        search: async ({ path }) => {
+          const botId = botFromPath(path);
+          return searchPage(botId, [resultRow({ botId, conversationId: `${botId}-conversation` })]);
+        },
+        readExport: async ({ path }) =>
+          jsonResponse({
+            botId: "docentes",
+            exportId: path.split("/").at(-1),
+            status: "ready",
+            conversationCount: 1,
+            rowCount: 1,
+            bytes: 72,
+            expiresAt: "2026-11-17T02:00:00.000Z",
+          }),
+        download: async () => pendingDownload.promise,
+      },
+    });
+
+    await harness.click(getButton(harness, "Descargar conversaciones en CSV"));
+    await waitForTextAdvancing(harness, /Descargar CSV/);
+    const nativeClicks = [];
+    const clickSpy = vi
+      .spyOn(harness.dom.window.HTMLAnchorElement.prototype, "click")
+      .mockImplementation(function () {
+        nativeClicks.push(this.href);
+      });
+    await harness.click(getButton(harness, "Descargar CSV"));
+    expect(exportDownloadRequests(harness)).toHaveLength(1);
+
+    await harness.click(getButton(harness, "Cerrar sesión"));
+    pendingDownload.resolve(
+      jsonResponse({
+        botId: "docentes",
+        exportId: exportStarts(harness)[0].body.exportId,
+        url: "https://downloads.example.test/late.csv?token=private",
+        expiresAt: "2026-11-16T02:02:00.000Z",
+      }),
+    );
+    await harness.settle();
+
+    expect(nativeClicks).toEqual([]);
+    expect(
+      [...harness.document.querySelectorAll("a")].some((link) =>
+        link.href.startsWith("https://downloads.example.test/"),
+      ),
+    ).toBe(false);
+    clickSpy.mockRestore();
   });
 
   it.each([

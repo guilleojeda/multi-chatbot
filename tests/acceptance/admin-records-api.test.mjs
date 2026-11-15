@@ -295,7 +295,7 @@ async function loadAdminLambda({ initialRows = [], indexPages = [] } = {}) {
   vi.stubEnv("RECORDS_CATALOG", JSON.stringify(recordsCatalog));
   vi.stubEnv(
     "RECORDS_EXPORT_STATE_MACHINE_ARN",
-    "arn:aws:states:us-east-1:118903272638:stateMachine:dev-admin-records-export",
+    "arn:aws:states:us-east-1:118903272638:stateMachine:multi-chatbot-dev-admin-records-export",
   );
 
   const dynamoSdk = await import("@aws-sdk/lib-dynamodb");
@@ -635,13 +635,27 @@ describe("administrative records API", () => {
       }),
     );
     expect(withoutAccent.statusCode).toBe(200);
-    expect(responseBody(withoutAccent).results).toEqual([]);
+    expect(responseBody(withoutAccent).results).toEqual([
+      expect.objectContaining({
+        conversationId: noAccent.conversationId,
+        queryId: noAccent.queryId,
+      }),
+    ]);
 
+    const testPersonFilters = { ...filters, personId: testPersonId };
+    const excludeTeamTests = await harness.invoke(
+      event({
+        method: "POST",
+        path: recordsPath("/search"),
+        body: { filters: testPersonFilters },
+      }),
+    );
+    expect(responseBody(excludeTeamTests).results).toEqual([]);
     const includeTeamTests = await harness.invoke(
       event({
         method: "POST",
         path: recordsPath("/search"),
-        body: { filters: { ...filters, excludeTests: false } },
+        body: { filters: { ...testPersonFilters, excludeTests: false } },
       }),
     );
     expect(responseBody(includeTeamTests).results).toEqual(
@@ -666,6 +680,7 @@ describe("administrative records API", () => {
     });
     const harness = await loadAdminLambda({
       initialRows: [
+        meta({ conversationId: matching.conversationId, personId: "person-2" }),
         matching,
         textChunk({ conversationId, queryId, text: "Consulta de continuación" }),
       ],
@@ -747,6 +762,8 @@ describe("administrative records API", () => {
       ordinal: 1,
       admittedAt: "2026-11-13T15:00:00.000Z",
       status: "completed",
+      questionCount: 2,
+      answerCount: 2,
     });
     const second = turn({
       conversationId,
@@ -926,6 +943,7 @@ describe("administrative records API", () => {
     let cursor;
     let assembled = "";
     let pageCount = 0;
+    let malformedCursorChecked = false;
     do {
       const response = await harness.invoke(
         event({
@@ -940,9 +958,30 @@ describe("administrative records API", () => {
       cursor = body.nextCursor;
       pageCount += 1;
       expect(pageCount).toBeLessThanOrEqual(fragmentCount);
+      if (cursor && !malformedCursorChecked) {
+        const cursorValue = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+        cursorValue.through = cursorValue.nextIndex;
+        const malformedCursor = Buffer.from(JSON.stringify(cursorValue)).toString("base64url");
+        const queryCount = harness.commands.filter(
+          (command) => command.constructor.name === "QueryCommand",
+        ).length;
+        const rejected = await harness.invoke(
+          event({
+            method: "GET",
+            path: recordsPath(`/conversations/${conversationId}/turns/1/text`),
+            query: { role: "question", cursor: malformedCursor },
+          }),
+        );
+        expect(rejected.statusCode).toBe(400);
+        expect(
+          harness.commands.filter((command) => command.constructor.name === "QueryCommand"),
+        ).toHaveLength(queryCount);
+        malformedCursorChecked = true;
+      }
     } while (cursor);
 
     expect(pageCount).toBeGreaterThan(1);
+    expect(malformedCursorChecked).toBe(true);
     expect(assembled).toBe(original);
     expect(Buffer.byteLength(assembled, "utf8")).toBe(Buffer.byteLength(original, "utf8"));
     expectNoGeneration(harness);
@@ -1006,7 +1045,7 @@ describe("administrative records API", () => {
       (command) => command.constructor.name === "StartExecutionCommand",
     );
     expect(startCommand.input.stateMachineArn).toBe(
-      "arn:aws:states:us-east-1:118903272638:stateMachine:dev-admin-records-export",
+      "arn:aws:states:us-east-1:118903272638:stateMachine:multi-chatbot-dev-admin-records-export",
     );
     const expectedExecutionName = `records-${createHash("sha256")
       .update(JSON.stringify(["dev", botId, adminSub, exportId]))
@@ -1159,6 +1198,9 @@ describe("administrative records API", () => {
     const headCommand = harness.s3Commands.at(-1);
     expect(headCommand.input.Bucket).toBe(defaultBot.uploadBucketName);
     expect(headCommand.input.Key).toBe(workerResult.objectKey);
+    expect(
+      harness.s3Commands.filter((command) => command.constructor.name === "HeadObjectCommand"),
+    ).toHaveLength(headCountAfterReady + 3);
 
     vi.setSystemTime(new Date(phase11Now + 1_000));
     const refreshedDownload = await harness.invoke(
@@ -1168,7 +1210,7 @@ describe("administrative records API", () => {
     expect(responseBody(refreshedDownload).url).not.toBe(responseBody(firstDownload).url);
     expect(
       harness.s3Commands.filter((command) => command.constructor.name === "HeadObjectCommand"),
-    ).toHaveLength(headCountAfterReady + 3);
+    ).toHaveLength(headCountAfterReady + 4);
 
     const wrongKeyId = "70896ec8-e643-4aca-89da-aacfa96434df";
     await harness.invoke(
@@ -1191,7 +1233,7 @@ describe("administrative records API", () => {
     expect(wrongKeyDownload.body).not.toContain("url");
     expect(
       harness.s3Commands.filter((command) => command.constructor.name === "HeadObjectCommand"),
-    ).toHaveLength(headCountAfterReady + 3);
+    ).toHaveLength(headCountAfterReady + 4);
 
     const failedId = "a401de12-209b-4f24-a09c-7bed3bb44679";
     await harness.invoke(
@@ -1241,6 +1283,6 @@ describe("administrative records API", () => {
     expect(expiredLink.body).not.toContain("url");
     expect(
       harness.s3Commands.filter((command) => command.constructor.name === "HeadObjectCommand"),
-    ).toHaveLength(headCountAfterReady + 3);
+    ).toHaveLength(headCountAfterReady + 4);
   });
 });

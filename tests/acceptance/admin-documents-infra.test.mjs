@@ -1173,8 +1173,10 @@ describe("phase 11.1 document administration infrastructure acceptance", () => {
         scenario.assembly,
       );
       const apiReceiptGrants = statementsForResource(
-        apiStatements.filter((statement) =>
-          statementActions(statement).some((action) => action.startsWith("s3:")),
+        apiStatements.filter(
+          (statement) =>
+            statementActions(statement).some((action) => action.startsWith("s3:")) &&
+            stringIncludes(statement.Resource, "incoming/"),
         ),
         handler,
         scenario.admin,
@@ -1452,6 +1454,11 @@ describe("phase 12 conversation records infrastructure acceptance", () => {
       const [machine] = machines;
       expect(machine.properties.StateMachineType).toBe("STANDARD");
       expect(machine.properties.LoggingConfiguration?.IncludeExecutionData).not.toBe(true);
+      expect(admin.template.Parameters?.RecordsTestPersonIds).toMatchObject({
+        Type: "String",
+        Default: "{}",
+        NoEcho: true,
+      });
       const definition = parseJsonTemplateValue(machine.properties.DefinitionString);
       expect(definition).toBeDefined();
       const tasks = Object.values(definition.States).filter(({ Type }) => Type === "Task");
@@ -1467,6 +1474,17 @@ describe("phase 12 conversation records infrastructure acceptance", () => {
       expect(worker.properties.Runtime).toBe("nodejs24.x");
       expect(worker.properties.Timeout).toBeGreaterThan(0);
       expect(worker.properties.Timeout).toBeLessThanOrEqual(900);
+      for (const lambda of [handler, worker]) {
+        expect(
+          referencesResource(
+            envValue(lambda, "RECORDS_TEST_PERSON_IDS"),
+            admin,
+            admin,
+            { logicalId: "RecordsTestPersonIds" },
+            assembly,
+          ),
+        ).toBe(true);
+      }
       const workflowRole = getAttLogicalId(machine.properties.RoleArn);
       const invocations = rolePolicyStatements(admin, workflowRole).filter((statement) =>
         statementActions(statement).some((action) => action.startsWith("lambda:")),

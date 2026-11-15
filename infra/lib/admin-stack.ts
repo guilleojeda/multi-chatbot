@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CfnOutput, Duration, Fn, RemovalPolicy, Stack, Tags } from "aws-cdk-lib";
+import { CfnOutput, CfnParameter, Duration, Fn, RemovalPolicy, Stack, Tags } from "aws-cdk-lib";
 import * as apigateway from "aws-cdk-lib/aws-apigatewayv2";
 import * as integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import * as authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
@@ -24,10 +24,15 @@ import type { SharedIdentityStack } from "./shared-identity-stack.js";
 
 const handlerPath = fileURLToPath(new URL("../../api/admin-lambda.js", import.meta.url));
 const workerPath = fileURLToPath(new URL("../../api/document-worker-lambda.js", import.meta.url));
+const recordsWorkerPath = fileURLToPath(
+  new URL("../../api/records-export-worker-lambda.js", import.meta.url),
+);
 const lockFilePath = fileURLToPath(new URL("../../../package-lock.json", import.meta.url));
 const websiteAssetPath = fileURLToPath(new URL("../../admin-web", import.meta.url));
 const incomingPrefix = "incoming/";
+const exportsPrefix = "exports/";
 const preparedObjectPattern = "prepared/*";
+const recordsIndexName = "ConversationRecords";
 
 type AdminBot = {
   botId: string;
@@ -132,11 +137,22 @@ function documentWorkflow(scope: Construct, worker: lambda.IFunction): sfn.IChai
   return sfn.Chain.start(validate);
 }
 
+function recordsExportWorkflow(scope: Construct, worker: lambda.IFunction): sfn.IChainable {
+  return new tasks.LambdaInvoke(scope, "PrepareRecordsExport", {
+    lambdaFunction: worker,
+    payload: sfn.TaskInput.fromJsonPathAt("$"),
+    payloadResponseOnly: true,
+    retryOnServiceExceptions: false,
+  });
+}
+
 export class AdminStack extends Stack {
   readonly userPoolClient: cognito.UserPoolClient;
   readonly handler: nodejs.NodejsFunction;
   readonly documentWorker: nodejs.NodejsFunction;
   readonly documentStateMachine: sfn.StateMachine;
+  readonly recordsExportWorker: nodejs.NodejsFunction;
+  readonly recordsExportStateMachine: sfn.StateMachine;
   readonly httpApi: apigateway.HttpApi;
   readonly websiteBucket: s3.Bucket;
   readonly distribution: cloudfront.Distribution;
@@ -167,6 +183,13 @@ export class AdminStack extends Stack {
       description: `Global administrators for ${environment.environment}.`,
     });
 
+    const recordsTestPersonIds = new CfnParameter(this, "RecordsTestPersonIds", {
+      type: "String",
+      default: "{}",
+      noEcho: true,
+      description: "JSON botId-to-sub list for identifying team test conversations.",
+    });
+
     this.userPoolClient = new cognito.UserPoolClient(this, "AdminClient", {
       userPool: identity.userPool,
       userPoolClientName: `${environment.resourcePrefix}-admin`,
@@ -194,6 +217,12 @@ export class AdminStack extends Stack {
             id: "ExpireIncomingReceipts",
             prefix: incomingPrefix,
             expiration: Duration.days(1),
+          },
+          {
+            id: "ExpireRecordExports",
+            prefix: exportsPrefix,
+            expiration: Duration.days(1),
+            abortIncompleteMultipartUploadAfter: Duration.days(1),
           },
         ],
         removalPolicy: RemovalPolicy.DESTROY,
@@ -229,6 +258,44 @@ export class AdminStack extends Stack {
       stateMachineName: `${environment.resourcePrefix}-document-operations`,
       stateMachineType: sfn.StateMachineType.STANDARD,
       definitionBody: sfn.DefinitionBody.fromChainable(workflow),
+      timeout: Duration.hours(24),
+    });
+
+    const recordsCatalog = bots.map(({ botId }) => ({
+      botId,
+      recordsIndexName,
+      testPersonIds: [] as string[],
+    }));
+    const recordsWorkerCatalog = bots.map(({ botId, chat }) => {
+      const uploadBucket = uploadBuckets.get(botId);
+      if (!uploadBucket) throw new Error(`Upload bucket is missing for ${botId}.`);
+      return {
+        botId,
+        conversationTableName: chat.conversationTable.tableName,
+        recordsIndexName,
+        documentUploadBucketName: uploadBucket.bucketName,
+        testPersonIds: [] as string[],
+      };
+    });
+    this.recordsExportWorker = new nodejs.NodejsFunction(this, "RecordsExportWorker", {
+      entry: recordsWorkerPath,
+      handler: "handler",
+      runtime: lambda.Runtime.NODEJS_24_X,
+      timeout: Duration.minutes(15),
+      depsLockFilePath: lockFilePath,
+      bundling: { bundleAwsSDK: true },
+      environment: {
+        ENVIRONMENT: environment.environment,
+        RECORDS_TEST_PERSON_IDS: recordsTestPersonIds.valueAsString,
+        RECORDS_WORKER_CATALOG: JSON.stringify(recordsWorkerCatalog),
+      },
+    });
+    this.recordsExportStateMachine = new sfn.StateMachine(this, "RecordsExport", {
+      stateMachineName: `${environment.resourcePrefix}-admin-records-export`,
+      stateMachineType: sfn.StateMachineType.STANDARD,
+      definitionBody: sfn.DefinitionBody.fromChainable(
+        recordsExportWorkflow(this, this.recordsExportWorker),
+      ),
       timeout: Duration.hours(24),
     });
 
@@ -296,6 +363,10 @@ export class AdminStack extends Stack {
         USER_POOL_ID: identity.userPool.userPoolId,
         ADMIN_CLIENT_ID: this.userPoolClient.userPoolClientId,
         ADMIN_GROUP: this.groupName,
+        ENVIRONMENT: environment.environment,
+        RECORDS_TEST_PERSON_IDS: recordsTestPersonIds.valueAsString,
+        RECORDS_CATALOG: JSON.stringify(recordsCatalog),
+        RECORDS_EXPORT_STATE_MACHINE_ARN: this.recordsExportStateMachine.stateMachineArn,
         BOT_CATALOG: JSON.stringify(apiBotCatalog),
         ...(invitationSender ? { INVITATION_SENDER: invitationSender } : {}),
       },
@@ -321,6 +392,31 @@ export class AdminStack extends Stack {
         }),
       );
 
+      const conversationTableArn = bot.chat.conversationTable.tableArn;
+      const conversationPartitionReadConditions = {
+        "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["CONV#*"] },
+        Null: { "dynamodb:LeadingKeys": "false" },
+      };
+      for (const principal of [this.handler, this.recordsExportWorker]) {
+        principal.addToRolePolicy(
+          new iam.PolicyStatement({
+            actions: ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query"],
+            resources: [conversationTableArn],
+            conditions: conversationPartitionReadConditions,
+          }),
+        );
+        principal.addToRolePolicy(
+          new iam.PolicyStatement({
+            actions: ["dynamodb:Query"],
+            resources: [`${conversationTableArn}/index/${recordsIndexName}`],
+            conditions: {
+              "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [bot.botId] },
+              Null: { "dynamodb:LeadingKeys": "false" },
+            },
+          }),
+        );
+      }
+
       const documentTableArn = bot.chat.documents.documentTable.tableArn;
       const documentTableActions = [
         "dynamodb:ConditionCheckItem",
@@ -345,6 +441,12 @@ export class AdminStack extends Stack {
           resources: [uploadBucket.arnForObjects(`${incomingPrefix}*`)],
         }),
       );
+      this.handler.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["s3:GetObject"],
+          resources: [uploadBucket.arnForObjects(`${exportsPrefix}*`)],
+        }),
+      );
       this.documentWorker.addToRolePolicy(
         new iam.PolicyStatement({
           actions: documentTableActions,
@@ -355,6 +457,12 @@ export class AdminStack extends Stack {
         new iam.PolicyStatement({
           actions: ["s3:GetObject"],
           resources: [uploadBucket.arnForObjects(`${incomingPrefix}*`)],
+        }),
+      );
+      this.recordsExportWorker.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["s3:PutObject", "s3:AbortMultipartUpload"],
+          resources: [uploadBucket.arnForObjects(`${exportsPrefix}*`)],
         }),
       );
       this.documentWorker.addToRolePolicy(
@@ -378,6 +486,8 @@ export class AdminStack extends Stack {
 
     this.documentStateMachine.grants.startExecution(this.handler);
     this.documentStateMachine.grants.execution(this.handler, "states:DescribeExecution");
+    this.recordsExportStateMachine.grants.startExecution(this.handler);
+    this.recordsExportStateMachine.grants.execution(this.handler, "states:DescribeExecution");
 
     this.handler.addToRolePolicy(
       new iam.PolicyStatement({
@@ -436,6 +546,36 @@ export class AdminStack extends Stack {
         "AdminGetDocumentOperationRoute",
         "/api/admin/bots/{botId}/document-operations/{operationId}",
         apigateway.HttpMethod.GET,
+      ],
+      [
+        "AdminRecordsSearchRoute",
+        "/api/admin/bots/{botId}/records/search",
+        apigateway.HttpMethod.POST,
+      ],
+      [
+        "AdminRecordsConversationRoute",
+        "/api/admin/bots/{botId}/records/conversations/{conversationId}",
+        apigateway.HttpMethod.GET,
+      ],
+      [
+        "AdminRecordsTextRoute",
+        "/api/admin/bots/{botId}/records/conversations/{conversationId}/turns/{ordinal}/text",
+        apigateway.HttpMethod.GET,
+      ],
+      [
+        "AdminRecordsExportRoute",
+        "/api/admin/bots/{botId}/records/exports",
+        apigateway.HttpMethod.POST,
+      ],
+      [
+        "AdminRecordsExportStatusRoute",
+        "/api/admin/bots/{botId}/records/exports/{exportId}",
+        apigateway.HttpMethod.GET,
+      ],
+      [
+        "AdminRecordsExportDownloadRoute",
+        "/api/admin/bots/{botId}/records/exports/{exportId}/download",
+        apigateway.HttpMethod.POST,
       ],
     ] as const;
     for (const [routeId, routePath, method] of adminRoutes) {

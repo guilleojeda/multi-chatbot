@@ -147,7 +147,16 @@ jobs:
 
       - name: Deploy the checked CDK assembly
         if: steps.current.outputs.current == 'true'
-        run: ./node_modules/.bin/cdk deploy --app cdk.out --all --require-approval never
+        env:
+          DEPLOYMENT_ENVIRONMENT: ${{ needs.checks.outputs.environment }}
+          RECORDS_TEST_PERSON_IDS: ${{ secrets[needs.checks.outputs.environment == 'dev' && 'RECORDS_TEST_PERSON_IDS_DEV' || 'RECORDS_TEST_PERSON_IDS_PROD'] }}
+        run: |
+          record_ids="$RECORDS_TEST_PERSON_IDS"
+          if [[ -z "$record_ids" ]]; then
+            record_ids='{}'
+          fi
+          ./node_modules/.bin/cdk deploy --app cdk.out --all --require-approval never \
+            --parameters "multi-chatbot-$DEPLOYMENT_ENVIRONMENT-admin:RecordsTestPersonIds=$record_ids"
 
       - name: Skip the stale deployment
         if: steps.current.outputs.current == 'false'

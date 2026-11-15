@@ -15,6 +15,12 @@ import {
 import type { QuotaPolicyReader, QuotaPolicyWriter } from "./quota-policy-store.js";
 import { DOCUMENT_MAX_BYTES, isDocumentAction, validateDocumentFile } from "../config/documents.js";
 import type { DocumentAdministration } from "./document-administration.js";
+import { normalizeRecordsFilters } from "./records-reader.js";
+import type { createRecordsReader } from "./records-reader.js";
+import type { createRecordsExportAdministration } from "./records-export-administration.js";
+
+type RecordsReader = ReturnType<typeof createRecordsReader>;
+type RecordsExportAdministration = ReturnType<typeof createRecordsExportAdministration>;
 
 type AdminStore = AccountAccessStore;
 
@@ -139,6 +145,100 @@ function documentRoute(
     return null;
   }
   return match[4] ? { botId, kind: "start", operationId } : { botId, kind: "get", operationId };
+}
+
+type RecordsRoute =
+  | { botId: string; kind: "search" }
+  | { botId: string; kind: "conversation"; conversationId: string }
+  | {
+      botId: string;
+      kind: "text";
+      conversationId: string;
+      ordinal: string;
+    }
+  | { botId: string; kind: "exportStart" }
+  | { botId: string; kind: "exportGet" | "exportDownload"; exportId: string };
+
+function recordsRoute(path: string): RecordsRoute | null {
+  const match = path.match(/^\/api\/admin\/bots\/([^/]+)\/records(?:\/(.*))?$/);
+  if (!match) return null;
+  const decode = (value: string): string | null => {
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded !== "" && !decoded.includes("/") && !/[\u0000-\u001f\u007f]/.test(decoded)
+        ? decoded
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  const botId = decode(match[1]);
+  if (!botId) return null;
+  const segments = match[2] === undefined || match[2] === "" ? [] : match[2].split("/");
+  const parts = segments.map(decode);
+  if (parts.some((part) => part === null)) return null;
+  const suffix = parts as string[];
+  if (suffix.length === 1 && suffix[0] === "search") return { botId, kind: "search" };
+  if (suffix.length === 2 && suffix[0] === "conversations") {
+    return { botId, kind: "conversation", conversationId: suffix[1] };
+  }
+  if (
+    suffix.length === 5 &&
+    suffix[0] === "conversations" &&
+    suffix[2] === "turns" &&
+    suffix[4] === "text"
+  ) {
+    return {
+      botId,
+      kind: "text",
+      conversationId: suffix[1],
+      ordinal: suffix[3],
+    };
+  }
+  if (suffix.length === 1 && suffix[0] === "exports") return { botId, kind: "exportStart" };
+  if (suffix.length === 2 && suffix[0] === "exports") {
+    return { botId, kind: "exportGet", exportId: suffix[1] };
+  }
+  if (suffix.length === 3 && suffix[0] === "exports" && suffix[2] === "download") {
+    return { botId, kind: "exportDownload", exportId: suffix[1] };
+  }
+  return null;
+}
+
+function recordsErrorResponse(error: unknown): HttpResponse {
+  const code = isObject(error) && typeof error.code === "string" ? error.code : "";
+  if (code === "INVALID_INPUT") return response(400, { code: "INVALID_INPUT" });
+  if (code === "NOT_FOUND") return response(404, { code: "NOT_FOUND" });
+  if (code === "CONFLICT") return response(409, { code: "CONFLICT" });
+  if (code === "EXPORT_NOT_READY") return response(409, { code: "EXPORT_NOT_READY" });
+  if (code === "EXPORT_UNCONFIRMED") return response(503, { code: "EXPORT_UNCONFIRMED" });
+  return response(503, { code: "RECORDS_UNAVAILABLE" });
+}
+
+function queryParameters(
+  event: HttpEvent,
+  allowed: string[],
+): Record<string, string> | HttpResponse {
+  const raw = event.queryStringParameters ?? {};
+  if (!isObject(raw) || !Object.keys(raw).every((key) => allowed.includes(key))) {
+    return response(400, { code: "INVALID_INPUT" });
+  }
+  const parsed: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== "string") return response(400, { code: "INVALID_INPUT" });
+    parsed[key] = value;
+  }
+  return parsed;
+}
+
+function isHttpResponse(value: Record<string, string> | HttpResponse): value is HttpResponse {
+  return "statusCode" in value && typeof value.statusCode === "number";
+}
+
+function emptyPostBody(event: HttpEvent): boolean {
+  if (typeof event.body !== "string" || event.body.trim() === "") return true;
+  const body = parseBody(event);
+  return body !== null && exactKeys(body, []);
 }
 
 function documentErrorResponse(error: unknown): HttpResponse {
@@ -370,6 +470,8 @@ export function createAdminHandler(deps: {
   config: AdminConfig;
   stores: Record<string, AdminStore>;
   documentAdministrations?: Record<string, DocumentAdministration>;
+  recordsReaders?: Record<string, RecordsReader>;
+  recordsExportAdministrations?: Record<string, RecordsExportAdministration>;
   quotaReaders?: Record<string, QuotaPolicyReader>;
   quotaWriters?: Record<string, QuotaPolicyWriter>;
   identity: AdminIdentity;
@@ -381,6 +483,8 @@ export function createAdminHandler(deps: {
   const quotaReaders = deps.quotaReaders || {};
   const quotaWriters = deps.quotaWriters || {};
   const documentAdministrations = deps.documentAdministrations || {};
+  const recordsReaders = deps.recordsReaders || {};
+  const recordsExportAdministrations = deps.recordsExportAdministrations || {};
   const bots = new Map(config.bots.map((bot) => [bot.botId, bot]));
 
   async function lookup(botId: string, email: string): Promise<HttpResponse> {
@@ -453,6 +557,121 @@ export function createAdminHandler(deps: {
       return response(200, {
         bots: config.bots.map(({ botId, projectName }) => ({ botId, projectName })),
       });
+    }
+
+    const queryRoute = recordsRoute(path);
+    if (queryRoute) {
+      if (!bots.has(queryRoute.botId)) return response(404, { code: "NOT_FOUND" });
+      const reader = Object.hasOwn(recordsReaders, queryRoute.botId)
+        ? recordsReaders[queryRoute.botId]
+        : undefined;
+      const exportAdministration = Object.hasOwn(recordsExportAdministrations, queryRoute.botId)
+        ? recordsExportAdministrations[queryRoute.botId]
+        : undefined;
+
+      try {
+        if (queryRoute.kind === "search") {
+          if (method !== "POST") return response(404, { code: "NOT_FOUND" });
+          if (!reader) return response(503, { code: "RECORDS_UNAVAILABLE" });
+          const body = parseBody(event);
+          if (
+            !body ||
+            !hasOnlyKeys(body, ["filters", "cursor"]) ||
+            !Object.hasOwn(body, "filters") ||
+            !isObject(body.filters) ||
+            (Object.hasOwn(body, "cursor") && typeof body.cursor !== "string")
+          ) {
+            return response(400, { code: "INVALID_INPUT" });
+          }
+          const result = await reader.search({
+            actorSub: principal.sub,
+            filters: body.filters,
+            ...(typeof body.cursor === "string" ? { cursor: body.cursor } : {}),
+          });
+          return response(200, { botId: queryRoute.botId, ...result });
+        }
+
+        if (queryRoute.kind === "conversation") {
+          if (method !== "GET") return response(404, { code: "NOT_FOUND" });
+          if (!reader) return response(503, { code: "RECORDS_UNAVAILABLE" });
+          const query = queryParameters(event, ["cursor"]);
+          if (isHttpResponse(query)) return query;
+          const result = await reader.conversation({
+            actorSub: principal.sub,
+            conversationId: queryRoute.conversationId,
+            ...(typeof query.cursor === "string" ? { cursor: query.cursor } : {}),
+          });
+          return response(200, { botId: queryRoute.botId, ...result });
+        }
+
+        if (queryRoute.kind === "text") {
+          if (method !== "GET") return response(404, { code: "NOT_FOUND" });
+          if (!reader) return response(503, { code: "RECORDS_UNAVAILABLE" });
+          const query = queryParameters(event, ["role", "cursor"]);
+          if (isHttpResponse(query)) return query;
+          if (
+            (query.role !== "question" && query.role !== "answer") ||
+            !/^[1-9]\d*$/.test(queryRoute.ordinal) ||
+            !Number.isSafeInteger(Number(queryRoute.ordinal))
+          ) {
+            return response(400, { code: "INVALID_INPUT" });
+          }
+          const result = await reader.text({
+            actorSub: principal.sub,
+            conversationId: queryRoute.conversationId,
+            ordinal: Number(queryRoute.ordinal),
+            role: query.role,
+            ...(typeof query.cursor === "string" ? { cursor: query.cursor } : {}),
+          });
+          return response(200, { botId: queryRoute.botId, ...result });
+        }
+
+        if (queryRoute.kind === "exportStart") {
+          if (method !== "POST") return response(404, { code: "NOT_FOUND" });
+          if (!exportAdministration) return response(503, { code: "RECORDS_UNAVAILABLE" });
+          const body = parseBody(event);
+          if (
+            !body ||
+            !exactKeys(body, ["exportId", "filters"]) ||
+            typeof body.exportId !== "string" ||
+            !isObject(body.filters)
+          ) {
+            return response(400, { code: "INVALID_INPUT" });
+          }
+          const filters = normalizeRecordsFilters(body.filters);
+          const result = await exportAdministration.start({
+            actorSub: principal.sub,
+            exportId: body.exportId,
+            filters,
+          });
+          return response(202, result);
+        }
+
+        if (queryRoute.kind === "exportGet") {
+          if (method !== "GET") return response(404, { code: "NOT_FOUND" });
+          if (!exportAdministration) return response(503, { code: "RECORDS_UNAVAILABLE" });
+          const query = queryParameters(event, []);
+          if (isHttpResponse(query)) return query;
+          const result = await exportAdministration.get({
+            actorSub: principal.sub,
+            exportId: queryRoute.exportId,
+          });
+          return response(200, result);
+        }
+
+        if (queryRoute.kind === "exportDownload") {
+          if (method !== "POST") return response(404, { code: "NOT_FOUND" });
+          if (!exportAdministration) return response(503, { code: "RECORDS_UNAVAILABLE" });
+          if (!emptyPostBody(event)) return response(400, { code: "INVALID_INPUT" });
+          const result = await exportAdministration.download({
+            actorSub: principal.sub,
+            exportId: queryRoute.exportId,
+          });
+          return response(200, result);
+        }
+      } catch (error) {
+        return recordsErrorResponse(error);
+      }
     }
 
     const documentsRoute = documentRoute(path);
