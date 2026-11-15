@@ -478,7 +478,11 @@ describe("chat infrastructure acceptance", () => {
         ]),
       );
       expect(conversationTable.properties.TimeToLiveSpecification).toBeUndefined();
-      expect(conversationTable.properties.GlobalSecondaryIndexes).toEqual([
+      expect(
+        conversationTable.properties.GlobalSecondaryIndexes.filter(
+          ({ IndexName }) => IndexName === "ConversationHistory",
+        ),
+      ).toEqual([
         {
           IndexName: "ConversationHistory",
           KeySchema: [
@@ -552,6 +556,22 @@ describe("chat infrastructure acceptance", () => {
       );
       const accountTableActions = new Set(matchingActions(accountReads, "dynamodb:"));
       const conversationActions = new Set(matchingActions(conversationWrites, "dynamodb:"));
+
+      expect
+        .soft(
+          dynamoStatements
+            .filter((statement) =>
+              matchingActions([statement], "dynamodb:").includes("dynamodb:Query"),
+            )
+            .flatMap(({ Resource }) => [Resource].flat())
+            .every(
+              (resource) =>
+                referencesResource(resource, conversationTable.logicalId) &&
+                !JSON.stringify(resource).includes("/index/"),
+            ),
+          "Runtime queries the base conversation table without access to its indexes",
+        )
+        .toBe(true);
 
       expect(accountTableActions).toEqual(
         new Set(["dynamodb:GetItem", "dynamodb:ConditionCheckItem"]),

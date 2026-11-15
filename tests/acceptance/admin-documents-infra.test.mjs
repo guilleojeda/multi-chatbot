@@ -308,7 +308,11 @@ function flattenedStrings(value) {
 }
 
 function workerAndStateMachine(scenario) {
-  const machines = records(scenario.admin, "AWS::StepFunctions::StateMachine");
+  const { admin, assembly } = scenario;
+  const catalog = envValue(apiHandler(scenario), "BOT_CATALOG");
+  const machines = records(admin, "AWS::StepFunctions::StateMachine").filter((machine) =>
+    referencesResource(catalog, admin, admin, machine, assembly),
+  );
   expect(machines, "AdminStack owns a durable document workflow").toHaveLength(1);
   if (machines.length !== 1) return {};
   const machine = machines[0];
@@ -685,8 +689,12 @@ describe("phase 11.1 document administration infrastructure acceptance", () => {
       expect(documentBucket.properties.NotificationConfiguration).toBeUndefined();
 
       const apiStatements = roleStatements(scenario, handler);
-      const apiS3 = apiStatements.filter((statement) =>
-        statementActions(statement).some((action) => action.toLowerCase().startsWith("s3:")),
+      const apiS3 = apiStatements.filter(
+        (statement) =>
+          statementActions(statement).some((action) => action.toLowerCase().startsWith("s3:")) &&
+          !resourceItems(statement.Resource).every((resource) =>
+            stringIncludes(resource, "/exports/*"),
+          ),
       );
       expect(apiS3.length).toBeGreaterThan(0);
       const apiS3Actions = [...new Set(apiS3.flatMap(statementActions))].sort();
@@ -712,17 +720,13 @@ describe("phase 11.1 document administration infrastructure acceptance", () => {
         apiStatements.flatMap(statementActions).filter((action) => action.startsWith("lambda:")),
       ).toEqual([]);
 
-      const machineStatements = roleStatements(scenario, handler).filter((statement) =>
-        statementActions(statement).some((action) => action.startsWith("states:")),
+      const machineStatements = roleStatements(scenario, handler).filter(
+        (statement) =>
+          statementActions(statement).some((action) => action.startsWith("states:")) &&
+          referencesResource(statement.Resource, admin, admin, machine, assembly),
       );
       const stateActions = [...new Set(machineStatements.flatMap(statementActions))].sort();
       expect(stateActions).toEqual(["states:DescribeExecution", "states:StartExecution"]);
-      expect(
-        machineStatements.every((statement) =>
-          referencesResource(statement.Resource, admin, admin, machine, assembly),
-        ),
-        "the API starts and reads only this environment's executor",
-      ).toBe(true);
       expect(
         referencesResource(envValue(handler, "BOT_CATALOG"), admin, admin, machine, assembly),
         "the server-side catalog resolves the environment's executor",
@@ -1303,6 +1307,306 @@ describe("phase 11.1 document administration infrastructure acceptance", () => {
           ),
         "Runtime Retrieve remains limited to its existing Knowledge Base",
       ).toBe(true);
+    },
+  );
+});
+
+const recordsBaseRoute = "/api/admin/bots/{botId}/records";
+const recordsIndexName = "ConversationRecords";
+
+function leadingKeysAre(statement, comparator, key) {
+  const condition = statement.Condition || {};
+  const values = resourceItems(condition[comparator]?.["dynamodb:LeadingKeys"]);
+  const nullCheck = condition.Null?.["dynamodb:LeadingKeys"];
+  return (
+    values.length === 1 &&
+    values[0] === key &&
+    (!comparator.startsWith("ForAllValues:") || nullCheck === "false" || nullCheck === false)
+  );
+}
+
+function expectBoundedRecordsReads(scenario, statements, tables) {
+  const { admin, assembly } = scenario;
+  for (const [botId, { table, chat }] of tables) {
+    const reads = [];
+    const discovers = [];
+    for (const statement of statements) {
+      const resources = resourceItems(statement.Resource);
+      const related = resources.filter((resource) =>
+        referencesResource(resource, admin, chat, table, assembly),
+      );
+      if (related.length === 0) continue;
+      expect(related).toEqual(resources);
+      if (resources.every((resource) => stringIncludes(resource, `/index/${recordsIndexName}`))) {
+        expect(related.every((resource) => !stringIncludes(resource, "*"))).toBe(true);
+        expect(statementActions(statement)).toEqual(["dynamodb:Query"]);
+        expect(
+          leadingKeysAre(statement, "ForAllValues:StringEquals", botId) ||
+            leadingKeysAre(statement, "StringEquals", botId),
+        ).toBe(true);
+        discovers.push(statement);
+      } else {
+        expect(
+          related.every(
+            (resource) => !stringIncludes(resource, "*") && !stringIncludes(resource, "/index/"),
+          ),
+        ).toBe(true);
+        expect(
+          statementActions(statement).every((action) =>
+            ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query"].includes(action),
+          ),
+        ).toBe(true);
+        expect(
+          leadingKeysAre(statement, "ForAllValues:StringLike", "CONV#*") ||
+            (!statementActions(statement).includes("dynamodb:BatchGetItem") &&
+              leadingKeysAre(statement, "StringLike", "CONV#*")),
+        ).toBe(true);
+        reads.push(statement);
+      }
+    }
+    expect(discovers, `${botId} discovers turns only by its index and partition`).not.toEqual([]);
+    expect(reads, `${botId} can hydrate its own base conversation partitions`).not.toEqual([]);
+  }
+}
+
+describe("phase 12 conversation records infrastructure acceptance", () => {
+  it.each(environments)(
+    "%s discovers historical turns on the same table by native keys",
+    async (environment) => {
+      const scenario = await scenarioFor(environment);
+      const chat = templateOf(scenario, scenario.bots.get("docentes").chatId);
+      const { properties } = conversationTable(chat);
+      expect(properties.GlobalSecondaryIndexes.map(({ IndexName }) => IndexName).sort()).toEqual([
+        "ConversationHistory",
+        recordsIndexName,
+      ]);
+      expect(
+        properties.GlobalSecondaryIndexes.find(({ IndexName }) => IndexName === recordsIndexName),
+      ).toEqual({
+        IndexName: recordsIndexName,
+        KeySchema: [
+          { AttributeName: "botId", KeyType: "HASH" },
+          { AttributeName: "createdAt", KeyType: "RANGE" },
+          { AttributeName: "conversationId", KeyType: "RANGE" },
+          { AttributeName: "ordinal", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "KEYS_ONLY" },
+      });
+      expect(properties.AttributeDefinitions).toEqual(
+        expect.arrayContaining([
+          { AttributeName: "botId", AttributeType: "S" },
+          { AttributeName: "createdAt", AttributeType: "S" },
+          { AttributeName: "conversationId", AttributeType: "S" },
+          { AttributeName: "ordinal", AttributeType: "N" },
+        ]),
+      );
+    },
+  );
+
+  it.each(environments)(
+    "%s registers the records routes on the existing admin JWT integration",
+    async (environment) => {
+      const scenario = await scenarioFor(environment);
+      const { admin, assembly } = scenario;
+      const handler = apiHandler(scenario);
+      const [authorizer] = records(admin, "AWS::ApiGatewayV2::Authorizer");
+      const integration = records(admin, "AWS::ApiGatewayV2::Integration").find(({ properties }) =>
+        referencesResource(properties.IntegrationUri, admin, admin, handler, assembly),
+      );
+      expect(authorizer).toBeDefined();
+      expect(integration).toBeDefined();
+
+      const routes = [
+        ["POST", "/search"],
+        ["GET", "/conversations/{conversationId}"],
+        ["GET", "/conversations/{conversationId}/turns/{ordinal}/text"],
+        ["POST", "/exports"],
+        ["GET", "/exports/{exportId}"],
+        ["POST", "/exports/{exportId}/download"],
+      ];
+      for (const [method, suffix] of routes) {
+        const key = `${method} ${recordsBaseRoute}${suffix}`;
+        const matches = routeRecords(admin, key);
+        expect(matches, key).toHaveLength(1);
+        expect(matches[0].properties.AuthorizationType).toBe("JWT");
+        expect(sameStackReference(matches[0].properties.AuthorizerId, authorizer.logicalId)).toBe(
+          true,
+        );
+        expect(sameStackReference(matches[0].properties.Target, integration.logicalId)).toBe(true);
+      }
+    },
+  );
+
+  it.each(environments)(
+    "%s prepares private exports with bounded grants on the existing temporary buckets",
+    async (environment) => {
+      const botIds = environment === "dev" ? ["docentes", "bot-uno"] : ["docentes"];
+      const scenario = await scenarioFor(environment, botIds);
+      const { admin, assembly } = scenario;
+      const handler = apiHandler(scenario);
+      const { machine: documentMachine, worker: documentWorker } = workerAndStateMachine(scenario);
+      const machines = records(admin, "AWS::StepFunctions::StateMachine").filter(
+        ({ logicalId }) => logicalId !== documentMachine.logicalId,
+      );
+      expect(machines, "one export workflow alongside the document workflow").toHaveLength(1);
+      const [machine] = machines;
+      expect(machine.properties.StateMachineType).toBe("STANDARD");
+      expect(machine.properties.LoggingConfiguration?.IncludeExecutionData).not.toBe(true);
+      const definition = parseJsonTemplateValue(machine.properties.DefinitionString);
+      expect(definition).toBeDefined();
+      const tasks = Object.values(definition.States).filter(({ Type }) => Type === "Task");
+      expect(tasks).toHaveLength(1);
+      expect(definition.States[definition.StartAt]).toEqual(tasks[0]);
+      const workers = records(admin, "AWS::Lambda::Function").filter((lambda) =>
+        referencesResource(machine.properties, admin, admin, lambda, assembly),
+      );
+      expect(workers).toHaveLength(1);
+      const [worker] = workers;
+      expect(worker.logicalId).not.toBe(documentWorker.logicalId);
+      expect(worker.logicalId).not.toBe(handler.logicalId);
+      expect(worker.properties.Runtime).toBe("nodejs24.x");
+      expect(worker.properties.Timeout).toBeGreaterThan(0);
+      expect(worker.properties.Timeout).toBeLessThanOrEqual(900);
+      const workflowRole = getAttLogicalId(machine.properties.RoleArn);
+      const invocations = rolePolicyStatements(admin, workflowRole).filter((statement) =>
+        statementActions(statement).some((action) => action.startsWith("lambda:")),
+      );
+      expect(invocations).not.toEqual([]);
+      for (const statement of invocations) {
+        expect(statementActions(statement)).toEqual(["lambda:InvokeFunction"]);
+        expect(
+          resourceItems(statement.Resource).every((resource) =>
+            referencesResource(resource, admin, admin, worker, assembly),
+          ),
+        ).toBe(true);
+      }
+      const roles = [handler, documentWorker, worker].map(
+        (lambda) => lambdaPolicies(admin, lambda).roles[0]?.logicalId,
+      );
+      expect(roles.every(Boolean)).toBe(true);
+      expect(new Set([...roles, workflowRole]).size).toBe(4);
+
+      const apiGrants = roleStatements(scenario, handler);
+      const stateGrants = apiGrants.filter((statement) =>
+        statementActions(statement).some((action) => action.startsWith("states:")),
+      );
+      for (const statement of stateGrants) {
+        expect(
+          statementActions(statement).every((action) =>
+            ["states:StartExecution", "states:DescribeExecution"].includes(action),
+          ),
+        ).toBe(true);
+        expect(
+          resourceItems(statement.Resource).every((resource) =>
+            [machine, documentMachine].some((owner) =>
+              referencesResource(resource, admin, admin, owner, assembly),
+            ),
+          ),
+        ).toBe(true);
+      }
+      const exportGrants = stateGrants.filter((statement) =>
+        referencesResource(statement.Resource, admin, admin, machine, assembly),
+      );
+      expect(new Set(exportGrants.flatMap(statementActions))).toEqual(
+        new Set(["states:StartExecution", "states:DescribeExecution"]),
+      );
+      expect(
+        referencesResource(
+          envValue(handler, "RECORDS_EXPORT_STATE_MACHINE_ARN"),
+          admin,
+          admin,
+          machine,
+          assembly,
+        ),
+      ).toBe(true);
+
+      const receipts = incomingBuckets(scenario);
+      expect(receipts).toHaveLength(botIds.length);
+      const buckets = records(admin, "AWS::S3::Bucket");
+      expect(buckets).toHaveLength(botIds.length + 1);
+      for (const receipt of receipts) {
+        const exportRule = receipt.properties.LifecycleConfiguration.Rules.find(
+          (rule) => (rule.Filter?.Prefix || rule.Prefix) === "exports/",
+        );
+        expect(exportRule).toMatchObject({
+          Status: "Enabled",
+          ExpirationInDays: 1,
+          AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
+        });
+      }
+      const workerGrants = roleStatements(scenario, worker);
+      const apiExportObjects = apiGrants.filter((statement) =>
+        stringIncludes(statement.Resource, "/exports/*"),
+      );
+      const workerObjects = workerGrants.filter((statement) =>
+        statementActions(statement).some((action) => action.startsWith("s3:")),
+      );
+      for (const [grants, expectedActions] of [
+        [apiExportObjects, ["s3:GetObject"]],
+        [workerObjects, ["s3:PutObject", "s3:AbortMultipartUpload"]],
+      ]) {
+        expect(new Set(grants.flatMap(statementActions))).toEqual(new Set(expectedActions));
+        const resources = grants.flatMap(({ Resource }) => resourceItems(Resource));
+        expect(
+          resources.every(
+            (resource) =>
+              stringIncludes(resource, "/exports/*") &&
+              receipts.some((bucket) =>
+                referencesResource(resource, admin, admin, bucket, assembly),
+              ),
+          ),
+        ).toBe(true);
+        for (const bucket of receipts) {
+          expect(
+            resources.some((resource) =>
+              referencesResource(resource, admin, admin, bucket, assembly),
+            ),
+          ).toBe(true);
+        }
+      }
+      expect(
+        roleStatements(scenario, documentWorker).some((statement) =>
+          stringIncludes(statement.Resource, "/exports/*"),
+        ),
+      ).toBe(false);
+      expect(
+        workerGrants
+          .flatMap(statementActions)
+          .every((action) => /^(logs:|s3:|dynamodb:(?:GetItem|BatchGetItem|Query)$)/.test(action)),
+      ).toBe(true);
+
+      const tables = new Map(
+        botIds.map((botId) => {
+          const chat = templateOf(scenario, scenario.bots.get(botId).chatId);
+          return [botId, { chat, table: conversationTable(chat) }];
+        }),
+      );
+      const dynamoGrants = (statements) =>
+        statements.filter((statement) =>
+          statementActions(statement).some((action) => action.startsWith("dynamodb:")),
+        );
+      for (const statement of dynamoGrants(workerGrants)) {
+        expect(
+          resourceItems(statement.Resource).every((resource) =>
+            [...tables.values()].some(({ chat, table }) =>
+              referencesResource(resource, admin, chat, table, assembly),
+            ),
+          ),
+        ).toBe(true);
+      }
+      expectBoundedRecordsReads(scenario, dynamoGrants(workerGrants), tables);
+      const readsWithoutQuota = dynamoGrants(apiGrants).filter(
+        (statement) =>
+          !botIds.some((botId) =>
+            leadingKeysAre(statement, "ForAllValues:StringEquals", `BOT#${botId}`),
+          ),
+      );
+      expectBoundedRecordsReads(scenario, readsWithoutQuota, tables);
+      const publicConfig = receiptConfigFile(scenario);
+      expect(publicConfig).toBeDefined();
+      expect(readAssetFile(publicConfig)).not.toMatch(
+        /testPersonIds|RecordsExport|ConversationRecords|exports\//i,
+      );
     },
   );
 });
