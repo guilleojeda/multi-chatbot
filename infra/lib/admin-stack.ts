@@ -140,7 +140,12 @@ function documentWorkflow(scope: Construct, worker: lambda.IFunction): sfn.IChai
 function recordsExportWorkflow(scope: Construct, worker: lambda.IFunction): sfn.IChainable {
   return new tasks.LambdaInvoke(scope, "PrepareRecordsExport", {
     lambdaFunction: worker,
-    payload: sfn.TaskInput.fromJsonPathAt("$"),
+    payload: sfn.TaskInput.fromObject({
+      botId: sfn.JsonPath.stringAt("$.botId"),
+      actorSub: sfn.JsonPath.stringAt("$.actorSub"),
+      exportId: sfn.JsonPath.stringAt("$.exportId"),
+      filters: sfn.JsonPath.objectAt("$.filters"),
+    }),
     payloadResponseOnly: true,
     retryOnServiceExceptions: false,
   });
