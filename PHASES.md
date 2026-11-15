@@ -176,7 +176,7 @@ Se detallará solo la próxima fase contra el estado real del proyecto. Una fase
 
 **Resultado.** El administrador selecciona un chatbot, filtra consultas y descarga un CSV que permite analizar los intereses de sus usuarios fuera de la aplicación.
 
-**Alcance.** Consulta de conversaciones y preguntas, filtros simples y exportación de la selección. Una fila por consulta, con identificador interno de usuario, conversación y orden, fecha, pregunta, respuesta o estado del fallo y contexto profesional en ese momento. Conservar los seguimientos para interpretar preguntas como «¿y para primaria?». Las pruebas del equipo se identifican para excluirlas del análisis de docentes.
+**Alcance.** Consulta de conversaciones y preguntas con filtros por fecha, estado, ID de persona, nivel y materia históricos. La exportación incluye la conversación completa si coincide alguna de sus consultas. Una fila por consulta, con identificador interno de usuario, conversación y orden, fecha, pregunta, respuesta o estado del fallo y contexto profesional en ese momento. Conservar los seguimientos para interpretar preguntas como «¿y para primaria?». Las pruebas del equipo se identifican para excluirlas del análisis de docentes.
 
 **Verificación.** Comparar una selección conocida con sus registros y CSV, incluyendo acentos, saltos de línea, consultas fallidas, cambios de perfil y conversaciones quitadas del historial. No mezclar proyectos ni añadir columnas de nombre o email por defecto; las preguntas y respuestas conservan su texto original. No depender del contexto resumido para recuperar esos textos.
 

@@ -34,6 +34,7 @@ const modelId = "anthropic.claude-sonnet-4-6";
 const globalModelArn = "arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-4-6";
 const revisionPattern = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
 const historyIndexName = "ConversationHistory";
+const recordsIndexName = "ConversationRecords";
 const historyHandlerPath = fileURLToPath(
   new URL("../../api/chat-history-lambda.js", import.meta.url),
 );
@@ -94,6 +95,16 @@ export class ChatStack extends Stack {
       indexName: historyIndexName,
       partitionKey: { name: "historyOwner", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "historyOrder", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.KEYS_ONLY,
+    });
+    this.conversationTable.addGlobalSecondaryIndex({
+      indexName: recordsIndexName,
+      partitionKey: { name: "botId", type: dynamodb.AttributeType.STRING },
+      sortKeys: [
+        { name: "createdAt", type: dynamodb.AttributeType.STRING },
+        { name: "conversationId", type: dynamodb.AttributeType.STRING },
+        { name: "ordinal", type: dynamodb.AttributeType.NUMBER },
+      ],
       projectionType: dynamodb.ProjectionType.KEYS_ONLY,
     });
     this.documents = new DocumentInfrastructure(this, "Documents", environment);
@@ -219,10 +230,15 @@ export class ChatStack extends Stack {
     this.conversationTable.grant(
       this.runtime.role,
       "dynamodb:GetItem",
-      "dynamodb:Query",
       "dynamodb:PutItem",
       "dynamodb:UpdateItem",
       "dynamodb:ConditionCheckItem",
+    );
+    this.runtime.role.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:Query"],
+        resources: [this.conversationTable.tableArn],
+      }),
     );
 
     this.runtime.role.addToPrincipalPolicy(

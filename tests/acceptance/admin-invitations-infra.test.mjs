@@ -654,6 +654,18 @@ describe("phase 9 admin infrastructure acceptance", () => {
           continue;
         }
 
+        const actions = statementActions(statement);
+        const recordsRead =
+          !hasExactLeadingKeyCondition(statement, expectedBotId) &&
+          resources.length > 0 &&
+          resources.every((resource) =>
+            referencesResource(resource, admin, chat, conversationTable, assembly),
+          ) &&
+          actions.every((action) =>
+            ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query"].includes(action),
+          );
+        if (recordsRead) continue;
+
         expect(resources, "quota access names only the conversation table").toHaveLength(1);
         expect(
           isExactTableResource(resources[0], conversationTable, admin, chat, assembly),

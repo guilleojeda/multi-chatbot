@@ -15,6 +15,7 @@ import {
   type AdminPublicConfig,
 } from "./admin-api";
 import { AdminDocuments } from "./AdminDocuments";
+import { AdminRecords } from "./AdminRecords";
 import { asApiError } from "./api";
 import type { Session } from "./session";
 import "./admin-style.css";
@@ -44,7 +45,7 @@ type AdminProfile = {
   invitation?: { expiresAt: number; delivery: Delivery; invitedEmail?: string };
 };
 type Message = { kind: "status" | "error"; text: string };
-type AdminSection = "access" | "quotas" | "documents";
+type AdminSection = "access" | "quotas" | "documents" | "records";
 type QuotaField = "dailyLimit" | "monthlyLimit";
 type QuotaDraft = { dailyLimit: string; monthlyLimit: string };
 type QuotaView =
@@ -1740,6 +1741,15 @@ export function AdminApp({ getSession }: AdminAppProps) {
                 >
                   Documentos
                 </button>
+                <button
+                  className="admin-section-nav__button"
+                  type="button"
+                  aria-pressed={activeSection === "records"}
+                  disabled={!selectedBotId}
+                  onClick={() => changeSection("records")}
+                >
+                  Consultas
+                </button>
               </nav>
             </div>
 
@@ -2034,6 +2044,27 @@ export function AdminApp({ getSession }: AdminAppProps) {
                 session={documentsSession}
                 onAuthorizationError={(status) => {
                   if (!documentsSession) return;
+                  leaveSession(
+                    documentsSession,
+                    documentsIdentityTicket,
+                    status === 403 ? "forbidden" : "login",
+                    status === 403
+                      ? "Esta cuenta ya no tiene permiso de administrador. La sesión se cerró."
+                      : "La sesión venció. Iniciá sesión nuevamente.",
+                  );
+                }}
+              />
+            ) : null}
+            {selectedBot && config && documentsSession ? (
+              <AdminRecords
+                key={`${adminSub}:${documentsIdentityTicket}`}
+                botId={selectedBot.botId}
+                projectName={selectedBot.projectName}
+                config={config}
+                session={documentsSession}
+                sessionKey={`${adminSub}:${documentsIdentityTicket}`}
+                active={activeSection === "records"}
+                onAuthorizationError={(status) => {
                   leaveSession(
                     documentsSession,
                     documentsIdentityTicket,

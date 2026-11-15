@@ -20,8 +20,30 @@ import {
   createDocumentUploadSigner,
 } from "./document-aws-adapters.js";
 import { createDocumentStore } from "./document-store.js";
+import { parseRecordsApiConfig } from "./records-api-config.js";
+import { parseRecordsTestPersonIds } from "./records-test-people.js";
+import { createRecordsReader } from "./records-reader.js";
+import { createRecordsExportAdministration } from "./records-export-administration.js";
+import {
+  createRecordsExportExecution,
+  createRecordsExportObjects,
+} from "./records-export-aws-adapters.js";
 
 const runtimeConfig = parseAdminLambdaConfig();
+const hasRecordsConfiguration =
+  process.env.RECORDS_CATALOG !== undefined ||
+  process.env.RECORDS_EXPORT_STATE_MACHINE_ARN !== undefined;
+const recordsConfig = hasRecordsConfiguration
+  ? parseRecordsApiConfig(runtimeConfig.bots, process.env)
+  : undefined;
+const privateTestPeople = parseRecordsTestPersonIds(process.env.RECORDS_TEST_PERSON_IDS);
+const configuredBotIds = new Set(recordsConfig?.bots.map((bot) => bot.botId) ?? []);
+if (
+  [...privateTestPeople.keys()].some((botId) => !configuredBotIds.has(botId)) ||
+  (privateTestPeople.size > 0 && !recordsConfig)
+) {
+  throw new Error("RECORDS_TEST_PERSON_IDS includes a chatbot outside RECORDS_CATALOG.");
+}
 const identityClient = new CognitoIdentityProviderClient({ region: runtimeConfig.region });
 const s3Client = new S3Client({ region: runtimeConfig.region, maxAttempts: 2 });
 const sfnClient = new SFNClient({ region: runtimeConfig.region, maxAttempts: 1 });
@@ -81,6 +103,59 @@ const documentAdministrations = Object.fromEntries(
     }),
   ]),
 );
+const recordsReaders = recordsConfig
+  ? Object.fromEntries(
+      recordsConfig.bots.map((recordsBot) => {
+        const bot = runtimeConfig.bots.find((candidate) => candidate.botId === recordsBot.botId);
+        if (!bot) throw new Error("RECORDS_CATALOG references an unknown chatbot.");
+        const testPersonIds = [
+          ...new Set([
+            ...recordsBot.testPersonIds,
+            ...(privateTestPeople.get(recordsBot.botId) ?? []),
+          ]),
+        ];
+        return [
+          recordsBot.botId,
+          createRecordsReader({
+            botId: recordsBot.botId,
+            conversationTableName: bot.conversationTableName,
+            recordsIndexName: recordsBot.recordsIndexName,
+            testPersonIds,
+            documentClient: dynamoClient,
+            environment: recordsConfig.environment,
+            now: Date.now,
+          }),
+        ];
+      }),
+    )
+  : {};
+const recordsExportAdministrations = recordsConfig
+  ? (() => {
+      const recordsExportExecution = createRecordsExportExecution({
+        sfnClient,
+        stateMachineArn: recordsConfig.stateMachineArn,
+      });
+      const recordsExportObjects = createRecordsExportObjects({ s3Client });
+      return Object.fromEntries(
+        recordsConfig.bots.map((recordsBot) => {
+          const bot = runtimeConfig.bots.find((candidate) => candidate.botId === recordsBot.botId);
+          if (!bot) throw new Error("RECORDS_CATALOG references an unknown chatbot.");
+          return [
+            recordsBot.botId,
+            createRecordsExportAdministration({
+              botId: recordsBot.botId,
+              environment: recordsConfig.environment,
+              stateMachineArn: recordsConfig.stateMachineArn,
+              bucketName: bot.uploadBucketName,
+              execution: recordsExportExecution,
+              objects: recordsExportObjects,
+              now: Date.now,
+            }),
+          ];
+        }),
+      );
+    })()
+  : {};
 
 export const handler = createAdminHandler({
   config: {
@@ -98,6 +173,8 @@ export const handler = createAdminHandler({
   quotaReaders,
   quotaWriters,
   documentAdministrations,
+  recordsReaders,
+  recordsExportAdministrations,
   identity: createCognitoIdentityAdapter({
     client: identityClient,
     userPoolId: runtimeConfig.userPoolId,

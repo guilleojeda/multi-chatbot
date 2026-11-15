@@ -54,6 +54,12 @@ El rol `multi-chatbot-github-actions` acepta la audiencia `sts.amazonaws.com` y 
 
 Las sesiones humanas se obtienen mediante el acceso autorizado de cada integrante y se renuevan al expirar. Las credenciales son externas al código, configuración pública y artefactos. La primera confianza OIDC requiere una identidad AWS previa; después Actions obtiene su propia sesión temporal. Añadir integrantes requiere conocer su identidad y permisos antes de conceder acceso.
 
+El índice `ConversationRecords` comparte la tabla de conversaciones de cada chatbot. La comprobación después del despliegue espera a que DynamoDB informe `ACTIVE` y confirma que el índice incluye turnos ya guardados. El lector administrativo y su worker reciben acceso de lectura al índice y a particiones conversacionales del bot correspondiente. Runtime conserva acceso a la tabla y el historial público conserva su índice propio.
+
+Un flujo Step Functions Standard y una Lambda por ambiente preparan el CSV con carga incremental. El resultado durable del workflow identifica la carga completa. Cada bot reutiliza el bucket temporal privado y mantiene los permisos y ciclos de vida de `incoming/` y `exports/` acotados por prefijo. Se expiran objetos y partes incompletas de exportación a partir de un día. Antes de firmar, la API verifica el recibo del iniciador y el tamaño y ETag del objeto. El panel y la administración documental tienen permisos distintos de los del worker de exportación.
+
+El secreto de Actions `RECORDS_TEST_PERSON_IDS_DEV` o `RECORDS_TEST_PERSON_IDS_PROD` contiene un objeto JSON con una lista de `sub` por `botId`. El paso de despliegue carga el secreto del ambiente como parámetro `RecordsTestPersonIds` con `NoEcho`. Ambas Lambdas consumen ese valor. El assembly comprobado contiene la referencia y la configuración pública del navegador se limita a sus datos de conexión. Un valor ausente usa una lista vacía por chatbot.
+
 ## Checks y builds
 
 Node y npm, dependencias directas y lockfile están fijados. Infraestructura, configuración, API y Runtime comprueban tipos NodeNext; CDK ejecuta el resultado ESM de infraestructura. TypeScript web comprueba TSX y DOM por separado; Vite produce activos estáticos para los sitios del chatbot y el panel administrativo en salidas separadas. La Lambda se empaqueta con `NodejsFunction`, el SDK de AWS incluido y el esbuild local fijado por el lockfile. El mismo Vitest recoge la aceptación de servidor, cliente e infraestructura.
