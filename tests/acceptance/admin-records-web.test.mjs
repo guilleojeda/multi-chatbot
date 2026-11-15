@@ -121,7 +121,6 @@ function exportDownloadRequests(harness) {
 }
 
 function resultRow({
-  botId = "docentes",
   conversationId = "conversation-1",
   queryId = "query-2",
   ordinal = 2,
@@ -136,7 +135,6 @@ function resultRow({
   isTest = false,
 } = {}) {
   return {
-    botId,
     conversationId,
     queryId,
     ordinal,
@@ -453,7 +451,6 @@ describe("administrative conversation records", () => {
           if (botFromPath(path) === "docentes") return oldResult.promise;
           return searchPage("robotica", [
             resultRow({
-              botId: "robotica",
               conversationId: "robotica-conversation",
               questionPreview: "Solo del chatbot Robótica",
             }),
@@ -475,7 +472,6 @@ describe("administrative conversation records", () => {
     oldResult.resolve(
       searchPage("docentes", [
         resultRow({
-          botId: "docentes",
           conversationId: "stale-conversation",
           questionPreview: "Resultado atrasado de Docentes",
         }),
@@ -494,7 +490,7 @@ describe("administrative conversation records", () => {
       behavior: {
         search: async ({ path }) => {
           const botId = botFromPath(path);
-          return searchPage(botId, [resultRow({ botId, conversationId: `${botId}-conversation` })]);
+          return searchPage(botId, [resultRow({ conversationId: `${botId}-conversation` })]);
         },
         startExport: async ({ body, path }) => {
           startCount += 1;
@@ -599,7 +595,7 @@ describe("administrative conversation records", () => {
       behavior: {
         search: async ({ path }) => {
           const botId = botFromPath(path);
-          return searchPage(botId, [resultRow({ botId, conversationId: `${botId}-conversation` })]);
+          return searchPage(botId, [resultRow({ conversationId: `${botId}-conversation` })]);
         },
         readExport: async ({ path }) =>
           jsonResponse({
@@ -657,9 +653,7 @@ describe("administrative conversation records", () => {
         behavior: {
           search: async ({ path }) => {
             const botId = botFromPath(path);
-            return searchPage(botId, [
-              resultRow({ botId, conversationId: `${botId}-conversation` }),
-            ]);
+            return searchPage(botId, [resultRow({ conversationId: `${botId}-conversation` })]);
           },
           readExport: async ({ path }) => {
             statusReadCount += 1;

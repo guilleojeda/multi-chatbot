@@ -1464,6 +1464,12 @@ describe("phase 12 conversation records infrastructure acceptance", () => {
       const tasks = Object.values(definition.States).filter(({ Type }) => Type === "Task");
       expect(tasks).toHaveLength(1);
       expect(definition.States[definition.StartAt]).toEqual(tasks[0]);
+      expect(tasks[0].Parameters).toEqual({
+        "botId.$": "$.botId",
+        "actorSub.$": "$.actorSub",
+        "exportId.$": "$.exportId",
+        "filters.$": "$.filters",
+      });
       const workers = records(admin, "AWS::Lambda::Function").filter((lambda) =>
         referencesResource(machine.properties, admin, admin, lambda, assembly),
       );

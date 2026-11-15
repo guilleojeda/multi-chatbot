@@ -16,7 +16,6 @@ export type RecordFilters = {
 export type RecordProfileFields = Record<string, Array<string | { id: string; label: string }>>;
 
 export type RecordSearchResult = {
-  botId: string;
   conversationId: string;
   queryId: string;
   ordinal: number;
@@ -146,7 +145,6 @@ export function parseRecordSearchPage(value: unknown, expectedBotId: string): Re
   const results = value.results.map((candidate): RecordSearchResult => {
     if (
       !isRecord(candidate) ||
-      candidate.botId !== expectedBotId ||
       typeof candidate.conversationId !== "string" ||
       !candidate.conversationId ||
       typeof candidate.queryId !== "string" ||
@@ -160,7 +158,6 @@ export function parseRecordSearchPage(value: unknown, expectedBotId: string): Re
       throw new Error("INVALID_RESPONSE");
     }
     return {
-      botId: expectedBotId,
       conversationId: candidate.conversationId,
       queryId: candidate.queryId,
       ordinal: parseOrdinal(candidate.ordinal),
