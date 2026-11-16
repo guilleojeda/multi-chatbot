@@ -9,6 +9,7 @@ import {
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { isDeepStrictEqual } from "node:util";
 import type { RecordsExportExecution } from "./records-export-administration.js";
+import { parseRecordsExportInput } from "./records-export-contract.js";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -27,15 +28,6 @@ function executionArnForName(stateMachineArn: string, name: string): string {
   }
   const [, partition, region, accountId, stateMachineName] = match;
   return `arn:${partition}:states:${region}:${accountId}:execution:${stateMachineName}:${name}`;
-}
-
-function parsedInput(value: string | undefined): unknown {
-  if (typeof value !== "string" || value.length > 32_768) return undefined;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return undefined;
-  }
 }
 
 function confirmedAbsence(error: unknown): boolean {
@@ -111,8 +103,8 @@ export function createRecordsExportExecution({
             code: "EXPORT_UNCONFIRMED",
           });
         }
-        const existingInput = parsedInput(existing.input);
-        if (existingInput === undefined) {
+        const existingInput = parseRecordsExportInput(existing.input);
+        if (existingInput === null) {
           throw Object.assign(new Error("Records execution input is unavailable."), {
             code: "RECORDS_UNAVAILABLE",
           });

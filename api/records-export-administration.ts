@@ -2,6 +2,8 @@ import { isDeepStrictEqual } from "node:util";
 import {
   isRecordsExportId,
   ownsRecordsExportKey,
+  parseRecordsExportInput,
+  RECORDS_EXPORT_INPUT_MAX_BYTES,
   recordsExecutionName,
 } from "./records-export-contract.js";
 import { normalizeRecordsFilters } from "./records-reader.js";
@@ -58,16 +60,6 @@ function timeValue(value: Date | string | number | undefined): number | null {
         ? value
         : Date.parse(value ?? "");
   return Number.isSafeInteger(result) && result > 0 ? result : null;
-}
-
-function parseExecutionInput(value: string | undefined): Record<string, unknown> | null {
-  if (typeof value !== "string" || value.length > 32_768) return null;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return isObject(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
 }
 
 function parseExecutionOutput(value: string | undefined): Record<string, unknown> | null {
@@ -134,7 +126,7 @@ function validateExecution(
   ) {
     throw failure("RECORDS_UNAVAILABLE");
   }
-  const input = parseExecutionInput(execution.input);
+  const input = parseRecordsExportInput(execution.input);
   let canonicalFilters: Record<string, unknown> | null = null;
   try {
     if (input && isObject(input.filters)) canonicalFilters = normalizeRecordsFilters(input.filters);
@@ -262,6 +254,11 @@ export function createRecordsExportAdministration(options: {
         exportId: input.exportId,
         filters: input.filters,
       };
+      if (
+        Buffer.byteLength(JSON.stringify(executionInput), "utf8") > RECORDS_EXPORT_INPUT_MAX_BYTES
+      ) {
+        throw failure("INVALID_INPUT");
+      }
       try {
         const started = await execution.start({ name: expected.name, input: executionInput });
         if (typeof started.executionArn !== "string" || started.executionArn.length === 0) {

@@ -280,7 +280,7 @@ function pageForQuery(command, rows) {
   };
 }
 
-async function loadAdminLambda({ initialRows = [], indexPages = [] } = {}) {
+async function loadAdminLambda({ initialRows = [], indexPages = [], batchLimit } = {}) {
   vi.resetModules();
   vi.stubEnv("USER_POOL_ID", "user-pool");
   vi.stubEnv("ADMIN_CLIENT_ID", "admin-client");
@@ -314,11 +314,16 @@ async function loadAdminLambda({ initialRows = [], indexPages = [] } = {}) {
       const Responses = {};
       const UnprocessedKeys = {};
       for (const [tableName, request] of Object.entries(command.input.RequestItems ?? {})) {
-        const items = (request.Keys ?? [])
+        const keys = request.Keys ?? [];
+        const limit = batchLimit ?? keys.length;
+        const items = keys
+          .slice(0, limit)
           .map((key) => rows.get(rowKey(tableName, key)))
           .filter(Boolean)
+          .reverse()
           .map(clone);
         Responses[tableName] = items;
+        if (keys.length > limit) UnprocessedKeys[tableName] = { Keys: keys.slice(limit) };
       }
       return { Responses, UnprocessedKeys };
     }
@@ -746,6 +751,151 @@ describe("administrative records API", () => {
     expectNoGeneration(harness);
   });
 
+  it("finds an exact long Unicode subject and reopens the same canonical export receipt", async () => {
+    const conversationId = uuid("conversation-long-subject");
+    const queryId = uuid("query-long-subject");
+    const subject = `Fonética ǰ, ${"İ".repeat(1_117)}`;
+    const inputSubject = ` FONÉTICA J\u030c, ${"İ".repeat(1_117)} `;
+    const canonicalSubject = `fonética ǰ, ${"i\u0307".repeat(1_117)}`;
+    const harness = await loadAdminLambda({
+      initialRows: [
+        meta({ conversationId }),
+        turn({ conversationId, queryId, fields: { educationLevels: [], subjects: [subject] } }),
+        textChunk({ conversationId, queryId, text: "¿Cómo enseño fonética?" }),
+      ],
+    });
+    const search = async (subjectFilter) =>
+      harness.invoke(
+        event({
+          method: "POST",
+          path: recordsPath("/search"),
+          body: { filters: { subject: subjectFilter } },
+        }),
+      );
+
+    const matching = await search(inputSubject);
+    expect(matching.statusCode).toBe(200);
+    expect(responseBody(matching).results).toEqual([expect.objectContaining({ queryId })]);
+    const different = await search(canonicalSubject.replace(",", ""));
+    expect(different.statusCode).toBe(200);
+    expect(responseBody(different).results).toEqual([]);
+
+    const start = async (subjectFilter) =>
+      harness.invoke(
+        event({
+          method: "POST",
+          path: recordsPath("/exports"),
+          body: { exportId, filters: { subject: subjectFilter } },
+        }),
+      );
+    expect((await start(inputSubject)).statusCode).toBe(202);
+    expect(harness.executions.size).toBe(1);
+    const [execution] = harness.executions.values();
+    expect(JSON.parse(execution.input).filters.subject).toBe(canonicalSubject);
+    harness.setExecution(execution.name, { status: "SUCCEEDED", output: { status: "empty" } });
+    const replay = await start(canonicalSubject);
+    expect(replay.statusCode).toBe(202);
+    expect(responseBody(replay)).toEqual({ botId, exportId, status: "processing" });
+    const receipt = await harness.invoke(event({ path: recordsPath(`/exports/${exportId}`) }));
+    expect(receipt.statusCode).toBe(200);
+    expect(responseBody(receipt)).toEqual({ botId, exportId, status: "empty" });
+    expect(harness.executions.size).toBe(1);
+    const initialStarts = harness.commands.filter(
+      (command) => command.constructor.name === "StartExecutionCommand",
+    ).length;
+    // The text occupies less than 256 Ki characters, but the envelope exceeds 256 KiB.
+    expect((await start("á".repeat(128 * 1024))).statusCode).toBe(400);
+    expect(
+      harness.commands.filter((command) => command.constructor.name === "StartExecutionCommand"),
+    ).toHaveLength(initialStarts);
+  });
+
+  it("opens on the matching ordinal and pages both ways inside the original ordinal cut", async () => {
+    const conversationId = uuid("conversation-with-many-turns");
+    const path = recordsPath(`/conversations/${conversationId}`);
+    const turns = Array.from({ length: 80 }, (_, index) =>
+      turn({ conversationId, ordinal: index + 1, queryId: uuid(`conversation-turn-${index + 1}`) }),
+    );
+    const harness = await loadAdminLambda({
+      initialRows: [meta({ conversationId, lastOrdinal: 80 }), ...turns],
+    });
+    const get = async (query) => harness.invoke(event({ path, query }));
+    const page = async (query, first, last, throughOrdinal = 80) => {
+      const response = await get(query);
+      expect(response.statusCode).toBe(200);
+      const body = responseBody(response);
+      expect(body.throughOrdinal).toBe(throughOrdinal);
+      expect(body.turns.map(({ ordinal }) => ordinal)).toEqual(
+        Array.from({ length: last - first + 1 }, (_, index) => first + index),
+      );
+      return body;
+    };
+    const anchored = await page({ ordinal: "37" }, 13, 37);
+    expect(anchored.turns.at(-1).queryId).toBe(turns[36].queryId);
+    expect(anchored.nextCursor).toEqual(expect.any(String));
+    expect(anchored.newerCursor).toEqual(expect.any(String));
+    expect((await get({ ordinal: "0" })).statusCode).toBe(400);
+    expect((await get({ ordinal: "37", cursor: anchored.newerCursor })).statusCode).toBe(400);
+    expect((await get({ ordinal: "81" })).statusCode).toBe(404);
+
+    addRows(
+      harness.rows,
+      meta({ conversationId, lastOrdinal: 81 }),
+      turn({ conversationId, ordinal: 81, queryId: uuid("conversation-turn-81") }),
+    );
+    const older = await page({ cursor: anchored.nextCursor }, 1, 12);
+    expect(older.nextCursor).toBeNull();
+    const newer = await page({ cursor: anchored.newerCursor }, 38, 62);
+    await page({ cursor: newer.nextCursor }, 13, 37);
+    const newestAtCut = await page({ cursor: newer.newerCursor }, 63, 80);
+    expect(newestAtCut.newerCursor).toBeNull();
+    const latest = await page(undefined, 57, 81, 81);
+    expect(latest.newerCursor).toBeNull();
+    expectNoGeneration(harness);
+  });
+
+  it("assembles a page when a partition keeps returning a smaller batch of unprocessed keys", async () => {
+    const conversationId = uuid("batch-get-partial-progress");
+    const turns = Array.from({ length: 25 }, (_, index) =>
+      turn({ conversationId, ordinal: index + 1, queryId: uuid(`batch-get-turn-${index + 1}`) }),
+    );
+    const harness = await loadAdminLambda({
+      initialRows: [meta({ conversationId, lastOrdinal: turns.length }), ...turns],
+      batchLimit: 3,
+    });
+    const response = await harness.invoke(
+      event({ path: recordsPath(`/conversations/${conversationId}`) }),
+    );
+    expect(response.statusCode).toBe(200);
+    expect(responseBody(response).turns.map(({ queryId }) => queryId)).toEqual(
+      turns.map(({ queryId }) => queryId),
+    );
+    const requestedCounts = harness.commands
+      .filter((command) => command.constructor.name === "BatchGetCommand")
+      .map((command) => command.input.RequestItems[conversationTableName].Keys.length);
+    expect(requestedCounts).toEqual([25, 22, 19, 16, 13, 10, 7, 4, 1]);
+    expectNoGeneration(harness);
+  });
+
+  it("ends the batch read after bounded retries without any progress", async () => {
+    const conversationId = uuid("batch-get-stalled");
+    const harness = await loadAdminLambda({
+      initialRows: [
+        meta({ conversationId }),
+        turn({ conversationId, queryId: uuid("stalled-turn") }),
+      ],
+      batchLimit: 0,
+    });
+    const response = await harness.invoke(
+      event({ path: recordsPath(`/conversations/${conversationId}`) }),
+    );
+    expect(response.statusCode).toBe(503);
+    expect(
+      harness.commands.filter((command) => command.constructor.name === "BatchGetCommand"),
+    ).toHaveLength(6);
+    expectNoGeneration(harness);
+  });
+
   it("reads hidden conversation manifests and original text in order without restoring or mutating history", async () => {
     const conversationId = uuid("removed-from-owner-history");
     const query1 = uuid("query-original");
@@ -848,6 +998,7 @@ describe("administrative records API", () => {
         },
       ],
       nextCursor: null,
+      newerCursor: null,
     });
 
     const question = await harness.invoke(
@@ -879,8 +1030,20 @@ describe("administrative records API", () => {
       text: "¿Cómo enseño fracciones?",
       nextCursor: null,
     });
-    expect(responseBody(answer).text).toBe("Con material concreto.");
-    expect(responseBody(partial).text).toBe("Podrías usar ");
+    expect(responseBody(answer)).toMatchObject({
+      text: "Con material concreto.",
+      status: "completed",
+      answerComplete: true,
+    });
+    expect(responseBody(partial)).toMatchObject({
+      text: "Podrías usar ",
+      status: "failed",
+      answerComplete: false,
+      failureCode: "provider_error",
+    });
+    expect(
+      harness.commands.filter((command) => command.constructor.name === "QueryCommand"),
+    ).toHaveLength(3);
     expectNoGeneration(harness);
 
     const wrongBotMeta = meta({
@@ -984,6 +1147,174 @@ describe("administrative records API", () => {
     expect(malformedCursorChecked).toBe(true);
     expect(assembled).toBe(original);
     expect(Buffer.byteLength(assembled, "utf8")).toBe(Buffer.byteLength(original, "utf8"));
+    expectNoGeneration(harness);
+  });
+
+  it.each([
+    { status: "completed", append: false, answerComplete: true },
+    { status: "failed", append: true, answerComplete: false, failureCode: "provider_error" },
+  ])(
+    "keeps the text and answer metadata on one cut when the turn becomes $status",
+    async (terminal) => {
+      const conversationId = uuid(`conversation-answer-cut-${terminal.status}`);
+      const queryId = uuid(`query-answer-cut-${terminal.status}`);
+      const original = ["a", "b", "c", "d", "e", "f"];
+      const chunks = original.map((text, index) =>
+        textChunk({ conversationId, queryId, role: "assistant", index, text }),
+      );
+      const harness = await loadAdminLambda({
+        initialRows: [
+          meta({ conversationId }),
+          turn({ conversationId, queryId, status: "in_progress", answerCount: original.length }),
+          ...chunks,
+        ],
+      });
+      const get = async (cursor) => {
+        const response = await harness.invoke(
+          event({
+            path: recordsPath(`/conversations/${conversationId}/turns/1/text`),
+            query: { role: "answer", ...(cursor ? { cursor } : {}) },
+          }),
+        );
+        expect(response.statusCode).toBe(200);
+        return responseBody(response);
+      };
+      const beforeTerminal = await get();
+      expect(beforeTerminal).toMatchObject({
+        text: "abcd",
+        status: "in_progress",
+        answerComplete: false,
+        nextCursor: expect.any(String),
+      });
+      const { append, ...terminalState } = terminal;
+      addRows(
+        harness.rows,
+        turn({
+          conversationId,
+          queryId,
+          ...terminalState,
+          answerCount: original.length + Number(append),
+        }),
+      );
+      if (append) {
+        addRows(
+          harness.rows,
+          textChunk({
+            conversationId,
+            queryId,
+            role: "assistant",
+            index: original.length,
+            text: "g",
+          }),
+        );
+      }
+      const previousCut = await get(beforeTerminal.nextCursor);
+      expect(previousCut).toMatchObject({
+        text: "ef",
+        status: "in_progress",
+        answerComplete: false,
+        nextCursor: null,
+      });
+      expect(previousCut).not.toHaveProperty("failureCode");
+      const fresh = await get();
+      expect(fresh).toMatchObject({
+        ...terminalState,
+        text: "abcd",
+        nextCursor: expect.any(String),
+      });
+      const freshEnd = await get(fresh.nextCursor);
+      expect(freshEnd).toMatchObject({
+        ...terminalState,
+        text: append ? "efg" : "ef",
+        nextCursor: null,
+      });
+      expectNoGeneration(harness);
+    },
+  );
+
+  it("uses text continuation only when necessary and still rejects fragments outside terminal manifests", async () => {
+    const conversationId = uuid("terminal-answer-integrity");
+    const completeQueryId = uuid("terminal-answer-completed");
+    const failedQueryId = uuid("terminal-answer-no-fragments");
+    const complete = turn({ conversationId, queryId: completeQueryId, answerCount: 16 });
+    const failed = turn({
+      conversationId,
+      queryId: failedQueryId,
+      ordinal: 2,
+      status: "failed",
+      failureCode: "provider_error",
+    });
+    const chunk = (descriptor, index, text) =>
+      textChunk({
+        conversationId,
+        queryId: descriptor.queryId,
+        ordinal: descriptor.ordinal,
+        role: "assistant",
+        index,
+        text,
+      });
+    const harness = await loadAdminLambda({
+      initialRows: [
+        meta({ conversationId, lastOrdinal: 2 }),
+        complete,
+        failed,
+        ...Array.from({ length: 16 }, (_, index) => chunk(complete, index, "x")),
+      ],
+    });
+    const { createRecordsReader } = await import("../../api/records-reader.ts");
+    const reader = createRecordsReader({
+      botId,
+      conversationTableName,
+      recordsIndexName,
+      testPersonIds: [],
+      documentClient: { send: harness.dynamoSend },
+      environment: "dev",
+    });
+    const consume = async (descriptor) => {
+      let output = "";
+      for await (const piece of reader.readTextChunks(descriptor, "answer")) output += piece;
+      return output;
+    };
+    const countQueries = () =>
+      harness.commands.filter((command) => command.constructor.name === "QueryCommand").length;
+    expect(await consume(complete)).toBe("x".repeat(16));
+    expect(countQueries()).toBe(1);
+    const get = async (ordinal, cursor) =>
+      harness.invoke(
+        event({
+          path: recordsPath(`/conversations/${conversationId}/turns/${ordinal}/text`),
+          query: { role: "answer", ...(cursor ? { cursor } : {}) },
+        }),
+      );
+    const zero = await get(2);
+    expect(zero.statusCode).toBe(200);
+    expect(responseBody(zero)).toMatchObject({
+      text: "",
+      status: "failed",
+      answerComplete: false,
+      failureCode: "provider_error",
+    });
+    expect(countQueries()).toBe(2);
+    expect(await consume(failed)).toBe("");
+    expect(countQueries()).toBe(3);
+
+    addRows(
+      harness.rows,
+      chunk(complete, 16, "unexpected extra"),
+      chunk(failed, 0, "unreported answer"),
+    );
+    await expect(consume(complete)).rejects.toMatchObject({ code: "RECORDS_UNAVAILABLE" });
+    expect(countQueries()).toBe(5);
+    await expect(consume(failed)).rejects.toMatchObject({ code: "RECORDS_UNAVAILABLE" });
+    expect((await get(2)).statusCode).toBe(503);
+    let cursor;
+    for (let page = 0; page < 3; page += 1) {
+      const response = await get(1, cursor);
+      expect(response.statusCode).toBe(200);
+      cursor = responseBody(response).nextCursor;
+      expect(cursor).toEqual(expect.any(String));
+    }
+    expect((await get(1, cursor)).statusCode).toBe(503);
     expectNoGeneration(harness);
   });
 

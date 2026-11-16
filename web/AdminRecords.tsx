@@ -10,6 +10,7 @@ import {
   recordAdministrations,
   type ExportStatus,
   type RecordExportReceipt,
+  type RecordAnswerTextPage,
   type RecordFilters,
   type RecordProfileFields,
   type RecordSearchResult,
@@ -40,14 +41,16 @@ type ConversationView = {
   throughOrdinal?: number;
   turns: TextTurn[];
   nextCursor: string | null;
-  loadingMore?: boolean;
+  newerCursor: string | null;
+  loadingOlder?: boolean;
+  loadingNewer?: boolean;
   error?: string;
 };
 
 type ExportJob = {
   exportId: string;
   filters: RecordFilters;
-  state: "starting" | "uncertain" | ExportStatus;
+  state: "starting" | "uncertain" | "start_rejected" | ExportStatus;
   receipt?: RecordExportReceipt;
   error?: string;
 };
@@ -190,6 +193,8 @@ function exportStatusMessage(job: ExportJob | undefined): string | null {
   if (job.state === "starting") return "Iniciando la preparación del archivo…";
   if (job.state === "uncertain")
     return job.error ?? "No se pudo confirmar el inicio de la preparación.";
+  if (job.state === "start_rejected")
+    return job.error ?? "El servidor rechazó el inicio de la preparación.";
   if (job.state === "processing")
     return (
       job.error ?? "Preparando el CSV con todas las consultas de cada conversación coincidente…"
@@ -203,10 +208,6 @@ function exportStatusMessage(job: ExportJob | undefined): string | null {
 function isAuthError(error: unknown): error is { status: 401 | 403 } {
   const status = asApiError(error).status;
   return status === 401 || status === 403;
-}
-
-function turnWithText(turn: RecordTurnDescriptor, question: string, answer: string): TextTurn {
-  return { ...turn, question, answer };
 }
 
 export function AdminRecords({
@@ -349,6 +350,9 @@ export function AdminRecords({
       return;
     }
     setFormError("");
+    // A new applied view invalidates every in-flight conversation read, including
+    // reads whose response arrives after the new result set has rendered.
+    detailEpochRef.current += 1;
     setConversation(null);
     setRows([]);
     setNextCursor(null);
@@ -378,6 +382,9 @@ export function AdminRecords({
       let cursor: string | null = null;
       let text = "";
       const seenCursors = new Set<string>();
+      let answerMetadata:
+        | (Pick<RecordAnswerTextPage, "status" | "answerComplete"> & { failureCode?: string })
+        | undefined;
       do {
         const response = await recordAdministrations(
           config,
@@ -388,13 +395,32 @@ export function AdminRecords({
         if (!isCurrent()) throw new Error("STALE_REQUEST");
         const page = parseRecordTextPage(response, requestedBotId, conversationId, ordinal, role);
         text += page.text;
+        if (role === "answer") {
+          const answerPage = page as RecordAnswerTextPage;
+          const pageMetadata = {
+            status: answerPage.status,
+            answerComplete: answerPage.answerComplete,
+            ...(answerPage.failureCode !== undefined
+              ? { failureCode: answerPage.failureCode }
+              : {}),
+          };
+          if (
+            answerMetadata &&
+            (answerMetadata.status !== pageMetadata.status ||
+              answerMetadata.answerComplete !== pageMetadata.answerComplete ||
+              answerMetadata.failureCode !== pageMetadata.failureCode)
+          ) {
+            throw new Error("INVALID_RESPONSE");
+          }
+          answerMetadata = pageMetadata;
+        }
         cursor = page.nextCursor;
         if (cursor) {
           if (seenCursors.has(cursor)) throw new Error("INVALID_RESPONSE");
           seenCursors.add(cursor);
         }
       } while (cursor);
-      return text;
+      return { text, ...(answerMetadata ?? {}) };
     },
     [config, session],
   );
@@ -410,7 +436,19 @@ export function AdminRecords({
         readFullText(requestedBotId, conversationId, turn.ordinal, "question", isCurrent),
         readFullText(requestedBotId, conversationId, turn.ordinal, "answer", isCurrent),
       ]);
-      return turnWithText(turn, question, answer);
+      if (!answer.status || answer.answerComplete === undefined) {
+        throw new Error("INVALID_RESPONSE");
+      }
+      const descriptorWithoutFailure = { ...turn };
+      delete descriptorWithoutFailure.failureCode;
+      return {
+        ...descriptorWithoutFailure,
+        question: question.text,
+        answer: answer.text,
+        status: answer.status,
+        answerComplete: answer.answerComplete,
+        ...(answer.failureCode !== undefined ? { failureCode: answer.failureCode } : {}),
+      };
     },
     [readFullText],
   );
@@ -428,6 +466,7 @@ export function AdminRecords({
       selectedOrdinal: row.ordinal,
       turns: [],
       nextCursor: null,
+      newerCursor: null,
     });
     try {
       const response = await recordAdministrations(
@@ -435,7 +474,7 @@ export function AdminRecords({
         session,
         requestedBotId,
         isCurrent,
-      ).conversation(row.conversationId);
+      ).conversation(row.conversationId, { ordinal: row.ordinal });
       if (!isCurrent()) return;
       const page = parseRecordConversationPage(response, requestedBotId, row.conversationId);
       const turns = await Promise.all(
@@ -452,6 +491,7 @@ export function AdminRecords({
         throughOrdinal: page.throughOrdinal,
         turns: turns.sort((left, right) => left.ordinal - right.ordinal),
         nextCursor: page.nextCursor,
+        newerCursor: page.newerCursor,
       });
     } catch (error) {
       if (!isCurrent() || handleAuthError(error)) return;
@@ -463,24 +503,37 @@ export function AdminRecords({
     }
   };
 
-  const loadMoreTurns = async () => {
+  const loadMoreTurns = async (direction: "older" | "newer") => {
     if (
       !conversation ||
       conversation.kind !== "ready" ||
-      !conversation.nextCursor ||
-      conversation.loadingMore
+      (direction === "older" ? !conversation.nextCursor : !conversation.newerCursor) ||
+      (direction === "older" ? conversation.loadingOlder : conversation.loadingNewer)
     ) {
       return;
     }
     const requestEpoch = detailEpochRef.current;
     const requestedBotId = botId;
-    const { conversationId, nextCursor: cursor } = conversation;
+    const {
+      conversationId,
+      nextCursor,
+      newerCursor,
+      throughOrdinal: currentThroughOrdinal,
+    } = conversation;
+    const cursor = direction === "older" ? nextCursor : newerCursor;
+    if (!cursor) return;
     const isCurrent = () =>
       mountedRef.current &&
       botRef.current === requestedBotId &&
       detailEpochRef.current === requestEpoch;
     setConversation((current) =>
-      current ? { ...current, loadingMore: true, error: undefined } : current,
+      current
+        ? {
+            ...current,
+            ...(direction === "older" ? { loadingOlder: true } : { loadingNewer: true }),
+            error: undefined,
+          }
+        : current,
     );
     try {
       const response = await recordAdministrations(
@@ -491,6 +544,7 @@ export function AdminRecords({
       ).conversation(conversationId, cursor);
       if (!isCurrent()) return;
       const page = parseRecordConversationPage(response, requestedBotId, conversationId);
+      if (page.throughOrdinal !== currentThroughOrdinal) throw new Error("INVALID_RESPONSE");
       const turns = await Promise.all(
         page.turns.map((turn) => readTurn(requestedBotId, conversationId, turn, isCurrent)),
       );
@@ -509,8 +563,9 @@ export function AdminRecords({
                     all.findIndex((candidate) => candidate.ordinal === turn.ordinal) === index,
                 )
                 .sort((left, right) => left.ordinal - right.ordinal),
-              nextCursor: page.nextCursor,
-              loadingMore: false,
+              ...(direction === "older"
+                ? { nextCursor: page.nextCursor, loadingOlder: false }
+                : { newerCursor: page.newerCursor, loadingNewer: false }),
             }
           : current,
       );
@@ -518,7 +573,11 @@ export function AdminRecords({
       if (!isCurrent() || handleAuthError(error)) return;
       setConversation((current) =>
         current?.conversationId === conversationId
-          ? { ...current, loadingMore: false, error: messageForReadError(error) }
+          ? {
+              ...current,
+              ...(direction === "older" ? { loadingOlder: false } : { loadingNewer: false }),
+              error: messageForReadError(error),
+            }
           : current,
       );
     }
@@ -527,7 +586,13 @@ export function AdminRecords({
   const startExport = async (existing?: ExportJob) => {
     const requestedBotId = botId;
     const currentJob = existing;
-    const filters = currentJob?.filters ?? appliedFilters;
+    // An uncertain start must be retried with the exact same ID and filters.
+    // A confirmed execution failure retries its frozen criteria. A confirmed
+    // start rejection is a new request and can use corrected applied filters.
+    const filters =
+      currentJob?.state === "uncertain" || currentJob?.state === "failed"
+        ? currentJob.filters
+        : (appliedFilters ?? currentJob?.filters);
     if (!filters || !active) return;
     const exportId = currentJob?.state === "uncertain" ? currentJob.exportId : makeUuid();
     const job: ExportJob = { exportId, filters, state: "starting" };
@@ -537,13 +602,13 @@ export function AdminRecords({
         config,
         session,
         requestedBotId,
-        () => mountedRef.current && botRef.current === requestedBotId,
+        () => mountedRef.current,
       ).startExport(exportId, filters);
       const receipt = parseRecordExportReceipt(response, requestedBotId);
       if (receipt.exportId !== exportId || receipt.status !== "processing") {
         throw new Error("INVALID_RESPONSE");
       }
-      if (!mountedRef.current || botRef.current !== requestedBotId) return;
+      if (!mountedRef.current) return;
       updateExport(requestedBotId, {
         exportId,
         filters,
@@ -551,8 +616,21 @@ export function AdminRecords({
         receipt,
       });
     } catch (error) {
-      if (!mountedRef.current || botRef.current !== requestedBotId) return;
+      if (!mountedRef.current) return;
       if (handleAuthError(error)) return;
+      const status = asApiError(error).status;
+      if (status === 400 || status === 409) {
+        updateExport(requestedBotId, {
+          exportId,
+          filters,
+          state: "start_rejected",
+          error:
+            status === 409
+              ? "El servidor rechazó este inicio porque el identificador ya está en conflicto. Aplicá los filtros correctos y prepará una nueva exportación."
+              : "El servidor rechazó los filtros de esta exportación. Corregilos, aplicalos y prepará una nueva exportación.",
+        });
+        return;
+      }
       updateExport(requestedBotId, {
         exportId,
         filters,
@@ -572,9 +650,9 @@ export function AdminRecords({
           config,
           session,
           requestedBotId,
-          () => mountedRef.current && botRef.current === requestedBotId,
+          () => mountedRef.current,
         ).exportStatus(exportId);
-        if (botRef.current !== requestedBotId) return null;
+        if (!mountedRef.current) return null;
         const receipt = parseRecordExportReceipt(response, requestedBotId);
         if (receipt.exportId !== exportId) throw new Error("INVALID_RESPONSE");
         const previous = exportJobsRef.current.get(requestedBotId);
@@ -1050,10 +1128,24 @@ export function AdminRecords({
                 <button
                   className="admin-button admin-button--quiet admin-records__more"
                   type="button"
-                  disabled={conversation.loadingMore}
-                  onClick={() => void loadMoreTurns()}
+                  disabled={conversation.loadingOlder}
+                  onClick={() => void loadMoreTurns("older")}
                 >
-                  {conversation.loadingMore ? "Cargando turnos…" : "Cargar más turnos"}
+                  {conversation.loadingOlder
+                    ? "Cargando turnos anteriores…"
+                    : "Cargar turnos anteriores"}
+                </button>
+              ) : null}
+              {conversation.newerCursor ? (
+                <button
+                  className="admin-button admin-button--quiet admin-records__more"
+                  type="button"
+                  disabled={conversation.loadingNewer}
+                  onClick={() => void loadMoreTurns("newer")}
+                >
+                  {conversation.loadingNewer
+                    ? "Cargando turnos siguientes…"
+                    : "Cargar turnos siguientes"}
                 </button>
               ) : null}
             </>
@@ -1094,6 +1186,16 @@ export function AdminRecords({
           {currentExport?.state === "uncertain" || currentExport?.state === "failed" ? (
             <button className="admin-button" type="button" onClick={submitExport}>
               Reintentar preparación
+            </button>
+          ) : null}
+          {currentExport?.state === "start_rejected" ? (
+            <button
+              className="admin-button"
+              type="button"
+              disabled={!appliedFilters || searchState === "loading"}
+              onClick={submitExport}
+            >
+              Preparar otra exportación
             </button>
           ) : null}
           {currentExport?.state === "ready" ? (

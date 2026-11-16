@@ -52,16 +52,29 @@ export type RecordConversationPage = {
   throughOrdinal: number;
   turns: RecordTurnDescriptor[];
   nextCursor: string | null;
+  newerCursor: string | null;
 };
 
-export type RecordTextPage = {
+type RecordTextPageBase = {
   botId: string;
   conversationId: string;
   ordinal: number;
-  role: "question" | "answer";
   text: string;
   nextCursor: string | null;
 };
+
+export type RecordQuestionTextPage = RecordTextPageBase & {
+  role: "question";
+};
+
+export type RecordAnswerTextPage = RecordTextPageBase & {
+  role: "answer";
+  status: RecordStatus;
+  answerComplete: boolean;
+  failureCode?: string;
+};
+
+export type RecordTextPage = RecordQuestionTextPage | RecordAnswerTextPage;
 
 export type ExportStatus = "processing" | "ready" | "empty" | "failed" | "expired";
 
@@ -214,7 +227,9 @@ export function parseRecordConversationPage(
       ...(typeof failureCode === "string" ? { failureCode } : {}),
     };
   });
-  if (!isCursor(value.nextCursor)) throw new Error("INVALID_RESPONSE");
+  if (!isCursor(value.nextCursor) || !isCursor(value.newerCursor)) {
+    throw new Error("INVALID_RESPONSE");
+  }
   return {
     botId: expectedBotId,
     conversationId: expectedConversationId,
@@ -224,6 +239,7 @@ export function parseRecordConversationPage(
     throughOrdinal: parseOrdinal(value.throughOrdinal, true),
     turns,
     nextCursor: value.nextCursor,
+    newerCursor: value.newerCursor,
   };
 }
 
@@ -245,6 +261,23 @@ export function parseRecordTextPage(
   ) {
     throw new Error("INVALID_RESPONSE");
   }
+  if (expectedRole === "question") {
+    return {
+      botId: expectedBotId,
+      conversationId: expectedConversationId,
+      ordinal: expectedOrdinal,
+      role: expectedRole,
+      text: value.text,
+      nextCursor: value.nextCursor,
+    };
+  }
+  if (!isRecordStatus(value.status) || typeof value.answerComplete !== "boolean") {
+    throw new Error("INVALID_RESPONSE");
+  }
+  const failureCode = value.failureCode;
+  if (failureCode !== undefined && typeof failureCode !== "string") {
+    throw new Error("INVALID_RESPONSE");
+  }
   return {
     botId: expectedBotId,
     conversationId: expectedConversationId,
@@ -252,6 +285,9 @@ export function parseRecordTextPage(
     role: expectedRole,
     text: value.text,
     nextCursor: value.nextCursor,
+    status: value.status,
+    answerComplete: value.answerComplete,
+    ...(typeof failureCode === "string" ? { failureCode } : {}),
   };
 }
 
@@ -345,8 +381,26 @@ export function recordAdministrations(
         isActive,
       );
     },
-    conversation(conversationId: string, cursor?: string | null) {
-      const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+    conversation(
+      conversationId: string,
+      options?: { ordinal?: number; cursor?: string | null } | number | string | null,
+    ) {
+      const params = new URLSearchParams();
+      if (typeof options === "number") {
+        if (!Number.isSafeInteger(options) || options < 1) throw new Error("INVALID_REQUEST");
+        params.set("ordinal", String(options));
+      } else if (typeof options === "string") {
+        params.set("cursor", options);
+      } else if (options) {
+        if (options.ordinal !== undefined) {
+          if (!Number.isSafeInteger(options.ordinal) || options.ordinal < 1) {
+            throw new Error("INVALID_REQUEST");
+          }
+          params.set("ordinal", String(options.ordinal));
+        }
+        if (options.cursor) params.set("cursor", options.cursor);
+      }
+      const query = params.toString() ? `?${params.toString()}` : "";
       return adminRequest(
         config,
         session,

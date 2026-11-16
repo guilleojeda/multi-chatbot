@@ -235,6 +235,11 @@ function isHttpResponse(value: Record<string, string> | HttpResponse): value is 
   return "statusCode" in value && typeof value.statusCode === "number";
 }
 
+function parseRecordsOrdinal(value: string): number | null {
+  const ordinal = Number(value);
+  return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(ordinal) ? ordinal : null;
+}
+
 function emptyPostBody(event: HttpEvent): boolean {
   if (typeof event.body !== "string" || event.body.trim() === "") return true;
   const body = parseBody(event);
@@ -594,11 +599,17 @@ export function createAdminHandler(deps: {
         if (queryRoute.kind === "conversation") {
           if (method !== "GET") return response(404, { code: "NOT_FOUND" });
           if (!reader) return response(503, { code: "RECORDS_UNAVAILABLE" });
-          const query = queryParameters(event, ["cursor"]);
+          const query = queryParameters(event, ["cursor", "ordinal"]);
           if (isHttpResponse(query)) return query;
+          const ordinal =
+            query.ordinal === undefined ? undefined : parseRecordsOrdinal(query.ordinal);
+          if (ordinal === null || (ordinal !== undefined && query.cursor !== undefined)) {
+            return response(400, { code: "INVALID_INPUT" });
+          }
           const result = await reader.conversation({
             actorSub: principal.sub,
             conversationId: queryRoute.conversationId,
+            ...(ordinal === undefined ? {} : { ordinal }),
             ...(typeof query.cursor === "string" ? { cursor: query.cursor } : {}),
           });
           return response(200, { botId: queryRoute.botId, ...result });
@@ -609,17 +620,14 @@ export function createAdminHandler(deps: {
           if (!reader) return response(503, { code: "RECORDS_UNAVAILABLE" });
           const query = queryParameters(event, ["role", "cursor"]);
           if (isHttpResponse(query)) return query;
-          if (
-            (query.role !== "question" && query.role !== "answer") ||
-            !/^[1-9]\d*$/.test(queryRoute.ordinal) ||
-            !Number.isSafeInteger(Number(queryRoute.ordinal))
-          ) {
+          const ordinal = parseRecordsOrdinal(queryRoute.ordinal);
+          if ((query.role !== "question" && query.role !== "answer") || ordinal === null) {
             return response(400, { code: "INVALID_INPUT" });
           }
           const result = await reader.text({
             actorSub: principal.sub,
             conversationId: queryRoute.conversationId,
-            ordinal: Number(queryRoute.ordinal),
+            ordinal,
             role: query.role,
             ...(typeof query.cursor === "string" ? { cursor: query.cursor } : {}),
           });
