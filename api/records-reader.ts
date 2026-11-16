@@ -7,7 +7,7 @@ const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const MAX_SEARCH_CANDIDATES = 50;
 const MAX_TURNS_PER_PAGE = 25;
 const MAX_BATCH_KEYS = 100;
-const MAX_BATCH_RETRIES = 5;
+const MAX_BATCH_STALL_RETRIES = 5;
 const MAX_TEXT_CHUNKS = 16;
 const MAX_HTTP_TEXT_CHUNKS = 4;
 const MAX_CURSOR_BYTES = 8192;
@@ -76,6 +76,12 @@ type Candidate = {
   createdAt: string;
   conversationId: string;
   ordinal: number;
+};
+
+type AnswerState = {
+  status: RecordsStatus;
+  answerComplete: boolean;
+  failureCode?: string;
 };
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -173,7 +179,7 @@ function nextCalendarDay(value: string): string {
 }
 
 function normalizeSubject(value: string): string {
-  return value.trim().normalize("NFC").toLowerCase();
+  return value.trim().normalize("NFC").toLowerCase().normalize("NFC");
 }
 
 /** Validate and canonicalize the filters shared by the panel and export worker. */
@@ -224,7 +230,7 @@ export function normalizeRecordsFilters(value: unknown): NormalizedRecordsFilter
     normalized[key] = id;
   }
   if (source.subject !== undefined) {
-    if (typeof source.subject !== "string" || source.subject.length > 1024) {
+    if (typeof source.subject !== "string") {
       throw fail("INVALID_INPUT", "The records subject is invalid.");
     }
     const subject = normalizeSubject(source.subject);
@@ -350,6 +356,14 @@ function scopeHash(...parts: unknown[]): string {
 
 function isKey(value: unknown): value is Key {
   return record(value) && typeof value.pk === "string" && typeof value.sk === "string";
+}
+
+function hasTextContinuation(value: unknown, lastKey?: Key): boolean {
+  if (value === undefined || (record(value) && Object.keys(value).length === 0)) return false;
+  if (!lastKey || !isKey(value) || value.pk !== lastKey.pk || value.sk !== lastKey.sk) {
+    throw fail("RECORDS_UNAVAILABLE", "Conversation text continuation is invalid.");
+  }
+  return true;
 }
 
 function turnKey(conversationId: string, ordinal: number): Key {
@@ -502,17 +516,25 @@ function fitsResponse(value: unknown): boolean {
   return bytes <= MAX_RESPONSE_BYTES;
 }
 
-function toPublicTurn(turn: RecordsTurn) {
+function toPublicAnswerState(turn: RecordsTurn): AnswerState {
   const failure =
-    record(turn.failure) && typeof turn.failure.code === "string" ? turn.failure.code : undefined;
+    turn.status === "failed" && record(turn.failure) && typeof turn.failure.code === "string"
+      ? turn.failure.code
+      : undefined;
+  return {
+    status: turn.status,
+    answerComplete: turn.answerManifest.complete,
+    ...(failure ? { failureCode: failure } : {}),
+  };
+}
+
+function toPublicTurn(turn: RecordsTurn) {
   return {
     ordinal: turn.ordinal,
     queryId: turn.queryId,
     admittedAt: turn.createdAt,
-    status: turn.status,
-    answerComplete: turn.answerManifest.complete,
+    ...toPublicAnswerState(turn),
     profileFields: turn.profileSnapshot.fields,
-    ...(failure ? { failureCode: failure } : {}),
   };
 }
 
@@ -611,10 +633,9 @@ export function createRecordsReader(options: RecordsReaderOptions) {
       let keys: Key[] = Array.from({ length: batchEnd - batchStart + 1 }, (_, index) =>
         turnKey(meta.conversationId, batchStart + index),
       );
-      for (let retry = 0; keys.length > 0; retry += 1) {
-        if (retry > MAX_BATCH_RETRIES) {
-          throw fail("RECORDS_UNAVAILABLE", "Conversation turn reads could not be completed.");
-        }
+      let stalledRetries = 0;
+      while (keys.length > 0) {
+        const pending = new Set(keys.map((key) => key.sk));
         const result = await send(
           new BatchGetCommand({
             RequestItems: {
@@ -631,25 +652,34 @@ export function createRecordsReader(options: RecordsReaderOptions) {
           throw fail("RECORDS_UNAVAILABLE", "Conversation turn reads returned invalid data.");
         }
         for (const row of (rows ?? []) as unknown[]) {
-          if (!record(row) || !isSafePositive(row.ordinal) || !isValidTurn(row, { botId, meta })) {
+          if (!isValidTurn(row, { botId, meta }) || !pending.delete(row.sk)) {
             throw fail("RECORDS_UNAVAILABLE", "A conversation turn is invalid.");
-          }
-          if (row.ordinal < batchStart || row.ordinal > batchEnd || expected.has(row.ordinal)) {
-            throw fail("RECORDS_UNAVAILABLE", "Conversation turn reads returned duplicate data.");
           }
           expected.set(row.ordinal, row);
         }
         const unprocessed = record(result.UnprocessedKeys) ? result.UnprocessedKeys : {};
         const unprocessedTable = unprocessed[conversationTableName];
-        const nextKeys = record(unprocessedTable) ? unprocessedTable.Keys : undefined;
-        if (nextKeys === undefined) {
-          keys = [];
-        } else if (!Array.isArray(nextKeys) || !nextKeys.every(isKey)) {
+        const nextKeys = (record(unprocessedTable) ? unprocessedTable.Keys : undefined) ?? [];
+        if (
+          !Array.isArray(nextKeys) ||
+          !nextKeys.every((key) => isKey(key) && key.pk === meta.pk && pending.delete(key.sk))
+        ) {
           throw fail("RECORDS_UNAVAILABLE", "Conversation turn reads returned invalid keys.");
-        } else {
-          keys = nextKeys;
-          await sleep(Math.min(20 * 2 ** retry, 250));
         }
+        if (pending.size > 0) {
+          throw fail("RECORDS_UNAVAILABLE", "A conversation turn is missing.");
+        }
+        // DynamoDB can cap a partition's results even when the request stays under 100 keys.
+        if (nextKeys.length < keys.length) {
+          stalledRetries = 0;
+        } else {
+          if (stalledRetries === MAX_BATCH_STALL_RETRIES) {
+            throw fail("RECORDS_UNAVAILABLE", "Conversation turn reads could not be completed.");
+          }
+          await sleep(Math.min(20 * 2 ** stalledRetries, 250));
+          stalledRetries += 1;
+        }
+        keys = nextKeys;
       }
       for (let ordinal = batchStart; ordinal <= batchEnd; ordinal += 1) {
         const turn = expected.get(ordinal);
@@ -734,11 +764,12 @@ export function createRecordsReader(options: RecordsReaderOptions) {
     role: "user" | "assistant";
     actorSub: string;
     cursor?: unknown;
-  }): Promise<{ chunks: string[]; nextCursor: string | null }> {
+  }): Promise<{ chunks: string[]; nextCursor: string | null; answer?: AnswerState }> {
     const manifest =
       input.role === "user" ? input.turn.questionManifest : input.turn.answerManifest;
     const currentCount = manifest.count;
     let through = currentCount;
+    let answer = input.role === "assistant" ? toPublicAnswerState(input.turn) : undefined;
     const digest = scopeHash(
       options.environment,
       botId,
@@ -776,6 +807,29 @@ export function createRecordsReader(options: RecordsReaderOptions) {
       through = cursor.through;
       startIndex = cursor.nextIndex;
       startKey = cursor.key;
+      if (answer) {
+        const captured = cursor.answer;
+        if (!record(captured)) {
+          throw fail("INVALID_INPUT", "The text cursor has no captured answer state.");
+        }
+        // An answer can finish while its earlier durable prefix is still being read.
+        if (
+          captured.status === "in_progress" &&
+          captured.answerComplete === false &&
+          captured.failureCode === undefined
+        ) {
+          answer = { status: "in_progress", answerComplete: false };
+        } else if (
+          through !== currentCount ||
+          captured.status !== answer.status ||
+          captured.answerComplete !== answer.answerComplete ||
+          captured.failureCode !== answer.failureCode
+        ) {
+          throw fail("INVALID_INPUT", "The text cursor has an invalid captured answer state.");
+        }
+      } else if (cursor.answer !== undefined) {
+        throw fail("INVALID_INPUT", "The question cursor contains an answer state.");
+      }
     }
 
     const immutable =
@@ -827,12 +881,13 @@ export function createRecordsReader(options: RecordsReaderOptions) {
           role: publicTextRole(input.role),
           text: proposed.join(""),
           nextCursor: null,
+          ...answer,
         };
-        if (!fitsResponse(envelope) && chunks.length > 0) {
-          stoppedForSize = true;
-          break;
-        }
         if (!fitsResponse(envelope)) {
+          if (chunks.length > 0) {
+            stoppedForSize = true;
+            break;
+          }
           throw fail(
             "RECORDS_UNAVAILABLE",
             "A conversation text fragment exceeds the response limit.",
@@ -843,11 +898,14 @@ export function createRecordsReader(options: RecordsReaderOptions) {
         lastIncludedKey = { pk: row.pk as string, sk: row.sk as string };
       }
     }
-    if (expectedIndex === through && immutable) {
-      await rejectExtraTextChunk(input.turn, input.role, lastIncludedKey);
-    }
-    if (expectedIndex < through && !stoppedForSize && !page.LastEvaluatedKey) {
-      throw fail("RECORDS_UNAVAILABLE", "Conversation text is incomplete.");
+    if (!stoppedForSize) {
+      const hasMore = hasTextContinuation(page.LastEvaluatedKey, lastIncludedKey);
+      if (expectedIndex === through && immutable && (through === 0 || hasMore)) {
+        await rejectExtraTextChunk(input.turn, input.role, lastIncludedKey);
+      }
+      if (expectedIndex < through && !hasMore) {
+        throw fail("RECORDS_UNAVAILABLE", "Conversation text is incomplete.");
+      }
     }
 
     if (startIndex < through && chunks.length === 0) {
@@ -868,9 +926,10 @@ export function createRecordsReader(options: RecordsReaderOptions) {
         through,
         nextIndex: expectedIndex,
         key: lastIncludedKey,
+        ...(answer ? { answer } : {}),
       });
     }
-    return { chunks, nextCursor };
+    return { chunks, nextCursor, ...(answer ? { answer } : {}) };
   }
 
   function validChunk(
@@ -921,9 +980,7 @@ export function createRecordsReader(options: RecordsReaderOptions) {
       }
       throw fail("RECORDS_UNAVAILABLE", "Conversation text extends beyond its manifest.");
     }
-    if (result.LastEvaluatedKey) {
-      throw fail("RECORDS_UNAVAILABLE", "Conversation text continuation is invalid.");
-    }
+    hasTextContinuation(result.LastEvaluatedKey);
   }
 
   async function questionPreview(turn: RecordsTurn): Promise<string> {
@@ -1067,6 +1124,7 @@ export function createRecordsReader(options: RecordsReaderOptions) {
   async function conversation(input: {
     actorSub: string;
     conversationId: string;
+    ordinal?: number;
     cursor?: unknown;
   }): Promise<{
     conversationId: string;
@@ -1076,12 +1134,17 @@ export function createRecordsReader(options: RecordsReaderOptions) {
     throughOrdinal: number;
     turns: ReturnType<typeof toPublicTurn>[];
     nextCursor: string | null;
+    newerCursor: string | null;
   }> {
     if (typeof input?.actorSub !== "string" || input.actorSub.trim().length === 0) {
       throw fail("INVALID_INPUT", "The administrative identity is invalid.");
     }
     if (typeof input.conversationId !== "string" || !UUID.test(input.conversationId)) {
       throw fail("INVALID_INPUT", "The conversation ID is invalid.");
+    }
+    const hasCursor = input.cursor !== undefined && input.cursor !== null;
+    if (input.ordinal !== undefined && (!isSafePositive(input.ordinal) || hasCursor)) {
+      throw fail("INVALID_INPUT", "The conversation anchor is invalid.");
     }
     const digest = scopeHash(
       options.environment,
@@ -1090,15 +1153,17 @@ export function createRecordsReader(options: RecordsReaderOptions) {
       input.actorSub,
       input.conversationId,
     );
-    let throughOrdinal: number | undefined;
-    let nextOrdinal: number | undefined;
-    if (input.cursor !== undefined && input.cursor !== null) {
+    let capturedOrdinal: number | undefined;
+    let boundaryOrdinal = input.ordinal;
+    let direction: "older" | "newer" = "older";
+    if (hasCursor) {
       const cursor = decodeCursor(input.cursor);
       if (
         cursor.v !== 1 ||
         cursor.kind !== "conversation" ||
         cursor.scope !== digest ||
         cursor.conversationId !== input.conversationId ||
+        (cursor.direction !== "older" && cursor.direction !== "newer") ||
         !isSafePositive(cursor.throughOrdinal) ||
         !isSafePositive(cursor.nextOrdinal) ||
         !isKey(cursor.key) ||
@@ -1108,40 +1173,51 @@ export function createRecordsReader(options: RecordsReaderOptions) {
       ) {
         throw fail("INVALID_INPUT", "The conversation cursor does not match this request.");
       }
-      throughOrdinal = cursor.throughOrdinal;
-      nextOrdinal = cursor.nextOrdinal;
+      capturedOrdinal = cursor.throughOrdinal;
+      boundaryOrdinal = cursor.nextOrdinal;
+      direction = cursor.direction;
     }
     const meta = await readMeta(input.conversationId);
     if (!meta) throw fail("NOT_FOUND", "The conversation was not found.");
-    if (throughOrdinal !== undefined && throughOrdinal > meta.lastOrdinal) {
+    if (capturedOrdinal !== undefined && capturedOrdinal > meta.lastOrdinal) {
       throw fail("INVALID_INPUT", "The conversation cursor is newer than the conversation.");
     }
-    throughOrdinal ??= meta.lastOrdinal;
-    nextOrdinal ??= throughOrdinal;
-    const firstOrdinal = Math.max(1, nextOrdinal - MAX_TURNS_PER_PAGE + 1);
-    const descriptors = await readTurns(meta, firstOrdinal, nextOrdinal);
-    const turns = descriptors.map(toPublicTurn);
-    const nextTurnOrdinal = firstOrdinal - 1;
-    const nextCursor =
-      nextTurnOrdinal > 0
-        ? encodeCursor({
-            v: 1,
-            kind: "conversation",
-            scope: digest,
-            conversationId: input.conversationId,
-            throughOrdinal,
-            nextOrdinal: nextTurnOrdinal,
-            key: turnKey(input.conversationId, nextTurnOrdinal),
-          })
-        : null;
+    const throughOrdinal = capturedOrdinal ?? meta.lastOrdinal;
+    boundaryOrdinal ??= throughOrdinal;
+    if (boundaryOrdinal > throughOrdinal) {
+      throw fail("NOT_FOUND", "The conversation turn was not found.");
+    }
+    const firstOrdinal =
+      direction === "newer"
+        ? boundaryOrdinal
+        : Math.max(1, boundaryOrdinal - MAX_TURNS_PER_PAGE + 1);
+    const lastOrdinal =
+      direction === "older"
+        ? boundaryOrdinal
+        : Math.min(throughOrdinal, boundaryOrdinal + MAX_TURNS_PER_PAGE - 1);
+    const descriptors = await readTurns(meta, firstOrdinal, lastOrdinal);
+    function cursorFor(nextOrdinal: number, nextDirection: "older" | "newer"): string | null {
+      if (nextOrdinal < 1 || nextOrdinal > throughOrdinal) return null;
+      return encodeCursor({
+        v: 1,
+        kind: "conversation",
+        scope: digest,
+        conversationId: input.conversationId,
+        throughOrdinal,
+        direction: nextDirection,
+        nextOrdinal,
+        key: turnKey(input.conversationId, nextOrdinal),
+      });
+    }
     const response = {
       conversationId: input.conversationId,
       personId: meta.sub,
       hidden: Object.hasOwn(meta, "hiddenAt"),
       isTest: testPersonIds.includes(meta.sub),
       throughOrdinal,
-      turns,
-      nextCursor,
+      turns: descriptors.map(toPublicTurn),
+      nextCursor: cursorFor(firstOrdinal - 1, "older"),
+      newerCursor: cursorFor(lastOrdinal + 1, "newer"),
     };
     if (!fitsResponse(response))
       throw fail("RECORDS_UNAVAILABLE", "The conversation page exceeds its response limit.");
@@ -1154,13 +1230,15 @@ export function createRecordsReader(options: RecordsReaderOptions) {
     ordinal: number;
     role: "question" | "answer";
     cursor?: unknown;
-  }): Promise<{
-    conversationId: string;
-    ordinal: number;
-    role: "question" | "answer";
-    text: string;
-    nextCursor: string | null;
-  }> {
+  }): Promise<
+    {
+      conversationId: string;
+      ordinal: number;
+      role: "question" | "answer";
+      text: string;
+      nextCursor: string | null;
+    } & Partial<AnswerState>
+  > {
     if (
       typeof input?.actorSub !== "string" ||
       input.actorSub.trim().length === 0 ||
@@ -1186,6 +1264,7 @@ export function createRecordsReader(options: RecordsReaderOptions) {
       role: input.role,
       text: page.chunks.join(""),
       nextCursor: page.nextCursor,
+      ...page.answer,
     };
     if (!fitsResponse(response))
       throw fail("RECORDS_UNAVAILABLE", "The conversation text page exceeds its response limit.");
@@ -1256,11 +1335,12 @@ export function createRecordsReader(options: RecordsReaderOptions) {
         if ((row.text as string).trim().length > 0) hasNonWhitespaceText = true;
         yield row.text as string;
       }
+      const hasMore = hasTextContinuation(result.LastEvaluatedKey, lastIncludedKey);
       if (expected === count) {
-        if (immutable) await rejectExtraTextChunk(turn, role, lastIncludedKey);
+        if (immutable && hasMore) await rejectExtraTextChunk(turn, role, lastIncludedKey);
         break;
       }
-      if (!lastIncludedKey || !isKey(result.LastEvaluatedKey)) {
+      if (!lastIncludedKey || !hasMore) {
         throw fail("RECORDS_UNAVAILABLE", "Conversation text is incomplete.");
       }
       startKey = lastIncludedKey;

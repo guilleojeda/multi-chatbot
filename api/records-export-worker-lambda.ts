@@ -1,10 +1,9 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { S3Client } from "@aws-sdk/client-s3";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import { Upload } from "@aws-sdk/lib-storage";
-import { Readable } from "node:stream";
 import { parseRecordsTestPersonIds } from "./records-test-people.js";
 import { createRecordsExportWorker, type RecordsExportResources } from "./records-export-worker.js";
+import { uploadRecordsCsv } from "./records-export-uploader.js";
 
 type WorkerCatalogEntry = RecordsExportResources & { botId: string };
 type WorkerEvent = {
@@ -122,20 +121,13 @@ const worker = createRecordsExportWorker({
   resourcesByBot,
   documentClient,
   publishCsv: async ({ bucket, key, contentType, body }) => {
-    const upload = new Upload({
+    return uploadRecordsCsv({
       client: s3Client,
-      params: {
-        Bucket: bucket,
-        Key: key,
-        ContentType: contentType,
-        Body: Readable.from(body),
-      },
-      queueSize: 2,
-      partSize: 8 * 1024 * 1024,
-      leavePartsOnError: false,
+      bucket,
+      key,
+      contentType,
+      body,
     });
-    const result = await upload.done();
-    return { eTag: result.ETag };
   },
 });
 

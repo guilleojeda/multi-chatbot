@@ -188,6 +188,7 @@ async function startRecordsAdmin({ behavior = {}, fakeTimers = true } = {}) {
           throughOrdinal: 0,
           turns: [],
           nextCursor: null,
+          newerCursor: null,
         });
       }),
   );
@@ -203,6 +204,9 @@ async function startRecordsAdmin({ behavior = {}, fakeTimers = true } = {}) {
           role: url.searchParams.get("role"),
           text: "",
           nextCursor: null,
+          ...(url.searchParams.get("role") === "answer"
+            ? { status: "completed", answerComplete: true }
+            : {}),
         })),
   );
   harness.route(
@@ -369,9 +373,8 @@ describe("administrative conversation records", () => {
         ordinal: 2,
         queryId: "query-2",
         admittedAt: "2026-11-14T16:00:00.000Z",
-        status: "failed",
-        answerComplete: false,
-        failureCode: "generation_failed",
+        status: "completed",
+        answerComplete: true,
         profileFields: {
           educationLevels: [{ id: "primario", label: "Primaria" }],
           subjects: ["Ciencias"],
@@ -391,10 +394,12 @@ describe("administrative conversation records", () => {
             throughOrdinal: 2,
             turns,
             nextCursor: null,
+            newerCursor: null,
           }),
         text: async ({ path, url }) => {
           const ordinal = Number(path.split("/")[9]);
           const role = url.searchParams.get("role");
+          const cursor = url.searchParams.get("cursor");
           return jsonResponse({
             botId: botFromPath(path),
             conversationId: "conversation-1",
@@ -407,8 +412,18 @@ describe("administrative conversation records", () => {
                   : "Respuesta original de noviembre."
                 : role === "question"
                   ? "¿Y para primaria?"
-                  : "Prefijo de respuesta guardado.",
-            nextCursor: null,
+                  : cursor === null
+                    ? "Prefijo de respuesta guardado."
+                    : " Resto exacto del corte.",
+            nextCursor:
+              ordinal === 2 && role === "answer" && cursor === null ? "answer-tail" : null,
+            ...(role === "answer"
+              ? {
+                  status: ordinal === 1 ? "completed" : "failed",
+                  answerComplete: ordinal === 1,
+                  ...(ordinal === 2 ? { failureCode: "generation_failed" } : {}),
+                }
+              : {}),
           });
         },
       },
@@ -424,10 +439,18 @@ describe("administrative conversation records", () => {
     await waitForText(harness, /Pregunta original, con acentos/);
     expect(bodyText(harness.document)).toContain("Respuesta original de noviembre.");
     expect(bodyText(harness.document)).toContain("Prefijo de respuesta guardado.");
+    expect(bodyText(harness.document)).toContain("Resto exacto del corte.");
+    expect(bodyText(harness.document)).toContain("Respuesta original · parcial");
+    expect(bodyText(harness.document)).toContain("Turno 2 · Coincidencia");
     expect(bodyText(harness.document)).toContain("Secundaria");
     expect(bodyText(harness.document)).toContain("Ciencias naturales");
     expect(bodyText(harness.document)).toMatch(/retirad[ao]|ocult[ao]|quitad[ao]/i);
     expect(recordRequests(harness, "GET", "/conversations/conversation-1")).toHaveLength(1);
+    expect(
+      recordRequests(harness, "GET", "/conversations/conversation-1")[0].url.searchParams.get(
+        "ordinal",
+      ),
+    ).toBe("2");
     const textReads = harness.apiRequests.filter(
       ({ method, path }) =>
         method === "GET" && /\/records\/conversations\/[^/]+\/turns\/\d+\/text$/.test(path),
@@ -441,6 +464,134 @@ describe("administrative conversation records", () => {
       ),
     ).toBe(false);
     expect(harness.apiRequests.every(({ hostname }) => hostname === "localhost")).toBe(true);
+  });
+
+  it("opens the clicked ordinal and pages both older and newer turns under one cut", async () => {
+    const conversationRequests = [];
+    const harness = await startRecordsAdmin({
+      behavior: {
+        search: async ({ path }) =>
+          searchPage(botFromPath(path), [resultRow({ ordinal: 2, queryId: "query-2" })]),
+        conversation: async ({ path, url }) => {
+          const cursor = url.searchParams.get("cursor");
+          conversationRequests.push({ ordinal: url.searchParams.get("ordinal"), cursor });
+          const turn = (ordinal) => ({
+            ordinal,
+            queryId: `query-${ordinal}`,
+            admittedAt: `2026-11-0${ordinal}T14:00:00.000Z`,
+            status: "completed",
+            answerComplete: true,
+            profileFields: {},
+          });
+          if (cursor === "older-2") {
+            return jsonResponse({
+              botId: botFromPath(path),
+              conversationId: "conversation-1",
+              personId: "person-1",
+              hidden: false,
+              isTest: false,
+              throughOrdinal: 3,
+              turns: [turn(1)],
+              nextCursor: null,
+              newerCursor: "newer-from-older",
+            });
+          }
+          if (cursor === "newer-2" || cursor === "newer-from-older") {
+            return jsonResponse({
+              botId: botFromPath(path),
+              conversationId: "conversation-1",
+              personId: "person-1",
+              hidden: false,
+              isTest: false,
+              throughOrdinal: 3,
+              turns: [turn(3)],
+              nextCursor: null,
+              newerCursor: null,
+            });
+          }
+          return jsonResponse({
+            botId: botFromPath(path),
+            conversationId: "conversation-1",
+            personId: "person-1",
+            hidden: false,
+            isTest: false,
+            throughOrdinal: 3,
+            turns: [turn(2)],
+            nextCursor: "older-2",
+            newerCursor: "newer-2",
+          });
+        },
+        text: async ({ path, url }) => {
+          const ordinal = Number(path.split("/")[9]);
+          const role = url.searchParams.get("role");
+          return jsonResponse({
+            botId: botFromPath(path),
+            conversationId: "conversation-1",
+            ordinal,
+            role,
+            text: role === "question" ? `Pregunta ${ordinal}` : `Respuesta ${ordinal}`,
+            nextCursor: null,
+            ...(role === "answer" ? { status: "completed", answerComplete: true } : {}),
+          });
+        },
+      },
+    });
+    if (searchRequests(harness).length === 0) await applyFilters(harness);
+    await harness.click(
+      [...harness.document.querySelectorAll("button")].find((candidate) =>
+        controlName(candidate).includes("¿Y para primaria?"),
+      ),
+    );
+    await waitForText(harness, /Pregunta 2/);
+    expect(conversationRequests[0]).toEqual({ ordinal: "2", cursor: null });
+    expect(bodyText(harness.document)).toContain("Turno 2 · Coincidencia");
+
+    await harness.click(getButton(harness, "Cargar turnos anteriores"));
+    await waitForText(harness, /Pregunta 1/);
+    expect(conversationRequests.at(-1)).toEqual({ ordinal: null, cursor: "older-2" });
+
+    await harness.click(getButton(harness, "Cargar turnos siguientes"));
+    await waitForText(harness, /Pregunta 3/);
+    expect(conversationRequests.at(-1)).toEqual({ ordinal: null, cursor: "newer-2" });
+    expect(bodyText(harness.document)).toContain("Turno 3");
+  });
+
+  it("does not let a conversation response reopen after applying new filters", async () => {
+    const pendingConversation = deferred();
+    const harness = await startRecordsAdmin({
+      behavior: {
+        search: async ({ path }) =>
+          searchPage(botFromPath(path), [resultRow({ questionPreview: "Nuevo filtro" })]),
+        conversation: async () => pendingConversation.promise,
+      },
+    });
+    if (searchRequests(harness).length === 0) await applyFilters(harness);
+    await harness.click(
+      [...harness.document.querySelectorAll("button")].find((candidate) =>
+        controlName(candidate).includes("Nuevo filtro"),
+      ),
+    );
+    expect(bodyText(harness.document)).toMatch(/cargando originales/i);
+
+    await harness.setValue(getControl(harness, "Materia"), "Aplicada después");
+    await harness.click(getButton(harness, "Aplicar filtros"));
+    expect(bodyText(harness.document)).not.toMatch(/cargando originales|Conversación/);
+    pendingConversation.resolve(
+      jsonResponse({
+        botId: "docentes",
+        conversationId: "conversation-1",
+        personId: "person-1",
+        hidden: false,
+        isTest: false,
+        throughOrdinal: 1,
+        turns: [],
+        nextCursor: null,
+        newerCursor: null,
+      }),
+    );
+    await harness.settle();
+    expect(bodyText(harness.document)).not.toContain("Identificador: conversation-1");
+    expect(bodyText(harness.document)).toContain("Nuevo filtro");
   });
 
   it("drops a late search response from a different chatbot selection", async () => {
@@ -482,6 +633,81 @@ describe("administrative conversation records", () => {
     expect(bodyText(harness.document)).toContain("Solo del chatbot Robótica");
     expect(bodyText(harness.document)).not.toContain("Resultado atrasado de Docentes");
   });
+
+  it("keeps an export start response attached to its bot while switching chatbots", async () => {
+    const pendingStart = deferred();
+    let statusReads = 0;
+    const harness = await startRecordsAdmin({
+      behavior: {
+        search: async ({ path }) =>
+          searchPage(botFromPath(path), [
+            resultRow({ conversationId: `${botFromPath(path)}-conversation` }),
+          ]),
+        startExport: async () => pendingStart.promise,
+        readExport: async ({ path }) => {
+          statusReads += 1;
+          const exportId = path.split("/").at(-1);
+          return jsonResponse({
+            botId: "docentes",
+            exportId,
+            status: "ready",
+            conversationCount: 1,
+            rowCount: 1,
+            bytes: 72,
+            expiresAt: "2026-11-17T02:00:00.000Z",
+          });
+        },
+      },
+    });
+    await harness.click(getButton(harness, "Descargar conversaciones en CSV"));
+    expect(exportStarts(harness)).toHaveLength(1);
+    const start = exportStarts(harness)[0];
+    await harness.setValue(getControl(harness, "Chatbot", "select"), "robotica");
+    pendingStart.resolve(
+      jsonResponse({ botId: "docentes", exportId: start.body.exportId, status: "processing" }, 202),
+    );
+    await harness.settle();
+    await harness.setValue(getControl(harness, "Chatbot", "select"), "docentes");
+    await advanceUntil(harness, () => /1\s+conversaciones/.test(bodyText(harness.document)));
+    expect(statusReads).toBeGreaterThan(0);
+    expect(exportStarts(harness)).toHaveLength(1);
+    expect(bodyText(harness.document)).toMatch(/1\s+conversaciones/);
+  });
+
+  it.each([400, 409])(
+    "shows a confirmed %s start rejection and allows a new request with corrected applied filters",
+    async (status) => {
+      let starts = 0;
+      const harness = await startRecordsAdmin({
+        behavior: {
+          search: async ({ path }) => searchPage(botFromPath(path), [resultRow()]),
+          startExport: async ({ body, path }) => {
+            starts += 1;
+            if (starts === 1) return jsonResponse({ code: "start_rejected" }, status);
+            return jsonResponse(
+              { botId: botFromPath(path), exportId: body.exportId, status: "processing" },
+              202,
+            );
+          },
+        },
+      });
+      if (searchRequests(harness).length === 0) await applyFilters(harness);
+      await harness.click(getButton(harness, "Descargar conversaciones en CSV"));
+      await waitForText(harness, /rechazó/i);
+      expect(getButton(harness, "Preparar otra exportación")).toBeTruthy();
+      const first = exportStarts(harness)[0];
+
+      await harness.setValue(getControl(harness, "Materia"), "Materia corregida");
+      await harness.click(getButton(harness, "Aplicar filtros"));
+      await harness.click(getButton(harness, "Preparar otra exportación"));
+      expect(exportStarts(harness)).toHaveLength(2);
+      expect(exportStarts(harness)[1].body.exportId).not.toBe(first.body.exportId);
+      expect(exportStarts(harness)[1].body.filters).toMatchObject({
+        ...defaultFilters,
+        subject: "Materia corregida",
+      });
+    },
+  );
 
   it("retries an unconfirmed export with the same ID, resumes processing, and starts a native download only on click", async () => {
     let startCount = 0;
